@@ -6,6 +6,10 @@ export const BOARD_ITEM_TYPES = [
   "goal",
   "decision",
   "task",
+  "issue",
+  "feature",
+  "main_goal",
+  "main_description",
   "constraint",
   "question",
   "risk",
@@ -13,7 +17,7 @@ export const BOARD_ITEM_TYPES = [
 ] as const;
 
 export const BOARD_ITEM_STATUSES = ["candidate", "confirmed", "rejected"] as const;
-export const BOARD_TEMPLATES = ["brainstorming", "idea", "project"] as const;
+export const BOARD_TEMPLATES = ["brainstorming", "idea", "project", "software_project"] as const;
 
 export type BoardItemType = (typeof BOARD_ITEM_TYPES)[number];
 export type BoardItemStatus = (typeof BOARD_ITEM_STATUSES)[number];

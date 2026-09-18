@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { boardTemplates } from "../src/templates/boardTemplates";
 
 describe("board template configuration", () => {
-  it("defines exactly the three initial templates", () => {
-    expect(Object.keys(boardTemplates)).toEqual(["brainstorming", "idea", "project"]);
+  it("defines the available board templates", () => {
+    expect(Object.keys(boardTemplates)).toEqual(["brainstorming", "idea", "project", "software_project"]);
   });
 
   it("keeps brainstorming neutral and category-free", () => {
@@ -18,5 +18,9 @@ describe("board template configuration", () => {
     expect(boardTemplates.project.cardTypes.map((type) => type.id)).toEqual([
       "goal", "decision", "task", "constraint", "question", "risk", "reference", "note"
     ]);
+    expect(boardTemplates.software_project.cardTypes.map((type) => type.id)).toEqual([
+      "issue", "feature", "decision", "task", "main_goal", "main_description", "note"
+    ]);
+    expect(boardTemplates.software_project.defaultCardType).toBe("task");
   });
 });

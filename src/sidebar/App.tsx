@@ -5,8 +5,9 @@ import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { BOARD_TEMPLATES, type AppState, type BoardItem, type BoardTemplate } from "../types";
 import { Card } from "./components/Card";
 import { CopyIcon } from "./components/CopyIcon";
+import { ProjectPicker } from "./components/ProjectPicker";
 import { cardDeletionNeedsConfirmation } from "./deletion";
-import { reorderAtTarget, type DropPosition } from "./reorder";
+import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 
@@ -28,7 +29,8 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<
     { kind: "project"; id: string } | { kind: "card"; id: string } | null
   >(null);
-  const [focusCardId, setFocusCardId] = useState<string | null>(null);
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{ id: string; afterSave: boolean } | null>(null);
   const newCardTextareaRef = useRef<HTMLTextAreaElement>(null);
   const newCardFormRef = useRef<HTMLFormElement>(null);
   const inlineCardTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -93,7 +95,8 @@ export function App() {
       status: target?.status === "rejected" ? "rejected" : "candidate",
       afterItemId: insertingAfterId
     });
-    setFocusCardId(created.id);
+    setSelectedCardId(created.id);
+    setFocusRequest({ id: created.id, afterSave: true });
     cancelInlineCard();
     await reload();
   }
@@ -120,6 +123,10 @@ export function App() {
     .sort((a, b) => a.order - b.order) ?? [], [state]);
   const visibleItems = items.filter((item) => item.status !== "rejected");
   const rejectedItems = items.filter((item) => item.status === "rejected");
+
+  useEffect(() => {
+    if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
+  }, [items, selectedCardId]);
 
   async function createProject(event: FormEvent) {
     event.preventDefault();
@@ -296,6 +303,31 @@ export function App() {
     await reload();
   }
 
+  function cardSection(itemId: string) {
+    const item = items.find((candidate) => candidate.id === itemId);
+    if (!item) return [];
+    return item.status === "rejected" ? rejectedItems : visibleItems;
+  }
+
+  function navigateCard(itemId: string, direction: -1 | 1) {
+    const targetId = adjacentItemId(cardSection(itemId).map((item) => item.id), itemId, direction);
+    if (!targetId) return;
+    setSelectedCardId(targetId);
+    setFocusRequest({ id: targetId, afterSave: false });
+  }
+
+  async function moveCardWithKeyboard(itemId: string, direction: -1 | 1) {
+    if (!currentProject) return;
+    const targetId = adjacentItemId(cardSection(itemId).map((item) => item.id), itemId, direction);
+    if (!targetId) return;
+    const position: DropPosition = direction === -1 ? "before" : "after";
+    const ordered = reorderAtTarget(items.map((item) => item.id), itemId, targetId, position);
+    await repository.reorderItems(currentProject.id, ordered);
+    setSelectedCardId(itemId);
+    await reload();
+    setFocusRequest({ id: itemId, afterSave: false });
+  }
+
   async function copyBoard() {
     if (!currentProject) return;
     await navigator.clipboard.writeText(serializeBoard(currentProject, items));
@@ -309,7 +341,7 @@ export function App() {
     const showAfter = dropTarget?.id === item.id && dropTarget.position === "after";
     return (
       <Fragment key={item.id}>
-        {showBefore && <DropPlaceholder />}
+        {showBefore && <DropPlaceholder targetId={item.id} position="before" onDragOver={previewDrop} onDrop={dropOn} />}
         <Card
           item={item}
           template={currentProject.template}
@@ -322,8 +354,13 @@ export function App() {
           isDragging={draggedId === item.id}
           onInsertAfter={beginInsertAfter}
           onDuplicate={(itemId) => void duplicateItem(itemId)}
-          focusRequested={focusCardId === item.id}
-          onFocusHandled={() => setFocusCardId((current) => current === item.id ? null : current)}
+          selected={selectedCardId === item.id}
+          onSelect={setSelectedCardId}
+          onNavigate={navigateCard}
+          onKeyboardMove={(itemId, direction) => void moveCardWithKeyboard(itemId, direction)}
+          focusRequested={focusRequest?.id === item.id}
+          armInsertOnFocus={focusRequest?.id === item.id && focusRequest.afterSave}
+          onFocusHandled={() => setFocusRequest((current) => current?.id === item.id ? null : current)}
         />
         {pendingDelete?.kind === "card" && pendingDelete.id === item.id && (
           <DeleteConfirmation
@@ -347,7 +384,7 @@ export function App() {
             <small className="edit-hint">Enter or double-click to add · Shift+Enter for a new line · Esc to cancel</small>
           </form>
         )}
-        {showAfter && <DropPlaceholder />}
+        {showAfter && <DropPlaceholder targetId={item.id} position="after" onDragOver={previewDrop} onDrop={dropOn} />}
       </Fragment>
     );
   }
@@ -395,19 +432,21 @@ export function App() {
                 aria-label="Project name"
               />
             </form>
-          ) : state.projects.length ? (
-            <select
-              aria-label="Current project"
-              value={currentProject?.id ?? ""}
-              onChange={async (event) => {
+          ) : state.projects.length && currentProject ? (
+            <ProjectPicker
+              projects={state.projects}
+              currentProjectId={currentProject.id}
+              onSelect={async (projectId) => {
                 setPendingDelete(null);
                 setRenamingProject(false);
-                await repository.selectProject(event.target.value);
+                await repository.selectProject(projectId);
                 await reload();
               }}
-            >
-              {state.projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-            </select>
+              onReorder={async (orderedIds) => {
+                await repository.reorderProjects(orderedIds);
+                await reload();
+              }}
+            />
           ) : <h1>Your project state</h1>}
           <button
             className={`project-action-button${addingProject ? " active" : ""}`}
@@ -525,8 +564,34 @@ export function App() {
   );
 }
 
-function DropPlaceholder() {
-  return <div className="drop-placeholder" aria-hidden="true"><span>Drop here</span></div>;
+function DropPlaceholder({
+  targetId,
+  position,
+  onDragOver,
+  onDrop
+}: {
+  targetId: string;
+  position: DropPosition;
+  onDragOver: (itemId: string, position: DropPosition) => void;
+  onDrop: (itemId: string, position: DropPosition) => void;
+}) {
+  return (
+    <div
+      className="drop-placeholder"
+      aria-hidden="true"
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        onDragOver(targetId, position);
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        onDrop(targetId, position);
+      }}
+    >
+      <span>Drop here</span>
+    </div>
+  );
 }
 
 function NewProjectIcon() {

@@ -56,6 +56,16 @@ export function createRepository(storage: KeyValueStorage) {
     await save(state);
   }
 
+  async function reorderProjects(orderedIds: string[]): Promise<void> {
+    const state = await load();
+    const projectIds = state.projects.map((project) => project.id);
+    if (orderedIds.length !== projectIds.length || !projectIds.every((id) => orderedIds.includes(id))) {
+      throw new Error("Reorder list must contain every project exactly once");
+    }
+    state.projects = orderedIds.map((id) => state.projects.find((project) => project.id === id) as Project);
+    await save(state);
+  }
+
   async function renameProject(projectId: string, name: string): Promise<void> {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("Project name is required");
@@ -198,7 +208,7 @@ export function createRepository(storage: KeyValueStorage) {
     await save(state);
   }
 
-  return { load, createProject, selectProject, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, reorderItems };
+  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, reorderItems };
 }
 
 function normalizeOrder(state: AppState, projectId: string) {

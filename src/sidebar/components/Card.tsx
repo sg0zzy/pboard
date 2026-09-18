@@ -2,7 +2,8 @@ import { type CSSProperties, type KeyboardEvent, useEffect, useRef, useState } f
 import { getCardTypeDefinition, getTemplateDefinition, isTypeSupported } from "../../templates/boardTemplates";
 import { BOARD_ITEM_STATUSES, type BoardItem, type BoardTemplate } from "../../types";
 import { cardTextForClipboard } from "../cardText";
-import { toSafeWebHref, tokenizeLinks } from "../linkify";
+import { toSafeWebHref } from "../linkify";
+import { MarkdownContent, MarkdownInline, setTaskCheckedAtLine } from "../markdown";
 import type { DropPosition } from "../reorder";
 import { CopyIcon } from "./CopyIcon";
 
@@ -18,7 +19,12 @@ type Props = {
   isDragging: boolean;
   onInsertAfter: (itemId: string) => void;
   onDuplicate: (itemId: string) => void;
+  selected: boolean;
+  onSelect: (itemId: string) => void;
+  onNavigate: (itemId: string, direction: -1 | 1) => void;
+  onKeyboardMove: (itemId: string, direction: -1 | 1) => void;
   focusRequested: boolean;
+  armInsertOnFocus: boolean;
   onFocusHandled: () => void;
 };
 
@@ -28,11 +34,12 @@ const statusLabels: Record<BoardItem["status"], string> = {
   rejected: "× Rejected"
 };
 
-export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, onInsertAfter, onDuplicate, focusRequested, onFocusHandled }: Props) {
+export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, armInsertOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);
   const [copied, setCopied] = useState(false);
+  const [enterCreatesDraft, setEnterCreatesDraft] = useState(false);
   const cardRef = useRef<HTMLElement>(null);
   const templateDefinition = getTemplateDefinition(template);
   const typeDefinition = getCardTypeDefinition(template, item.type);
@@ -53,28 +60,36 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
   useEffect(() => {
     if (!focusRequested || editing) return;
     window.requestAnimationFrame(() => {
+      setEnterCreatesDraft(armInsertOnFocus);
       cardRef.current?.focus({ preventScroll: true });
       cardRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
       onFocusHandled();
     });
-  }, [editing, focusRequested, onFocusHandled]);
+  }, [armInsertOnFocus, editing, focusRequested, onFocusHandled]);
 
   function startEditing() {
+    setEnterCreatesDraft(false);
     setTitle(item.title ?? "");
     setContent(item.content);
     setEditing(true);
   }
 
   function cancelEditing() {
+    setEnterCreatesDraft(false);
     setTitle(item.title ?? "");
     setContent(item.content);
     setEditing(false);
+    window.requestAnimationFrame(() => {
+      cardRef.current?.focus({ preventScroll: true });
+      cardRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
   }
 
-  async function save() {
+  async function save(armNextInsert = true) {
     if (!content.trim()) return;
     await onUpdate(item.id, { title: title.trim() || undefined, content: content.trim() });
     setEditing(false);
+    setEnterCreatesDraft(armNextInsert);
     window.requestAnimationFrame(() => cardRef.current?.focus({ preventScroll: true }));
   }
 
@@ -86,7 +101,7 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
     }
     if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      void save();
+      void save(!(event.ctrlKey || event.metaKey));
     }
   }
 
@@ -96,11 +111,18 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
     window.setTimeout(() => setCopied(false), 1400);
   }
 
+  function toggleTask(lineIndex: number, checked: boolean) {
+    const nextContent = setTaskCheckedAtLine(content, lineIndex, checked);
+    if (nextContent === content) return;
+    setContent(nextContent);
+    void onUpdate(item.id, { content: nextContent });
+  }
+
   return (
     <article
       ref={cardRef}
-      tabIndex={-1}
-      className={`card status-${item.status}${isDragging ? " dragging" : ""}`}
+      tabIndex={0}
+      className={`card status-${item.status}${selected ? " selected" : ""}${isDragging ? " dragging" : ""}`}
       style={cardStyle}
       draggable={!editing}
       onDragStart={(event) => {
@@ -121,10 +143,17 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
       }}
       onDragEnd={onDragEnd}
       onMouseDown={(event) => {
-        if (event.button === 1 && !(event.target as HTMLElement).closest("a, button, input, textarea, select")) {
+        const isInteractive = Boolean((event.target as HTMLElement).closest("a, button, input, textarea, select"));
+        if (event.button === 0 && !isInteractive && !editing) {
+          setEnterCreatesDraft(false);
+          onSelect(item.id);
+          cardRef.current?.focus({ preventScroll: true });
+        }
+        if (event.button === 1 && !isInteractive) {
           event.preventDefault();
         }
       }}
+      onFocus={() => onSelect(item.id)}
       onAuxClick={(event) => {
         if (event.button !== 1 || (event.target as HTMLElement).closest("a, button, input, textarea, select")) return;
         event.preventDefault();
@@ -132,9 +161,23 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
         else onInsertAfter(item.id);
       }}
       onKeyDown={(event) => {
-        if (!editing && event.key === "Enter" && event.target === event.currentTarget) {
+        if (editing || event.target !== event.currentTarget) return;
+        if (event.key === "Enter") {
           event.preventDefault();
-          onInsertAfter(item.id);
+          if (enterCreatesDraft) {
+            setEnterCreatesDraft(false);
+            onInsertAfter(item.id);
+          } else {
+            startEditing();
+          }
+          return;
+        }
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault();
+          setEnterCreatesDraft(false);
+          const direction = event.key === "ArrowUp" ? -1 : 1;
+          if (event.shiftKey && (event.ctrlKey || event.metaKey)) onKeyboardMove(item.id, direction);
+          else if (!event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) onNavigate(item.id, direction);
         }
       }}
       onDoubleClick={() => { if (!editing) startEditing(); }}
@@ -170,12 +213,12 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
         >
           <input value={title} onChange={(event) => setTitle(event.target.value)} onKeyDown={handleEditKeyDown} placeholder="Optional title" />
           <textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={handleEditKeyDown} rows={5} autoFocus />
-          <small className="edit-hint">Enter or double-click to save · Shift+Enter for a new line · Esc to cancel</small>
+          <small className="edit-hint">Enter saves, then Enter adds below · Ctrl+Enter saves only · Shift+Enter for a new line · Esc to cancel</small>
         </div>
       ) : (
         <>
-          {item.title && <h3><LinkifiedText text={item.title} /></h3>}
-          <p><LinkifiedText text={item.content} /></p>
+          {item.title && <h3><MarkdownInline text={item.title} /></h3>}
+          <MarkdownContent text={content} onTaskToggle={toggleTask} />
           <div className="card-actions" onDoubleClick={(event) => event.stopPropagation()}>
             {sourceHref && (
               <a
@@ -210,21 +253,6 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
       )}
     </article>
   );
-}
-
-function LinkifiedText({ text }: { text: string }) {
-  return tokenizeLinks(text).map((part, index) => part.type === "link" ? (
-    <a
-      key={`${index}-${part.href}`}
-      className="card-link"
-      href={part.href}
-      target="_blank"
-      rel="noreferrer"
-      onDoubleClick={(event) => event.stopPropagation()}
-    >
-      {part.text}
-    </a>
-  ) : <span key={index}>{part.text}</span>);
 }
 
 function TrashIcon() {

@@ -52,7 +52,10 @@ Implemented behavior:
 - Pressing Escape anywhere in the New Project form closes it, discards its temporary name/template selection, and leaves stored project data unchanged.
 - After successful project creation, the Add Point editor opens automatically and receives focus so the next typed text can be submitted as the first card with Enter.
 - A newly created project becomes the current project.
-- A user can switch projects with the project selector.
+- A user can switch projects with a custom dropdown selector styled like the previous compact project control.
+- Projects can be dragged directly inside the open dropdown to change their persistent order; an insertion line previews the destination.
+- The dropdown supports Up/Down and Home/End navigation, Enter selection, Escape dismissal, and closing by clicking outside it.
+- Reordering does not change the current project or any project/card content. Existing storage remains compatible because project array order is already authoritative.
 - A folder-plus icon in the project-title row opens and closes the New Project form, replacing the previous separate text action.
 - A pencil icon replaces the project selector with a focused inline name field; Enter persists a non-empty trimmed name and Escape cancels without changes.
 - The selected project is global to the extension; it is not tied to the current ChatGPT conversation.
@@ -68,7 +71,7 @@ Project data:
 type Project = {
   id: string;
   name: string;
-  template: "brainstorming" | "idea" | "project";
+  template: "brainstorming" | "idea" | "project" | "software_project";
   createdAt: string;
   updatedAt: string;
 };
@@ -78,12 +81,13 @@ type Project = {
 
 Templates are configuration-driven through `src/templates/boardTemplates.ts`. Each definition supplies its display name, description, supported card types, default card type, prompt behavior, labels, and semantic colors.
 
-The three templates represent increasing structure:
+The original three templates represent increasing structure, with SW Project as a specialized operational variant:
 
 ```text
 Brainstorming → no semantic structure
 Idea          → exploratory semantic structure
 Project       → decision and execution structure
+SW Project    → software product and implementation structure
 ```
 
 #### Brainstorming
@@ -107,6 +111,13 @@ Project       → decision and execution structure
 - Available semantic types: Goal, Decision, Task / Next Step, Constraint, Open Question, Risk / Blocker, and Reference.
 - Uncategorized is also available as a safe fallback and is the default for new or pinned cards.
 - Types use restrained blue, green, teal, purple, yellow, red, and blue-gray accents.
+
+#### SW Project
+
+- Description: **Software goals, product work, issues and implementation tasks.**
+- Available semantic types: Issue, Feature, Decision, Task, Main Goal, and Main Description.
+- New manually added and pinned cards default to Task; Uncategorized remains available as a safe fallback when changing templates.
+- Types use restrained red, green, purple, teal, blue, and blue-gray accents, while status remains visually independent.
 
 #### Changing templates
 
@@ -139,6 +150,8 @@ Implemented behavior:
 - Manually created cards default to type `note` and status `candidate`.
 - Cards enter inline editing when the user double-clicks their title or content area.
 - While editing, Enter saves, Shift+Enter inserts a newline, Escape cancels, and another double-click saves.
+- Ctrl+Enter saves without arming creation of a new card below; Command+Enter is the macOS equivalent. The next Enter therefore edits the same selected card again.
+- Cancelling an edit with Escape restores focus to the same selected card, allowing immediate arrow navigation or Enter-to-edit without selecting it again.
 - After an existing card is saved, focus returns to that card and a second Enter opens a new inline draft directly beneath it.
 - No persistent Edit or Save button is shown on a card.
 - A card may have an optional title.
@@ -152,6 +165,9 @@ Implemented behavior:
 - A conventional overlapping-sheets icon copies the optional title and card content to the clipboard without type, status, or source metadata.
 - The copy icon temporarily becomes a check mark after a successful copy.
 - Card content and its compact action row use minimal vertical spacing so short cards remain easy to scan in long boards.
+- Card display supports a deliberately small Markdown subset: lines beginning with `* ` or `- ` become bullet lists; numbered lines such as `1. ` become ordered lists; `**text**`, `*text*`, and backticks render bold, italic, and inline code; `[text](url)` renders a labelled link.
+- Lines beginning with `- [ ]` or `- [x]` render as unchecked or checked task boxes. Clicking a checkbox updates that exact marker in the stored card content, so its state persists and is preserved by card/board copying; completed task text is visually struck through.
+- Markdown is presentation-only. Editing always exposes and preserves the original plain-text syntax, and no HTML input is interpreted.
 - HTTP, HTTPS, and `www.` addresses in card titles and content are rendered as native links.
 - Stored source-conversation badges are links when they contain a valid HTTP or HTTPS address.
 - Links open in a browser tab and retain Firefox's native middle-click and context-menu actions.
@@ -159,7 +175,11 @@ Implemented behavior:
 - Cards can be reordered with native drag-and-drop.
 - While dragging, the original card is visually subdued and a dashed card-shaped placeholder previews whether it will be inserted before or after the card under the pointer.
 - The placeholder updates as the pointer crosses the vertical midpoint of a target card.
+- The visible placeholder remains a live drop target, so releasing the pointer over the preview completes the reorder.
 - Rejected and non-rejected sections only accept reorder previews from their own section, preventing a misleading cross-section placement.
+- A focused card is visibly selected. Up and Down move selection through cards in the same active or rejected section.
+- Enter starts editing the selected card. Immediately after saving a card, the existing second-Enter shortcut retains its special behavior and opens a draft below it.
+- Ctrl+Shift+Up and Ctrl+Shift+Down reorder the selected card by one position; Command+Shift+Up/Down provides the macOS equivalent.
 - Deleting a card normalizes the remaining order values.
 - Rejected cards are placed in a collapsed **Rejected** section.
 - Card changes update the card's `updatedAt` timestamp.
@@ -195,6 +215,10 @@ type BoardItem = {
     | "goal"
     | "decision"
     | "task"
+    | "issue"
+    | "feature"
+    | "main_goal"
+    | "main_description"
     | "constraint"
     | "question"
     | "risk"
@@ -215,7 +239,7 @@ type BoardItem = {
 
 ## 5. Pinning from web pages
 
-The extension provides a one-way capture flow from any ordinary HTTP/HTTPS page to the current board without injecting a content script into generic sites.
+The extension provides a one-way capture flow from any ordinary HTTP/HTTPS page to the current board. Generic sites receive no persistent content script; shortcut capture uses a one-off selection reader only after an explicit keypress.
 
 User flow:
 
@@ -224,9 +248,17 @@ User flow:
 3. Choose **Pin selection to Pboard**.
 4. The text is added to the currently selected project.
 
+Keyboard flow:
+
+- `Alt+Shift+C` (**Capture**) pins the selected text from the active page without conflicting with Firefox's existing `Alt+Shift+S` binding.
+- `Alt+Shift+W` pins the active page URL and title.
+- Both combinations use only left-hand letter keys and can be reassigned in Firefox's Manage Extension Shortcuts screen.
+- The context-menu labels show the corresponding default shortcuts in parentheses so the keyboard actions are discoverable.
+- The selection shortcut reads accessible frames and uses the first non-empty selection. Restricted browser pages fail safely without changing the board.
+
 Pinned-card behavior:
 
-- The card type is `note`.
+- The card uses the current template's default type (`note` for the original templates and `task` for SW Project).
 - The card status is `candidate`.
 - The selected text becomes both the card content and `source.sourceText`.
 - The provider is stored as `chatgpt`.
@@ -380,13 +412,14 @@ Production artifacts are written to `dist/`. The sidebar is built as a normal we
 
 Current automated coverage includes:
 
-- project creation, selection, persistence, and deletion;
+- project creation, selection, reordering, persistence, and deletion;
 - cascading card deletion with a project;
 - card creation, editing, deletion, and reordering;
 - before/after insertion calculations used by the drag placeholder;
 - repository insertion directly after a selected card;
 - individual card-text formatting for clipboard copy;
 - safe card-link detection, punctuation handling, and `www.` normalization;
+- simple Markdown inline tokenization and paragraph, bullet-list, numbered-list, and persistent task-list parsing;
 - board-template creation, configuration, and safe template changes;
 - note-only enforcement for Brainstorming;
 - version-1 storage migration without card-data loss;

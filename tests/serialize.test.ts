@@ -29,4 +29,15 @@ describe("serializeBoard", () => {
       "PROJECT: Loose thoughts\n\nA raw thought\n\nMaybe\nAnother thought"
     );
   });
+
+  it("uses software-project labels in copied board prompts", () => {
+    const softwareProject: Project = { ...project, template: "software_project", name: "Compiler" };
+    const items: BoardItem[] = [
+      { ...base, id: "1", type: "main_goal", status: "confirmed", order: 0, content: "Compile safely." },
+      { ...base, id: "2", type: "issue", status: "candidate", order: 1, content: "Parser crashes." }
+    ];
+    expect(serializeBoard(softwareProject, items)).toBe(
+      "PROJECT: Compiler\n\nMAIN GOAL\nCompile safely.\n\nISSUE\nParser crashes."
+    );
+  });
 });

@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { reorderAtTarget } from "../src/sidebar/reorder";
+import { adjacentItemId, reorderAtTarget } from "../src/sidebar/reorder";
+
+describe("adjacentItemId", () => {
+  it("finds the cards immediately above and below the current card", () => {
+    expect(adjacentItemId(["a", "b", "c"], "b", -1)).toBe("a");
+    expect(adjacentItemId(["a", "b", "c"], "b", 1)).toBe("c");
+  });
+
+  it("returns null at a boundary or for an unknown card", () => {
+    expect(adjacentItemId(["a", "b"], "a", -1)).toBeNull();
+    expect(adjacentItemId(["a", "b"], "b", 1)).toBeNull();
+    expect(adjacentItemId(["a", "b"], "missing", 1)).toBeNull();
+  });
+});
 
 describe("reorderAtTarget", () => {
   it("places a dragged card before the preview target", () => {

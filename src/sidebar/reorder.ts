@@ -1,5 +1,15 @@
 export type DropPosition = "before" | "after";
 
+export function adjacentItemId(
+  orderedIds: string[],
+  currentId: string,
+  direction: -1 | 1
+): string | null {
+  const currentIndex = orderedIds.indexOf(currentId);
+  if (currentIndex < 0) return null;
+  return orderedIds[currentIndex + direction] ?? null;
+}
+
 export function reorderAtTarget(
   orderedIds: string[],
   draggedId: string,

@@ -68,6 +68,23 @@ export const boardTemplates: Record<BoardTemplate, BoardTemplateDefinition> = {
     defaultCardType: "note",
     showTypeSelector: true,
     includeTypeInPrompt: true
+  },
+  software_project: {
+    id: "software_project",
+    displayName: "SW Project",
+    description: "Software goals, product work, issues and implementation tasks.",
+    cardTypes: [
+      { id: "issue", label: "Issue", color: "#b6504b", tint: "#fdecea" },
+      { id: "feature", label: "Feature", color: "#398458", tint: "#eaf7ee" },
+      { id: "decision", label: "Decision", color: "#745e99", tint: "#f1edf8" },
+      { id: "task", label: "Task", color: "#22827d", tint: "#e4f6f4" },
+      { id: "main_goal", label: "Main Goal", color: "#3974c1", tint: "#e9f2ff" },
+      { id: "main_description", label: "Main Description", color: "#59758d", tint: "#edf3f7" },
+      note
+    ],
+    defaultCardType: "task",
+    showTypeSelector: true,
+    includeTypeInPrompt: true
   }
 };
 

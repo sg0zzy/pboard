@@ -33,6 +33,19 @@ describe("Pboard repository", () => {
     expect(storage.data[STORAGE_KEY]).toBeDefined();
   });
 
+  it("persists an explicit project order without changing the selected project", async () => {
+    const first = await repository.createProject("First");
+    const second = await repository.createProject("Second");
+    const third = await repository.createProject("Third");
+    await repository.selectProject(second.id);
+
+    await repository.reorderProjects([third.id, first.id, second.id]);
+
+    const state = await repository.load();
+    expect(state.projects.map((project) => project.name)).toEqual(["Third", "First", "Second"]);
+    expect(state.currentProjectId).toBe(second.id);
+  });
+
   it("renames a project and persists the trimmed name", async () => {
     const project = await repository.createProject("Old name", "idea");
     await repository.renameProject(project.id, "  New name  ");
@@ -109,6 +122,16 @@ describe("Pboard repository", () => {
     const project = await repository.createProject("Raw ideas", "brainstorming");
     const card = await repository.addItem({ projectId: project.id, content: "Unclassified", type: "risk" });
     expect(card.type).toBe("note");
+  });
+
+  it("uses tasks by default for software projects and accepts software card types", async () => {
+    const project = await repository.createProject("Compiler", "software_project");
+    const task = await repository.addItem({ projectId: project.id, content: "Implement parser" });
+    const issue = await repository.addItem({ projectId: project.id, content: "Parser crashes", type: "issue" });
+    const goal = await repository.addItem({ projectId: project.id, content: "Compile safely", type: "main_goal" });
+    expect(task.type).toBe("task");
+    expect(issue.type).toBe("issue");
+    expect(goal.type).toBe("main_goal");
   });
 
   it("changes templates without losing cards and remaps only unsupported types", async () => {

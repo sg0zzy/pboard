@@ -3,7 +3,7 @@
   "name": "Pboard",
   "version": "0.1.0",
   "description": "Keep a private, structured project state alongside AI conversations.",
-  "permissions": ["storage", "menus", "clipboardWrite"],
+  "permissions": ["storage", "menus", "clipboardWrite", "activeTab", "scripting"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*"
@@ -31,6 +31,20 @@
       "run_at": "document_idle"
     }
   ],
+  "commands": {
+    "pin-selection-to-pboard": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Pin the selected text to Pboard"
+    },
+    "pin-page-to-pboard": {
+      "suggested_key": {
+        "default": "Alt+Shift+W"
+      },
+      "description": "Pin the current web page to Pboard"
+    }
+  },
   "browser_specific_settings": {
     "gecko": {
       "id": "project-board@local.invalid",
