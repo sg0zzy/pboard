@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "Pboard",
+  "version": "0.1.0",
+  "description": "Keep a private, structured project state alongside AI conversations.",
+  "permissions": ["storage", "menus", "clipboardWrite"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "sidebar_action": {
+    "default_title": "Pboard",
+    "default_panel": "sidebar.html",
+    "open_at_install": true
+  },
+  "page_action": {
+    "default_title": "Pin current page to Pboard",
+    "default_icon": "icons/pin.svg",
+    "show_matches": ["http://*/*", "https://*/*"]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "project-board@local.invalid",
+      "strict_min_version": "121.0"
+    }
+  }
+}

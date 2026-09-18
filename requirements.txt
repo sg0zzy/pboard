@@ -1,0 +1,8 @@
+PROJECT: pboard
+
+refine categories and templates for better organization and usability
+
+
+
+further features (future)
+types customizable (templates, categories, colors)
