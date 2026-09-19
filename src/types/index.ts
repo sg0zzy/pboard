@@ -23,6 +23,13 @@ export type BoardItemType = (typeof BOARD_ITEM_TYPES)[number];
 export type BoardItemStatus = (typeof BOARD_ITEM_STATUSES)[number];
 export type BoardTemplate = (typeof BOARD_TEMPLATES)[number];
 
+export type BoardImage = {
+  dataUrl: string;
+  mimeType: string;
+  width: number;
+  height: number;
+};
+
 export type Project = {
   id: string;
   name: string;
@@ -37,6 +44,7 @@ export type BoardItem = {
   type: BoardItemType;
   title?: string;
   content: string;
+  image?: BoardImage;
   status: BoardItemStatus;
   order: number;
   source?: {

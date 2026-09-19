@@ -14,10 +14,11 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Choose Brainstorming, Idea, Project, or SW Project structure when creating a board, and change it later without losing card content.
 - Use SW Project cards for Issues, Features, Decisions, Tasks, the Main Goal, and the Main Description.
 - Press Escape to leave project creation without creating or changing a project.
-- After creating a project, immediately type its first point in the automatically focused Add Point editor.
+- After creating a project, immediately type its first point in the automatically focused Add Card editor.
 - Add, edit, type, status, delete, and drag cards to reorder them.
 - Confirm deletion of protected cards and projects in an inline panel beside the affected item.
 - Preview the exact insertion position with a placeholder while dragging a card.
+- Press or release Shift at any time while dragging a text card to switch dynamically between reorder and merge; Escape cancels the drag.
 - Select cards with Up/Down, edit the selected card with Enter, and reorder it with Ctrl+Shift+Up/Down (Command+Shift on macOS).
 - Middle-click a card to compose and insert a new card directly beneath it.
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
@@ -26,8 +27,8 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Use Ctrl+Enter while editing to save without arming the follow-up Enter shortcut that creates a card below; Command+Enter is the macOS equivalent.
 - Cancel card editing with Escape while keeping that card selected for continued keyboard navigation.
 - Add a new card with Enter or a double-click; use Shift+Enter for multiline text.
-- Keep entering points continuously: after each save the empty Add Point editor retains focus for the next card.
-- Keep the active Add Point editor fully visible when working with long boards.
+- Keep entering points continuously: after each save the empty Add Card editor retains focus for the next card.
+- Keep the active Add Card editor fully visible when working with long boards.
 - Adjust and persist the board's text and control size with the −/+ buttons beside the Pboard heading.
 - Read the current board scale as a percentage between the size buttons; 100% is the default.
 - Open web addresses in card titles, content, and source metadata as native browser links.
@@ -41,6 +42,9 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Right-click a web link to pin its URL and visible label as a reference.
 - Right-click an ordinary page area or use the pin icon in Firefox's address bar to pin the current page.
 - Keep the source page URL on pinned cards.
+- Capture part of the current page as an image card with the camera button beside **Add card**: drag a rectangle on the page, or press Escape to cancel.
+- Drop an image file anywhere on the board to add it as an image card.
+- Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current non-rejected board as a clean, structured prompt.
 - Persist all state in `browser.storage.local` across Firefox restarts.
 
@@ -52,7 +56,7 @@ Any HTTP/HTTPS page
 ChatGPT page
   └─ isolated content script and ChatGptAdapter
             ⇅ WebExtension messaging
-background script (context menus and address-bar page action)
+background script (context menus, page action, and region capture)
             ⇅ browser.storage.local
 React sidebar ─ project/card repository
 ```
@@ -61,20 +65,20 @@ Provider-specific page access lives in `src/providers`. The rest of the board kn
 
 State is stored as one versioned object. Projects are application-owned; a conversation URL is optional source metadata on a card, never the owner of a project.
 
-## Minimal Firefox permissions
+## Firefox permissions
 
 - `storage`: persist projects, cards, order, and the selected project locally.
 - `menus`: expose pin actions for selected text, links, and pages.
 - `clipboardWrite`: copy the board prompt after an explicit button click.
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
-- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`; nothing is installed persistently on generic pages.
-- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the small selection-capture content script only on supported ChatGPT origins.
+- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used.
+- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Region capture uses temporary `activeTab` access instead of broad host access.
 
-No broad web host access, browsing-history permission, remote code, or network endpoint is used. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress.
+No browsing-history permission, remote code, or network endpoint is used. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.
 
 ## Develop and build
 
-Requirements: Node.js 20 or newer, npm, and Firefox 121 or newer.
+Requirements: Node.js 20 or newer, npm, and Firefox 126 or newer.
 
 ```bash
 npm install
@@ -112,13 +116,14 @@ npm run typecheck
 npm run build
 ```
 
-Tests cover project creation/deletion and persistence, card creation/editing/deletion/reordering, prompt serialization, selection messaging, generic web selections and links, source metadata, missing projects, unsupported hosts, and missing provider selections. Generic capture uses Firefox's context-menu metadata; ChatGPT selection capture uses the standard browser Selection API rather than provider-specific message selectors.
+Tests cover project creation/deletion and persistence, card creation/editing/deletion/reordering, image persistence and sizing, capture-region cropping, prompt serialization, selection messaging, generic web selections and links, source metadata, missing projects, unsupported hosts, and missing provider selections. Generic capture uses Firefox's context-menu metadata; ChatGPT selection capture uses the standard browser Selection API rather than provider-specific message selectors.
 
 ## Repository map
 
 ```text
 src/background/   context-menu orchestration
 src/content/      content-script message handling
+src/images/       image decoding, cropping, and scaling
 src/messaging/    typed message contracts
 src/providers/    isolated provider adapters
 src/sidebar/      React board UI and prompt serialization

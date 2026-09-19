@@ -1,8 +1,10 @@
-import { FormEvent, Fragment, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { processImageFile } from "../images/processing";
+import type { CaptureRegionResponse } from "../messaging/messages";
 import { repository } from "../storage/browser";
 import { STORAGE_KEY } from "../storage/repository";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
-import { BOARD_TEMPLATES, type AppState, type BoardItem, type BoardTemplate } from "../types";
+import { BOARD_TEMPLATES, type AppState, type BoardImage, type BoardItem, type BoardTemplate } from "../types";
 import { Card } from "./components/Card";
 import { CopyIcon } from "./components/CopyIcon";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -15,25 +17,23 @@ export function App() {
   const [state, setState] = useState<AppState | null>(null);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectTemplate, setNewProjectTemplate] = useState<BoardTemplate>("brainstorming");
-  const [newCard, setNewCard] = useState("");
   const [addingProject, setAddingProject] = useState(false);
   const [renamingProject, setRenamingProject] = useState(false);
   const [projectNameDraft, setProjectNameDraft] = useState("");
-  const [addingCard, setAddingCard] = useState(false);
   const [draggedId, setDraggedId] = useState<string | null>(null);
+  const [dragMergeMode, setDragMergeMode] = useState(false);
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition } | null>(null);
+  const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
-  const [insertingAfterId, setInsertingAfterId] = useState<string | null>(null);
-  const [inlineCard, setInlineCard] = useState("");
   const [pendingDelete, setPendingDelete] = useState<
     { kind: "project"; id: string } | { kind: "card"; id: string } | null
   >(null);
+  const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
-  const [focusRequest, setFocusRequest] = useState<{ id: string; afterSave: boolean } | null>(null);
-  const newCardTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const newCardFormRef = useRef<HTMLFormElement>(null);
-  const inlineCardTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
+  const [imageDropActive, setImageDropActive] = useState(false);
+  const [capturingRegion, setCapturingRegion] = useState(false);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(async () => setState(await repository.load()), []);
@@ -53,68 +53,11 @@ export function App() {
     return () => browser.storage.onChanged.removeListener(listener);
   }, [reload]);
 
-  useEffect(() => {
-    if (addingCard) focusNewCardEditor();
-  }, [addingCard]);
-
-  function focusNewCardEditor() {
-    window.requestAnimationFrame(() => {
-      newCardTextareaRef.current?.focus({ preventScroll: true });
-      newCardFormRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    });
-  }
-
   function changeUiScale(direction: -1 | 1) {
     const next = adjustUiScale(uiScale, direction);
     if (next === uiScale) return;
     setUiScale(next);
     void browser.storage.local.set({ [UI_SCALE_STORAGE_KEY]: next });
-  }
-
-  function beginInsertAfter(itemId: string) {
-    setInsertingAfterId(itemId);
-    setInlineCard("");
-    window.requestAnimationFrame(() => {
-      inlineCardTextareaRef.current?.focus({ preventScroll: true });
-      inlineCardTextareaRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    });
-  }
-
-  function cancelInlineCard() {
-    setInlineCard("");
-    setInsertingAfterId(null);
-  }
-
-  async function addInlineCard(event: FormEvent) {
-    event.preventDefault();
-    if (!currentProject || !insertingAfterId || !inlineCard.trim()) return;
-    const target = items.find((item) => item.id === insertingAfterId);
-    const created = await repository.addItem({
-      projectId: currentProject.id,
-      content: inlineCard,
-      status: target?.status === "rejected" ? "rejected" : "candidate",
-      afterItemId: insertingAfterId
-    });
-    setSelectedCardId(created.id);
-    setFocusRequest({ id: created.id, afterSave: true });
-    cancelInlineCard();
-    await reload();
-  }
-
-  function submitInlineCard(textarea: HTMLTextAreaElement) {
-    if (inlineCard.trim()) textarea.form?.requestSubmit();
-  }
-
-  function handleInlineCardKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      cancelInlineCard();
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-      event.preventDefault();
-      submitInlineCard(event.currentTarget);
-    }
   }
 
   const currentProject = state?.projects.find((project) => project.id === state.currentProjectId) ?? null;
@@ -131,12 +74,11 @@ export function App() {
   async function createProject(event: FormEvent) {
     event.preventDefault();
     if (!newProjectName.trim()) return;
-    await repository.createProject(newProjectName, newProjectTemplate);
+    const project = await repository.createProject(newProjectName, newProjectTemplate);
     setNewProjectName("");
     setAddingProject(false);
-    setAddingCard(true);
     await reload();
-    focusNewCardEditor();
+    void createCard(project.id);
   }
 
   function cancelProjectCreation() {
@@ -207,39 +149,26 @@ export function App() {
     await reload();
   }
 
-  async function addCard(event: FormEvent) {
-    event.preventDefault();
-    if (!currentProject || !newCard.trim()) return;
-    await repository.addItem({ projectId: currentProject.id, content: newCard });
-    setNewCard("");
+  async function createCard(projectId: string, afterItemId?: string) {
+    const created = await repository.addItem({
+      projectId,
+      content: "",
+      ...(afterItemId ? { afterItemId } : {})
+    });
+    setSelectedCardId(created.id);
     await reload();
-    focusNewCardEditor();
+    setFocusRequest({ id: created.id, startEditing: true });
   }
 
-  function submitNewCard(textarea: HTMLTextAreaElement) {
-    if (newCard.trim()) textarea.form?.requestSubmit();
-  }
-
-  function cancelNewCard() {
-    setNewCard("");
-    setAddingCard(false);
-  }
-
-  function handleNewCardKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      cancelNewCard();
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-      event.preventDefault();
-      submitNewCard(event.currentTarget);
-    }
-  }
-
-  async function updateItem(itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>) {
+  async function updateItem(
+    itemId: string,
+    patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>,
+    afterSave?: "focus" | "insert"
+  ) {
     await repository.updateItem(itemId, patch);
     await reload();
+    if (afterSave === "insert" && currentProject) void createCard(currentProject.id, itemId);
+    if (afterSave === "focus") setFocusRequest({ id: itemId, startEditing: false });
   }
 
   async function deleteItem(itemId: string) {
@@ -249,7 +178,6 @@ export function App() {
   }
 
   async function duplicateItem(itemId: string) {
-    cancelInlineCard();
     await repository.duplicateItem(itemId);
     await reload();
   }
@@ -263,19 +191,39 @@ export function App() {
     await deleteItem(itemId);
   }
 
-  function beginDrag(itemId: string) {
+  function beginDrag(itemId: string, mergeMode: boolean) {
+    setPendingMerge(null);
     setDraggedId(itemId);
+    setDragMergeMode(mergeMode);
     setDropTarget(null);
+    setMergeTargetId(null);
   }
 
-  function previewDrop(targetId: string, position: DropPosition) {
+  function changeDragMode(mergeMode: boolean) {
+    setDragMergeMode(mergeMode);
+    if (mergeMode) setDropTarget(null);
+    else setMergeTargetId(null);
+  }
+
+  function previewDrop(targetId: string, position: DropPosition, mergeMode: boolean) {
+    changeDragMode(mergeMode);
     if (!draggedId || draggedId === targetId) {
+      setDropTarget(null);
+      setMergeTargetId(null);
+      return;
+    }
+    if (mergeMode) {
+      setDropTarget(null);
+      setMergeTargetId(targetId);
+      return;
+    }
+    setMergeTargetId(null);
+    const dragged = items.find((item) => item.id === draggedId);
+    const target = items.find((item) => item.id === targetId);
+    if (!dragged || !target || (dragged.status === "rejected") !== (target.status === "rejected")) {
       setDropTarget(null);
       return;
     }
-    const dragged = items.find((item) => item.id === draggedId);
-    const target = items.find((item) => item.id === targetId);
-    if (!dragged || !target || (dragged.status === "rejected") !== (target.status === "rejected")) return;
     setDropTarget((current) => current?.id === targetId && current.position === position
       ? current
       : { id: targetId, position });
@@ -283,12 +231,20 @@ export function App() {
 
   function endDrag() {
     setDraggedId(null);
+    setDragMergeMode(false);
     setDropTarget(null);
+    setMergeTargetId(null);
   }
 
-  async function dropOn(targetId: string, position: DropPosition) {
+  async function dropOn(targetId: string, position: DropPosition, mergeMode: boolean) {
     if (!currentProject || !draggedId || draggedId === targetId) {
       endDrag();
+      return;
+    }
+    if (mergeMode) {
+      const sourceId = draggedId;
+      endDrag();
+      await requestMerge(sourceId, targetId);
       return;
     }
     const dragged = items.find((item) => item.id === draggedId);
@@ -303,6 +259,30 @@ export function App() {
     await reload();
   }
 
+  async function requestMerge(sourceId: string, targetId: string) {
+    const source = items.find((item) => item.id === sourceId);
+    const target = items.find((item) => item.id === targetId);
+    if (!source || !target) return;
+    if (source.image) {
+      setNotice("Image cards cannot be merged because the image would be lost");
+      window.setTimeout(() => setNotice(""), 3000);
+      return;
+    }
+    if (source.status === "confirmed") {
+      setPendingMerge({ sourceId, targetId });
+      return;
+    }
+    await mergeItems(sourceId, targetId);
+  }
+
+  async function mergeItems(sourceId: string, targetId: string) {
+    await repository.mergeItems(sourceId, targetId);
+    setPendingMerge(null);
+    setSelectedCardId(targetId);
+    await reload();
+    setFocusRequest({ id: targetId, startEditing: false });
+  }
+
   function cardSection(itemId: string) {
     const item = items.find((candidate) => candidate.id === itemId);
     if (!item) return [];
@@ -313,7 +293,7 @@ export function App() {
     const targetId = adjacentItemId(cardSection(itemId).map((item) => item.id), itemId, direction);
     if (!targetId) return;
     setSelectedCardId(targetId);
-    setFocusRequest({ id: targetId, afterSave: false });
+    setFocusRequest({ id: targetId, startEditing: false });
   }
 
   async function moveCardWithKeyboard(itemId: string, direction: -1 | 1) {
@@ -325,7 +305,7 @@ export function App() {
     await repository.reorderItems(currentProject.id, ordered);
     setSelectedCardId(itemId);
     await reload();
-    setFocusRequest({ id: itemId, afterSave: false });
+    setFocusRequest({ id: itemId, startEditing: false });
   }
 
   async function copyBoard() {
@@ -335,13 +315,66 @@ export function App() {
     window.setTimeout(() => setNotice(""), 2200);
   }
 
+  async function addImageCard(image: BoardImage, content: string, title?: string, pageUrl?: string) {
+    if (!currentProject) return;
+    const created = await repository.addItem({
+      projectId: currentProject.id,
+      content,
+      ...(title ? { title } : {}),
+      image,
+      ...(pageUrl ? {
+        source: { provider: "web", conversationUrl: pageUrl, sourceText: content }
+      } : {})
+    });
+    setSelectedCardId(created.id);
+    await reload();
+    setFocusRequest({ id: created.id, startEditing: false });
+  }
+
+  async function captureRegion() {
+    if (!currentProject || capturingRegion) return;
+    setCapturingRegion(true);
+    setNotice("Drag a rectangle on the page · Esc to cancel");
+    try {
+      const response = await browser.runtime.sendMessage({ type: "CAPTURE_PAGE_REGION" }) as CaptureRegionResponse;
+      if (!response.ok) {
+        setNotice(response.cancelled ? "" : response.reason);
+        return;
+      }
+      await addImageCard(response.image, "Page capture", response.pageTitle, response.pageUrl);
+      setNotice("Capture added");
+      window.setTimeout(() => setNotice(""), 2200);
+    } catch {
+      setNotice("The page could not be captured");
+    } finally {
+      setCapturingRegion(false);
+    }
+  }
+
+  async function dropImage(event: DragEvent<HTMLElement>) {
+    const file = Array.from(event.dataTransfer.files).find((candidate) => candidate.type.startsWith("image/"));
+    if (!file) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setImageDropActive(false);
+    setNotice("Processing image…");
+    try {
+      const image = await processImageFile(file);
+      await addImageCard(image, file.name || "Image");
+      setNotice("Image added");
+      window.setTimeout(() => setNotice(""), 2200);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The image could not be added");
+    }
+  }
+
   function renderSortableCard(item: BoardItem) {
     if (!currentProject) return null;
     const showBefore = dropTarget?.id === item.id && dropTarget.position === "before";
     const showAfter = dropTarget?.id === item.id && dropTarget.position === "after";
     return (
       <Fragment key={item.id}>
-        {showBefore && <DropPlaceholder targetId={item.id} position="before" onDragOver={previewDrop} onDrop={dropOn} />}
+        {showBefore && <DropPlaceholder targetId={item.id} position="before" />}
         <Card
           item={item}
           template={currentProject.template}
@@ -352,14 +385,16 @@ export function App() {
           onDrop={dropOn}
           onDragEnd={endDrag}
           isDragging={draggedId === item.id}
-          onInsertAfter={beginInsertAfter}
+          isMergeTarget={mergeTargetId === item.id}
+          isMergeSource={draggedId === item.id && (dragMergeMode || mergeTargetId !== null)}
+          onInsertAfter={(itemId) => void createCard(currentProject.id, itemId)}
           onDuplicate={(itemId) => void duplicateItem(itemId)}
           selected={selectedCardId === item.id}
           onSelect={setSelectedCardId}
           onNavigate={navigateCard}
           onKeyboardMove={(itemId, direction) => void moveCardWithKeyboard(itemId, direction)}
           focusRequested={focusRequest?.id === item.id}
-          armInsertOnFocus={focusRequest?.id === item.id && focusRequest.afterSave}
+          startEditingOnFocus={focusRequest?.id === item.id && focusRequest.startEditing}
           onFocusHandled={() => setFocusRequest((current) => current?.id === item.id ? null : current)}
         />
         {pendingDelete?.kind === "card" && pendingDelete.id === item.id && (
@@ -370,21 +405,16 @@ export function App() {
             onConfirm={() => void deleteItem(item.id)}
           />
         )}
-        {insertingAfterId === item.id && (
-          <form className="inline-insert-card" onSubmit={addInlineCard}>
-            <textarea
-              ref={inlineCardTextareaRef}
-              value={inlineCard}
-              onChange={(event) => setInlineCard(event.target.value)}
-              onKeyDown={handleInlineCardKeyDown}
-              onDoubleClick={(event) => submitInlineCard(event.currentTarget)}
-              placeholder="New point…"
-              rows={3}
-            />
-            <small className="edit-hint">Enter or double-click to add · Shift+Enter for a new line · Esc to cancel</small>
-          </form>
+        {pendingMerge?.sourceId === item.id && (
+          <DeleteConfirmation
+            message="Merge this confirmed card?"
+            detail="Its text will be appended to the target card and this card will be removed."
+            confirmLabel="Merge"
+            onCancel={() => setPendingMerge(null)}
+            onConfirm={() => void mergeItems(pendingMerge.sourceId, pendingMerge.targetId)}
+          />
         )}
-        {showAfter && <DropPlaceholder targetId={item.id} position="after" onDragOver={previewDrop} onDrop={dropOn} />}
+        {showAfter && <DropPlaceholder targetId={item.id} position="after" />}
       </Fragment>
     );
   }
@@ -438,6 +468,7 @@ export function App() {
               currentProjectId={currentProject.id}
               onSelect={async (projectId) => {
                 setPendingDelete(null);
+                setPendingMerge(null);
                 setRenamingProject(false);
                 await repository.selectProject(projectId);
                 await reload();
@@ -518,7 +549,21 @@ export function App() {
               ))}
             </select>
           </div>
-          <section className="board" aria-label="Board cards">
+          <section
+            className={`board${imageDropActive ? " image-drop-active" : ""}`}
+            aria-label="Board cards"
+            onDragOver={(event) => {
+              if (!hasImageFile(event.dataTransfer)) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              setImageDropActive(true);
+            }}
+            onDragLeave={(event) => {
+              if (!event.relatedTarget || !event.currentTarget.contains(event.relatedTarget as Node)) setImageDropActive(false);
+            }}
+            onDrop={(event) => void dropImage(event)}
+          >
+            {imageDropActive && <div className="image-drop-overlay" aria-hidden="true">Drop image to add a card</div>}
             {!visibleItems.length && !rejectedItems.length && (
               <div className="empty-state small">
                 <h2>No pinned points yet.</h2>
@@ -535,23 +580,16 @@ export function App() {
           </section>
 
           <section className="board-controls">
-            <button className="text-button add-card" onClick={() => setAddingCard((value) => !value)}>+ Add point</button>
-            {addingCard && (
-              <form ref={newCardFormRef} className="add-card-form" onSubmit={addCard}>
-                <textarea
-                  ref={newCardTextareaRef}
-                  value={newCard}
-                  onChange={(event) => setNewCard(event.target.value)}
-                  onKeyDown={handleNewCardKeyDown}
-                  onDoubleClick={(event) => submitNewCard(event.currentTarget)}
-                  placeholder="What matters right now?"
-                  rows={4}
-                  autoFocus
-                />
-                <small className="edit-hint">Enter or double-click to add the next point · Shift+Enter for a new line · Esc to finish</small>
-                <div><button className="text-button" type="button" onClick={cancelNewCard}>Cancel</button><button disabled={!newCard.trim()}>Add</button></div>
-              </form>
-            )}
+            <div className="board-add-row">
+              <button className="text-button add-card" onClick={() => void createCard(currentProject.id)}>+ Add card</button>
+              <button
+                className="capture-button"
+                aria-label="Capture part of the current page"
+                title="Capture part of the current page"
+                disabled={capturingRegion}
+                onClick={() => void captureRegion()}
+              ><CameraIcon /></button>
+            </div>
             <button className="copy-button" onClick={copyBoard} disabled={!items.some((item) => item.status !== "rejected")}>
               <CopyIcon />
               <span>Copy board</span>
@@ -566,28 +604,17 @@ export function App() {
 
 function DropPlaceholder({
   targetId,
-  position,
-  onDragOver,
-  onDrop
+  position
 }: {
   targetId: string;
   position: DropPosition;
-  onDragOver: (itemId: string, position: DropPosition) => void;
-  onDrop: (itemId: string, position: DropPosition) => void;
 }) {
   return (
     <div
       className="drop-placeholder"
+      data-drop-target-id={targetId}
+      data-drop-position={position}
       aria-hidden="true"
-      onDragOver={(event) => {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-        onDragOver(targetId, position);
-      }}
-      onDrop={(event) => {
-        event.preventDefault();
-        onDrop(targetId, position);
-      }}
     >
       <span>Drop here</span>
     </div>
@@ -610,16 +637,31 @@ function EditIcon() {
   );
 }
 
+function CameraIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 7.75h3l1.4-2h7.2l1.4 2h3v10.5H4z" />
+      <circle cx="12" cy="13" r="3.25" />
+    </svg>
+  );
+}
+
+function hasImageFile(dataTransfer: DataTransfer): boolean {
+  return Array.from(dataTransfer.items).some((item) => item.kind === "file" && item.type.startsWith("image/"));
+}
+
 function DeleteConfirmation({
   message,
   detail,
   onCancel,
-  onConfirm
+  onConfirm,
+  confirmLabel = "Delete"
 }: {
   message: string;
   detail: string;
   onCancel: () => void;
   onConfirm: () => void;
+  confirmLabel?: string;
 }) {
   return (
     <div
@@ -636,7 +678,7 @@ function DeleteConfirmation({
       <div><strong>{message}</strong><small>{detail}</small></div>
       <div className="delete-confirmation-actions">
         <button className="text-button" onClick={onCancel} autoFocus>Cancel</button>
-        <button className="delete-confirm-button" onClick={onConfirm}>Delete</button>
+        <button className="delete-confirm-button" onClick={onConfirm}>{confirmLabel}</button>
       </div>
     </div>
   );

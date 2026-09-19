@@ -68,23 +68,33 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .empty-state h2 { color: #2a2b27; font-size: 1.0625em; }
 .empty-state p { font-size: .875em; line-height: 1.55; }
 .empty-state.small { margin: 34px auto; }
-.board { display: grid; gap: 10px; padding: 15px 0; }
-.card { border: 1px solid #dedfd9; border-top: 3px solid var(--card-accent); border-radius: 9px; background: #fff; box-shadow: 0 1px 2px rgb(30 32 27 / 5%); padding: 8px 11px 7px; }
-.card[draggable="true"] { cursor: grab; }
-.card[draggable="true"]:active { cursor: grabbing; }
+.board { position: relative; display: grid; gap: 10px; padding: 15px 0; }
+.image-drop-overlay { position: absolute; z-index: 10; inset: 7px 0; display: grid; place-items: center; border: 2px dashed #6c7967; border-radius: 10px; background: rgb(239 243 235 / 94%); color: #42503e; font-size: .75em; font-weight: 750; pointer-events: none; }
+.card { position: relative; border: 1px solid #dedfd9; border-top: 3px solid var(--card-accent); border-radius: 9px; background: #fff; box-shadow: 0 1px 2px rgb(30 32 27 / 5%); padding: 8px 11px 7px; transition: background-color 90ms ease, border-color 90ms ease, box-shadow 90ms ease, transform 90ms ease; }
+.card:not(.editing) { cursor: grab; }
+.card.editing { cursor: default; }
+.card-pointer-dragging, .card-pointer-dragging * { cursor: grabbing !important; user-select: none !important; }
 .card:focus, .card.selected { outline: 2px solid #8b9483; outline-offset: 2px; }
 .card.dragging { opacity: .28; transform: scale(.985); }
+.card.merge-target { z-index: 2; border-color: #d88330; outline: 3px dashed #b35d08; outline-offset: 2px; background: #fff1df; box-shadow: 0 5px 18px rgb(124 65 10 / 24%); transform: scale(1.015); }
+.card.merge-target::after { position: absolute; z-index: 2; top: 50%; left: 50%; transform: translate(-50%, -50%); border-radius: 999px; background: #a95405; color: #fff; padding: .5em .8em; content: "MERGE HERE"; font-size: .75em; font-weight: 800; letter-spacing: .07em; white-space: nowrap; pointer-events: none; }
+.card.merge-source { outline: 2px dashed #b35d08; outline-offset: 2px; filter: saturate(.65); }
+.card.pointer-drag-overlay { position: fixed; z-index: 1000; max-height: min(60vh, 28em); margin: 0; overflow: hidden; opacity: .92; transform: scale(.985); box-shadow: 0 8px 24px rgb(30 32 27 / 28%); pointer-events: none; }
+.card.pointer-drag-overlay.merge-preview { border-color: #d88330; outline: 3px dashed #b35d08; outline-offset: -4px; background: #fff1df; opacity: .97; transform: none; box-shadow: 0 8px 24px rgb(92 45 8 / 32%); }
+.card.pointer-drag-overlay.merge-preview::after { position: absolute; z-index: 3; top: 50%; left: 50%; transform: translate(-50%, -50%); border-radius: 999px; background: #a95405; color: #fff; padding: .5em .8em; content: "MERGE"; font-size: .75em; font-weight: 800; letter-spacing: .08em; pointer-events: none; }
+.card.drag-preview.merge-preview::after { position: absolute; z-index: 3; top: 50%; left: 50%; transform: translate(-50%, -50%); border-radius: 999px; background: #a95405; color: #fff; padding: .45em .75em; content: "MERGE"; font-size: .75em; font-weight: 800; letter-spacing: .08em; pointer-events: none; }
 .drop-placeholder { display: grid; min-height: 62px; place-items: center; border: 2px dashed #9da198; border-radius: 9px; background: #eff1eb; color: #70746b; animation: placeholder-in 100ms ease-out; }
 .drop-placeholder span { font-size: .6875em; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
 @keyframes placeholder-in { from { min-height: 16px; opacity: 0; } to { min-height: 62px; opacity: 1; } }
 .card.status-rejected { opacity: .66; }
 .card-topline { display: flex; align-items: center; gap: 5px; }
-.drag-handle { color: #a1a39c; font-size: 1.0625em; user-select: none; }
+.drag-handle { color: #a1a39c; font-size: 1.0625em; touch-action: none; user-select: none; }
 .card-type, .card-type-label { width: auto; border: 0; border-radius: 5px; background: var(--card-tint); padding: 3px 5px; color: var(--card-accent); font-size: .625em; font-weight: 780; letter-spacing: .06em; text-transform: uppercase; }
 .card-status { width: auto; margin-left: auto; border: 1px solid #d6d7d1; border-radius: 999px; background: transparent; padding: 2px 5px; color: #62645d; font-size: .625em; font-weight: 650; }
 .status-confirmed .card-status { border-color: #8eac93; color: #3e6c46; }
 .status-rejected .card-status { border-color: #bd9995; color: #944740; }
 .card h3 { margin: 8px 3px 2px; font-size: .875em; }
+.card-image { display: block; width: 100%; height: auto; max-height: 28em; margin: 7px 0 4px; border-radius: 6px; object-fit: contain; background: #eceee8; }
 .card-content { font-size: .875em; line-height: 1.43; overflow-wrap: anywhere; }
 .card-content p { margin: 5px 3px 3px; white-space: pre-wrap; }
 .card-content ul, .card-content ol { margin: 5px 3px 3px; padding-left: 1.45em; }
@@ -104,9 +114,8 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .source-badge { margin-right: auto; max-width: 110px; overflow: hidden; color: #70746b; font-size: .6875em; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
 .source-badge:hover { color: #2868ae; text-decoration: underline; }
 .edit-form { display: grid; gap: 7px; margin-top: 9px; }
-.edit-form textarea, .edit-form input, .add-card-form textarea, .inline-insert-card textarea { width: 100%; resize: vertical; }
+.edit-form textarea, .edit-form input { width: 100%; resize: vertical; }
 .edit-hint { color: #7a7c74; font-size: .625em; line-height: 1.35; }
-.inline-insert-card { display: grid; gap: 6px; border: 2px dashed #b4b7af; border-radius: 9px; background: #f1f2ee; padding: 8px; }
 .delete-confirmation { display: grid; gap: 8px; border: 1px solid #d6aaa5; border-radius: 8px; background: #fff5f3; color: #512b27; padding: 9px 10px; box-shadow: 0 2px 5px rgb(60 25 20 / 8%); }
 .delete-confirmation > div:first-child { display: grid; gap: 2px; }
 .delete-confirmation strong { font-size: .8125em; }
@@ -117,9 +126,11 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .rejected-section > summary { cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
 .rejected-section .card { margin-top: 9px; }
 .board-controls { border-top: 1px solid #deded9; padding-top: 12px; }
-.add-card { margin-bottom: 10px; }
-.add-card-form { display: grid; gap: 7px; margin-bottom: 12px; }
-.add-card-form div { display: flex; justify-content: flex-end; gap: 7px; }
+.board-add-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.add-card { margin-bottom: 0; }
+.capture-button { display: inline-grid; width: 2em; height: 2em; place-items: center; border: 0; border-radius: 6px; background: transparent; color: #565851; padding: .3em; }
+.capture-button:hover { background: #ecece7; color: #171816; }
+  .capture-button svg { width: 1.2em; height: 1.2em; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .copy-button { display: flex; width: 100%; align-items: center; justify-content: center; gap: .45em; padding: 10px; }
 .copy-button svg { width: 1.05em; height: 1.05em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .notice { margin: 8px 0 0; color: #4f6f54; font-size: .75em; text-align: center; }
@@ -136,8 +147,12 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .project-picker-option.drop-before::before, .project-picker-option.drop-after::after { background: #aeb8a5; }
   .card { border-color: #41423e; background: #292a27; }
   .card:focus, .card.selected { outline-color: #899681; }
+  .card.merge-target { border-color: #c9803d; outline-color: #e5a15c; background: #49311f; box-shadow: 0 5px 18px rgb(0 0 0 / 38%); }
+  .card.merge-target::after { background: #b96516; }
+  .card.merge-source { outline-color: #e5a15c; }
+  .card.pointer-drag-overlay.merge-preview { border-color: #c9803d; outline-color: #e5a15c; background: #49311f; box-shadow: 0 8px 24px rgb(0 0 0 / 45%); }
   .drop-placeholder { border-color: #6f7469; background: #2c302a; color: #aeb3a7; }
-  .inline-insert-card { border-color: #60645b; background: #292d27; }
+  .image-drop-overlay { border-color: #83907d; background: rgb(39 45 37 / 95%); color: #d9e1d5; }
   .delete-confirmation { border-color: #754a46; background: #382725; color: #f1d9d6; }
   .delete-confirmation small { color: #c9aaa6; }
   .template-picker label { border-color: #41423e; background: #292a27; }
@@ -156,6 +171,9 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .card-icon-button.danger:hover { background: #4b302e; color: #efaaa4; }
   .card-link { color: #8dbcf0; }
   .card-link:hover { color: #bad8f7; }
+  .card-image { background: #393b36; }
+  .capture-button { color: #bbbbb5; }
+  .capture-button:hover { background: #363733; color: white; }
   .card-content code, .card h3 code { background: #393b36; color: #e4e7df; }
   .source-badge { color: #a8aaa2; }
   .source-badge:hover { color: #8dbcf0; }

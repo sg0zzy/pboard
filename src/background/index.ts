@@ -1,6 +1,9 @@
 import type { CaptureSelectionResponse } from "../messaging/messages";
+import { isCaptureRegionMessage, type CaptureRegionResponse } from "../messaging/messages";
+import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
-import { pinSelection, pinWebResource } from "./handlers";
+import type { BoardImage } from "../types";
+import { isWebUrl, pinSelection, pinWebResource } from "./handlers";
 import {
   firstSelectedText,
   PIN_PAGE_COMMAND,
@@ -8,6 +11,7 @@ import {
   PIN_SELECTION_COMMAND,
   PIN_SELECTION_SHORTCUT
 } from "./shortcuts";
+import { firstCaptureRegion, selectPageRegion } from "./regionCapture";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
@@ -112,6 +116,54 @@ browser.commands.onCommand.addListener(async (command, tab) => {
     warnOnFailure({ ok: false, reason: "The selected text cannot be read on this page." });
   }
 });
+
+browser.runtime.onMessage.addListener((message: unknown) => {
+  if (!isCaptureRegionMessage(message)) return undefined;
+  return capturePageRegion();
+});
+
+async function capturePageRegion(): Promise<CaptureRegionResponse> {
+  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id || tab.windowId === undefined) {
+    return { ok: false, reason: "No active web page is available." };
+  }
+  let results;
+  try {
+    results = await browser.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: selectPageRegion as unknown as () => void
+    });
+  } catch {
+    return {
+      ok: false,
+      reason: isWebUrl(tab.url)
+        ? "The page could not be captured. Try again."
+        : "This page type cannot be captured by Firefox."
+    };
+  }
+  const region = firstCaptureRegion(results);
+  if (!region) return { ok: false, reason: "Capture cancelled.", cancelled: true };
+  const [active] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (!active?.id || active.windowId === undefined) {
+    return { ok: false, reason: "No active web page is available." };
+  }
+  if (active.id !== tab.id || (region.href && active.url && active.url !== region.href)) {
+    return { ok: false, reason: "The page changed while capturing. Try again." };
+  }
+  let screenshot: string;
+  try {
+    screenshot = await browser.tabs.captureVisibleTab(active.windowId, { format: "png" });
+  } catch {
+    return { ok: false, reason: "The page could not be captured. Try again." };
+  }
+  let image: BoardImage;
+  try {
+    image = await cropCapturedImage(screenshot, region);
+  } catch {
+    return { ok: false, reason: "The captured image could not be processed." };
+  }
+  return { ok: true, image, pageUrl: active.url, pageTitle: active.title };
+}
 
 function isChatGptUrl(value?: string): boolean {
   if (!value) return false;

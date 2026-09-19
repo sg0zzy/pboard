@@ -1,5 +1,5 @@
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
-import type { AppState, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
+import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
 
 export const STORAGE_KEY = "projectBoardState";
 
@@ -111,10 +111,10 @@ export function createRepository(storage: KeyValueStorage) {
     type?: BoardItemType;
     status?: BoardItemStatus;
     source?: BoardItem["source"];
+    image?: BoardImage;
     afterItemId?: string;
   }): Promise<BoardItem> {
     const content = input.content.trim();
-    if (!content) throw new Error("Card content is required");
     const state = await load();
     const timestamp = now();
     const project = state.projects.find((candidate) => candidate.id === input.projectId);
@@ -139,6 +139,7 @@ export function createRepository(storage: KeyValueStorage) {
       content,
       ...(input.title?.trim() ? { title: input.title.trim() } : {}),
       ...(input.source ? { source: input.source } : {}),
+      ...(input.image ? { image: input.image } : {}),
       order,
       createdAt: timestamp,
       updatedAt: timestamp
@@ -152,7 +153,6 @@ export function createRepository(storage: KeyValueStorage) {
     const state = await load();
     const item = state.boardItems.find((candidate) => candidate.id === itemId);
     if (!item) throw new Error("Card not found");
-    if (patch.content !== undefined && !patch.content.trim()) throw new Error("Card content is required");
     const project = state.projects.find((candidate) => candidate.id === item.projectId);
     if (patch.type && project && !isTypeSupported(project.template, patch.type)) {
       throw new Error("Card type is not supported by this board template");
@@ -192,6 +192,23 @@ export function createRepository(storage: KeyValueStorage) {
     return duplicate;
   }
 
+  async function mergeItems(sourceId: string, targetId: string): Promise<void> {
+    if (sourceId === targetId) throw new Error("A card cannot be merged into itself");
+    const state = await load();
+    const source = state.boardItems.find((item) => item.id === sourceId);
+    const target = state.boardItems.find((item) => item.id === targetId);
+    if (!source || !target) throw new Error("Card not found");
+    if (source.projectId !== target.projectId) throw new Error("Cards must belong to the same project");
+    if (source.image) throw new Error("Image cards cannot be merged without losing the image");
+
+    const appended = [source.title?.trim(), source.content.trim()].filter(Boolean).join("\n");
+    target.content = [target.content.trimEnd(), appended].filter(Boolean).join("\n\n");
+    target.updatedAt = now();
+    state.boardItems = state.boardItems.filter((item) => item.id !== sourceId);
+    normalizeOrder(state, source.projectId);
+    await save(state);
+  }
+
   async function reorderItems(projectId: string, orderedIds: string[]): Promise<void> {
     const state = await load();
     const projectIds = state.boardItems.filter((item) => item.projectId === projectId).map((item) => item.id);
@@ -208,7 +225,7 @@ export function createRepository(storage: KeyValueStorage) {
     await save(state);
   }
 
-  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, reorderItems };
+  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, mergeItems, reorderItems };
 }
 
 function normalizeOrder(state: AppState, projectId: string) {

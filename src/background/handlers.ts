@@ -59,7 +59,8 @@ export async function pinWebResource(
   return { ok: true };
 }
 
-function isWebUrl(value: string): boolean {
+export function isWebUrl(value: string | undefined): boolean {
+  if (!value) return false;
   try {
     const url = new URL(value);
     return url.protocol === "http:" || url.protocol === "https:";

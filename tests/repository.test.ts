@@ -71,6 +71,54 @@ describe("Pboard repository", () => {
     expect(state.boardItems.sort((a, b) => a.order - b.order).map((item) => item.order)).toEqual([0, 1]);
   });
 
+  it("persists local image data on a card", async () => {
+    const project = await repository.createProject("Visual notes");
+    const image = { dataUrl: "data:image/webp;base64,AAAA", mimeType: "image/webp", width: 320, height: 180 };
+    const card = await repository.addItem({ projectId: project.id, content: "Captured diagram", image });
+    expect(card.image).toEqual(image);
+    expect((await repository.load()).boardItems[0].image).toEqual(image);
+  });
+
+  it("merges a text card into another card and removes the source", async () => {
+    const project = await repository.createProject("Merge cards", "project");
+    const target = await repository.addItem({
+      projectId: project.id,
+      content: "First paragraph",
+      type: "decision",
+      status: "confirmed"
+    });
+    const source = await repository.addItem({
+      projectId: project.id,
+      title: "More detail",
+      content: "Second paragraph",
+      type: "task"
+    });
+
+    await repository.mergeItems(source.id, target.id);
+
+    const state = await repository.load();
+    expect(state.boardItems).toHaveLength(1);
+    expect(state.boardItems[0]).toMatchObject({
+      id: target.id,
+      type: "decision",
+      status: "confirmed",
+      content: "First paragraph\n\nMore detail\nSecond paragraph",
+      order: 0
+    });
+  });
+
+  it("refuses to consume an image card during a merge", async () => {
+    const project = await repository.createProject("Keep images");
+    const source = await repository.addItem({
+      projectId: project.id,
+      content: "Diagram",
+      image: { dataUrl: "data:image/webp;base64,AAAA", mimeType: "image/webp", width: 20, height: 10 }
+    });
+    const target = await repository.addItem({ projectId: project.id, content: "Target" });
+    await expect(repository.mergeItems(source.id, target.id)).rejects.toThrow("Image cards cannot be merged");
+    expect((await repository.load()).boardItems).toHaveLength(2);
+  });
+
   it("inserts a new card immediately after a chosen card", async () => {
     const project = await repository.createProject("Ordered", "brainstorming");
     const first = await repository.addItem({ projectId: project.id, content: "First" });

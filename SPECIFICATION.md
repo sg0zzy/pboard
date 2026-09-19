@@ -24,7 +24,7 @@ Discuss in ChatGPT → Pin selected text → Refine and reorder cards → Copy b
 ## 2. Supported environment
 
 - Firefox WebExtension using Manifest V3.
-- Minimum declared Firefox version: 121.
+- Minimum declared Firefox version: 126.
 - Sidebar UI implemented with React and TypeScript.
 - Chat selection capture supported on:
   - `https://chatgpt.com/*`
@@ -50,7 +50,7 @@ Implemented behavior:
 - A user can create a project with a non-empty name.
 - Project creation requires choosing one of the three board templates.
 - Pressing Escape anywhere in the New Project form closes it, discards its temporary name/template selection, and leaves stored project data unchanged.
-- After successful project creation, the Add Point editor opens automatically and receives focus so the next typed text can be submitted as the first card with Enter.
+- After successful project creation, the Add Card editor opens automatically and receives focus so the next typed text can be submitted as the first card with Enter.
 - A newly created project becomes the current project.
 - A user can switch projects with a custom dropdown selector styled like the previous compact project control.
 - Projects can be dragged directly inside the open dropdown to change their persistent order; an insertion line previews the destination.
@@ -135,9 +135,10 @@ A project can contain any number of ordered cards.
 Implemented behavior:
 
 - Cards can be created manually from the sidebar.
-- In the Add Point editor, Enter or a double-click creates the card, Shift+Enter inserts a newline, and Escape cancels; the visible Add button remains available.
-- After a card is created, the Add Point editor stays open, clears only the saved draft, and restores focus so the user can immediately type and submit another card.
-- On long boards, opening the Add Point editor or inserting a card scrolls the minimum necessary distance to keep the complete active form inside the sidebar viewport.
+- The primary manual action is labelled **Add card** rather than Add point.
+- In the Add Card editor, Enter or a double-click creates the card, Shift+Enter inserts a newline, and Escape cancels; the visible Add button remains available.
+- After a card is created, the Add Card editor stays open, clears only the saved draft, and restores focus so the user can immediately type and submit another card.
+- On long boards, opening the Add Card editor or inserting a card scrolls the minimum necessary distance to keep the complete active form inside the sidebar viewport.
 - Middle-clicking a card surface opens a focused inline draft directly below that card.
 - Ctrl+middle-click duplicates the card directly below it; Command+middle-click is the macOS equivalent.
 - Duplication preserves title, content, template type, and source metadata while assigning a new ID and timestamps; the duplicate always starts with Candidate status regardless of the original status.
@@ -155,6 +156,8 @@ Implemented behavior:
 - After an existing card is saved, focus returns to that card and a second Enter opens a new inline draft directly beneath it.
 - No persistent Edit or Save button is shown on a card.
 - A card may have an optional title.
+- A card may carry an optional image, added by page region capture or by dropping an image file onto the board. The image is stored as a WebP data URL scaled so its longest side is at most 1400 px and renders above the card text.
+- Dropped image files larger than 20 MB or files that are not images are rejected with a visible notice and do not change the board.
 - Card content must not be empty.
 - A user can change a card's type and status at any time.
 - Cards can be deleted.
@@ -177,6 +180,12 @@ Implemented behavior:
 - The placeholder updates as the pointer crosses the vertical midpoint of a target card.
 - The visible placeholder remains a live drop target, so releasing the pointer over the preview completes the reorder.
 - Rejected and non-rejected sections only accept reorder previews from their own section, preventing a misleading cross-section placement.
+- Card sorting and merging use a custom Pointer Events layer rather than native HTML card dragging. This keeps behavior consistent across browsers and permits dynamic feedback while dragging; native file drag-and-drop remains separate for adding images.
+- Pressing Shift before or during a card drag switches from reorder to merge mode; releasing it switches back to reorder. The floating preview and destination card become orange, gray reorder placeholders disappear, the destination grows slightly and displays **MERGE HERE**. Escape cancels an active drag.
+- On merge, the dragged card is the source. Its optional title and content are appended to the destination content after a blank line, then the source card is removed and order values are normalized.
+- The destination retains its ID, title, type, status, image, source metadata, position, and creation timestamp; only its content and update timestamp change.
+- Consuming a Confirmed source requires confirmation in an inline panel beneath that source card.
+- A source card containing an image cannot be merged in this version because the destination model supports only one image; the board shows a notice and leaves both cards unchanged.
 - A focused card is visibly selected. Up and Down move selection through cards in the same active or rejected section.
 - Enter starts editing the selected card. Immediately after saving a card, the existing second-Enter shortcut retains its special behavior and opens a draft below it.
 - Ctrl+Shift+Up and Ctrl+Shift+Down reorder the selected card by one position; Command+Shift+Up/Down provides the macOS equivalent.
@@ -225,6 +234,12 @@ type BoardItem = {
     | "reference";
   title?: string;
   content: string;
+  image?: {
+    dataUrl: string;
+    mimeType: string;
+    width: number;
+    height: number;
+  };
   status: "candidate" | "confirmed" | "rejected";
   order: number;
   source?: {
@@ -284,6 +299,20 @@ Link and page behavior:
 - Link and page cards request the `reference` type; Brainstorming safely converts this to its generic `note` type.
 - Only HTTP and HTTPS resources are accepted.
 - Firefox does not expose selected or uncommitted text inside its privileged address bar to WebExtension context menus. The address-bar button therefore pins the currently loaded page, not arbitrary text typed into the URL bar.
+
+### Page region capture
+
+The board controls row exposes a camera button next to **Add card**.
+
+Implemented behavior:
+
+- Clicking the button injects a short-lived overlay into the active tab. The user drags a rectangle over the page; the rectangle is previewed live and Escape cancels.
+- On release, the visible tab is screenshotted, the selected rectangle is cropped and scaled (longest side at most 1400 px, encoded as WebP), and an image card is created in the current project.
+- The captured page URL and title are stored as the card's source metadata and optional title; the card content is **Page capture**.
+- Drag distances under 8 px are treated as a cancellation. Pointer cancellation removes the overlay and resolves the capture as cancelled, so the sidebar never stays in a capturing state.
+- If the active tab navigates or changes between the drag and the screenshot, the capture is rejected with a visible notice instead of storing a misaligned image.
+- Pages that cannot be scripted (browser UI, PDF viewer, and similar privileged pages) fail with a page-specific notice and do not change the board.
+- A current project must exist before a capture can be stored.
 
 ## 6. Copy board as prompt
 
@@ -365,6 +394,7 @@ Code boundaries:
 
 - `src/background/`: context-menu orchestration and pin handler.
 - `src/content/`: content-script message handling and selection capture.
+- `src/images/`: image decoding, region cropping, and scaling.
 - `src/messaging/`: typed WebExtension message contracts.
 - `src/providers/`: provider-specific page access behind a shared adapter.
 - `src/sidebar/`: React UI, card component, styling, and prompt serialization.
@@ -379,8 +409,10 @@ Declared permissions:
 - `storage`: save projects, cards, order, and current-project selection.
 - `menus`: add selection, link, and page pin actions.
 - `clipboardWrite`: copy either a serialized board or one card's text after a user action.
-- Host permissions for the two supported ChatGPT origins only.
-- Generic sites require no host permission and receive no content script; their selected text and URLs come from Firefox's user-invoked menu event.
+- `scripting`: read the current selection through a one-off script and inject the short-lived region-capture overlay on demand.
+- `activeTab`: temporary current-tab access after an explicit Pboard shortcut or menu action.
+- Host access is limited to the two supported ChatGPT origins for their existing content script. Page-region capture uses temporary `activeTab` permission after the explicit camera-button click, avoiding broad `<all_urls>` access.
+- Generic sites receive no content script; their selected text and URLs come from Firefox's user-invoked menu event or the user-invoked capture overlay.
 
 Privacy properties:
 
@@ -390,7 +422,8 @@ Privacy properties:
 - No external API or AI request.
 - No conversation scraping.
 - No entire-conversation upload.
-- Pinned content remains in local Firefox extension storage.
+- Pinned content, including captured and dropped images, remains in local Firefox extension storage.
+- Captured images are resized and encoded entirely inside the extension; no capture data is sent over the network.
 
 ## 10. Build and verification
 
@@ -415,6 +448,7 @@ Current automated coverage includes:
 - project creation, selection, reordering, persistence, and deletion;
 - cascading card deletion with a project;
 - card creation, editing, deletion, and reordering;
+- text-card merging, source removal, destination preservation, and image-source rejection;
 - before/after insertion calculations used by the drag placeholder;
 - repository insertion directly after a selected card;
 - individual card-text formatting for clipboard copy;
@@ -425,6 +459,7 @@ Current automated coverage includes:
 - version-1 storage migration without card-data loss;
 - board prompt serialization and rejected-card exclusion;
 - runtime message validation;
+- capture-region cropping, scaling, and out-of-bounds clamping;
 - content selection capture and source metadata;
 - generic-page selections, web-link references, page sources, and unsafe-protocol rejection;
 - behavior with no selected project;

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { pinSelection, pinWebResource } from "../src/background/handlers";
 import { captureSelection } from "../src/content/selection";
-import { isRuntimeMessage } from "../src/messaging/messages";
+import { isCaptureRegionMessage, isRuntimeMessage } from "../src/messaging/messages";
 import type { ChatProviderAdapter } from "../src/providers/provider";
 
 describe("selection messaging", () => {
@@ -9,6 +9,8 @@ describe("selection messaging", () => {
     expect(isRuntimeMessage({ type: "CAPTURE_SELECTION" })).toBe(true);
     expect(isRuntimeMessage({ type: "UNKNOWN" })).toBe(false);
     expect(isRuntimeMessage(null)).toBe(false);
+    expect(isCaptureRegionMessage({ type: "CAPTURE_PAGE_REGION" })).toBe(true);
+    expect(isCaptureRegionMessage({ type: "CAPTURE_SELECTION" })).toBe(false);
   });
 
   it("captures selected text and source metadata through an adapter", () => {
