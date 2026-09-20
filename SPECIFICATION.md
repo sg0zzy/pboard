@@ -166,8 +166,9 @@ Implemented behavior:
 - Removing a card that is already in Trash, or emptying the Trash, permanently removes it after a confirmation panel.
 - Confirmation panels focus Cancel by default and may be dismissed with Escape.
 - A trash-can icon replaces the textual Delete action and retains an accessible label and tooltip.
-- A conventional overlapping-sheets icon copies the card's optional title and content prefixed by its category tag (for example, `[issue]`), without status, order, or source metadata.
+- A conventional overlapping-sheets icon copies the card's optional title and content prefixed by its category and status tags (for example, `[issue] [confirmed]`), without order or source metadata.
 - The copy icon temporarily becomes a check mark after a successful copy.
+- Copy buttons in the **Rejected** and **Done** section title rows copy all cards of that section to the clipboard in the same format as the full board copy.
 - Card content and its compact action row use minimal vertical spacing so short cards remain easy to scan in long boards.
 - Card display supports a deliberately small Markdown subset: lines beginning with `* ` or `- ` become bullet lists; numbered lines such as `1. ` become ordered lists; `**text**`, `*text*`, and backticks render bold, italic, and inline code; `[text](url)` renders a labelled link.
 - Lines beginning with `- [ ]` or `- [x]` render as unchecked or checked task boxes. Clicking a checkbox updates that exact marker in the stored card content, so its state persists and is preserved by card/board copying; completed task text is visually struck through.
@@ -199,6 +200,7 @@ Implemented behavior:
 - Deleting a card normalizes the remaining order values.
 - Rejected cards are placed in a collapsed **Rejected** section.
 - Done cards are placed in a collapsed **Done** section.
+- Each **Rejected** and **Done** section title row also holds a trash button that moves every card of the section to the project's Trash at once.
 - Trash cards are placed in a collapsed **Trash** section, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
 - Card changes update the card's `updatedAt` timestamp.
 
@@ -307,6 +309,7 @@ Link and page behavior:
 
 - Right-clicking a link exposes **Pin link to Pboard**.
 - A pinned link stores its URL as content, its visible link text as an optional title, and the containing page as source metadata.
+- Right-clicking an image exposes **Pin image to Pboard**. Pboard captures the visible image rectangle through temporary active-tab access, stores it locally as a resized image card, and keeps the image URL, page URL, and alt text when available.
 - **Pin current page to Pboard** appears for ordinary page, selection, and link context menus, so a page can be captured without dismissing the current context.
 - A pin page-action icon is shown inside Firefox's address bar on HTTP/HTTPS pages and stores the loaded page URL and title.
 - Link and page cards request the `reference` type; Brainstorming safely converts this to its generic `note` type.
@@ -335,10 +338,10 @@ Implemented behavior:
 
 - The button is disabled when there are no non-rejected cards.
 - Cards are serialized in their current board order.
-- Rejected cards are excluded.
-- Candidate and confirmed cards are included.
-- Every card is prefixed with its category id in square brackets (for example, `[issue]`); legacy `idea` types are exported as `[core_idea]`.
-- An optional card title appears after the tag and before the content.
+- Rejected and trash cards are excluded.
+- Candidate, confirmed, started, and done cards are included.
+- Every card is prefixed with its category id and status tags in square brackets (for example, `[issue] [confirmed]`); legacy `idea` types are exported as `[core_idea]`.
+- An optional card title appears after the status tag and before the content.
 - The resulting text is written to the clipboard.
 - The sidebar displays a temporary success notice.
 
@@ -347,9 +350,9 @@ Example:
 ```text
 PROJECT: AI brainstorming SaaS
 
-[goal] Create a lightweight tool for developing ideas with AI.
+[goal] [candidate] Create a lightweight tool for developing ideas with AI.
 
-[decision] Use a browser sidebar.
+[decision] [confirmed] Use a browser sidebar.
 ```
 
 Copying is currently the only implemented board-to-chat workflow. The user must paste the generated prompt into ChatGPT or another AI application manually.

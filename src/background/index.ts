@@ -4,7 +4,7 @@ import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
 import type { BoardImage } from "../types";
 import { PINNED_CARD_FOCUS_KEY } from "../types";
-import { isWebUrl, pinSelection, pinWebResource } from "./handlers";
+import { isWebUrl, pinImage, pinSelection, pinWebResource } from "./handlers";
 import {
   firstSelectedText,
   PIN_PAGE_COMMAND,
@@ -12,36 +12,45 @@ import {
   PIN_SELECTION_COMMAND,
   PIN_SELECTION_SHORTCUT
 } from "./shortcuts";
-import { firstCaptureRegion, selectPageRegion } from "./regionCapture";
+import { firstCaptureImageRegion, firstCaptureRegion, findContextImage, selectPageRegion } from "./regionCapture";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
 const PAGE_MENU_ID = "pin-page-to-pboard";
+const IMAGE_MENU_ID = "pin-image-to-pboard";
 const WEB_PAGES = ["http://*/*", "https://*/*"];
 
-browser.runtime.onInstalled.addListener(() => {
-  browser.menus.removeAll().then(() => {
-    browser.menus.create({
+browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
+void registerMenus();
+
+async function registerMenus() {
+  await browser.menus.removeAll();
+  browser.menus.create({
       id: SELECTION_MENU_ID,
       title: `Pin selection to Pboard (${PIN_SELECTION_SHORTCUT})`,
       contexts: ["selection"],
       documentUrlPatterns: WEB_PAGES
-    });
-    browser.menus.create({
+  });
+  browser.menus.create({
       id: LINK_MENU_ID,
       title: "Pin link to Pboard",
       contexts: ["link"],
       documentUrlPatterns: WEB_PAGES,
       targetUrlPatterns: WEB_PAGES
-    });
-    browser.menus.create({
+  });
+  browser.menus.create({
       id: PAGE_MENU_ID,
       title: `Pin current page to Pboard (${PIN_PAGE_SHORTCUT})`,
       contexts: ["page", "selection", "link"],
       documentUrlPatterns: WEB_PAGES
-    });
   });
-});
+  browser.menus.create({
+      id: IMAGE_MENU_ID,
+      title: "Pin image to Pboard",
+      contexts: ["image"],
+      documentUrlPatterns: WEB_PAGES
+  });
+}
 
 browser.menus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === SELECTION_MENU_ID) {
@@ -80,6 +89,23 @@ browser.menus.onClicked.addListener(async (info, tab) => {
       pageUrl: info.pageUrl ?? tab?.url,
       title: tab?.title
     }));
+    return;
+  }
+
+  if (info.menuItemId === IMAGE_MENU_ID) {
+    const result = await captureContextImage(tab, info.srcUrl, info.frameId);
+    if (!result.ok) {
+      warnOnFailure(result);
+      return;
+    }
+    const pinned = await pinImage(repository, {
+      image: result.image,
+      url: result.imageUrl,
+      pageUrl: info.pageUrl ?? tab?.url,
+      alt: result.alt
+    });
+    warnOnFailure(pinned);
+    setPinnedCardFocus(pinned.cardId);
   }
 });
 
@@ -167,6 +193,38 @@ async function capturePageRegion(): Promise<CaptureRegionResponse> {
     return { ok: false, reason: "The captured image could not be processed." };
   }
   return { ok: true, image, pageUrl: active.url, pageTitle: active.title };
+}
+
+async function captureContextImage(
+  tab: browser.tabs.Tab | undefined,
+  imageUrl?: string,
+  frameId?: number
+): Promise<{ ok: true; image: BoardImage; imageUrl?: string; alt?: string } | { ok: false; reason: string }> {
+  if (!tab?.id || tab.windowId === undefined) return { ok: false, reason: "No active web page is available." };
+  let results;
+  try {
+    results = await browser.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [frameId ?? 0] },
+      args: [imageUrl],
+      func: findContextImage as unknown as (url?: string) => void
+    });
+  } catch {
+    return { ok: false, reason: "The image could not be captured on this page." };
+  }
+  const region = firstCaptureImageRegion(results);
+  if (!region) return { ok: false, reason: "The selected image is no longer visible." };
+  let screenshot: string;
+  try {
+    screenshot = await browser.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+  } catch {
+    return { ok: false, reason: "The image could not be captured. Try again." };
+  }
+  try {
+    const image = await cropCapturedImage(screenshot, region);
+    return { ok: true, image, imageUrl: region.sourceUrl, alt: region.alt };
+  } catch {
+    return { ok: false, reason: "The image could not be processed." };
+  }
 }
 
 function isChatGptUrl(value?: string): boolean {

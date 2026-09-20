@@ -17,7 +17,7 @@ import { Card } from "./components/Card";
 import { CopyIcon } from "./components/CopyIcon";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
-import { serializeBoard } from "./serialize";
+import { serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 
 const STATUS_MOVE_DELAY_MS = 800;
@@ -444,6 +444,17 @@ export function App() {
     window.setTimeout(() => setNotice(""), 2200);
   }
 
+  async function copySection(sectionItems: BoardItem[], label: string) {
+    if (!currentProject) return;
+    await navigator.clipboard.writeText(serializeProject(currentProject, sectionItems));
+    setNotice(`${label} copied as a prompt`);
+    window.setTimeout(() => setNotice(""), 2200);
+  }
+
+  async function trashAllSection(sectionItems: BoardItem[]) {
+    for (const item of sectionItems) await moveCardToTrash(item.id);
+  }
+
   async function addImageCard(image: BoardImage, content: string, title?: string, pageUrl?: string) {
     if (!currentProject) return;
     const created = await repository.addItem({
@@ -694,13 +705,69 @@ export function App() {
             {visibleItems.map(renderSortableCard)}
             {rejectedItems.length > 0 && (
               <details className="rejected-section">
-                <summary>Rejected ({rejectedItems.length})</summary>
+                <summary>
+                  <span>Rejected ({rejectedItems.length})</span>
+                  <button
+                    type="button"
+                    className="copy-section-button"
+                    title="Copy rejected cards"
+                    aria-label="Copy rejected cards"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void copySection(rejectedItems, "Rejected cards");
+                    }}
+                  >
+                    <CopyIcon />
+                  </button>
+                  <button
+                    type="button"
+                    className="empty-trash-button"
+                    title="Trash rejected cards"
+                    aria-label="Trash rejected cards"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void trashAllSection(rejectedItems);
+                    }}
+                  >
+                    <EmptyTrashIcon />
+                  </button>
+                </summary>
                 {rejectedItems.map(renderSortableCard)}
               </details>
             )}
             {doneItems.length > 0 && (
               <details className="done-section">
-                <summary>Done ({doneItems.length})</summary>
+                <summary>
+                  <span>Done ({doneItems.length})</span>
+                  <button
+                    type="button"
+                    className="copy-section-button"
+                    title="Copy done cards"
+                    aria-label="Copy done cards"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void copySection(doneItems, "Done cards");
+                    }}
+                  >
+                    <CopyIcon />
+                  </button>
+                  <button
+                    type="button"
+                    className="empty-trash-button"
+                    title="Trash done cards"
+                    aria-label="Trash done cards"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void trashAllSection(doneItems);
+                    }}
+                  >
+                    <EmptyTrashIcon />
+                  </button>
+                </summary>
                 {doneItems.map(renderSortableCard)}
               </details>
             )}

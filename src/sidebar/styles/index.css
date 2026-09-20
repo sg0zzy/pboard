@@ -153,9 +153,16 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .delete-confirmation-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .delete-confirm-button { border-color: #9f4038; background: #9f4038; padding: 5px 9px; font-size: .75em; }
 .delete-confirm-button:hover { border-color: #7d2d27; background: #7d2d27; }
-.rejected-section > summary { cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
+.rejected-section > summary, .done-section > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: #6e7069;
+  font-size: .8125em;
+  margin: 8px 2px;
+}
 .rejected-section .card { margin-top: 9px; }
-.done-section > summary { cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
 .done-section .card { margin-top: 9px; }
 .trash-section > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
 .trash-section > summary::before { content: ""; }
@@ -165,6 +172,24 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .empty-trash-button svg { width: 14px; height: 14px; }
 .empty-trash-button:hover { background: #f8e9e7; color: #a03d35; }
 .empty-trash-button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.copy-section-button {
+  align-self: center;
+  margin-left: 2px;
+  display: grid;
+  place-items: center;
+  width: 1.8em;
+  height: 1.8em;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #7a7b74;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.copy-section-button svg { width: 14px; height: 14px; }
+.copy-section-button:hover { background: #ecece7; color: #171816; }
+.copy-section-button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 .board-controls { border-top: 1px solid #deded9; padding-top: 12px; }
 .board-add-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .add-card { margin-bottom: 0; }
@@ -230,6 +255,8 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .trash-section .card { opacity: .8; }
   .empty-trash-button { color: #bbbbb5; }
   .empty-trash-button:hover { background: #4b302e; color: #efaaa4; }
+  .copy-section-button { color: #bbbbb5; }
+  .copy-section-button:hover { background: #353632; color: #d3d5cb; }
   .status-trash .card-status { border-color: #565852; color: #b1b3aa; }
   .status-picker-menu { border-color: #50514c; background: #282926; box-shadow: 0 8px 24px rgb(0 0 0 / 35%); }
   .status-picker-option { color: #e7e7e3; }

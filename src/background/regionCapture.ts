@@ -1,5 +1,10 @@
 import type { CaptureRegion } from "../images/processing";
 
+export type CaptureImageRegion = CaptureRegion & {
+  sourceUrl?: string;
+  alt?: string;
+};
+
 export function firstCaptureRegion(results: Array<{ result?: unknown }>): CaptureRegion | null {
   for (const { result } of results) {
     if (!result || typeof result !== "object") continue;
@@ -10,6 +15,66 @@ export function firstCaptureRegion(results: Array<{ result?: unknown }>): Captur
     }
   }
   return null;
+}
+
+export function firstCaptureImageRegion(results: Array<{ result?: unknown }>): CaptureImageRegion | null {
+  for (const { result } of results) {
+    if (!result || typeof result !== "object") continue;
+    const value = result as Partial<CaptureImageRegion>;
+    if ([value.x, value.y, value.width, value.height, value.viewportWidth, value.viewportHeight]
+      .every((entry) => typeof entry === "number" && Number.isFinite(entry))
+      && value.width! > 0 && value.height! > 0 && value.viewportWidth! > 0 && value.viewportHeight! > 0) {
+      return value as CaptureImageRegion;
+    }
+  }
+  return null;
+}
+
+// This function is serialized by browser.scripting.executeScript. It must stay
+// self-contained and only returns the visible image rectangle, not page data.
+export function findContextImage(imageUrl?: string): CaptureImageRegion | null {
+  const images = Array.from(document.images);
+  const image = images.find((candidate) => {
+    if (!imageUrl) return false;
+    return candidate.currentSrc === imageUrl || candidate.src === imageUrl || candidate.getAttribute("src") === imageUrl;
+  });
+  if (!image) return null;
+  const imageBounds = image.getBoundingClientRect();
+  if (imageBounds.width < 1 || imageBounds.height < 1) return null;
+
+  let x = imageBounds.left;
+  let y = imageBounds.top;
+  let frame: Window | null = window;
+  try {
+    while (frame?.frameElement) {
+      const frameBounds = frame.frameElement.getBoundingClientRect();
+      x += frameBounds.left;
+      y += frameBounds.top;
+      frame = frame.parent;
+    }
+  } catch {
+    // Cross-origin frame boundaries may not expose their parent geometry.
+  }
+
+  const topWindow = window.top ?? window;
+  const viewportWidth = topWindow === window ? window.innerWidth : topWindow.innerWidth;
+  const viewportHeight = topWindow === window ? window.innerHeight : topWindow.innerHeight;
+  const left = Math.max(0, x);
+  const top = Math.max(0, y);
+  const right = Math.min(viewportWidth, x + imageBounds.width);
+  const bottom = Math.min(viewportHeight, y + imageBounds.height);
+  if (right <= left || bottom <= top) return null;
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+    viewportWidth,
+    viewportHeight,
+    href: location.href,
+    sourceUrl: image.currentSrc || image.src || imageUrl,
+    alt: image.alt || undefined
+  };
 }
 
 // This function is serialized by browser.scripting.executeScript. It must stay

@@ -1,5 +1,5 @@
 import type { CaptureSelectionResponse } from "../messaging/messages";
-import type { BoardItem } from "../types";
+import type { BoardImage, BoardItem } from "../types";
 
 type Repository = {
   load(): Promise<{ currentProjectId: string | null }>;
@@ -10,6 +10,7 @@ type Repository = {
     type?: BoardItem["type"];
     status?: BoardItem["status"];
     source?: BoardItem["source"];
+    image?: BoardImage;
   }): Promise<BoardItem>;
 };
 
@@ -58,6 +59,33 @@ export async function pinWebResource(
     }
   });
   return { ok: true };
+}
+
+export async function pinImage(
+  repository: Repository,
+  input: { image: BoardImage; url?: string; pageUrl?: string; alt?: string }
+): Promise<{ ok: boolean; reason?: string; cardId?: string }> {
+  const state = await repository.load();
+  if (!state.currentProjectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
+  if (!input.image?.dataUrl) return { ok: false, reason: "The image could not be captured." };
+
+  const url = input.url?.trim();
+  const alt = input.alt?.trim();
+  const content = alt || url || "Pinned image";
+  const created = await repository.addItem({
+    projectId: state.currentProjectId,
+    content,
+    ...(alt ? { title: alt } : {}),
+    type: "reference",
+    status: "candidate",
+    image: input.image,
+    source: {
+      provider: "web",
+      conversationUrl: input.pageUrl && isWebUrl(input.pageUrl) ? input.pageUrl : url,
+      sourceText: url || content
+    }
+  });
+  return { ok: true, cardId: created.id };
 }
 
 export function isWebUrl(value: string | undefined): boolean {

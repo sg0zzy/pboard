@@ -1,10 +1,17 @@
 import type { BoardItem, Project } from "../types";
 import { cardTextForClipboard } from "./cardText";
 
-export function serializeBoard(project: Project, items: BoardItem[]): string {
-  const sections = items
-    .filter((item) => item.status !== "rejected" && item.status !== "trash")
+function serializeCards(items: BoardItem[]): string[] {
+  return [...items]
     .sort((a, b) => a.order - b.order)
     .map((item) => cardTextForClipboard(item));
-  return [`PROJECT: ${project.name}`, ...sections].join("\n\n");
+}
+
+export function serializeProject(project: Project, items: BoardItem[]): string {
+  return [`PROJECT: ${project.name}`, ...serializeCards(items)].join("\n\n");
+}
+
+export function serializeBoard(project: Project, items: BoardItem[]): string {
+  const sections = items.filter((item) => item.status !== "rejected" && item.status !== "trash");
+  return serializeProject(project, sections);
 }

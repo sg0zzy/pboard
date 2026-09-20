@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { pinSelection, pinWebResource } from "../src/background/handlers";
+import { pinImage, pinSelection, pinWebResource } from "../src/background/handlers";
 import { captureSelection } from "../src/content/selection";
 import { isCaptureRegionMessage, isRuntimeMessage } from "../src/messaging/messages";
+import { firstCaptureImageRegion } from "../src/background/regionCapture";
 import type { ChatProviderAdapter } from "../src/providers/provider";
 
 describe("selection messaging", () => {
@@ -107,5 +108,35 @@ describe("selection messaging", () => {
       reason: "Only HTTP and HTTPS links can be pinned."
     });
     expect(repository.addItem).not.toHaveBeenCalled();
+  });
+
+  it("pins an image into the selected project with source metadata", async () => {
+    const addItem = vi.fn(async (item) => ({ ...item, id: "i-image", order: 0, createdAt: "", updatedAt: "" }));
+    const repository = { load: vi.fn(async () => ({ currentProjectId: "p1" })), addItem };
+    const image = { dataUrl: "data:image/webp;base64,AAAA", mimeType: "image/webp", width: 640, height: 480 };
+    const result = await pinImage(repository, {
+      image,
+      url: "https://cdn.example.com/photo.jpg",
+      pageUrl: "https://example.com/article",
+      alt: "A useful diagram"
+    });
+    expect(result).toEqual({ ok: true, cardId: "i-image" });
+    expect(addItem).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "p1",
+      title: "A useful diagram",
+      content: "A useful diagram",
+      image,
+      type: "reference",
+      source: expect.objectContaining({
+        conversationUrl: "https://example.com/article",
+        sourceText: "https://cdn.example.com/photo.jpg"
+      })
+    }));
+  });
+
+  it("accepts an image capture that starts at the viewport origin", () => {
+    expect(firstCaptureImageRegion([{
+      result: { x: 0, y: 0, width: 120, height: 80, viewportWidth: 800, viewportHeight: 600, sourceUrl: "https://example.com/a.png" }
+    }])).toMatchObject({ x: 0, y: 0, width: 120, height: 80 });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { serializeBoard } from "../src/sidebar/serialize";
+import { serializeBoard, serializeProject } from "../src/sidebar/serialize";
 import type { BoardItem, Project } from "../src/types";
 
 const project: Project = { id: "p1", name: "New SaaS", template: "project", createdAt: "2026-01-01", updatedAt: "2026-01-01" };
@@ -8,7 +8,7 @@ const base: Omit<BoardItem, "id" | "type" | "content" | "order" | "status"> = {
 };
 
 describe("serializeBoard", () => {
-  it("creates clean ordered prompt text tagged by category and excludes rejected items", () => {
+  it("creates clean ordered prompt text tagged by category and status, excluding rejected items", () => {
     const items: BoardItem[] = [
       { ...base, id: "2", type: "decision", status: "confirmed", order: 1, content: "Use a browser sidebar." },
       { ...base, id: "1", type: "goal", status: "candidate", order: 0, title: "Purpose", content: "Keep what matters." },
@@ -16,7 +16,7 @@ describe("serializeBoard", () => {
       { ...base, id: "4", type: "risk", status: "rejected", order: 3, content: "This should be absent." }
     ];
     expect(serializeBoard(project, items)).toBe(
-      "PROJECT: New SaaS\n\n[goal] Purpose\nKeep what matters.\n\n[decision] Use a browser sidebar.\n\n[decision] In progress."
+      "PROJECT: New SaaS\n\n[goal] [candidate] Purpose\nKeep what matters.\n\n[decision] [confirmed] Use a browser sidebar.\n\n[decision] [started] In progress."
     );
   });
 
@@ -27,7 +27,7 @@ describe("serializeBoard", () => {
       { ...base, id: "2", type: "note", status: "confirmed", order: 1, title: "Maybe", content: "Another thought" }
     ];
     expect(serializeBoard(brainstorming, items)).toBe(
-      "PROJECT: Loose thoughts\n\n[note] A raw thought\n\n[note] Maybe\nAnother thought"
+      "PROJECT: Loose thoughts\n\n[note] [candidate] A raw thought\n\n[note] [confirmed] Maybe\nAnother thought"
     );
   });
 
@@ -38,7 +38,7 @@ describe("serializeBoard", () => {
       { ...base, id: "2", type: "issue", status: "candidate", order: 1, content: "Parser crashes." }
     ];
     expect(serializeBoard(softwareProject, items)).toBe(
-      "PROJECT: Compiler\n\n[main_goal] Compile safely.\n\n[issue] Parser crashes."
+      "PROJECT: Compiler\n\n[main_goal] [confirmed] Compile safely.\n\n[issue] [candidate] Parser crashes."
     );
   });
 
@@ -49,7 +49,24 @@ describe("serializeBoard", () => {
       { ...base, id: "3", type: "goal", status: "trash", order: 2, content: "Trash text" }
     ];
     expect(serializeBoard(project, items)).toBe(
-      "PROJECT: New SaaS\n\n[goal] Keep me."
+      "PROJECT: New SaaS\n\n[goal] [candidate] Keep me."
+    );
+  });
+
+  it("serializes arbitrary card subsets for section copies, including rejected and done cards", () => {
+    const items: BoardItem[] = [
+      { ...base, id: "3", type: "risk", status: "rejected", order: 2, content: "This is rejected." },
+      { ...base, id: "1", type: "goal", status: "candidate", order: 0, title: "Purpose", content: "Keep what matters." },
+      { ...base, id: "4", type: "decision", status: "rejected", order: 4, content: "Also rejected." },
+      { ...base, id: "2", type: "decision", status: "done", order: 1, content: "Finished." }
+    ];
+    const rejected = items.filter((item) => item.status === "rejected");
+    expect(serializeProject(project, rejected)).toBe(
+      "PROJECT: New SaaS\n\n[risk] [rejected] This is rejected.\n\n[decision] [rejected] Also rejected."
+    );
+    const done = items.filter((item) => item.status === "done");
+    expect(serializeProject(project, done)).toBe(
+      "PROJECT: New SaaS\n\n[decision] [done] Finished."
     );
   });
 });

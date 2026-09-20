@@ -22,10 +22,11 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Select cards with Up/Down, edit the selected card with Enter, and reorder it with Ctrl+Shift+Up/Down (Command+Shift on macOS).
 - On a focused card, Left/Right step its status through the non-trash statuses (Candidate → Confirmed → Rejected → Started → Done, wrapping), and Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
 - Delete always moves a focused, non-editing card to its project's Trash, matching the trash icon; each project has its own Trash, and emptying the Trash (trash-can icon in the section title row) or deleting a trash card removes it permanently, with a confirmation.
+- The Rejected and Done section title rows each have a copy button (copies all cards of that section in the same format as "Copy board") and a trash icon (trashes all cards of the section at once).
 - Middle-click a card to compose and insert a new card directly beneath it.
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
-- Double-click a card to edit it; save with Enter or another double-click, and copy its text (tagged by category, e.g., `[issue]`) with the overlapping-sheets copy action.
+- Double-click a card to edit it; save with Enter or another double-click, and copy its text (tagged by category and status, e.g., `[issue] [confirmed]`) with the overlapping-sheets copy action.
 - Use Ctrl+Enter while editing to save without arming the follow-up Enter shortcut that creates a card below; Command+Enter is the macOS equivalent.
 - Cancel card editing with Escape while keeping that card selected for continued keyboard navigation.
 - Add a new card with Enter or a double-click; use Shift+Enter for multiline text.
@@ -39,6 +40,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Scan semantic card types by accessible, template-specific colors while status remains a separate icon/pill treatment.
 - Hide rejected and done cards in collapsed sections.
 - Select text on any HTTP/HTTPS page and use **Pin selection to Pboard** from Firefox's context menu; the new card is added as **Uncategorized** and receives focus in the sidebar.
+- Right-click an image on any HTTP/HTTPS page and choose **Pin image to Pboard** to save the visible image as a local image card with its source URL and page metadata.
 - Pin selected text with `Alt+Shift+C` (**Capture**), or pin the current web page with `Alt+Shift+W`; both are left-hand shortcuts.
 - Discover both shortcuts from the corresponding action labels in Firefox's context menu.
 - Right-click a web link to pin its URL and visible label as a reference.
@@ -47,7 +49,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Capture part of the current page as an image card with the camera button beside **Add card**: drag a rectangle on the page, or press Escape to cancel.
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
-- Copy the current non-rejected board as a clean, structured prompt; every card carries its category tag (e.g., `[issue]`).
+- Copy the current non-rejected, non-trash board as a clean, structured prompt; every card carries its category and status tags (e.g., `[issue] [confirmed]`).
 - Persist all state in `browser.storage.local` across Firefox restarts.
 
 ## Architecture

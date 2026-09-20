@@ -1,4 +1,4 @@
-import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from "react";
+import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/boardTemplates";
 import { type BoardItem, type BoardTemplate } from "../../types";
 import { stepCardType, stepStatus } from "../cardCycle";
@@ -45,8 +45,38 @@ type PointerDragSession = {
   targetId: string | null;
   position: DropPosition;
   overlay: HTMLElement | null;
-  removeKeyboardListeners: (() => void) | null;
+      removeKeyboardListeners: (() => void) | null;
 };
+
+const FOCUS_MARGIN_PX = 24;
+
+function ensureCardVisible(card: HTMLElement | null) {
+  if (!card) return;
+  const viewport = window.innerHeight;
+  const margin = FOCUS_MARGIN_PX;
+  const rect = card.getBoundingClientRect();
+  if (rect.top >= margin && rect.bottom <= viewport - margin) return;
+
+  let delta: number;
+  if (rect.height > viewport - margin * 2) {
+    const topDelta = margin - rect.top;
+    const bottomDelta = rect.bottom - (viewport - margin);
+    delta = Math.abs(topDelta) <= Math.abs(bottomDelta) ? topDelta : bottomDelta;
+  } else if (rect.bottom <= margin) {
+    delta = rect.bottom - (viewport - margin);
+  } else if (rect.top >= viewport - margin) {
+    delta = margin - rect.top;
+  } else if (rect.top < margin) {
+    delta = margin - rect.top;
+  } else {
+    delta = rect.bottom - (viewport - margin);
+  }
+
+  const maxScroll = Math.max(0, document.documentElement.scrollHeight - viewport);
+  const target = Math.min(Math.max(0, window.scrollY + delta), maxScroll);
+  if (target === window.scrollY) return;
+  window.scrollTo({ top: target, behavior: "smooth" });
+}
 
 export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
@@ -80,11 +110,18 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
         startEditing();
       } else {
         cardRef.current?.focus({ preventScroll: true });
-        cardRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        ensureCardVisible(cardRef.current);
       }
-      onFocusHandled();
+      if (!startEditingOnFocus) onFocusHandled();
     });
-  }, [editing, focusRequested, startEditingOnFocus, onFocusHandled]);
+  }, [editing, focusRequested, startEditingOnFocus]);
+
+  useLayoutEffect(() => {
+    if (focusRequested && editing) {
+      ensureCardVisible(cardRef.current);
+      onFocusHandled();
+    }
+  }, [focusRequested, editing]);
 
   useEffect(() => () => clearPointerDrag(), []);
 
@@ -226,7 +263,7 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
     setEditing(false);
     window.requestAnimationFrame(() => {
       cardRef.current?.focus({ preventScroll: true });
-      cardRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      ensureCardVisible(cardRef.current);
     });
   }
 
@@ -234,7 +271,10 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
     await onUpdate(item.id, { title: title.trim() || undefined, content: content.trim() }, afterSave);
     setEditing(false);
     if (afterSave === undefined) {
-      window.requestAnimationFrame(() => cardRef.current?.focus({ preventScroll: true }));
+      window.requestAnimationFrame(() => {
+        cardRef.current?.focus({ preventScroll: true });
+        ensureCardVisible(cardRef.current);
+      });
     }
   }
 
