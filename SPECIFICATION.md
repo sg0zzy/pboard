@@ -162,8 +162,8 @@ Implemented behavior:
 - A user can change a card's type and status at any time.
 - The card-type selector is a custom dropdown menu in the card's top line rather than a native select. The open menu shows every category with a color swatch in that category's semantic color, and the current category is marked bold with a check. Up/Down and Home/End navigate the open menu, Enter selects, and Escape or clicking outside closes it and returns focus to the selector.
 - Cards can be deleted.
-- Deleting a Confirmed card requires approval in a panel directly beneath that card; the panel pushes neighboring content rather than overlapping the card.
-- Candidate and Rejected cards retain immediate deletion.
+- Deleting any card always moves it to its project's Trash without confirmation; the card is recoverable by changing its status back, and each project has its own Trash.
+- Removing a card that is already in Trash, or emptying the Trash, permanently removes it after a confirmation panel.
 - Confirmation panels focus Cancel by default and may be dismissed with Escape.
 - A trash-can icon replaces the textual Delete action and retains an accessible label and tooltip.
 - A conventional overlapping-sheets icon copies the card's optional title and content prefixed by its category tag (for example, `[issue]`), without status, order, or source metadata.
@@ -190,16 +190,16 @@ Implemented behavior:
 - A focused card is visibly selected. Up and Down move selection through cards in the same active, rejected, or done section.
 - Enter starts editing the selected card. Immediately after saving a card, the existing second-Enter shortcut retains its special behavior and opens a draft below it.
 - Ctrl+Shift+Up and Ctrl+Shift+Down reorder the selected card by one position; Command+Shift+Up/Down provides the macOS equivalent.
-- Left and Right cycle the card status through the non-trash statuses (Candidate, Confirmed, Rejected, and Done in the given project's cycle) while the card has focus and is not editing; Right increases and Left decreases, wrapping at both ends. Stepping from a Trash card lands on the first/last non-trash status in that direction.
+- Left and Right cycle the card status through the non-trash statuses (Candidate, Confirmed, Rejected, Started, and Done in the given project's cycle) while the card has focus and is not editing; Right increases and Left decreases, wrapping at both ends. Stepping from a Trash card lands on the first/last non-trash status in that direction.
 - Ctrl+Left and Ctrl+Right step the card type through the categories supported by the board template in order, Command+Left/Right providing the macOS equivalent; single-category templates such as Brainstorming have no effect.
 - Status changes are visually staged: the card's status chip and pill update immediately, but the card moves to its new section after a short pause (~800ms).
 - Moving a card out of the visible section into the Rejected, Done, or Trash section moves focus to the next visible card in the list, or clears focus if there is no successor; moving back into the visible section keeps focus on the moved card. Sections are uncontrolled, so a status change never opens or closes one.
-- Clicking the trash icon (or pressing Delete on a focused, non-editing card) moves the card to Trash, undoable by changing its status back. A Confirmed card requires the confirmation panel first; emptying the trash requires the same style of confirmation panel.
+- Clicking the trash icon (or pressing Delete on a focused, non-editing card) always moves the card to that project's Trash, undoable by changing its status back. Emptying the trash and removing a card from Trash require the confirmation panel.
 - Deleting a card that is already in Trash removes it permanently.
 - Deleting a card normalizes the remaining order values.
 - Rejected cards are placed in a collapsed **Rejected** section.
 - Done cards are placed in a collapsed **Done** section.
-- Trash cards are placed in a collapsed **Trash** section; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards.
+- Trash cards are placed in a collapsed **Trash** section, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
 - Card changes update the card's `updatedAt` timestamp.
 
 Supported card types are supplied by the selected board template rather than a global UI list. The storage union includes the current template types plus the legacy `idea` value so older data can be preserved.
@@ -209,6 +209,7 @@ Supported statuses:
 - `candidate`
 - `confirmed`
 - `rejected`
+- `started`
 - `done`
 - `trash`
 
@@ -216,7 +217,7 @@ Status semantics in version 0.1:
 
 - Status is local board metadata controlled by the user and remains independent from card type.
 - Semantic type is shown with a subtle colored top border and label chip.
-- Status is shown separately with `○`, `●`, `×`, `✓`, or `–` (Trash) and its own pill/border treatment; semantic card color does not encode status.
+- Status is shown separately with `○`, `●`, `×`, `▶`, `✓`, or `–` (Trash) and its own pill/border treatment; semantic card color does not encode status.
 - **Confirmed does not send the card to ChatGPT.**
 - Changing status does not start an AI operation or modify a conversation.
 - Rejected and trash cards remain stored and editable but are excluded from copied prompts. Trash cards can be restored by changing their status to any other status.

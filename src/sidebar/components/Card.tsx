@@ -1,6 +1,6 @@
 import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from "react";
 import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/boardTemplates";
-import { BOARD_ITEM_STATUSES, type BoardItem, type BoardTemplate } from "../../types";
+import { type BoardItem, type BoardTemplate } from "../../types";
 import { stepCardType, stepStatus } from "../cardCycle";
 import { cardTextForClipboard } from "../cardText";
 import { toSafeWebHref } from "../linkify";
@@ -9,6 +9,7 @@ import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag
 import type { DropPosition } from "../reorder";
 import { CopyIcon } from "./CopyIcon";
 import { CategoryPicker } from "./CategoryPicker";
+import { StatusPicker } from "./StatusPicker";
 
 type Props = {
   item: BoardItem;
@@ -45,14 +46,6 @@ type PointerDragSession = {
   position: DropPosition;
   overlay: HTMLElement | null;
   removeKeyboardListeners: (() => void) | null;
-};
-
-const statusLabels: Record<BoardItem["status"], string> = {
-  candidate: "○ Candidate",
-  confirmed: "● Confirmed",
-  rejected: "× Rejected",
-  done: "✓ Done",
-  trash: "– Trash"
 };
 
 export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
@@ -350,14 +343,10 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
           />
         )}
         {!templateDefinition.showTypeSelector && <span className="card-type-label">NOTE</span>}
-        <select
-          className="card-status"
-          aria-label="Card status"
+        <StatusPicker
           value={item.status}
-          onChange={(event) => onUpdate(item.id, { status: event.target.value as BoardItem["status"] })}
-        >
-          {BOARD_ITEM_STATUSES.map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}
-        </select>
+          onChange={(status) => void onUpdate(item.id, { status })}
+        />
       </div>
 
       {editing ? (

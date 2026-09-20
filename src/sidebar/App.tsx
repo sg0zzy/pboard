@@ -16,7 +16,6 @@ import {
 import { Card } from "./components/Card";
 import { CopyIcon } from "./components/CopyIcon";
 import { ProjectPicker } from "./components/ProjectPicker";
-import { cardDeletionNeedsConfirmation } from "./deletion";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
@@ -36,9 +35,7 @@ export function App() {
   const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
-  const [pendingDelete, setPendingDelete] = useState<
-    { kind: "project"; id: string } | { kind: "card"; id: string } | null
-  >(null);
+  const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
   const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
@@ -240,15 +237,11 @@ export function App() {
 
   async function requestItemDeletion(itemId: string) {
     const item = items.find((candidate) => candidate.id === itemId);
-    if (item && cardDeletionNeedsConfirmation(item.status)) {
-      setPendingDelete({ kind: "card", id: itemId });
-      return;
-    }
     if (item?.status === "trash") {
       void removeCardPermanently(itemId);
-      return;
+    } else {
+      void moveCardToTrash(itemId);
     }
-    void moveCardToTrash(itemId);
   }
 
   function isHiddenStatus(status: BoardItemStatus): boolean {
@@ -533,14 +526,6 @@ export function App() {
           startEditingOnFocus={focusRequest?.id === item.id && focusRequest.startEditing}
           onFocusHandled={() => setFocusRequest((current) => current?.id === item.id ? null : current)}
         />
-        {pendingDelete?.kind === "card" && pendingDelete.id === item.id && (
-          <DeleteConfirmation
-            message="Delete this confirmed card?"
-            detail="The card will be moved to the trash."
-            onCancel={() => setPendingDelete(null)}
-            onConfirm={() => void moveCardToTrash(item.id)}
-          />
-        )}
         {pendingMerge?.sourceId === item.id && (
           <DeleteConfirmation
             message="Merge this confirmed card?"

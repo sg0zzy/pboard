@@ -7,10 +7,12 @@ describe("stepStatus", () => {
     expect(stepStatus("candidate", -1)).toBe("done");
     expect(stepStatus("confirmed", 1)).toBe("rejected");
     expect(stepStatus("confirmed", -1)).toBe("candidate");
-    expect(stepStatus("rejected", 1)).toBe("done");
+    expect(stepStatus("rejected", 1)).toBe("started");
     expect(stepStatus("rejected", -1)).toBe("confirmed");
+    expect(stepStatus("started", 1)).toBe("done");
+    expect(stepStatus("started", -1)).toBe("rejected");
     expect(stepStatus("done", 1)).toBe("candidate");
-    expect(stepStatus("done", -1)).toBe("rejected");
+    expect(stepStatus("done", -1)).toBe("started");
   });
 
   it("steps from trash to the ends of the status cycle without cycling through trash", () => {

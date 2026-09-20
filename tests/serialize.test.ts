@@ -12,10 +12,11 @@ describe("serializeBoard", () => {
     const items: BoardItem[] = [
       { ...base, id: "2", type: "decision", status: "confirmed", order: 1, content: "Use a browser sidebar." },
       { ...base, id: "1", type: "goal", status: "candidate", order: 0, title: "Purpose", content: "Keep what matters." },
-      { ...base, id: "3", type: "risk", status: "rejected", order: 2, content: "This should be absent." }
+      { ...base, id: "3", type: "decision", status: "started", order: 2, content: "In progress." },
+      { ...base, id: "4", type: "risk", status: "rejected", order: 3, content: "This should be absent." }
     ];
     expect(serializeBoard(project, items)).toBe(
-      "PROJECT: New SaaS\n\n[goal] Purpose\nKeep what matters.\n\n[decision] Use a browser sidebar."
+      "PROJECT: New SaaS\n\n[goal] Purpose\nKeep what matters.\n\n[decision] Use a browser sidebar.\n\n[decision] In progress."
     );
   });
 

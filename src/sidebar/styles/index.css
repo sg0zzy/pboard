@@ -101,10 +101,28 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .type-picker-swatch { width: 8px; height: 8px; border-radius: 50%; }
 .type-picker-option > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .type-picker-check { color: #4f7254; text-align: right; }
+.status-picker { position: relative; }
+.status-picker-trigger { display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+.status-picker-chevron { font-size: .85em; line-height: 1; }
+.status-picker-menu { position: absolute; z-index: 30; top: calc(100% + 4px); left: auto; right: 0; display: grid; min-width: 160px; max-width: min(320px, calc(100vw - 28px)); max-height: 50vh; overflow-y: auto; border: 1px solid #caccc4; border-radius: 8px; background: #fff; padding: 4px; box-shadow: 0 8px 24px rgb(30 32 27 / 18%); }
+.status-picker-option { display: grid; grid-template-columns: 10px 1fr 1em; align-items: center; gap: 5px; border: 0; border-radius: 5px; background: transparent; color: #2b2c28; padding: 5px 8px; font-size: .8125em; text-align: left; }
+.status-picker-option:hover, .status-picker-option:focus-visible { background: #eeefe9; outline: none; }
+.status-picker-option.selected { font-weight: 700; }
+.status-picker-swatch { width: 8px; height: 8px; border-radius: 50%; }
+.status-picker-option > span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status-picker-check { color: #4f7254; text-align: right; }
+.status-picker-trigger:disabled { opacity: .42; cursor: not-allowed; }
+.status-picker-option--candidate { color: #62645d; }
+.status-picker-option--confirmed { color: #3e6c46; }
+.status-picker-option--rejected { color: #944740; }
+.status-picker-option--started { color: #6a5112; }
+.status-picker-option--done { color: #2c5c38; }
+.status-picker-option--trash { color: #62645d; }
 .card-status { width: auto; margin-left: auto; border: 1px solid #d6d7d1; border-radius: 999px; background: transparent; padding: 2px 5px; color: #62645d; font-size: .625em; font-weight: 650; }
 .status-confirmed .card-status { border-color: #8eac93; color: #3e6c46; }
 .status-rejected .card-status { border-color: #bd9995; color: #944740; }
 .status-done .card-status { border-color: #7aa97f; color: #2c5c38; }
+.status-started .card-status { border-color: #d9c98f; color: #6a5112; }
 .card h3 { margin: 8px 3px 2px; font-size: .875em; }
 .card-image { display: block; width: 100%; height: auto; max-height: 28em; margin: 7px 0 4px; border-radius: 6px; object-fit: contain; background: #eceee8; }
 .card-content { font-size: .875em; line-height: 1.43; overflow-wrap: anywhere; }
@@ -213,4 +231,16 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .empty-trash-button { color: #bbbbb5; }
   .empty-trash-button:hover { background: #4b302e; color: #efaaa4; }
   .status-trash .card-status { border-color: #565852; color: #b1b3aa; }
+  .status-picker-menu { border-color: #50514c; background: #282926; box-shadow: 0 8px 24px rgb(0 0 0 / 35%); }
+  .status-picker-option { color: #e7e7e3; }
+  .status-picker-option:hover, .status-picker-option:focus-visible { background: #393a36; color: white; }
+  .status-picker-check { color: #a3c8a5; }
+  .status-picker-option--candidate { color: #b1b3aa; }
+  .status-picker-option--confirmed { color: #8fbf9e; }
+  .status-picker-option--rejected { color: #d29a94; }
+  .status-picker-option--started { color: #d0ad5a; }
+  .status-picker-option--done { color: #86c99a; }
+  .status-picker-option--trash { color: #b1b3aa; }
+  .status-picker-trigger:disabled { opacity: .42; }
+  .status-started .card-status { border-color: #6f7048; color: #d0ad5a; }
 }

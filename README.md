@@ -20,8 +20,8 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Preview the exact insertion position with a placeholder while dragging a card.
 - Press or release Shift at any time while dragging a text card to switch dynamically between reorder and merge; Escape cancels the drag.
 - Select cards with Up/Down, edit the selected card with Enter, and reorder it with Ctrl+Shift+Up/Down (Command+Shift on macOS).
-- On a focused card, Left/Right step its status through the non-trash statuses (Candidate → Confirmed → Rejected → Done, wrapping), and Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
-- Delete moves a focused, non-editing card to the Trash, matching the trash icon; a confirmed card first shows the confirmation panel. Emptying the Trash (trash-can icon in the section title row) or deleting a trash card removes it permanently, with a confirmation.
+- On a focused card, Left/Right step its status through the non-trash statuses (Candidate → Confirmed → Rejected → Started → Done, wrapping), and Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
+- Delete always moves a focused, non-editing card to its project's Trash, matching the trash icon; each project has its own Trash, and emptying the Trash (trash-can icon in the section title row) or deleting a trash card removes it permanently, with a confirmation.
 - Middle-click a card to compose and insert a new card directly beneath it.
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
