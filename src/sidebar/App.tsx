@@ -19,6 +19,7 @@ import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
+import { browser } from "../platform/browser";
 
 const STATUS_MOVE_DELAY_MS = 800;
 
@@ -54,14 +55,14 @@ export function App() {
 
   useEffect(() => {
     void reload();
-    void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result) => {
+    void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
-    void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result) => {
+    void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result: Record<string, unknown>) => {
       const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
       if (cardId) void consumePinnedCardFocus(cardId);
     });
-    const listener = (changes: Record<string, browser.storage.StorageChange>, area: string) => {
+    const listener = (changes: Record<string, { newValue?: unknown }>, area: string) => {
       if (area === "local" && changes[STORAGE_KEY]) void reload();
       if (area === "local" && changes[UI_SCALE_STORAGE_KEY]) {
         setUiScale(normalizeUiScale(changes[UI_SCALE_STORAGE_KEY].newValue));

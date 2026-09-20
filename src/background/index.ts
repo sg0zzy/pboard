@@ -13,6 +13,7 @@ import {
   PIN_SELECTION_SHORTCUT
 } from "./shortcuts";
 import { firstCaptureImageRegion, firstCaptureRegion, findContextImage, selectPageRegion } from "./regionCapture";
+import { browser } from "../platform/browser";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
@@ -22,6 +23,10 @@ const WEB_PAGES = ["http://*/*", "https://*/*"];
 
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();
+
+if (browser.sidePanel?.setPanelBehavior) {
+  void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+}
 
 async function registerMenus() {
   await browser.menus.removeAll();
@@ -52,7 +57,7 @@ async function registerMenus() {
   });
 }
 
-browser.menus.onClicked.addListener(async (info, tab) => {
+browser.menus.onClicked.addListener(async (info: any, tab: any) => {
   if (info.menuItemId === SELECTION_MENU_ID) {
     let response: CaptureSelectionResponse | undefined;
     if (tab?.id && isChatGptUrl(info.pageUrl ?? tab.url)) {
@@ -93,7 +98,7 @@ browser.menus.onClicked.addListener(async (info, tab) => {
   }
 
   if (info.menuItemId === IMAGE_MENU_ID) {
-    const result = await captureContextImage(tab, info.srcUrl, info.frameId);
+    const result = await captureContextImage(tab, info.srcUrl, info.frameId, info.targetElementId);
     if (!result.ok) {
       warnOnFailure(result);
       return;
@@ -109,15 +114,17 @@ browser.menus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-browser.pageAction.onClicked.addListener(async (tab) => {
-  warnOnFailure(await pinWebResource(repository, {
-    url: tab.url,
-    pageUrl: tab.url,
-    title: tab.title
-  }));
-});
+if (browser.pageAction?.onClicked) {
+  browser.pageAction.onClicked.addListener(async (tab: { url?: string; title?: string }) => {
+    warnOnFailure(await pinWebResource(repository, {
+      url: tab.url,
+      pageUrl: tab.url,
+      title: tab.title
+    }));
+  });
+}
 
-browser.commands.onCommand.addListener(async (command, tab) => {
+browser.commands.onCommand.addListener(async (command: string, tab: any) => {
   if (command === PIN_PAGE_COMMAND) {
     warnOnFailure(await pinWebResource(repository, {
       url: tab.url,
@@ -196,17 +203,18 @@ async function capturePageRegion(): Promise<CaptureRegionResponse> {
 }
 
 async function captureContextImage(
-  tab: browser.tabs.Tab | undefined,
+  tab: { id?: number; windowId?: number; url?: string; title?: string } | undefined,
   imageUrl?: string,
-  frameId?: number
+  frameId?: number,
+  targetElementId?: number
 ): Promise<{ ok: true; image: BoardImage; imageUrl?: string; alt?: string } | { ok: false; reason: string }> {
   if (!tab?.id || tab.windowId === undefined) return { ok: false, reason: "No active web page is available." };
   let results;
   try {
     results = await browser.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [frameId ?? 0] },
-      args: [imageUrl],
-      func: findContextImage as unknown as (url?: string) => void
+      args: [imageUrl ?? null, targetElementId ?? null],
+      func: findContextImage as unknown as (url?: string | null, elementId?: number | null) => void
     });
   } catch {
     return { ok: false, reason: "The image could not be captured on this page." };

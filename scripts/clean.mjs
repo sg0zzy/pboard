@@ -1,3 +1,4 @@
 import { rm } from "node:fs/promises";
 
-await rm(new URL("../dist", import.meta.url), { recursive: true, force: true });
+const outputDir = process.env.PBOARD_OUT_DIR ?? "dist";
+await rm(new URL(`../${outputDir}`, import.meta.url), { recursive: true, force: true });

@@ -1,0 +1,23 @@
+import { rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const variant = process.argv[2] === "chromium" ? "chromium" : "firefox";
+const outputDir = variant === "chromium" ? "dist/chromium" : "dist";
+const env = { ...process.env, PBOARD_OUT_DIR: outputDir };
+
+await rm(resolve(root, outputDir), { recursive: true, force: true });
+for (const config of ["vite.sidebar.config.ts", "vite.background.config.ts", "vite.content.config.ts"]) {
+  execFileSync(process.execPath, [resolve(root, "node_modules/vite/bin/vite.js"), "build", "--config", config], {
+    cwd: root,
+    env,
+    stdio: "inherit"
+  });
+}
+execFileSync(process.execPath, [resolve(root, "scripts/copy-manifest.mjs"), variant], {
+  cwd: root,
+  env,
+  stdio: "inherit"
+});

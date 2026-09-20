@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --config vite.sidebar.config.ts",
-    "build": "node scripts/clean.mjs && vite build --config vite.sidebar.config.ts && vite build --config vite.background.config.ts && vite build --config vite.content.config.ts && node scripts/copy-manifest.mjs",
+    "build": "node scripts/build.mjs firefox",
+    "build:chromium": "node scripts/build.mjs chromium",
+    "build:all": "npm run build && npm run build:chromium",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

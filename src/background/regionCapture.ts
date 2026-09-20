@@ -32,14 +32,39 @@ export function firstCaptureImageRegion(results: Array<{ result?: unknown }>): C
 
 // This function is serialized by browser.scripting.executeScript. It must stay
 // self-contained and only returns the visible image rectangle, not page data.
-export function findContextImage(imageUrl?: string): CaptureImageRegion | null {
+export function findContextImage(imageUrl?: string | null, targetElementId?: number | null): CaptureImageRegion | null {
   const images = Array.from(document.images);
-  const image = images.find((candidate) => {
+  let target: Element | null = null;
+  try {
+    const extensionApi = (globalThis as typeof globalThis & {
+      browser?: { menus?: { getTargetElement?: (id: number) => Element | null } };
+      chrome?: { contextMenus?: { getTargetElement?: (id: number) => Element | null } };
+    }).browser ?? (globalThis as typeof globalThis & {
+      chrome?: { contextMenus?: { getTargetElement?: (id: number) => Element | null } };
+    }).chrome;
+    if (typeof targetElementId === "number") {
+      target = extensionApi?.menus?.getTargetElement?.(targetElementId)
+        ?? extensionApi?.contextMenus?.getTargetElement?.(targetElementId)
+        ?? null;
+    }
+  } catch {
+    // Some browser contexts do not expose getTargetElement to injected functions.
+  }
+
+  const targetImage = target instanceof HTMLImageElement
+    ? target
+    : target?.querySelector("img");
+  const image = targetImage ?? images.find((candidate) => {
     if (!imageUrl) return false;
     return candidate.currentSrc === imageUrl || candidate.src === imageUrl || candidate.getAttribute("src") === imageUrl;
   });
-  if (!image) return null;
-  const imageBounds = image.getBoundingClientRect();
+  const captureElement = image ?? (
+    target && (target instanceof HTMLCanvasElement || getComputedStyle(target).backgroundImage !== "none")
+      ? target
+      : null
+  );
+  if (!captureElement) return null;
+  const imageBounds = captureElement.getBoundingClientRect();
   if (imageBounds.width < 1 || imageBounds.height < 1) return null;
 
   let x = imageBounds.left;
@@ -72,8 +97,8 @@ export function findContextImage(imageUrl?: string): CaptureImageRegion | null {
     viewportWidth,
     viewportHeight,
     href: location.href,
-    sourceUrl: image.currentSrc || image.src || imageUrl,
-    alt: image.alt || undefined
+    sourceUrl: image?.currentSrc || image?.src || imageUrl || undefined,
+    alt: image?.alt || (target instanceof HTMLElement ? target.getAttribute("aria-label") || undefined : undefined)
   };
 }
 

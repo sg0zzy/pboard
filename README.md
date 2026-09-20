@@ -1,6 +1,6 @@
 # Pboard
 
-Pboard is a local-first Firefox extension that keeps the current state of a project alongside AI conversations and ordinary web research. Conversations remain the place for exploration; Pboard stores the goals, ideas, decisions, constraints, questions, risks, references, and notes that still matter.
+Pboard is a local-first Firefox and Chromium extension that keeps the current state of a project alongside AI conversations and ordinary web research. Conversations remain the place for exploration; Pboard stores the goals, ideas, decisions, constraints, questions, risks, references, and notes that still matter.
 
 Version 0.1 captures selected text and links from ordinary web pages, with a dedicated ChatGPT adapter where needed. It deliberately includes no account, backend, telemetry, AI API, or collaboration features. Captured content never leaves the browser.
 
@@ -56,11 +56,11 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 
 ```text
 Any HTTP/HTTPS page
-  └─ Firefox menu metadata (selection, link, or page URL)
+  └─ Browser menu metadata (selection, link, image, or page URL)
 ChatGPT page
   └─ isolated content script and ChatGptAdapter
             ⇅ WebExtension messaging
-background script (context menus, page action, and region capture)
+background/service worker (context menus, page action/action, and region capture)
             ⇅ browser.storage.local
 React sidebar ─ project/card repository
 ```
@@ -69,10 +69,10 @@ Provider-specific page access lives in `src/providers`. The rest of the board kn
 
 State is stored as one versioned object. Projects are application-owned; a conversation URL is optional source metadata on a card, never the owner of a project.
 
-## Firefox permissions
+## Browser permissions
 
 - `storage`: persist projects, cards, order, and the selected project locally.
-- `menus`: expose pin actions for selected text, links, and pages.
+- `menus` (Firefox) / `contextMenus` (Chromium): expose pin actions for selected text, links, images, and pages.
 - `clipboardWrite`: copy the board prompt after an explicit button click.
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
 - `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used.
@@ -80,16 +80,19 @@ State is stored as one versioned object. Projects are application-owned; a conve
 
 No browsing-history permission, remote code, or network endpoint is used. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.
 
+The Firefox build uses the native `sidebar_action` and Firefox page action. The Chromium build uses the MV3 `side_panel` and `action` APIs. Shared code goes through `src/platform/browser.ts`, which normalizes the runtime namespace and context-menu namespace.
+
 ## Develop and build
 
-Requirements: Node.js 20 or newer, npm, and Firefox 126 or newer.
+Requirements: Node.js 20 or newer and npm. Firefox 126+ and Chromium-based browsers with Side Panel support (Chrome/Chromium 114+, including current releases) are supported.
 
 ```bash
 npm install
 npm run check
+npm run build:all
 ```
 
-`npm run check` runs strict TypeScript checking, the test suite, and a production build. Build output is written to `dist/`. The background and content entries are separately bundled as classic IIFEs because Firefox content scripts and `background.scripts` do not rely on page module loading.
+`npm run check` runs strict TypeScript checking, the test suite, and the Firefox production build. `npm run build` writes the Firefox package to `dist/`; `npm run build:chromium` writes the Chromium package to `dist/chromium/`; `npm run build:all` creates both. The background and content entries are separately bundled as classic IIFEs so they work as Firefox background scripts or a Chromium MV3 service worker.
 
 For sidebar-only visual development:
 
@@ -111,6 +114,16 @@ The development page can render the UI, but WebExtension storage APIs are availa
 The default shortcuts are `Alt+Shift+C` for capturing selected text and `Alt+Shift+W` for the current page. They can be reassigned from Firefox's **Manage Extension Shortcuts** screen.
 
 Temporary add-ons are removed when Firefox restarts. Reload the add-on from the same debugging page after rebuilding.
+
+## Load temporarily in Chrome/Chromium
+
+1. Run `npm run build:chromium`.
+2. Open `chrome://extensions` (or the equivalent `*-extensions` page).
+3. Enable **Developer mode**.
+4. Choose **Load unpacked** and select `dist/chromium/`.
+5. Pin/open Pboard from the browser's side-panel toolbar button. On supported Chromium versions, the extension action opens the Pboard side panel.
+
+The Chromium package intentionally has a separate manifest: Chrome uses `side_panel`, `action`, `contextMenus`, and a service worker, while Firefox uses `sidebar_action`, `page_action`, `menus`, and background scripts. No Chrome-specific code is required in the sidebar or storage layer.
 
 ## Tests
 
