@@ -92,7 +92,9 @@ npm run check
 npm run build:all
 ```
 
-`npm run check` runs strict TypeScript checking, the test suite, and the Firefox production build. `npm run build` writes the Firefox package to `dist/`; `npm run build:chromium` writes the Chromium package to `dist/chromium/`; `npm run build:all` creates both. The background and content entries are separately bundled as classic IIFEs so they work as Firefox background scripts or a Chromium MV3 service worker.
+`npm run check` runs strict TypeScript checking, the shared test suite, both production builds, and a lightweight verification of both generated manifests and bundles. `npm run build` writes the Firefox package to `dist/`; `npm run build:chromium` writes the Chromium package to `dist/chromium/`; `npm run build:all` creates both. The tests and build verification are development-only and add no runtime code to the extension. The background and content entries are separately bundled as classic IIFEs so they work as Firefox background scripts or a Chromium MV3 service worker.
+
+For a single verified build, use `npm run release:firefox` or `npm run release:chromium`. These commands run typechecking and tests first, then build and verify only the selected browser package. `npm run release:all` does the same for both.
 
 For sidebar-only visual development:
 
@@ -131,6 +133,8 @@ The Chromium package intentionally has a separate manifest: Chrome uses `side_pa
 npm test
 npm run typecheck
 npm run build
+npm run build:chromium
+npm run verify:build
 ```
 
 Tests cover project creation/deletion and persistence, card creation/editing/deletion/reordering, image persistence and sizing, capture-region cropping, prompt serialization, selection messaging, generic web selections and links, source metadata, missing projects, unsupported hosts, and missing provider selections. Generic capture uses Firefox's context-menu metadata; ChatGPT selection capture uses the standard browser Selection API rather than provider-specific message selectors.

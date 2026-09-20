@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { firstCaptureRegion } from "../src/background/regionCapture";
-import { computeCropRect, fitImageWithin } from "../src/images/processing";
+import { computeCropRect, cropCapturedImage, fitImageWithin } from "../src/images/processing";
 
 describe("image sizing", () => {
   it("preserves small images and scales large images proportionally", () => {
@@ -14,6 +14,47 @@ describe("capture-region cropping", () => {
   it("scales region coordinates to the screenshot size", () => {
     const region = { x: 10, y: 20, width: 300, height: 180, viewportWidth: 1200, viewportHeight: 800 };
     expect(computeCropRect(2400, 1600, region)).toEqual({ x: 20, y: 40, width: 600, height: 360 });
+  });
+
+  it("uses the OffscreenCanvas path when running without a document", async () => {
+    vi.stubGlobal("document", undefined);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ blob: async () => new Blob(["source"], { type: "image/png" }) })));
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => ({
+      width: 1200,
+      height: 800,
+      close: vi.fn()
+    })));
+    vi.stubGlobal("OffscreenCanvas", class {
+      width: number;
+      height: number;
+      constructor(width: number, height: number) {
+        this.width = width;
+        this.height = height;
+      }
+      getContext() {
+        return { drawImage: vi.fn() };
+      }
+      async convertToBlob() {
+        return new Blob(["encoded"], { type: "image/webp" });
+      }
+    });
+
+    try {
+      const image = await cropCapturedImage("data:image/png;base64,c291cmNl", {
+        x: 0,
+        y: 0,
+        width: 300,
+        height: 180,
+        viewportWidth: 1200,
+        viewportHeight: 800
+      });
+      expect(image.mimeType).toBe("image/webp");
+      expect(image.dataUrl).toMatch(/^data:image\/webp;base64,/);
+      expect(image.width).toBe(300);
+      expect(image.height).toBe(180);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("clamps regions that extend beyond the screenshot", () => {
