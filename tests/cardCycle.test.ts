@@ -12,6 +12,11 @@ describe("stepStatus", () => {
     expect(stepStatus("done", 1)).toBe("candidate");
     expect(stepStatus("done", -1)).toBe("rejected");
   });
+
+  it("steps from trash to the ends of the status cycle without cycling through trash", () => {
+    expect(stepStatus("trash", 1)).toBe("confirmed");
+    expect(stepStatus("trash", -1)).toBe("done");
+  });
 });
 
 describe("stepCardType", () => {

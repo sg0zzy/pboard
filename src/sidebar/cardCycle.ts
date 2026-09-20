@@ -2,10 +2,13 @@ import { BOARD_ITEM_STATUSES } from "../types";
 import type { BoardItemType, BoardItemStatus, BoardTemplate } from "../types";
 import { boardTemplates } from "../templates/boardTemplates";
 
+const STATUS_CYCLE: readonly BoardItemStatus[] = BOARD_ITEM_STATUSES.filter((status) => status !== "trash");
+
 export function stepStatus(status: BoardItemStatus, direction: -1 | 1): BoardItemStatus {
-  const index = BOARD_ITEM_STATUSES.indexOf(status);
-  const next = (index + direction + BOARD_ITEM_STATUSES.length) % BOARD_ITEM_STATUSES.length;
-  return BOARD_ITEM_STATUSES[next];
+  const index = STATUS_CYCLE.indexOf(status);
+  const base = index === -1 ? 0 : index;
+  const next = (base + direction + STATUS_CYCLE.length) % STATUS_CYCLE.length;
+  return STATUS_CYCLE[next];
 }
 
 export function stepCardType(template: BoardTemplate, type: BoardItemType, direction: -1 | 1): BoardItemType {

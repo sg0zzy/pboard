@@ -169,6 +169,21 @@ export function createRepository(storage: KeyValueStorage) {
     await save(state);
   }
 
+  async function emptyTrash(projectId: string): Promise<number> {
+    const state = await load();
+    const trashIds = new Set(
+      state.boardItems
+        .filter((item) => item.projectId === projectId && item.status === "trash")
+        .map((item) => item.id)
+    );
+    if (trashIds.size) {
+      state.boardItems = state.boardItems.filter((item) => !trashIds.has(item.id));
+      normalizeOrder(state, projectId);
+    }
+    await save(state);
+    return trashIds.size;
+  }
+
   async function duplicateItem(itemId: string): Promise<BoardItem> {
     const state = await load();
     const source = state.boardItems.find((item) => item.id === itemId);
@@ -225,7 +240,7 @@ export function createRepository(storage: KeyValueStorage) {
     await save(state);
   }
 
-  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, mergeItems, reorderItems };
+  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems };
 }
 
 function normalizeOrder(state: AppState, projectId: string) {

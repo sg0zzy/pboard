@@ -10,6 +10,7 @@ import {
   type AppState,
   type BoardImage,
   type BoardItem,
+  type BoardItemStatus,
   type BoardTemplate
 } from "../types";
 import { Card } from "./components/Card";
@@ -19,6 +20,8 @@ import { cardDeletionNeedsConfirmation } from "./deletion";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
+
+const STATUS_MOVE_DELAY_MS = 800;
 
 export function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -41,9 +44,10 @@ export function App() {
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
   const [imageDropActive, setImageDropActive] = useState(false);
   const [capturingRegion, setCapturingRegion] = useState(false);
+  const [statusMovePending, setStatusMovePending] = useState<Record<string, BoardItemStatus>>({});
+  const [emptyTrashPending, setEmptyTrashPending] = useState(false);
+  const statusMoveTimers = useRef<Map<string, number>>(new Map());
   const projectNameInputRef = useRef<HTMLInputElement>(null);
-  const rejectedSectionRef = useRef<HTMLDetailsElement>(null);
-  const doneSectionRef = useRef<HTMLDetailsElement>(null);
 
   const reload = useCallback(async () => {
   const next = await repository.load();
@@ -91,19 +95,19 @@ export function App() {
   const items = useMemo(() => state?.boardItems
     .filter((item) => item.projectId === state.currentProjectId)
     .sort((a, b) => a.order - b.order) ?? [], [state]);
-  const visibleItems = items.filter((item) => item.status !== "rejected" && item.status !== "done");
-  const rejectedItems = items.filter((item) => item.status === "rejected");
-  const doneItems = items.filter((item) => item.status === "done");
+  const displayedStatus = (item: BoardItem): BoardItemStatus => statusMovePending[item.id] ?? item.status;
+  const visibleItems = items.filter((item) =>
+    displayedStatus(item) !== "rejected" &&
+    displayedStatus(item) !== "done" &&
+    displayedStatus(item) !== "trash"
+  );
+  const rejectedItems = items.filter((item) => displayedStatus(item) === "rejected");
+  const doneItems = items.filter((item) => displayedStatus(item) === "done");
+  const trashItems = items.filter((item) => displayedStatus(item) === "trash");
 
   useEffect(() => {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
   }, [items, selectedCardId]);
-
-  useEffect(() => {
-    const item = items.find((candidate) => candidate.id === selectedCardId);
-    if (item?.status === "rejected" && rejectedSectionRef.current) rejectedSectionRef.current.open = true;
-    if (item?.status === "done" && doneSectionRef.current) doneSectionRef.current.open = true;
-  }, [selectedCardId, items]);
 
   async function createProject(event: FormEvent) {
     event.preventDefault();
@@ -202,17 +206,30 @@ export function App() {
     const beforeStatus = items.find((candidate) => candidate.id === itemId)?.status;
     await repository.updateItem(itemId, patch);
     const newState = await reload();
-    const afterStatus = newState?.boardItems.find((candidate) => candidate.id === itemId)?.status;
+    const afterStatus =
+      newState?.boardItems.find((candidate) => candidate.id === itemId)?.status ?? beforeStatus;
     if (afterSave === "insert" && currentProject) void createCard(currentProject.id, itemId);
     if (afterSave === "focus") setFocusRequest({ id: itemId, startEditing: false });
-    if (patch.status !== undefined && beforeStatus !== afterStatus) {
-      setFocusRequest({ id: itemId, startEditing: false });
+    if (beforeStatus !== undefined && afterStatus !== undefined && beforeStatus !== afterStatus) {
+      applyStatusChange(itemId, beforeStatus, afterStatus);
     }
   }
 
-  async function deleteItem(itemId: string) {
-    await repository.deleteItem(itemId);
+  async function moveCardToTrash(itemId: string) {
+    const beforeStatus = items.find((candidate) => candidate.id === itemId)?.status;
+    if (beforeStatus === undefined || beforeStatus === "trash") return;
+    await repository.updateItem(itemId, { status: "trash" });
+    const newState = await reload();
+    const afterStatus =
+      newState?.boardItems.find((candidate) => candidate.id === itemId)?.status ?? beforeStatus;
+    applyStatusChange(itemId, beforeStatus, afterStatus);
+  }
+
+  async function removeCardPermanently(itemId: string) {
+    clearStatusMove(itemId);
     setPendingDelete(null);
+    if (selectedCardId === itemId) setSelectedCardId(null);
+    await repository.deleteItem(itemId);
     await reload();
   }
 
@@ -227,7 +244,80 @@ export function App() {
       setPendingDelete({ kind: "card", id: itemId });
       return;
     }
-    await deleteItem(itemId);
+    if (item?.status === "trash") {
+      void removeCardPermanently(itemId);
+      return;
+    }
+    void moveCardToTrash(itemId);
+  }
+
+  function isHiddenStatus(status: BoardItemStatus): boolean {
+    return status === "rejected" || status === "done" || status === "trash";
+  }
+
+  function scheduleStatusMove(itemId: string, shownStatus: BoardItemStatus) {
+    setStatusMovePending((current) => ({ ...current, [itemId]: shownStatus }));
+    const existingTimer = statusMoveTimers.current.get(itemId);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    const timer = window.setTimeout(() => {
+      statusMoveTimers.current.delete(itemId);
+      setStatusMovePending((current) => {
+        const next = { ...current };
+        delete next[itemId];
+        return next;
+      });
+    }, STATUS_MOVE_DELAY_MS);
+    statusMoveTimers.current.set(itemId, timer);
+  }
+
+  function clearStatusMove(itemId: string) {
+    const existingTimer = statusMoveTimers.current.get(itemId);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    statusMoveTimers.current.delete(itemId);
+    setStatusMovePending((current) => {
+      if (current[itemId] === undefined) return current;
+      const next = { ...current };
+      delete next[itemId];
+      return next;
+    });
+  }
+
+  function applyStatusChange(
+    itemId: string,
+    beforeStatus: BoardItemStatus,
+    afterStatus: BoardItemStatus
+  ) {
+    const shownBefore = statusMovePending[itemId] ?? beforeStatus;
+    scheduleStatusMove(itemId, shownBefore);
+    const leavesVisible = isHiddenStatus(afterStatus) && !isHiddenStatus(shownBefore);
+    if (leavesVisible) {
+      const index = visibleItems.findIndex((candidate) => candidate.id === itemId);
+      const successorId = index >= 0 ? visibleItems[index + 1]?.id : null;
+      if (successorId) {
+        setSelectedCardId(successorId);
+        setFocusRequest({ id: successorId, startEditing: false });
+      } else {
+        setSelectedCardId(null);
+        setFocusRequest(null);
+      }
+    } else {
+      setFocusRequest({ id: itemId, startEditing: false });
+    }
+  }
+
+  async function emptyTrash() {
+    if (!currentProject) return;
+    const trashIds = items.filter((item) => item.status === "trash").map((item) => item.id);
+    await repository.emptyTrash(currentProject.id);
+    trashIds.forEach((id) => clearStatusMove(id));
+    if (selectedCardId && trashIds.includes(selectedCardId)) setSelectedCardId(null);
+    setEmptyTrashPending(false);
+    await reload();
+  }
+
+  function requestEmptyTrash() {
+    if (trashItems.length === 0) return;
+    setEmptyTrashPending(true);
   }
 
   function beginDrag(itemId: string, mergeMode: boolean) {
@@ -259,7 +349,7 @@ export function App() {
     setMergeTargetId(null);
     const dragged = items.find((item) => item.id === draggedId);
     const target = items.find((item) => item.id === targetId);
-    if (!dragged || !target || statusSection(dragged.status) !== statusSection(target.status)) {
+    if (!dragged || !target || cardSection(draggedId) !== cardSection(targetId)) {
       setDropTarget(null);
       return;
     }
@@ -288,7 +378,7 @@ export function App() {
     }
     const dragged = items.find((item) => item.id === draggedId);
     const target = items.find((item) => item.id === targetId);
-    if (!dragged || !target || statusSection(dragged.status) !== statusSection(target.status)) {
+    if (!dragged || !target || cardSection(draggedId) !== cardSection(targetId)) {
       endDrag();
       return;
     }
@@ -322,16 +412,17 @@ export function App() {
     setFocusRequest({ id: targetId, startEditing: false });
   }
 
-  function statusSection(status: BoardItem["status"]) {
+  function statusSection(status: BoardItemStatus) {
     if (status === "rejected") return rejectedItems;
     if (status === "done") return doneItems;
+    if (status === "trash") return trashItems;
     return visibleItems;
   }
 
   function cardSection(itemId: string) {
     const item = items.find((candidate) => candidate.id === itemId);
     if (!item) return [];
-    return statusSection(item.status);
+    return statusSection(displayedStatus(item));
   }
 
   function navigateCard(itemId: string, direction: -1 | 1) {
@@ -445,9 +536,9 @@ export function App() {
         {pendingDelete?.kind === "card" && pendingDelete.id === item.id && (
           <DeleteConfirmation
             message="Delete this confirmed card?"
-            detail="This cannot be undone."
+            detail="The card will be moved to the trash."
             onCancel={() => setPendingDelete(null)}
-            onConfirm={() => void deleteItem(item.id)}
+            onConfirm={() => void moveCardToTrash(item.id)}
           />
         )}
         {pendingMerge?.sourceId === item.id && (
@@ -609,26 +700,56 @@ export function App() {
             onDrop={(event) => void dropImage(event)}
           >
             {imageDropActive && <div className="image-drop-overlay" aria-hidden="true">Drop image to add a card</div>}
-            {!visibleItems.length && !rejectedItems.length && !doneItems.length && (
+            {!visibleItems.length && !rejectedItems.length && !doneItems.length && !trashItems.length && (
               <div className="empty-state small">
                 <h2>No pinned points yet.</h2>
                 <p>Select something useful on a web page, right-click it, and choose <strong>Pin selection to Pboard</strong>.</p>
               </div>
             )}
             {visibleItems.map(renderSortableCard)}
-             {rejectedItems.length > 0 && (
-               <details className="rejected-section" ref={rejectedSectionRef}>
-                 <summary>Rejected ({rejectedItems.length})</summary>
-                 {rejectedItems.map(renderSortableCard)}
-               </details>
-             )}
-             {doneItems.length > 0 && (
-               <details className="done-section" ref={doneSectionRef}>
-                 <summary>Done ({doneItems.length})</summary>
-                 {doneItems.map(renderSortableCard)}
-               </details>
-             )}
-           </section>
+            {rejectedItems.length > 0 && (
+              <details className="rejected-section">
+                <summary>Rejected ({rejectedItems.length})</summary>
+                {rejectedItems.map(renderSortableCard)}
+              </details>
+            )}
+            {doneItems.length > 0 && (
+              <details className="done-section">
+                <summary>Done ({doneItems.length})</summary>
+                {doneItems.map(renderSortableCard)}
+              </details>
+            )}
+            {trashItems.length > 0 && (
+              <details className="trash-section">
+                <summary>
+                  <span>Trash ({trashItems.length})</span>
+                  <button
+                    type="button"
+                    className="empty-trash-button"
+                    title="Empty trash"
+                    aria-label="Empty trash"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      requestEmptyTrash();
+                    }}
+                  >
+                    <EmptyTrashIcon />
+                  </button>
+                </summary>
+                {trashItems.map(renderSortableCard)}
+              </details>
+            )}
+
+            {emptyTrashPending && (
+              <DeleteConfirmation
+                message="Empty trash?"
+                detail="All cards in the trash will be deleted permanently."
+                onCancel={() => setEmptyTrashPending(false)}
+                onConfirm={() => void emptyTrash()}
+              />
+            )}
+            </section>
 
           <section className="board-controls">
             <div className="board-add-row">
@@ -641,7 +762,7 @@ export function App() {
                 onClick={() => void captureRegion()}
               ><CameraIcon /></button>
             </div>
-            <button className="copy-button" onClick={copyBoard} disabled={!items.some((item) => item.status !== "rejected")}>
+            <button className="copy-button" onClick={copyBoard} disabled={!items.some((item) => item.status !== "rejected" && item.status !== "trash")}>
               <CopyIcon />
               <span>Copy board</span>
             </button>
@@ -693,6 +814,14 @@ function CameraIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M4 7.75h3l1.4-2h7.2l1.4 2h3v10.5H4z" />
       <circle cx="12" cy="13" r="3.25" />
+    </svg>
+  );
+}
+
+function EmptyTrashIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5.25 7.25h13.5M9 7.25V5h6v2.25m-8.5 0l.75 12.75h9.5l.75-12.75M10.25 10.5v6m4-6v6" />
     </svg>
   );
 }

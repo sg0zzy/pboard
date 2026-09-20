@@ -16,7 +16,7 @@ export const BOARD_ITEM_TYPES = [
   "reference"
 ] as const;
 
-export const BOARD_ITEM_STATUSES = ["candidate", "confirmed", "rejected", "done"] as const;
+export const BOARD_ITEM_STATUSES = ["candidate", "confirmed", "rejected", "done", "trash"] as const;
 export const BOARD_TEMPLATES = ["brainstorming", "idea", "project", "software_project"] as const;
 export const PINNED_CARD_FOCUS_KEY = "pinnedCardFocusId";
 

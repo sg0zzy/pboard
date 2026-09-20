@@ -40,4 +40,15 @@ describe("serializeBoard", () => {
       "PROJECT: Compiler\n\n[main_goal] Compile safely.\n\n[issue] Parser crashes."
     );
   });
+
+  it("excludes rejected and trash items from the prompt text", () => {
+    const items: BoardItem[] = [
+      { ...base, id: "1", type: "goal", status: "candidate", order: 0, content: "Keep me." },
+      { ...base, id: "2", type: "goal", status: "rejected", order: 1, content: "Rejected text" },
+      { ...base, id: "3", type: "goal", status: "trash", order: 2, content: "Trash text" }
+    ];
+    expect(serializeBoard(project, items)).toBe(
+      "PROJECT: New SaaS\n\n[goal] Keep me."
+    );
+  });
 });

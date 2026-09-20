@@ -139,6 +139,14 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .rejected-section .card { margin-top: 9px; }
 .done-section > summary { cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
 .done-section .card { margin-top: 9px; }
+.trash-section > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
+.trash-section > summary::before { content: ""; }
+.trash-section .card { margin-top: 9px; opacity: .66; }
+.status-trash .card-status { border-color: #c7c9c1; color: #62645d; }
+.empty-trash-button { align-self: center; margin-left: 2px; display: grid; place-items: center; width: 1.8em; height: 1.8em; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #7a7b74; cursor: pointer; flex-shrink: 0; }
+.empty-trash-button svg { width: 14px; height: 14px; }
+.empty-trash-button:hover { background: #f8e9e7; color: #a03d35; }
+.empty-trash-button:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 .board-controls { border-top: 1px solid #deded9; padding-top: 12px; }
 .board-add-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .add-card { margin-bottom: 0; }
@@ -200,4 +208,9 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .type-picker-option:hover, .type-picker-option:focus-visible { background: #393a36; color: white; }
   .type-picker-check { color: #a3c8a5; }
   .card-status { border-color: #565852; color: #b1b3aa; }
+  .trash-section > summary { color: #a7a9a0; }
+  .trash-section .card { opacity: .8; }
+  .empty-trash-button { color: #bbbbb5; }
+  .empty-trash-button:hover { background: #4b302e; color: #efaaa4; }
+  .status-trash .card-status { border-color: #565852; color: #b1b3aa; }
 }

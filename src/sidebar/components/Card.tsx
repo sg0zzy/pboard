@@ -51,7 +51,8 @@ const statusLabels: Record<BoardItem["status"], string> = {
   candidate: "○ Candidate",
   confirmed: "● Confirmed",
   rejected: "× Rejected",
-  done: "✓ Done"
+  done: "✓ Done",
+  trash: "– Trash"
 };
 
 export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {

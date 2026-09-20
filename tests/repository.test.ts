@@ -209,4 +209,24 @@ describe("Pboard repository", () => {
     expect(state.projects[0].template).toBe("project");
     expect(state.boardItems[0]).toMatchObject({ type: "idea", content: "Keep me", status: "confirmed" });
   });
+
+  it("removes only the project's trash cards when emptying trash and renumbers the rest", async () => {
+    const project = await repository.createProject("Trash", "project");
+    const live = await repository.addItem({ projectId: project.id, content: "Live" });
+    const lost = await repository.addItem({ projectId: project.id, content: "Lost" });
+    const gone = await repository.addItem({ projectId: project.id, content: "Gone" });
+    await repository.updateItem(lost.id, { status: "trash" });
+    await repository.updateItem(gone.id, { status: "trash" });
+
+    const removed = await repository.emptyTrash(project.id);
+
+    expect(removed).toBe(2);
+    const state = await repository.load();
+    expect(state.boardItems.map((item) => item.content)).toEqual(["Live"]);
+    expect(state.boardItems.find((item) => item.id === live.id)?.order).toBe(0);
+
+    const again = await repository.emptyTrash(project.id);
+    expect(again).toBe(0);
+    expect((await repository.load()).boardItems.length).toBe(1);
+  });
 });
