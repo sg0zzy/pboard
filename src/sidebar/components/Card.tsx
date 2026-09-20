@@ -1,12 +1,14 @@
 import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from "react";
-import { getCardTypeDefinition, getTemplateDefinition, isTypeSupported } from "../../templates/boardTemplates";
+import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/boardTemplates";
 import { BOARD_ITEM_STATUSES, type BoardItem, type BoardTemplate } from "../../types";
+import { stepCardType, stepStatus } from "../cardCycle";
 import { cardTextForClipboard } from "../cardText";
 import { toSafeWebHref } from "../linkify";
 import { MarkdownContent, MarkdownInline, setTaskCheckedAtLine } from "../markdown";
 import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag";
 import type { DropPosition } from "../reorder";
 import { CopyIcon } from "./CopyIcon";
+import { CategoryPicker } from "./CategoryPicker";
 
 type Props = {
   item: BoardItem;
@@ -48,7 +50,8 @@ type PointerDragSession = {
 const statusLabels: Record<BoardItem["status"], string> = {
   candidate: "○ Candidate",
   confirmed: "● Confirmed",
-  rejected: "× Rejected"
+  rejected: "× Rejected",
+  done: "✓ Done"
 };
 
 export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
@@ -63,7 +66,6 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
   pointerCallbacksRef.current = { onDragStart, onDragOver, onDrop, onDragEnd };
   const templateDefinition = getTemplateDefinition(template);
   const typeDefinition = getCardTypeDefinition(template, item.type);
-  const supportsCurrentType = isTypeSupported(template, item.type);
   const sourceHref = item.source?.conversationUrl ? toSafeWebHref(item.source.conversationUrl) : null;
   const cardStyle = {
     "--card-accent": typeDefinition.color,
@@ -319,21 +321,32 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
           if (event.shiftKey && (event.ctrlKey || event.metaKey)) onKeyboardMove(item.id, direction);
           else if (!event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) onNavigate(item.id, direction);
         }
-      }}
-      onDoubleClick={() => { if (!editing) startEditing(); }}
+        if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+          event.preventDefault();
+          const direction = event.key === "ArrowRight" ? 1 : -1;
+          if (event.ctrlKey || event.metaKey) {
+            const nextType = stepCardType(template, item.type, direction);
+            if (nextType !== item.type) void onUpdate(item.id, { type: nextType });
+            return;
+          }
+           void onUpdate(item.id, { status: stepStatus(item.status, direction) });
+         }
+         if (event.key === "Delete") {
+          event.preventDefault();
+          void onDelete(item.id);
+          return;
+         }
+       }}
+       onDoubleClick={() => { if (!editing) startEditing(); }}
     >
       <div className="card-topline" onDoubleClick={(event) => event.stopPropagation()}>
         <span className="drag-handle" title="Drag to reorder · Press Shift to merge" aria-label="Drag to reorder; press Shift to merge">≡</span>
         {templateDefinition.showTypeSelector && (
-          <select
-            className="card-type"
-            aria-label="Card type"
+          <CategoryPicker
+            cardTypes={templateDefinition.cardTypes}
             value={item.type}
-            onChange={(event) => onUpdate(item.id, { type: event.target.value as BoardItem["type"] })}
-          >
-            {!supportsCurrentType && <option value={item.type}>LEGACY: {item.type.replaceAll("_", " ").toUpperCase()}</option>}
-            {templateDefinition.cardTypes.map((type) => <option key={type.id} value={type.id}>{type.label.toUpperCase()}</option>)}
-          </select>
+            onChange={(type) => void onUpdate(item.id, { type })}
+          />
         )}
         {!templateDefinition.showTypeSelector && <span className="card-type-label">NOTE</span>}
         <select

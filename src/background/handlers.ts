@@ -17,7 +17,7 @@ export async function pinSelection(
   repository: Repository,
   response: CaptureSelectionResponse | undefined,
   fallback: { text?: string; url?: string; provider?: string } = {}
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<{ ok: boolean; reason?: string; cardId?: string }> {
   const state = await repository.load();
   if (!state.currentProjectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
 
@@ -26,13 +26,14 @@ export async function pinSelection(
   const provider = response?.ok ? response.selection.provider : fallback.provider ?? "web";
   const conversationUrl = response?.ok ? response.selection.conversationUrl : fallback.url;
 
-  await repository.addItem({
+  const created = await repository.addItem({
     projectId: state.currentProjectId,
     content: text,
+    type: "note",
     status: "candidate",
     source: { provider, conversationUrl, sourceText: text }
   });
-  return { ok: true };
+  return { ok: true, cardId: created.id };
 }
 
 export async function pinWebResource(

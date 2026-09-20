@@ -20,10 +20,12 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Preview the exact insertion position with a placeholder while dragging a card.
 - Press or release Shift at any time while dragging a text card to switch dynamically between reorder and merge; Escape cancels the drag.
 - Select cards with Up/Down, edit the selected card with Enter, and reorder it with Ctrl+Shift+Up/Down (Command+Shift on macOS).
+- On a focused card, Left/Right step its status (Candidate → Confirmed → Rejected → Done, wrapping), and Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
+- Delete deletes a focused, non-editing card, matching the trash icon; a confirmed card first shows the confirmation panel.
 - Middle-click a card to compose and insert a new card directly beneath it.
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
-- Double-click a card to edit it; save with Enter or another double-click, and copy its text with the overlapping-sheets copy action.
+- Double-click a card to edit it; save with Enter or another double-click, and copy its text (tagged by category, e.g., `[issue]`) with the overlapping-sheets copy action.
 - Use Ctrl+Enter while editing to save without arming the follow-up Enter shortcut that creates a card below; Command+Enter is the macOS equivalent.
 - Cancel card editing with Escape while keeping that card selected for continued keyboard navigation.
 - Add a new card with Enter or a double-click; use Shift+Enter for multiline text.
@@ -35,8 +37,8 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Render simple card Markdown: `*`/`-` bullet lists, numbered lists, `**bold**`, `*italic*`, inline code, and `[label](url)` links.
 - Turn `- [ ]` and `- [x]` task lines into clickable checkboxes whose state is persisted back into the card text.
 - Scan semantic card types by accessible, template-specific colors while status remains a separate icon/pill treatment.
-- Hide rejected cards in a collapsed section.
-- Select text on any HTTP/HTTPS page and use **Pin selection to Pboard** from Firefox's context menu.
+- Hide rejected and done cards in collapsed sections.
+- Select text on any HTTP/HTTPS page and use **Pin selection to Pboard** from Firefox's context menu; the new card is added as **Uncategorized** and receives focus in the sidebar.
 - Pin selected text with `Alt+Shift+C` (**Capture**), or pin the current web page with `Alt+Shift+W`; both are left-hand shortcuts.
 - Discover both shortcuts from the corresponding action labels in Firefox's context menu.
 - Right-click a web link to pin its URL and visible label as a reference.
@@ -45,7 +47,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Capture part of the current page as an image card with the camera button beside **Add card**: drag a rectangle on the page, or press Escape to cancel.
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
-- Copy the current non-rejected board as a clean, structured prompt.
+- Copy the current non-rejected board as a clean, structured prompt; every card carries its category tag (e.g., `[issue]`).
 - Persist all state in `browser.storage.local` across Firefox restarts.
 
 ## Architecture

@@ -17,7 +17,7 @@ export type BoardTemplateDefinition = {
   includeTypeInPrompt: boolean;
 };
 
-const note: CardTypeDefinition = {
+export const note: CardTypeDefinition = {
   id: "note",
   label: "Uncategorized",
   color: "#73766f",

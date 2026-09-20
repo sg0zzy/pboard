@@ -160,12 +160,13 @@ Implemented behavior:
 - Dropped image files larger than 20 MB or files that are not images are rejected with a visible notice and do not change the board.
 - Card content must not be empty.
 - A user can change a card's type and status at any time.
+- The card-type selector is a custom dropdown menu in the card's top line rather than a native select. The open menu shows every category with a color swatch in that category's semantic color, and the current category is marked bold with a check. Up/Down and Home/End navigate the open menu, Enter selects, and Escape or clicking outside closes it and returns focus to the selector.
 - Cards can be deleted.
 - Deleting a Confirmed card requires approval in a panel directly beneath that card; the panel pushes neighboring content rather than overlapping the card.
 - Candidate and Rejected cards retain immediate deletion.
 - Confirmation panels focus Cancel by default and may be dismissed with Escape.
 - A trash-can icon replaces the textual Delete action and retains an accessible label and tooltip.
-- A conventional overlapping-sheets icon copies the optional title and card content to the clipboard without type, status, or source metadata.
+- A conventional overlapping-sheets icon copies the card's optional title and content prefixed by its category tag (for example, `[issue]`), without status, order, or source metadata.
 - The copy icon temporarily becomes a check mark after a successful copy.
 - Card content and its compact action row use minimal vertical spacing so short cards remain easy to scan in long boards.
 - Card display supports a deliberately small Markdown subset: lines beginning with `* ` or `- ` become bullet lists; numbered lines such as `1. ` become ordered lists; `**text**`, `*text*`, and backticks render bold, italic, and inline code; `[text](url)` renders a labelled link.
@@ -179,18 +180,23 @@ Implemented behavior:
 - While dragging, the original card is visually subdued and a dashed card-shaped placeholder previews whether it will be inserted before or after the card under the pointer.
 - The placeholder updates as the pointer crosses the vertical midpoint of a target card.
 - The visible placeholder remains a live drop target, so releasing the pointer over the preview completes the reorder.
-- Rejected and non-rejected sections only accept reorder previews from their own section, preventing a misleading cross-section placement.
+- The active, Rejected, and Done sections each accept reorder previews only from their own section, preventing a misleading cross-section placement.
 - Card sorting and merging use a custom Pointer Events layer rather than native HTML card dragging. This keeps behavior consistent across browsers and permits dynamic feedback while dragging; native file drag-and-drop remains separate for adding images.
 - Pressing Shift before or during a card drag switches from reorder to merge mode; releasing it switches back to reorder. The floating preview and destination card become orange, gray reorder placeholders disappear, the destination grows slightly and displays **MERGE HERE**. Escape cancels an active drag.
 - On merge, the dragged card is the source. Its optional title and content are appended to the destination content after a blank line, then the source card is removed and order values are normalized.
 - The destination retains its ID, title, type, status, image, source metadata, position, and creation timestamp; only its content and update timestamp change.
 - Consuming a Confirmed source requires confirmation in an inline panel beneath that source card.
 - A source card containing an image cannot be merged in this version because the destination model supports only one image; the board shows a notice and leaves both cards unchanged.
-- A focused card is visibly selected. Up and Down move selection through cards in the same active or rejected section.
+- A focused card is visibly selected. Up and Down move selection through cards in the same active, rejected, or done section.
 - Enter starts editing the selected card. Immediately after saving a card, the existing second-Enter shortcut retains its special behavior and opens a draft below it.
 - Ctrl+Shift+Up and Ctrl+Shift+Down reorder the selected card by one position; Command+Shift+Up/Down provides the macOS equivalent.
+- Left and Right cycle the card status through Candidate, Confirmed, Rejected, and Done while the card has focus and is not editing; Right increases and Left decreases, wrapping at both ends.
+- Ctrl+Left and Ctrl+Right step the card type through the categories supported by the board template in order, Command+Left/Right providing the macOS equivalent; single-category templates such as Brainstorming have no effect.
+- Moving a card into or out of the Rejected or Done section keeps the card selected, opens the relevant section, and returns focus to the card so keyboard stepping can continue.
+- Pressing Delete on a focused, non-editing card deletes it, matching the trash icon; the confirmation panel for a Confirmed card also appears.
 - Deleting a card normalizes the remaining order values.
 - Rejected cards are placed in a collapsed **Rejected** section.
+- Done cards are placed in a collapsed **Done** section.
 - Card changes update the card's `updatedAt` timestamp.
 
 Supported card types are supplied by the selected board template rather than a global UI list. The storage union includes the current template types plus the legacy `idea` value so older data can be preserved.
@@ -200,12 +206,13 @@ Supported statuses:
 - `candidate`
 - `confirmed`
 - `rejected`
+- `done`
 
 Status semantics in version 0.1:
 
 - Status is local board metadata controlled by the user and remains independent from card type.
 - Semantic type is shown with a subtle colored top border and label chip.
-- Status is shown separately with `○`, `●`, or `×` and its own pill/border treatment; semantic card color does not encode status.
+- Status is shown separately with `○`, `●`, `×`, or `✓` and its own pill/border treatment; semantic card color does not encode status.
 - **Confirmed does not send the card to ChatGPT.**
 - Changing status does not start an AI operation or modify a conversation.
 - Rejected cards remain stored and editable but are excluded from copied prompts.
@@ -240,7 +247,7 @@ type BoardItem = {
     width: number;
     height: number;
   };
-  status: "candidate" | "confirmed" | "rejected";
+  status: "candidate" | "confirmed" | "rejected" | "done";
   order: number;
   source?: {
     provider?: string;
@@ -273,8 +280,9 @@ Keyboard flow:
 
 Pinned-card behavior:
 
-- The card uses the current template's default type (`note` for the original templates and `task` for SW Project).
+- The card uses the `note` type, shown as **Uncategorized** (as **Note** on Brainstorming boards).
 - The card status is `candidate`.
+- After a successful pin, the sidebar focuses the newly created card and scrolls it into view.
 - The selected text becomes both the card content and `source.sourceText`.
 - The provider is stored as `chatgpt`.
 - On non-ChatGPT pages, the provider is stored as `web`.
@@ -316,7 +324,7 @@ Implemented behavior:
 
 ## 6. Copy board as prompt
 
-The sidebar provides a prominent **Copy board** button, with the same overlapping-sheets icon used by card copy actions, for the current project. Its clipboard output remains a structured prompt.
+The sidebar provides a prominent **Copy board** button, with the same overlapping-sheets icon used by card copy actions, for the current project. Its clipboard output is a structured prompt in which every card is prefixed by a `[category]` tag.
 
 Implemented behavior:
 
@@ -324,8 +332,8 @@ Implemented behavior:
 - Cards are serialized in their current board order.
 - Rejected cards are excluded.
 - Candidate and confirmed cards are included.
-- Idea and Project type names are converted to readable uppercase section labels; Brainstorming omits category headings.
-- An optional card title appears between its type and content.
+- Every card is prefixed with its category id in square brackets (for example, `[issue]`); legacy `idea` types are exported as `[core_idea]`.
+- An optional card title appears after the tag and before the content.
 - The resulting text is written to the clipboard.
 - The sidebar displays a temporary success notice.
 
@@ -334,11 +342,9 @@ Example:
 ```text
 PROJECT: AI brainstorming SaaS
 
-GOAL
-Create a lightweight tool for developing ideas with AI.
+[goal] Create a lightweight tool for developing ideas with AI.
 
-DECISION
-Use a browser sidebar.
+[decision] Use a browser sidebar.
 ```
 
 Copying is currently the only implemented board-to-chat workflow. The user must paste the generated prompt into ChatGPT or another AI application manually.
@@ -448,16 +454,17 @@ Current automated coverage includes:
 - project creation, selection, reordering, persistence, and deletion;
 - cascading card deletion with a project;
 - card creation, editing, deletion, and reordering;
+- status and category stepping from a focused card;
 - text-card merging, source removal, destination preservation, and image-source rejection;
 - before/after insertion calculations used by the drag placeholder;
 - repository insertion directly after a selected card;
-- individual card-text formatting for clipboard copy;
+- individual card-text formatting for clipboard copy, including category tags;
 - safe card-link detection, punctuation handling, and `www.` normalization;
 - simple Markdown inline tokenization and paragraph, bullet-list, numbered-list, and persistent task-list parsing;
 - board-template creation, configuration, and safe template changes;
 - note-only enforcement for Brainstorming;
 - version-1 storage migration without card-data loss;
-- board prompt serialization and rejected-card exclusion;
+- board prompt serialization with category tags and rejected-card exclusion;
 - runtime message validation;
 - capture-region cropping, scaling, and out-of-bounds clamping;
 - content selection capture and source metadata;
@@ -478,7 +485,6 @@ Version 0.1 does not implement:
 - provider composer automation;
 - Claude, Gemini, Perplexity, or other provider adapters;
 - import or export;
-- keyboard shortcuts;
 - automatic summarization;
 - custom user-defined templates or card types;
 - accounts, server sync, collaboration, comments, or permissions;

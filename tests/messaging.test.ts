@@ -39,17 +39,18 @@ describe("selection messaging", () => {
     expect(captureSelection(null)).toEqual({ ok: false, reason: "Unsupported page" });
   });
 
-  it("adds a card to the selected project and retains the source URL", async () => {
+  it("adds a card to the selected project, retains the source URL, and reports the created card id", async () => {
     const addItem = vi.fn(async (item) => ({ ...item, id: "i1", order: 0, createdAt: "", updatedAt: "" }));
     const repository = { load: vi.fn(async () => ({ currentProjectId: "p1" })), addItem };
     const result = await pinSelection(repository, {
       ok: true,
       selection: { provider: "chatgpt", sourceText: "Pinned", conversationUrl: "https://chatgpt.com/c/1" }
     });
-    expect(result).toEqual({ ok: true });
+    expect(result).toEqual({ ok: true, cardId: "i1" });
     expect(addItem).toHaveBeenCalledWith(expect.objectContaining({
       projectId: "p1",
       content: "Pinned",
+      type: "note",
       source: expect.objectContaining({ conversationUrl: "https://chatgpt.com/c/1" })
     }));
   });
@@ -63,16 +64,18 @@ describe("selection messaging", () => {
     expect(repository.addItem).not.toHaveBeenCalled();
   });
 
-  it("pins Firefox-provided selections from ordinary web pages", async () => {
-    const addItem = vi.fn(async (item) => ({ ...item, id: "i1", type: "note", status: "candidate", order: 0, createdAt: "", updatedAt: "" }));
+  it("pins Firefox-provided selections from ordinary web pages as Uncategorized", async () => {
+    const addItem = vi.fn(async (item) => ({ ...item, id: "i1", status: "candidate", order: 0, createdAt: "", updatedAt: "" }));
     const repository = { load: vi.fn(async () => ({ currentProjectId: "p1" })), addItem };
-    expect(await pinSelection(repository, undefined, {
+    const result = await pinSelection(repository, undefined, {
       text: "Selected article text",
       url: "https://example.com/article",
       provider: "web"
-    })).toEqual({ ok: true });
+    });
+    expect(result).toEqual({ ok: true, cardId: "i1" });
     expect(addItem).toHaveBeenCalledWith(expect.objectContaining({
       content: "Selected article text",
+      type: "note",
       source: {
         provider: "web",
         conversationUrl: "https://example.com/article",

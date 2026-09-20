@@ -9,5 +9,6 @@ describe("card deletion confirmation policy", () => {
   it("allows candidate and rejected cards to be removed immediately", () => {
     expect(cardDeletionNeedsConfirmation("candidate")).toBe(false);
     expect(cardDeletionNeedsConfirmation("rejected")).toBe(false);
+    expect(cardDeletionNeedsConfirmation("done")).toBe(false);
   });
 });

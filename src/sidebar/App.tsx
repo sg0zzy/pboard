@@ -4,7 +4,14 @@ import type { CaptureRegionResponse } from "../messaging/messages";
 import { repository } from "../storage/browser";
 import { STORAGE_KEY } from "../storage/repository";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
-import { BOARD_TEMPLATES, type AppState, type BoardImage, type BoardItem, type BoardTemplate } from "../types";
+import {
+  BOARD_TEMPLATES,
+  PINNED_CARD_FOCUS_KEY,
+  type AppState,
+  type BoardImage,
+  type BoardItem,
+  type BoardTemplate
+} from "../types";
 import { Card } from "./components/Card";
 import { CopyIcon } from "./components/CopyIcon";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -35,23 +42,43 @@ export function App() {
   const [imageDropActive, setImageDropActive] = useState(false);
   const [capturingRegion, setCapturingRegion] = useState(false);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
+  const rejectedSectionRef = useRef<HTMLDetailsElement>(null);
+  const doneSectionRef = useRef<HTMLDetailsElement>(null);
 
-  const reload = useCallback(async () => setState(await repository.load()), []);
+  const reload = useCallback(async () => {
+  const next = await repository.load();
+  setState(next);
+  return next;
+}, []);
 
   useEffect(() => {
     void reload();
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
+    void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result) => {
+      const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
+      if (cardId) void consumePinnedCardFocus(cardId);
+    });
     const listener = (changes: Record<string, browser.storage.StorageChange>, area: string) => {
       if (area === "local" && changes[STORAGE_KEY]) void reload();
       if (area === "local" && changes[UI_SCALE_STORAGE_KEY]) {
         setUiScale(normalizeUiScale(changes[UI_SCALE_STORAGE_KEY].newValue));
       }
+      if (area === "local" && changes[PINNED_CARD_FOCUS_KEY]) {
+        const cardId = changes[PINNED_CARD_FOCUS_KEY].newValue as string | null | undefined;
+        if (cardId) void consumePinnedCardFocus(cardId);
+      }
     };
     browser.storage.onChanged.addListener(listener);
     return () => browser.storage.onChanged.removeListener(listener);
   }, [reload]);
+
+  function consumePinnedCardFocus(cardId: string) {
+    void browser.storage.local.set({ [PINNED_CARD_FOCUS_KEY]: null });
+    setSelectedCardId(cardId);
+    setFocusRequest({ id: cardId, startEditing: false });
+  }
 
   function changeUiScale(direction: -1 | 1) {
     const next = adjustUiScale(uiScale, direction);
@@ -64,12 +91,19 @@ export function App() {
   const items = useMemo(() => state?.boardItems
     .filter((item) => item.projectId === state.currentProjectId)
     .sort((a, b) => a.order - b.order) ?? [], [state]);
-  const visibleItems = items.filter((item) => item.status !== "rejected");
+  const visibleItems = items.filter((item) => item.status !== "rejected" && item.status !== "done");
   const rejectedItems = items.filter((item) => item.status === "rejected");
+  const doneItems = items.filter((item) => item.status === "done");
 
   useEffect(() => {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
   }, [items, selectedCardId]);
+
+  useEffect(() => {
+    const item = items.find((candidate) => candidate.id === selectedCardId);
+    if (item?.status === "rejected" && rejectedSectionRef.current) rejectedSectionRef.current.open = true;
+    if (item?.status === "done" && doneSectionRef.current) doneSectionRef.current.open = true;
+  }, [selectedCardId, items]);
 
   async function createProject(event: FormEvent) {
     event.preventDefault();
@@ -165,10 +199,15 @@ export function App() {
     patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>,
     afterSave?: "focus" | "insert"
   ) {
+    const beforeStatus = items.find((candidate) => candidate.id === itemId)?.status;
     await repository.updateItem(itemId, patch);
-    await reload();
+    const newState = await reload();
+    const afterStatus = newState?.boardItems.find((candidate) => candidate.id === itemId)?.status;
     if (afterSave === "insert" && currentProject) void createCard(currentProject.id, itemId);
     if (afterSave === "focus") setFocusRequest({ id: itemId, startEditing: false });
+    if (patch.status !== undefined && beforeStatus !== afterStatus) {
+      setFocusRequest({ id: itemId, startEditing: false });
+    }
   }
 
   async function deleteItem(itemId: string) {
@@ -220,7 +259,7 @@ export function App() {
     setMergeTargetId(null);
     const dragged = items.find((item) => item.id === draggedId);
     const target = items.find((item) => item.id === targetId);
-    if (!dragged || !target || (dragged.status === "rejected") !== (target.status === "rejected")) {
+    if (!dragged || !target || statusSection(dragged.status) !== statusSection(target.status)) {
       setDropTarget(null);
       return;
     }
@@ -249,7 +288,7 @@ export function App() {
     }
     const dragged = items.find((item) => item.id === draggedId);
     const target = items.find((item) => item.id === targetId);
-    if (!dragged || !target || (dragged.status === "rejected") !== (target.status === "rejected")) {
+    if (!dragged || !target || statusSection(dragged.status) !== statusSection(target.status)) {
       endDrag();
       return;
     }
@@ -283,10 +322,16 @@ export function App() {
     setFocusRequest({ id: targetId, startEditing: false });
   }
 
+  function statusSection(status: BoardItem["status"]) {
+    if (status === "rejected") return rejectedItems;
+    if (status === "done") return doneItems;
+    return visibleItems;
+  }
+
   function cardSection(itemId: string) {
     const item = items.find((candidate) => candidate.id === itemId);
     if (!item) return [];
-    return item.status === "rejected" ? rejectedItems : visibleItems;
+    return statusSection(item.status);
   }
 
   function navigateCard(itemId: string, direction: -1 | 1) {
@@ -564,20 +609,26 @@ export function App() {
             onDrop={(event) => void dropImage(event)}
           >
             {imageDropActive && <div className="image-drop-overlay" aria-hidden="true">Drop image to add a card</div>}
-            {!visibleItems.length && !rejectedItems.length && (
+            {!visibleItems.length && !rejectedItems.length && !doneItems.length && (
               <div className="empty-state small">
                 <h2>No pinned points yet.</h2>
                 <p>Select something useful on a web page, right-click it, and choose <strong>Pin selection to Pboard</strong>.</p>
               </div>
             )}
             {visibleItems.map(renderSortableCard)}
-            {rejectedItems.length > 0 && (
-              <details className="rejected-section">
-                <summary>Rejected ({rejectedItems.length})</summary>
-                {rejectedItems.map(renderSortableCard)}
-              </details>
-            )}
-          </section>
+             {rejectedItems.length > 0 && (
+               <details className="rejected-section" ref={rejectedSectionRef}>
+                 <summary>Rejected ({rejectedItems.length})</summary>
+                 {rejectedItems.map(renderSortableCard)}
+               </details>
+             )}
+             {doneItems.length > 0 && (
+               <details className="done-section" ref={doneSectionRef}>
+                 <summary>Done ({doneItems.length})</summary>
+                 {doneItems.map(renderSortableCard)}
+               </details>
+             )}
+           </section>
 
           <section className="board-controls">
             <div className="board-add-row">

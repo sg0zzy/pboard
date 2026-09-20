@@ -3,6 +3,7 @@ import { isCaptureRegionMessage, type CaptureRegionResponse } from "../messaging
 import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
 import type { BoardImage } from "../types";
+import { PINNED_CARD_FOCUS_KEY } from "../types";
 import { isWebUrl, pinSelection, pinWebResource } from "./handlers";
 import {
   firstSelectedText,
@@ -60,6 +61,7 @@ browser.menus.onClicked.addListener(async (info, tab) => {
       provider: isChatGptUrl(info.pageUrl ?? tab?.url) ? "chatgpt" : "web"
     });
     warnOnFailure(result);
+    setPinnedCardFocus(result.cardId);
     return;
   }
 
@@ -107,11 +109,13 @@ browser.commands.onCommand.addListener(async (command, tab) => {
       // WebExtension types currently narrow injected functions to void.
       func: (() => window.getSelection()?.toString() ?? "") as unknown as () => void
     });
-    warnOnFailure(await pinSelection(repository, undefined, {
+    const result = await pinSelection(repository, undefined, {
       text: firstSelectedText(results),
       url: tab.url,
       provider: isChatGptUrl(tab.url) ? "chatgpt" : "web"
-    }));
+    });
+    warnOnFailure(result);
+    setPinnedCardFocus(result.cardId);
   } catch {
     warnOnFailure({ ok: false, reason: "The selected text cannot be read on this page." });
   }
@@ -176,4 +180,9 @@ function isChatGptUrl(value?: string): boolean {
 
 function warnOnFailure(result: { ok: boolean; reason?: string }) {
   if (!result.ok) console.warn(`Pboard: ${result.reason}`);
+}
+
+function setPinnedCardFocus(cardId: string | undefined) {
+  if (!cardId) return;
+  void browser.storage.local.set({ [PINNED_CARD_FOCUS_KEY]: cardId });
 }
