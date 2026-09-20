@@ -231,6 +231,12 @@ export function App() {
     await reload();
   }
 
+  async function discardEmptyCard(itemId: string) {
+    if (selectedCardId === itemId) setSelectedCardId(null);
+    await repository.deleteItem(itemId);
+    await reload();
+  }
+
   async function duplicateItem(itemId: string) {
     await repository.duplicateItem(itemId);
     await reload();
@@ -521,6 +527,7 @@ export function App() {
           template={currentProject.template}
           onUpdate={updateItem}
           onDelete={requestItemDeletion}
+          onDiscardEmpty={discardEmptyCard}
           onDragStart={beginDrag}
           onDragOver={previewDrop}
           onDrop={dropOn}

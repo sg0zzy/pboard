@@ -51,9 +51,13 @@ export async function processImageFile(file: File): Promise<BoardImage> {
 }
 
 export async function cropCapturedImage(dataUrl: string, region: CaptureRegion): Promise<BoardImage> {
-  const image = await loadImage(dataUrl);
-  const rect = computeCropRect(image.naturalWidth, image.naturalHeight, region);
-  return drawImage(image, rect.x, rect.y, rect.width, rect.height);
+  if (typeof document !== "undefined") {
+    const image = await loadImage(dataUrl);
+    const rect = computeCropRect(image.naturalWidth, image.naturalHeight, region);
+    return drawImage(image, rect.x, rect.y, rect.width, rect.height);
+  }
+
+  return cropCapturedImageInWorker(dataUrl, region);
 }
 
 function drawImage(
@@ -73,6 +77,42 @@ function drawImage(
   const dataUrl = canvas.toDataURL("image/webp", 0.82);
   const mimeType = dataUrl.slice(5, dataUrl.indexOf(";")) || "image/png";
   return { dataUrl, mimeType, width: size.width, height: size.height };
+}
+
+async function cropCapturedImageInWorker(dataUrl: string, region: CaptureRegion): Promise<BoardImage> {
+  if (typeof OffscreenCanvas === "undefined" || typeof createImageBitmap !== "function") {
+    throw new Error("Image processing is unavailable.");
+  }
+  const response = await fetch(dataUrl);
+  const bitmap = await createImageBitmap(await response.blob());
+  try {
+    const rect = computeCropRect(bitmap.width, bitmap.height, region);
+    const size = fitImageWithin(rect.width, rect.height);
+    const canvas = new OffscreenCanvas(size.width, size.height);
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Image processing is unavailable.");
+    context.drawImage(bitmap, rect.x, rect.y, rect.width, rect.height, 0, 0, size.width, size.height);
+    const blob = await canvas.convertToBlob({ type: "image/webp", quality: 0.82 });
+    const encoded = await blobToBase64(blob);
+    return {
+      dataUrl: `data:${blob.type || "image/webp"};base64,${encoded}`,
+      mimeType: blob.type || "image/webp",
+      width: size.width,
+      height: size.height
+    };
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function loadImage(source: string): Promise<HTMLImageElement> {

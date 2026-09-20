@@ -16,6 +16,7 @@ type Props = {
   template: BoardTemplate;
   onUpdate: (itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>, afterSave?: "focus" | "insert") => Promise<void>;
   onDelete: (itemId: string) => Promise<void>;
+  onDiscardEmpty: (itemId: string) => Promise<void>;
   onDragStart: (itemId: string, mergeMode: boolean) => void;
   onDragOver: (itemId: string, position: DropPosition, mergeMode: boolean) => void;
   onDrop: (itemId: string, position: DropPosition, mergeMode: boolean) => void;
@@ -78,7 +79,7 @@ function ensureCardVisible(card: HTMLElement | null) {
   window.scrollTo({ top: target, behavior: "smooth" });
 }
 
-export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
+export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);
@@ -258,9 +259,15 @@ export function Card({ item, template, onUpdate, onDelete, onDragStart, onDragOv
   }
 
   function cancelEditing() {
+    const hasLetter = (value: string | undefined) => value ? /\p{L}/u.test(value) : false;
+    const isEmptyPersistedCard = !item.image && !hasLetter(item.title) && !hasLetter(item.content);
     setTitle(item.title ?? "");
     setContent(item.content);
     setEditing(false);
+    if (isEmptyPersistedCard) {
+      void onDiscardEmpty(item.id);
+      return;
+    }
     window.requestAnimationFrame(() => {
       cardRef.current?.focus({ preventScroll: true });
       ensureCardVisible(cardRef.current);
