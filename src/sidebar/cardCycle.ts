@@ -1,8 +1,8 @@
-import { BOARD_ITEM_STATUSES } from "../types";
+import { BOARD_ITEM_STATUS_CYCLE } from "../types";
 import type { BoardItemType, BoardItemStatus, BoardTemplate } from "../types";
 import { boardTemplates } from "../templates/boardTemplates";
 
-const STATUS_CYCLE: readonly BoardItemStatus[] = BOARD_ITEM_STATUSES.filter((status) => status !== "trash");
+const STATUS_CYCLE: readonly BoardItemStatus[] = BOARD_ITEM_STATUS_CYCLE;
 
 export function stepStatus(status: BoardItemStatus, direction: -1 | 1): BoardItemStatus {
   const index = STATUS_CYCLE.indexOf(status);

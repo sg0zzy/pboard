@@ -1,6 +1,8 @@
 import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/boardTemplates";
-import { type BoardItem, type BoardTemplate } from "../../types";
+import { nextCardDisplayMode, normalizeCardDisplayMode } from "../../cardDisplayModes";
+import { statusClassName } from "../../statuses";
+import { type BoardItem, type BoardItemStatus, type BoardTemplate } from "../../types";
 import { stepCardType, stepStatus } from "../cardCycle";
 import { cardTextForClipboard } from "../cardText";
 import { toSafeWebHref } from "../linkify";
@@ -9,12 +11,15 @@ import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag
 import type { DropPosition } from "../reorder";
 import { CopyIcon } from "./CopyIcon";
 import { CategoryPicker } from "./CategoryPicker";
+import { CardDisplayModeControls } from "./CardDisplayModeControls";
 import { StatusPicker } from "./StatusPicker";
 
 type Props = {
   item: BoardItem;
+  pendingStatus: BoardItemStatus;
   template: BoardTemplate;
-  onUpdate: (itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>, afterSave?: "focus" | "insert") => Promise<void>;
+  onUpdate: (itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>, afterSave?: "focus" | "insert") => Promise<void>;
+  onStatusChange: (itemId: string, status: BoardItemStatus) => void;
   onDelete: (itemId: string) => Promise<void>;
   onDiscardEmpty: (itemId: string) => Promise<void>;
   onDragStart: (itemId: string, mergeMode: boolean) => void;
@@ -79,7 +84,7 @@ function ensureCardVisible(card: HTMLElement | null) {
   window.scrollTo({ top: target, behavior: "smooth" });
 }
 
-export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
+export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);
@@ -92,6 +97,8 @@ export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDra
   const templateDefinition = getTemplateDefinition(template);
   const typeDefinition = getCardTypeDefinition(template, item.type);
   const sourceHref = item.source?.conversationUrl ? toSafeWebHref(item.source.conversationUrl) : null;
+  const displayMode = normalizeCardDisplayMode(item.displayMode);
+  const hasTitle = Boolean(item.title?.trim());
   const cardStyle = {
     "--card-accent": typeDefinition.color,
     "--card-tint": typeDefinition.tint
@@ -315,7 +322,7 @@ export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDra
       ref={cardRef}
       data-card-id={item.id}
       tabIndex={0}
-      className={`card status-${item.status}${editing ? " editing" : ""}${selected ? " selected" : ""}${isDragging ? " dragging" : ""}${isMergeTarget ? " merge-target" : ""}${isMergeSource ? " merge-source" : ""}`}
+      className={`card status-${statusClassName(item.status)} display-mode-${displayMode} ${hasTitle ? "has-title" : "no-title"}${editing ? " editing" : ""}${selected ? " selected" : ""}${isDragging ? " dragging" : ""}${isMergeTarget ? " merge-target" : ""}${isMergeSource ? " merge-source" : ""}`}
       style={cardStyle}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
@@ -370,7 +377,12 @@ export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDra
             if (nextType !== item.type) void onUpdate(item.id, { type: nextType });
             return;
           }
-           void onUpdate(item.id, { status: stepStatus(item.status, direction) });
+         onStatusChange(item.id, stepStatus(pendingStatus, direction));
+         }
+         if (event.key.toLowerCase() === "v" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          event.preventDefault();
+          void onUpdate(item.id, { displayMode: nextCardDisplayMode(displayMode) });
+          return;
          }
          if (event.key === "Delete") {
           event.preventDefault();
@@ -391,8 +403,12 @@ export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDra
         )}
         {!templateDefinition.showTypeSelector && <span className="card-type-label">NOTE</span>}
         <StatusPicker
-          value={item.status}
-          onChange={(status) => void onUpdate(item.id, { status })}
+          value={pendingStatus}
+          onChange={(status) => onStatusChange(item.id, status)}
+        />
+        <CardDisplayModeControls
+          value={displayMode}
+          onChange={(mode) => void onUpdate(item.id, { displayMode: mode })}
         />
       </div>
 
@@ -407,7 +423,7 @@ export function Card({ item, template, onUpdate, onDelete, onDiscardEmpty, onDra
         </div>
       ) : (
         <>
-          {item.title && <h3><MarkdownInline text={item.title} /></h3>}
+          {hasTitle && <h3><MarkdownInline text={item.title!} /></h3>}
           {item.image && (
             <img
               className="card-image"
@@ -476,7 +492,7 @@ function autoScrollForPointer(clientY: number) {
   else if (clientY > window.innerHeight - edge) window.scrollBy(0, speed);
 }
 
-function TrashIcon() {
+export function TrashIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M4.75 7.25h14.5M9 7.25V4.75h6v2.5m-8.5 0 .75 12h9.5l.75-12M10 10v6.5m4-6.5v6.5" />

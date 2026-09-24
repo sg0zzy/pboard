@@ -4,20 +4,26 @@ import { stepCardType, stepStatus } from "../src/sidebar/cardCycle";
 describe("stepStatus", () => {
   it("increases status for right and decreases it for left", () => {
     expect(stepStatus("candidate", 1)).toBe("confirmed");
-    expect(stepStatus("candidate", -1)).toBe("done");
-    expect(stepStatus("confirmed", 1)).toBe("rejected");
+    expect(stepStatus("candidate", -1)).toBe("rejected");
+    expect(stepStatus("confirmed", 1)).toBe("started");
     expect(stepStatus("confirmed", -1)).toBe("candidate");
-    expect(stepStatus("rejected", 1)).toBe("started");
-    expect(stepStatus("rejected", -1)).toBe("confirmed");
-    expect(stepStatus("started", 1)).toBe("done");
-    expect(stepStatus("started", -1)).toBe("rejected");
-    expect(stepStatus("done", 1)).toBe("candidate");
-    expect(stepStatus("done", -1)).toBe("started");
+    expect(stepStatus("rejected", 1)).toBe("candidate");
+    expect(stepStatus("rejected", -1)).toBe("trash");
+    expect(stepStatus("started", 1)).toBe("to validate");
+    expect(stepStatus("started", -1)).toBe("confirmed");
+    expect(stepStatus("to validate", 1)).toBe("done");
+    expect(stepStatus("to validate", -1)).toBe("started");
+    expect(stepStatus("done", 1)).toBe("trash");
+    expect(stepStatus("done", -1)).toBe("to validate");
+    expect(stepStatus("trash", 1)).toBe("rejected");
+    expect(stepStatus("trash", -1)).toBe("done");
   });
 
-  it("steps from trash to the ends of the status cycle without cycling through trash", () => {
-    expect(stepStatus("trash", 1)).toBe("confirmed");
-    expect(stepStatus("trash", -1)).toBe("done");
+  it("cycles through every status in the canonical menu order", () => {
+    const statuses = ["candidate", "confirmed", "started", "to validate", "done", "trash", "rejected"] as const;
+    expect(statuses.map((status) => stepStatus(status, 1))).toEqual([
+      "confirmed", "started", "to validate", "done", "trash", "rejected", "candidate"
+    ]);
   });
 });
 

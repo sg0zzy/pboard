@@ -14,6 +14,7 @@ import {
 } from "./shortcuts";
 import { firstCaptureImageRegion, firstCaptureRegion, findContextImage, selectPageRegion } from "./regionCapture";
 import { browser } from "../platform/browser";
+import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
@@ -23,6 +24,7 @@ const WEB_PAGES = ["http://*/*", "https://*/*"];
 
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();
+registerDriveBackgroundSync();
 
 if (browser.sidePanel?.setPanelBehavior) {
   void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -155,8 +157,8 @@ browser.commands.onCommand.addListener(async (command: string, tab: any) => {
 });
 
 browser.runtime.onMessage.addListener((message: unknown) => {
-  if (!isCaptureRegionMessage(message)) return undefined;
-  return capturePageRegion();
+  if (isCaptureRegionMessage(message)) return capturePageRegion();
+  return handleDriveSyncMessage(message);
 });
 
 async function capturePageRegion(): Promise<CaptureRegionResponse> {

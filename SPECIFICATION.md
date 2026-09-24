@@ -191,8 +191,9 @@ Implemented behavior:
 - A focused card is visibly selected. Up and Down move selection through cards in the same active, rejected, or done section.
 - Enter starts editing the selected card. Immediately after saving a card, the existing second-Enter shortcut retains its special behavior and opens a draft below it.
 - Ctrl+Shift+Up and Ctrl+Shift+Down reorder the selected card by one position; Command+Shift+Up/Down provides the macOS equivalent.
-- Left and Right cycle the card status through the non-trash statuses (Candidate, Confirmed, Rejected, Started, and Done in the given project's cycle) while the card has focus and is not editing; Right increases and Left decreases, wrapping at both ends. Stepping from a Trash card lands on the first/last non-trash status in that direction.
+- Left and Right cycle the card status in the same order shown by the menu: Candidate, Confirmed, Started, To validate, Done, Trashed, and Rejected. Right moves forward, Left moves backward, and both wrap at the ends.
 - Ctrl+Left and Ctrl+Right step the card type through the categories supported by the board template in order, Command+Left/Right providing the macOS equivalent; single-category templates such as Brainstorming have no effect.
+- V cycles the focused, non-editing card through Compact, Standard, and Expanded display modes. The same modes are directly selectable from the `─`, `▫`, and `□` header controls.
 - Status changes are visually staged: the card's status chip and pill update immediately, but the card moves to its new section after a short pause (~800ms).
 - Moving a card out of the visible section into the Rejected, Done, or Trash section moves focus to the next visible card in the list, or clears focus if there is no successor; moving back into the visible section keeps focus on the moved card. Sections are uncontrolled, so a status change never opens or closes one.
 - Clicking the trash icon (or pressing Delete on a focused, non-editing card) always moves the card to that project's Trash, undoable by changing its status back. Emptying the trash and removing a card from Trash require the confirmation panel.
@@ -210,16 +211,19 @@ Supported statuses:
 
 - `candidate`
 - `confirmed`
-- `rejected`
 - `started`
+- `to validate`
 - `done`
 - `trash`
+- `rejected`
 
 Status semantics in version 0.1:
 
 - Status is local board metadata controlled by the user and remains independent from card type.
+- Candidate is proposed, Confirmed is accepted and ready, Started is active work, To validate is implementation-complete but awaiting review or acceptance, Done is validated, and Rejected is discarded.
+- The status selector presents the states compactly in the canonical order Candidate, Confirmed, Started, To validate, Done, Trashed, Rejected; the same order drives Left/Right cycling.
 - Semantic type is shown with a subtle colored top border and label chip.
-- Status is shown separately with `○`, `●`, `×`, `▶`, `✓`, or `–` (Trash) and its own pill/border treatment; semantic card color does not encode status.
+- Status is shown separately with `○`, `●`, `▶`, `◐`, `✓`, `–` (Trashed), or `×` and its own pill/border treatment; semantic card color does not encode status.
 - **Confirmed does not send the card to ChatGPT.**
 - Changing status does not start an AI operation or modify a conversation.
 - Rejected and trash cards remain stored and editable but are excluded from copied prompts. Trash cards can be restored by changing their status to any other status.
@@ -254,7 +258,8 @@ type BoardItem = {
     width: number;
     height: number;
   };
-  status: "candidate" | "confirmed" | "rejected" | "done";
+  status: "candidate" | "confirmed" | "started" | "to validate" | "done" | "rejected" | "trash";
+  displayMode?: "compact" | "standard" | "expanded";
   order: number;
   source?: {
     provider?: string;
@@ -339,7 +344,7 @@ Implemented behavior:
 - The button is disabled when there are no non-rejected cards.
 - Cards are serialized in their current board order.
 - Rejected and trash cards are excluded.
-- Candidate, confirmed, started, and done cards are included.
+- Candidate, confirmed, started, to-validate, and done cards are included.
 - Every card is prefixed with its category id and status tags in square brackets (for example, `[issue] [confirmed]`); legacy `idea` types are exported as `[core_idea]`.
 - An optional card title appears after the status tag and before the content.
 - The resulting text is written to the clipboard.
@@ -360,8 +365,8 @@ Copying is currently the only implemented board-to-chat workflow. The user must 
 ## 7. Persistence and synchronization
 
 - All state is stored in `browser.storage.local` under the key `projectBoardState`.
-- State is stored as one versioned object with schema version `2`.
-- Version-1 projects without a template are migrated in memory to the `project` template without rewriting or deleting their cards.
+- State is stored as one versioned object with schema version `3`.
+- Older projects receive their missing template/revision metadata in memory without rewriting or deleting cards.
 - Data persists across browser restarts.
 - The sidebar listens for storage changes and reloads when the background script pins a new card.
 - Projects belong to Pboard, not to provider conversation IDs.
@@ -371,12 +376,14 @@ Application state:
 
 ```typescript
 type AppState = {
-  version: 2;
+  version: 3;
   projects: Project[];
   boardItems: BoardItem[];
   currentProjectId: string | null;
 };
 ```
+
+Optional Google Drive synchronization is a separate asynchronous layer. Each local project has a revision and may be serialized as its own versioned snapshot in Drive's hidden `appDataFolder`. Local repository writes complete before any Drive request, and failures leave the dirty local project intact. Dirty projects sync manually, when leaving a project, after debounced visibility loss, or after roughly 25 seconds of inactivity.
 
 ## 8. Extension architecture
 
@@ -396,6 +403,8 @@ background script
        │
        ▼
 browser.storage.local
+       │
+       └─ optional dirty-project snapshots → Google Drive appDataFolder
        ▲
        │
 React sidebar
@@ -413,6 +422,7 @@ Code boundaries:
 - `src/providers/`: provider-specific page access behind a shared adapter.
 - `src/sidebar/`: React UI, card component, styling, and prompt serialization.
 - `src/storage/`: storage adapter and project/card repository.
+- `src/sync/`: Google OAuth/PKCE, Drive transport, snapshot serialization, and sync state.
 - `src/templates/`: declarative template, type-label, and semantic-color configuration.
 - `src/types/`: shared domain types.
 
@@ -425,19 +435,21 @@ Declared permissions:
 - `clipboardWrite`: copy either a serialized board or one card's text after a user action.
 - `scripting`: read the current selection through a one-off script and inject the short-lived region-capture overlay on demand.
 - `activeTab`: temporary current-tab access after an explicit Pboard shortcut or menu action.
-- Host access is limited to the two supported ChatGPT origins for their existing content script. Page-region capture uses temporary `activeTab` permission after the explicit camera-button click, avoiding broad `<all_urls>` access.
+- `identity`: optional Google OAuth after an explicit toolbar action.
+- `alarms`: background scheduling for dirty-project Drive snapshots.
+- Host access covers the two supported ChatGPT origins plus the Google OAuth token and Drive API endpoints used only by optional sync. Page-region capture uses temporary `activeTab` permission after the explicit camera-button click, avoiding broad `<all_urls>` access.
 - Generic sites receive no content script; their selected text and URLs come from Firefox's user-invoked menu event or the user-invoked capture overlay.
 
 Privacy properties:
 
-- No account or authentication.
-- No backend or cloud synchronization.
+- Google authentication and Drive synchronization are optional and user-initiated.
+- The only requested Google scope is `drive.appdata`; snapshots are stored in the app's private Drive data folder.
 - No telemetry.
-- No external API or AI request.
+- No AI API request.
 - No conversation scraping.
 - No entire-conversation upload.
-- Pinned content, including captured and dropped images, remains in local Firefox extension storage.
-- Captured images are resized and encoded entirely inside the extension; no capture data is sent over the network.
+- Pinned content, including captured and dropped images, is always persisted in local extension storage first.
+- If Drive is connected, captured image data contained in a project snapshot is included in that project's asynchronous backup.
 
 ## 10. Build and verification
 

@@ -3,3 +3,5 @@ dist/
 coverage/
 *.xpi
 *.log
+.env.local
+.env.*.local

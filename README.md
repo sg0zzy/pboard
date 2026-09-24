@@ -20,7 +20,8 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Preview the exact insertion position with a placeholder while dragging a card.
 - Press or release Shift at any time while dragging a text card to switch dynamically between reorder and merge; Escape cancels the drag.
 - Select cards with Up/Down, edit the selected card with Enter, and reorder it with Ctrl+Shift+Up/Down (Command+Shift on macOS).
-- On a focused card, Left/Right step its status through the non-trash statuses (Candidate → Confirmed → Rejected → Started → Done, wrapping), and Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
+- On a focused card, Left/Right step its status through Candidate → Confirmed → Started → To validate → Done → Trashed → Rejected (wrapping), matching the status-menu order. Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
+- Use the `─`, `▫`, and `□` controls in a card header to show compact, standard, or expanded text. Press V on a focused, non-editing card to cycle those modes.
 - Delete always moves a focused, non-editing card to its project's Trash, matching the trash icon; each project has its own Trash, and emptying the Trash (trash-can icon in the section title row) or deleting a trash card removes it permanently, with a confirmation.
 - The Rejected and Done section title rows each have a copy button (copies all cards of that section in the same format as "Copy board") and a trash icon (trashes all cards of the section at once).
 - Middle-click a card to compose and insert a new card directly beneath it.
@@ -33,6 +34,8 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Keep entering points continuously: after each save the empty Add Card editor retains focus for the next card.
 - Keep the active Add Card editor fully visible when working with long boards.
 - Adjust and persist the board's text and control size with the −/+ buttons beside the Pboard heading.
+- Optionally connect Google Drive from the top toolbar and asynchronously sync one versioned project snapshot per project to Drive's private app-data folder; local storage remains the immediate source of truth.
+- Read a compact three-row project-status grid beneath the project title: Candidate/Confirmed, Started/To validate, and Done/Rejected. Every card keeps a deterministic hand-drawn cell using the existing status colors and symbols.
 - Read the current board scale as a percentage between the size buttons; 100% is the default.
 - Open web addresses in card titles, content, and source metadata as native browser links.
 - Render simple card Markdown: `*`/`-` bullet lists, numbered lists, `**bold**`, `*italic*`, inline code, and `[label](url)` links.
@@ -76,9 +79,18 @@ State is stored as one versioned object. Projects are application-owned; a conve
 - `clipboardWrite`: copy the board prompt after an explicit button click.
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
 - `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used.
+- `identity`: run the optional Google OAuth authorization-code flow after an explicit **Connect Drive** action.
+- `alarms`: schedule an optional dirty-project Drive sync after roughly 25 seconds of inactivity.
 - Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Region capture uses temporary `activeTab` access instead of broad host access.
+- Host access to Google OAuth and Drive API endpoints: exchange/refresh the optional OAuth token and persist snapshots in `appDataFolder`; pboard requests only the `drive.appdata` scope.
 
-No browsing-history permission, remote code, or network endpoint is used. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.
+No browsing-history permission or remote code is used. Unless the user explicitly connects Google Drive, pboard makes no cloud-sync requests. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.
+
+## Optional Google Drive sync
+
+Google Drive support requires separate OAuth clients for Chromium and Firefox. Their public client IDs are set in `src/sync/googleDriveConfig.ts` (per browser, per stage); the Chromium production client ID and `drive.appdata` scope are also declared in `manifest.chromium.json` for Chrome's native `identity.getAuthToken()` flow. Keep those two Chromium client-ID values identical. Firefox uses authorization-code PKCE with the loopback redirect derived from its fixed add-on ID (`http://127.0.0.1/mozoauth2/...`). If Google's Desktop OAuth client requires a client secret for Firefox token exchange, copy `.env.example` to the git-ignored `.env.local` and set `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`; Vite embeds it in the extension bundle, so it must not be treated as a confidential server-side secret. `<stage>` is `dev` under `npm run dev` and `production` under `npm run build` / `build:chromium`.
+
+The integration requests only `https://www.googleapis.com/auth/drive.appdata` and explicitly shows Google's account selector. Access/refresh token state stays in extension-local storage. Project content continues to save locally first; Drive writes run asynchronously after manual sync, project switching, a debounced visibility loss, or about 25 seconds of dirty idle time. A Drive failure never rolls back local data.
 
 The Firefox build uses the native `sidebar_action` and Firefox page action. The Chromium build uses the MV3 `side_panel` and `action` APIs. Shared code goes through `src/platform/browser.ts`, which normalizes the runtime namespace and context-menu namespace.
 
@@ -155,4 +167,4 @@ tests/            domain, serialization, messaging, and adapter tests
 
 ## Privacy
 
-All project and card data stays in Firefox's local extension storage. Version 0.1 makes no external requests and has no telemetry. Text and URLs are captured only after the user explicitly invokes a context-menu or address-bar pin action.
+All project and card data is written to local extension storage first. If the user explicitly connects Google Drive, versioned per-project snapshots are also sent asynchronously to that account's private app-data folder. Pboard has no telemetry. Text and URLs are captured only after the user explicitly invokes a context-menu or address-bar pin action.

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { serializeBoard, serializeProject } from "../src/sidebar/serialize";
 import type { BoardItem, Project } from "../src/types";
 
-const project: Project = { id: "p1", name: "New SaaS", template: "project", createdAt: "2026-01-01", updatedAt: "2026-01-01" };
+const project: Project = { id: "p1", name: "New SaaS", template: "project", revision: 1, createdAt: "2026-01-01", updatedAt: "2026-01-01" };
 const base: Omit<BoardItem, "id" | "type" | "content" | "order" | "status"> = {
   projectId: "p1", createdAt: "2026-01-01", updatedAt: "2026-01-01"
 };
@@ -18,6 +18,14 @@ describe("serializeBoard", () => {
     expect(serializeBoard(project, items)).toBe(
       "PROJECT: New SaaS\n\n[goal] [candidate] Purpose\nKeep what matters.\n\n[decision] [confirmed] Use a browser sidebar.\n\n[decision] [started] In progress."
     );
+  });
+
+  it("exports cards awaiting validation with their status tag", () => {
+    const items: BoardItem[] = [
+      { ...base, id: "validate", type: "task", status: "to validate", order: 0, content: "Verify the release." }
+    ];
+
+    expect(serializeBoard(project, items)).toContain("[task] [to validate] Verify the release.");
   });
 
   it("tags brainstorming note cards as well", () => {

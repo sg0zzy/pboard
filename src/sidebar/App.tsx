@@ -14,12 +14,19 @@ import {
   type BoardTemplate
 } from "../types";
 import { Card } from "./components/Card";
+import { BoardConfetti } from "./components/BoardConfetti";
 import { CopyIcon } from "./components/CopyIcon";
+import { TrashIcon } from "./components/Card";
+import { DriveSyncControls } from "./components/DriveSyncControls";
+import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
+import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
+import { StatusCommitScheduler } from "./statusCommitScheduler";
+import { focusTargetAfterStatusMove } from "./statusFocus";
 
 const STATUS_MOVE_DELAY_MS = 800;
 
@@ -42,9 +49,16 @@ export function App() {
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
   const [imageDropActive, setImageDropActive] = useState(false);
   const [capturingRegion, setCapturingRegion] = useState(false);
-  const [statusMovePending, setStatusMovePending] = useState<Record<string, BoardItemStatus>>({});
+  const [pendingStatuses, setPendingStatuses] = useState<Record<string, BoardItemStatus>>({});
   const [emptyTrashPending, setEmptyTrashPending] = useState(false);
-  const statusMoveTimers = useRef<Map<string, number>>(new Map());
+  const [fingerprintTransition, setFingerprintTransition] = useState<FingerprintTransition | null>(null);
+  const pendingStatusesRef = useRef<Record<string, BoardItemStatus>>({});
+  const statusCommitScheduler = useRef(new StatusCommitScheduler(STATUS_MOVE_DELAY_MS));
+  const itemsRef = useRef<BoardItem[]>([]);
+  const fingerprintTimer = useRef<number | null>(null);
+  const fingerprintRevision = useRef(0);
+  const visibilitySyncTimer = useRef<number | null>(null);
+  const currentProjectIdRef = useRef<string | null>(null);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   const reload = useCallback(async () => {
@@ -54,7 +68,7 @@ export function App() {
 }, []);
 
   useEffect(() => {
-    void reload();
+    void reload().then(() => requestDriveReconciliation());
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
@@ -93,23 +107,65 @@ export function App() {
   const items = useMemo(() => state?.boardItems
     .filter((item) => item.projectId === state.currentProjectId)
     .sort((a, b) => a.order - b.order) ?? [], [state]);
-  const displayedStatus = (item: BoardItem): BoardItemStatus => statusMovePending[item.id] ?? item.status;
+  itemsRef.current = items;
+  const fingerprintItems = items;
   const visibleItems = items.filter((item) =>
-    displayedStatus(item) !== "rejected" &&
-    displayedStatus(item) !== "done" &&
-    displayedStatus(item) !== "trash"
+    item.status !== "rejected" &&
+    item.status !== "done" &&
+    item.status !== "trash"
   );
-  const rejectedItems = items.filter((item) => displayedStatus(item) === "rejected");
-  const doneItems = items.filter((item) => displayedStatus(item) === "done");
-  const trashItems = items.filter((item) => displayedStatus(item) === "trash");
+  const rejectedItems = items.filter((item) => item.status === "rejected");
+  const doneItems = items.filter((item) => item.status === "done");
+  const trashItems = items.filter((item) => item.status === "trash");
+
+  useEffect(() => {
+    currentProjectIdRef.current = currentProject?.id ?? null;
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    const cancel = () => {
+      if (visibilitySyncTimer.current !== null) window.clearTimeout(visibilitySyncTimer.current);
+      visibilitySyncTimer.current = null;
+    };
+    const schedule = () => {
+      cancel();
+      visibilitySyncTimer.current = window.setTimeout(() => {
+        visibilitySyncTimer.current = null;
+        const projectId = currentProjectIdRef.current;
+        if (projectId) void requestProjectSync(projectId);
+      }, 3000);
+    };
+    const onVisibility = () => document.visibilityState === "hidden" ? schedule() : cancel();
+    const onPageHide = () => {
+      const projectId = currentProjectIdRef.current;
+      if (projectId) void requestProjectSync(projectId);
+    };
+    window.addEventListener("blur", schedule);
+    window.addEventListener("focus", cancel);
+    window.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancel();
+      window.removeEventListener("blur", schedule);
+      window.removeEventListener("focus", cancel);
+      window.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
 
   useEffect(() => {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
   }, [items, selectedCardId]);
 
+  useEffect(() => () => {
+    statusCommitScheduler.current.cancelAll();
+    if (fingerprintTimer.current !== null) window.clearTimeout(fingerprintTimer.current);
+  }, []);
+
   async function createProject(event: FormEvent) {
     event.preventDefault();
     if (!newProjectName.trim()) return;
+    clearAllPendingStatuses();
     const project = await repository.createProject(newProjectName, newProjectTemplate);
     setNewProjectName("");
     setAddingProject(false);
@@ -162,6 +218,7 @@ export function App() {
 
   async function removeCurrentProject() {
     if (!currentProject) return;
+    clearAllPendingStatuses();
     await repository.deleteProject(currentProject.id);
     setPendingDelete(null);
     await reload();
@@ -198,33 +255,25 @@ export function App() {
 
   async function updateItem(
     itemId: string,
-    patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status">>,
+    patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>,
     afterSave?: "focus" | "insert"
   ) {
-    const beforeStatus = items.find((candidate) => candidate.id === itemId)?.status;
-    await repository.updateItem(itemId, patch);
-    const newState = await reload();
-    const afterStatus =
-      newState?.boardItems.find((candidate) => candidate.id === itemId)?.status ?? beforeStatus;
+    const { status, ...immediatePatch } = patch;
+    if (Object.keys(immediatePatch).length > 0) {
+      await repository.updateItem(itemId, immediatePatch);
+      await reload();
+    }
+    if (status !== undefined) requestStatusChange(itemId, status);
     if (afterSave === "insert" && currentProject) void createCard(currentProject.id, itemId);
     if (afterSave === "focus") setFocusRequest({ id: itemId, startEditing: false });
-    if (beforeStatus !== undefined && afterStatus !== undefined && beforeStatus !== afterStatus) {
-      applyStatusChange(itemId, beforeStatus, afterStatus);
-    }
   }
 
   async function moveCardToTrash(itemId: string) {
-    const beforeStatus = items.find((candidate) => candidate.id === itemId)?.status;
-    if (beforeStatus === undefined || beforeStatus === "trash") return;
-    await repository.updateItem(itemId, { status: "trash" });
-    const newState = await reload();
-    const afterStatus =
-      newState?.boardItems.find((candidate) => candidate.id === itemId)?.status ?? beforeStatus;
-    applyStatusChange(itemId, beforeStatus, afterStatus);
+    requestStatusChange(itemId, "trash");
   }
 
   async function removeCardPermanently(itemId: string) {
-    clearStatusMove(itemId);
+    clearPendingStatus(itemId);
     setPendingDelete(null);
     if (selectedCardId === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
@@ -232,6 +281,7 @@ export function App() {
   }
 
   async function discardEmptyCard(itemId: string) {
+    clearPendingStatus(itemId);
     if (selectedCardId === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
     await reload();
@@ -251,30 +301,12 @@ export function App() {
     }
   }
 
-  function isHiddenStatus(status: BoardItemStatus): boolean {
-    return status === "rejected" || status === "done" || status === "trash";
-  }
-
-  function scheduleStatusMove(itemId: string, shownStatus: BoardItemStatus) {
-    setStatusMovePending((current) => ({ ...current, [itemId]: shownStatus }));
-    const existingTimer = statusMoveTimers.current.get(itemId);
-    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
-    const timer = window.setTimeout(() => {
-      statusMoveTimers.current.delete(itemId);
-      setStatusMovePending((current) => {
-        const next = { ...current };
-        delete next[itemId];
-        return next;
-      });
-    }, STATUS_MOVE_DELAY_MS);
-    statusMoveTimers.current.set(itemId, timer);
-  }
-
-  function clearStatusMove(itemId: string) {
-    const existingTimer = statusMoveTimers.current.get(itemId);
-    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
-    statusMoveTimers.current.delete(itemId);
-    setStatusMovePending((current) => {
+  function clearPendingStatus(itemId: string) {
+    statusCommitScheduler.current.cancel(itemId);
+    const nextRef = { ...pendingStatusesRef.current };
+    delete nextRef[itemId];
+    pendingStatusesRef.current = nextRef;
+    setPendingStatuses((current) => {
       if (current[itemId] === undefined) return current;
       const next = { ...current };
       delete next[itemId];
@@ -282,34 +314,67 @@ export function App() {
     });
   }
 
-  function applyStatusChange(
+  function clearAllPendingStatuses() {
+    statusCommitScheduler.current.cancelAll();
+    pendingStatusesRef.current = {};
+    setPendingStatuses({});
+  }
+
+  function requestStatusChange(itemId: string, status: BoardItemStatus) {
+    const committedStatus = itemsRef.current.find((item) => item.id === itemId)?.status;
+    if (committedStatus === undefined || committedStatus === status) {
+      clearPendingStatus(itemId);
+      return;
+    }
+    pendingStatusesRef.current = { ...pendingStatusesRef.current, [itemId]: status };
+    setPendingStatuses((current) => ({ ...current, [itemId]: status }));
+    statusCommitScheduler.current.schedule(itemId, status, commitStatusChange);
+  }
+
+  async function commitStatusChange(itemId: string, status: BoardItemStatus) {
+    if (pendingStatusesRef.current[itemId] !== status) return;
+    const beforeStatus = itemsRef.current.find((item) => item.id === itemId)?.status;
+    if (beforeStatus === undefined || beforeStatus === status) {
+      clearPendingStatus(itemId);
+      return;
+    }
+    const itemsBeforeCommit = itemsRef.current;
+    await repository.updateItem(itemId, { status });
+    const newState = await reload();
+    const afterStatus = newState.boardItems.find((item) => item.id === itemId)?.status;
+    if (pendingStatusesRef.current[itemId] === status) clearPendingStatus(itemId);
+    if (afterStatus !== undefined && beforeStatus !== afterStatus) {
+      applyCommittedStatusChange(itemId, beforeStatus, afterStatus, itemsBeforeCommit);
+    }
+  }
+
+  function applyCommittedStatusChange(
     itemId: string,
     beforeStatus: BoardItemStatus,
-    afterStatus: BoardItemStatus
+    afterStatus: BoardItemStatus,
+    itemsBeforeCommit: BoardItem[]
   ) {
-    const shownBefore = statusMovePending[itemId] ?? beforeStatus;
-    scheduleStatusMove(itemId, shownBefore);
-    const leavesVisible = isHiddenStatus(afterStatus) && !isHiddenStatus(shownBefore);
-    if (leavesVisible) {
-      const index = visibleItems.findIndex((candidate) => candidate.id === itemId);
-      const successorId = index >= 0 ? visibleItems[index + 1]?.id : null;
-      if (successorId) {
-        setSelectedCardId(successorId);
-        setFocusRequest({ id: successorId, startEditing: false });
-      } else {
-        setSelectedCardId(null);
-        setFocusRequest(null);
-      }
-    } else {
-      setFocusRequest({ id: itemId, startEditing: false });
-    }
+    playFingerprintTransition(itemId, beforeStatus, afterStatus);
+    const focusTargetId = focusTargetAfterStatusMove(itemsBeforeCommit, itemId, beforeStatus, afterStatus);
+    setSelectedCardId(focusTargetId);
+    setFocusRequest(focusTargetId ? { id: focusTargetId, startEditing: false } : null);
+  }
+
+  function playFingerprintTransition(itemId: string, fromStatus: BoardItemStatus, status: BoardItemStatus) {
+    fingerprintRevision.current += 1;
+    setFingerprintTransition({ itemId, fromStatus, status, revision: fingerprintRevision.current });
+    if (fingerprintTimer.current !== null) window.clearTimeout(fingerprintTimer.current);
+    fingerprintTimer.current = window.setTimeout(() => {
+      fingerprintTimer.current = null;
+      setFingerprintTransition(null);
+    }, status === "done" ? 1000 : 480);
   }
 
   async function emptyTrash() {
     if (!currentProject) return;
     const trashIds = items.filter((item) => item.status === "trash").map((item) => item.id);
     await repository.emptyTrash(currentProject.id);
-    trashIds.forEach((id) => clearStatusMove(id));
+    trashIds.forEach((id) => clearPendingStatus(id));
     if (selectedCardId && trashIds.includes(selectedCardId)) setSelectedCardId(null);
     setEmptyTrashPending(false);
     await reload();
@@ -405,6 +470,7 @@ export function App() {
   }
 
   async function mergeItems(sourceId: string, targetId: string) {
+    clearPendingStatus(sourceId);
     await repository.mergeItems(sourceId, targetId);
     setPendingMerge(null);
     setSelectedCardId(targetId);
@@ -422,7 +488,7 @@ export function App() {
   function cardSection(itemId: string) {
     const item = items.find((candidate) => candidate.id === itemId);
     if (!item) return [];
-    return statusSection(displayedStatus(item));
+    return statusSection(item.status);
   }
 
   function navigateCard(itemId: string, direction: -1 | 1) {
@@ -524,8 +590,10 @@ export function App() {
         {showBefore && <DropPlaceholder targetId={item.id} position="before" />}
         <Card
           item={item}
+          pendingStatus={pendingStatuses[item.id] ?? item.status}
           template={currentProject.template}
           onUpdate={updateItem}
+          onStatusChange={requestStatusChange}
           onDelete={requestItemDeletion}
           onDiscardEmpty={discardEmptyCard}
           onDragStart={beginDrag}
@@ -566,6 +634,7 @@ export function App() {
       <header>
         <div className="app-title-row">
           <p className="eyebrow">Pboard</p>
+          <DriveSyncControls projectId={currentProject?.id ?? null} />
           <div className="font-scale-controls" aria-label="Board font size">
             <button
               className="scale-button"
@@ -607,9 +676,13 @@ export function App() {
               projects={state.projects}
               currentProjectId={currentProject.id}
               onSelect={async (projectId) => {
+                const leavingProjectId = currentProject.id;
+                clearAllPendingStatuses();
                 setPendingDelete(null);
                 setPendingMerge(null);
+                setFingerprintTransition(null);
                 setRenamingProject(false);
+                void requestProjectSync(leavingProjectId);
                 await repository.selectProject(projectId);
                 await reload();
               }}
@@ -635,6 +708,13 @@ export function App() {
           )}
           {currentProject && <button className="icon-button danger" aria-label="Delete project" title="Delete project" onClick={requestProjectDeletion}>×</button>}
         </div>
+        {currentProject && (
+          <ProjectFingerprint
+            projectId={currentProject.id}
+            items={fingerprintItems}
+            transition={fingerprintTransition}
+          />
+        )}
         {currentProject && pendingDelete?.kind === "project" && pendingDelete.id === currentProject.id && (
           <DeleteConfirmation
             message={`Delete “${currentProject.name}”?`}
@@ -703,6 +783,9 @@ export function App() {
             }}
             onDrop={(event) => void dropImage(event)}
           >
+            {fingerprintTransition?.status === "done" && fingerprintTransition.fromStatus !== "done" && (
+              <BoardConfetti revision={fingerprintTransition.revision} />
+            )}
             {imageDropActive && <div className="image-drop-overlay" aria-hidden="true">Drop image to add a card</div>}
             {!visibleItems.length && !rejectedItems.length && !doneItems.length && !trashItems.length && (
               <div className="empty-state small">
@@ -739,7 +822,7 @@ export function App() {
                       void trashAllSection(rejectedItems);
                     }}
                   >
-                    <EmptyTrashIcon />
+                    <TrashIcon />
                   </button>
                 </summary>
                 {rejectedItems.map(renderSortableCard)}
@@ -773,7 +856,7 @@ export function App() {
                       void trashAllSection(doneItems);
                     }}
                   >
-                    <EmptyTrashIcon />
+                    <TrashIcon />
                   </button>
                 </summary>
                 {doneItems.map(renderSortableCard)}
@@ -794,7 +877,7 @@ export function App() {
                       requestEmptyTrash();
                     }}
                   >
-                    <EmptyTrashIcon />
+                    <TrashIcon />
                   </button>
                 </summary>
                 {trashItems.map(renderSortableCard)}
@@ -874,14 +957,6 @@ function CameraIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M4 7.75h3l1.4-2h7.2l1.4 2h3v10.5H4z" />
       <circle cx="12" cy="13" r="3.25" />
-    </svg>
-  );
-}
-
-function EmptyTrashIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M5.25 7.25h13.5M9 7.25V5h6v2.25m-8.5 0l.75 12.75h9.5l.75-12.75M10.25 10.5v6m4-6v6" />
     </svg>
   );
 }

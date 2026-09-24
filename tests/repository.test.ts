@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { createRepository, STORAGE_KEY, type KeyValueStorage } from "../src/storage/repository";
+import { BOARD_ITEM_STATUSES, type AppState } from "../src/types";
 
 class MemoryStorage implements KeyValueStorage {
   data: Record<string, unknown> = {};
@@ -33,6 +34,22 @@ describe("Pboard repository", () => {
     expect(storage.data[STORAGE_KEY]).toBeDefined();
   });
 
+  it("increments project revisions and emits dirty events only after local persistence", async () => {
+    const changed: Array<{ projectId: string; persistedRevision: number }> = [];
+    const observed = createRepository(storage, {
+      projectChanged: async (projectId) => {
+        const saved = (storage.data[STORAGE_KEY] as AppState).projects.find((project) => project.id === projectId);
+        changed.push({ projectId, persistedRevision: saved?.revision ?? -1 });
+      }
+    });
+    const project = await observed.createProject("Revisioned");
+    const card = await observed.addItem({ projectId: project.id, content: "First" });
+    await observed.updateItem(card.id, { content: "Second" });
+
+    expect(changed.map((entry) => entry.persistedRevision)).toEqual([1, 2, 3]);
+    expect((await observed.load()).projects[0].revision).toBe(3);
+  });
+
   it("persists an explicit project order without changing the selected project", async () => {
     const first = await repository.createProject("First");
     const second = await repository.createProject("Second");
@@ -58,6 +75,7 @@ describe("Pboard repository", () => {
     const first = await repository.addItem({ projectId: project.id, content: "First" });
     const second = await repository.addItem({ projectId: project.id, content: "Second", type: "decision" });
     const third = await repository.addItem({ projectId: project.id, content: "Third" });
+    expect(first.displayMode).toBe("standard");
 
     await repository.updateItem(first.id, { content: "Edited", status: "confirmed", title: "The first" });
     await repository.reorderItems(project.id, [third.id, first.id, second.id]);
@@ -205,9 +223,10 @@ describe("Pboard repository", () => {
       currentProjectId: "legacy"
     };
     const state = await repository.load();
-    expect(state.version).toBe(2);
+    expect(state.version).toBe(3);
+    expect(state.projects[0].revision).toBe(0);
     expect(state.projects[0].template).toBe("project");
-    expect(state.boardItems[0]).toMatchObject({ type: "idea", content: "Keep me", status: "confirmed" });
+    expect(state.boardItems[0]).toMatchObject({ type: "idea", content: "Keep me", status: "confirmed", displayMode: "standard" });
   });
 
   it("removes only the project's trash cards when emptying trash and renumbers the rest", async () => {
@@ -228,5 +247,42 @@ describe("Pboard repository", () => {
     const again = await repository.emptyTrash(project.id);
     expect(again).toBe(0);
     expect((await repository.load()).boardItems.length).toBe(1);
+  });
+
+  it("persists every status when cards are updated concurrently", async () => {
+    const project = await repository.createProject("Concurrent statuses", "project");
+    const items = [];
+    for (let index = 0; index < BOARD_ITEM_STATUSES.length; index += 1) {
+      items.push(await repository.addItem({ projectId: project.id, content: `Card ${index}` }));
+    }
+
+    await Promise.all(items.map((item, index) => repository.updateItem(item.id, { status: BOARD_ITEM_STATUSES[index] })));
+
+    const state = await repository.load();
+    expect(state.boardItems.map((item) => item.status).sort()).toEqual([...BOARD_ITEM_STATUSES].sort());
+  });
+
+  it("persists to validate across repository reloads", async () => {
+    const project = await repository.createProject("Validation", "project");
+    const card = await repository.addItem({ projectId: project.id, content: "Review me" });
+    await repository.updateItem(card.id, { status: "to validate" });
+
+    const reloadedRepository = createRepository(storage);
+    expect((await reloadedRepository.load()).boardItems[0].status).toBe("to validate");
+  });
+
+  it("persists independent display modes without changing card content", async () => {
+    const project = await repository.createProject("Display modes", "project");
+    const compact = await repository.addItem({ projectId: project.id, content: "Complete compact text" });
+    const expanded = await repository.addItem({ projectId: project.id, content: "Complete expanded text" });
+
+    await repository.updateItem(compact.id, { displayMode: "compact" });
+    await repository.updateItem(expanded.id, { displayMode: "expanded" });
+
+    const reloaded = await createRepository(storage).load();
+    expect(reloaded.boardItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: compact.id, content: "Complete compact text", displayMode: "compact" }),
+      expect.objectContaining({ id: expanded.id, content: "Complete expanded text", displayMode: "expanded" })
+    ]));
   });
 });
