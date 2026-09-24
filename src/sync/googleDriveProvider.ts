@@ -58,6 +58,10 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     if (!(await syncState.get(projectId)).dirty) await syncState.markDirty(projectId);
   }
 
+  async function canApplyRemote(projectId: string): Promise<boolean> {
+    return (await tombstones.get(projectId)) === null;
+  }
+
   async function uploadSnapshot(
     snapshot: ProjectSnapshot,
     file: DriveAppDataFile | null,
@@ -68,6 +72,13 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
       serializeProjectSnapshot(snapshot.project, snapshot.items),
       file?.id
     );
+    // A save may have landed locally while this request was in flight. Keep
+    // the remote file association, but leave the newer local snapshot pending.
+    const latest = await snapshots.read(snapshot.project.id).catch(() => null);
+    if (!latest || latest.project.revision !== snapshot.project.revision || latest.project.updatedAt !== snapshot.project.updatedAt) {
+      await syncState.markUploadStale(snapshot.project.id, uploaded.id);
+      return uploaded;
+    }
     await syncState.markSynced(
       snapshot.project.id,
       snapshot.project.revision,
@@ -83,8 +94,8 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     const { snapshot } = await readRemote(file);
     if (snapshot.project.id !== projectId) throw new Error("Google Drive returned a snapshot for a different project");
     const stateBeforePull = await syncState.get(projectId);
-    const result = await snapshots.applyIfNewer(snapshot);
-    if (result === "local-newer") return null;
+    const result = await snapshots.applyIfNewer(snapshot, () => canApplyRemote(projectId));
+    if (result === "local-newer" || result === "blocked") return null;
     await syncState.markSynced(projectId, snapshot.project.revision, file.id, stateBeforePull.changeToken ?? 0);
     return snapshot;
   }
@@ -97,6 +108,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   }
 
   async function performProjectSync(projectId: string): Promise<ProjectSyncResult> {
+    if (await tombstones.get(projectId)) return "not-dirty";
     const state = await syncState.get(projectId);
     if (!state.dirty) return "not-dirty";
     if (await auth.getConnectionState() !== "connected") throw new Error("Google Drive is not connected");
@@ -111,7 +123,8 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
         }
         const comparison = compareProjectTimestamps(local.project, remote.snapshot.project);
         if (comparison < 0) {
-          const applied = await snapshots.applyIfNewer(remote.snapshot);
+          const applied = await snapshots.applyIfNewer(remote.snapshot, () => canApplyRemote(projectId));
+          if (applied === "blocked") return "not-dirty";
           if (applied === "local-newer") {
             const latest = await snapshots.read(projectId);
             await uploadSnapshot(latest, remoteFile, (await syncState.get(projectId)).changeToken ?? 0);
@@ -143,6 +156,14 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   }
 
   async function deleteProject(projectId: string): Promise<"deleted" | "pending"> {
+    const inFlight = syncInFlight.get(projectId);
+    if (inFlight) {
+      try {
+        await inFlight;
+      } catch {
+        // The tombstone remains authoritative even if an older upload failed.
+      }
+    }
     const tombstone = await tombstones.get(projectId);
     if (!tombstone) return "deleted";
     if (await auth.getConnectionState() !== "connected") return "pending";
@@ -159,8 +180,8 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
 
   async function performReconciliation(): Promise<DriveReconcileResult> {
     const pendingTombstones = await tombstones.getAll();
+    // Explicit local deletes stay hidden even when Drive is unavailable.
     for (const tombstone of pendingTombstones) await snapshots.remove(tombstone.projectId);
-
     const empty: DriveReconcileResult = { status: "disconnected", imported: 0, pulled: 0, pushed: 0, deleted: 0 };
     if (await auth.getConnectionState() !== "connected") return empty;
 
@@ -215,10 +236,19 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     result.deleted = pendingTombstones.filter((entry) => deletionSucceeded.get(entry.projectId)).length;
 
     for (const [projectId, remote] of remoteByProject) {
+      if (await tombstones.get(projectId)) {
+        await snapshots.remove(projectId);
+        if (await deleteProject(projectId) === "deleted") result.deleted += 1;
+        continue;
+      }
       const local = localByProject.get(projectId);
       const syncStateBefore = await syncState.get(projectId);
       if (!local) {
-        await snapshots.apply(remote.snapshot);
+        const applied = await snapshots.apply(remote.snapshot, () => canApplyRemote(projectId));
+        if (!applied) {
+          if (await deleteProject(projectId) === "deleted") result.deleted += 1;
+          continue;
+        }
         await syncState.markSynced(projectId, remote.snapshot.project.revision, remote.file.id, syncStateBefore.changeToken ?? 0);
         result.imported += 1;
         continue;
@@ -226,13 +256,15 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
 
       const comparison = compareProjectTimestamps(local.project, remote.snapshot.project);
       if (comparison < 0) {
-        const applied = await snapshots.applyIfNewer(remote.snapshot);
+        const applied = await snapshots.applyIfNewer(remote.snapshot, () => canApplyRemote(projectId));
         if (applied === "applied" || applied === "equal") {
           await syncState.markSynced(projectId, remote.snapshot.project.revision, remote.file.id, syncStateBefore.changeToken ?? 0);
           if (applied === "applied") result.pulled += 1;
         } else if (applied === "local-newer") {
           await markDirtyIfNeeded(projectId);
           if (await syncProject(projectId) === "pushed") result.pushed += 1;
+        } else if (applied === "blocked") {
+          if (await deleteProject(projectId) === "deleted") result.deleted += 1;
         }
       } else if (comparison > 0) {
         await markDirtyIfNeeded(projectId);
@@ -245,8 +277,17 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
 
     for (const [projectId] of localByProject) {
       if (tombstonedIds.has(projectId)) continue;
+      if (await tombstones.get(projectId)) {
+        await snapshots.remove(projectId);
+        if (await deleteProject(projectId) === "deleted") result.deleted += 1;
+        continue;
+      }
       await markDirtyIfNeeded(projectId);
       if (await syncProject(projectId) === "pushed") result.pushed += 1;
+    }
+    for (const tombstone of await tombstones.getAll()) {
+      await snapshots.remove(tombstone.projectId);
+      if (await deleteProject(tombstone.projectId) === "deleted") result.deleted += 1;
     }
     return result;
   }

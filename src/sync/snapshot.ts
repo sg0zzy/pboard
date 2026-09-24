@@ -1,5 +1,6 @@
 import { EMPTY_STATE, STORAGE_KEY, type KeyValueStorage } from "../storage/repository";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
+import { withStorageLock } from "../storage/lock";
 import type { AppState, BoardItem, Project } from "../types";
 
 export const PROJECT_SNAPSHOT_VERSION = 1;
@@ -12,7 +13,8 @@ export type ProjectSnapshot = {
   items: BoardItem[];
 };
 
-export type SnapshotApplyResult = "applied" | "local-newer" | "equal";
+export type SnapshotApplyResult = "applied" | "local-newer" | "equal" | "blocked";
+export type SnapshotApplyGuard = () => boolean | Promise<boolean>;
 
 function timestampValue(value: string): number {
   const parsed = Date.parse(value);
@@ -103,32 +105,41 @@ export function createProjectSnapshotStore(storage: KeyValueStorage) {
     return { ...state, version: 3 };
   }
 
-  async function apply(snapshot: ProjectSnapshot): Promise<void> {
-    const state = await loadState();
-    await storage.set({ [STORAGE_KEY]: replaceProject(state, snapshot) });
+  async function apply(snapshot: ProjectSnapshot, canApply?: SnapshotApplyGuard): Promise<boolean> {
+    return withStorageLock(storage, STORAGE_KEY, async () => {
+      if (canApply && !(await canApply())) return false;
+      const state = await loadState();
+      await storage.set({ [STORAGE_KEY]: replaceProject(state, snapshot) });
+      return true;
+    });
   }
 
-  async function applyIfNewer(snapshot: ProjectSnapshot): Promise<SnapshotApplyResult> {
-    const state = await loadState();
-    const local = state.projects.find((project) => project.id === snapshot.project.id);
-    if (local) {
-      const comparison = compareProjectTimestamps(snapshot.project, local);
-      if (comparison < 0) return "local-newer";
-      if (comparison === 0) return "equal";
-    }
-    await storage.set({ [STORAGE_KEY]: replaceProject(state, snapshot) });
-    return "applied";
+  async function applyIfNewer(snapshot: ProjectSnapshot, canApply?: SnapshotApplyGuard): Promise<SnapshotApplyResult> {
+    return withStorageLock(storage, STORAGE_KEY, async () => {
+      if (canApply && !(await canApply())) return "blocked";
+      const state = await loadState();
+      const local = state.projects.find((project) => project.id === snapshot.project.id);
+      if (local) {
+        const comparison = compareProjectTimestamps(snapshot.project, local);
+        if (comparison < 0) return "local-newer";
+        if (comparison === 0) return "equal";
+      }
+      await storage.set({ [STORAGE_KEY]: replaceProject(state, snapshot) });
+      return "applied";
+    });
   }
 
   async function remove(projectId: string): Promise<void> {
-    const state = await loadState();
-    const hadProject = state.projects.some((project) => project.id === projectId);
-    const hadItems = state.boardItems.some((item) => item.projectId === projectId);
-    if (!hadProject && !hadItems) return;
-    state.projects = state.projects.filter((project) => project.id !== projectId);
-    state.boardItems = state.boardItems.filter((item) => item.projectId !== projectId);
-    if (state.currentProjectId === projectId) state.currentProjectId = state.projects[0]?.id ?? null;
-    await storage.set({ [STORAGE_KEY]: { ...state, version: 3 } satisfies AppState });
+    return withStorageLock(storage, STORAGE_KEY, async () => {
+      const state = await loadState();
+      const hadProject = state.projects.some((project) => project.id === projectId);
+      const hadItems = state.boardItems.some((item) => item.projectId === projectId);
+      if (!hadProject && !hadItems) return;
+      state.projects = state.projects.filter((project) => project.id !== projectId);
+      state.boardItems = state.boardItems.filter((item) => item.projectId !== projectId);
+      if (state.currentProjectId === projectId) state.currentProjectId = state.projects[0]?.id ?? null;
+      await storage.set({ [STORAGE_KEY]: { ...state, version: 3 } satisfies AppState });
+    });
   }
 
   return { read, list, apply, applyIfNewer, remove };

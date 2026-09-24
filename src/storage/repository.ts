@@ -1,5 +1,6 @@
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
+import { withStorageLock } from "./lock";
 import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
 
 export const STORAGE_KEY = "projectBoardState";
@@ -26,12 +27,8 @@ const now = () => new Date().toISOString();
 const newId = () => crypto.randomUUID();
 
 export function createRepository(storage: KeyValueStorage, events: RepositoryEvents = {}) {
-  let lockTail: Promise<void> = Promise.resolve();
-
   function withLock<T>(operation: () => Promise<T>): Promise<T> {
-    const run = lockTail.then(operation);
-    lockTail = run.then(() => undefined, () => undefined);
-    return run;
+    return withStorageLock(storage, STORAGE_KEY, operation);
   }
 
   async function load(): Promise<AppState> {
