@@ -78,10 +78,10 @@ State is stored as one versioned object. Projects are application-owned; a conve
 - `menus` (Firefox) / `contextMenus` (Chromium): expose pin actions for selected text, links, images, and pages.
 - `clipboardWrite`: copy the board prompt after an explicit button click.
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
-- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used.
+- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used. Chromium asks for optional page access the first time the camera is used because a side-panel click does not grant the `activeTab` access required by `captureVisibleTab()`.
 - `identity`: run the optional Google OAuth authorization-code flow after an explicit **Connect Drive** action.
 - `alarms`: schedule an optional dirty-project Drive sync after roughly 25 seconds of inactivity.
-- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Region capture uses temporary `activeTab` access instead of broad host access.
+- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Firefox region capture uses temporary `activeTab` access; Chromium `<all_urls>` access remains optional and is requested only when the camera is used.
 - Host access to Google OAuth and Drive API endpoints: exchange/refresh the optional OAuth token and persist snapshots in `appDataFolder`; pboard requests only the `drive.appdata` scope.
 
 No browsing-history permission or remote code is used. Unless the user explicitly connects Google Drive, pboard makes no cloud-sync requests. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.

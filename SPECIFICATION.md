@@ -437,7 +437,7 @@ Declared permissions:
 - `activeTab`: temporary current-tab access after an explicit Pboard shortcut or menu action.
 - `identity`: optional Google OAuth after an explicit toolbar action.
 - `alarms`: background scheduling for dirty-project Drive snapshots.
-- Host access covers the two supported ChatGPT origins plus the Google OAuth token and Drive API endpoints used only by optional sync. Page-region capture uses temporary `activeTab` permission after the explicit camera-button click, avoiding broad `<all_urls>` access.
+- Host access covers the two supported ChatGPT origins plus the Google OAuth token and Drive API endpoints used only by optional sync. Firefox page-region capture uses temporary `activeTab` permission. Chromium requests optional `<all_urls>` access when the camera is first used because side-panel clicks do not grant the `activeTab` access required by `captureVisibleTab()`.
 - Generic sites receive no content script; their selected text and URLs come from Firefox's user-invoked menu event or the user-invoked capture overlay.
 
 Privacy properties:

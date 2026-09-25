@@ -24,6 +24,7 @@ import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
+import { requestPageCaptureAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
 import { focusTargetAfterStatusMove } from "./statusFocus";
@@ -549,6 +550,10 @@ export function App() {
     setCapturingRegion(true);
     setNotice("Drag a rectangle on the page · Esc to cancel");
     try {
+      if (!await requestPageCaptureAccess(browser)) {
+        setNotice("Page access is required to capture part of the current page.");
+        return;
+      }
       const response = await browser.runtime.sendMessage({ type: "CAPTURE_PAGE_REGION" }) as CaptureRegionResponse;
       if (!response.ok) {
         setNotice(response.cancelled ? "" : response.reason);
@@ -709,11 +714,24 @@ export function App() {
           {currentProject && <button className="icon-button danger" aria-label="Delete project" title="Delete project" onClick={requestProjectDeletion}>×</button>}
         </div>
         {currentProject && (
-          <ProjectFingerprint
-            projectId={currentProject.id}
-            items={fingerprintItems}
-            transition={fingerprintTransition}
-          />
+          <div className="board-summary-row">
+            <ProjectFingerprint
+              projectId={currentProject.id}
+              items={fingerprintItems}
+              transition={fingerprintTransition}
+            />
+            <select
+              className="board-template-select"
+              aria-label="Board type"
+              title="Board type"
+              value={currentProject.template}
+              onChange={(event) => void changeTemplate(event.target.value as BoardTemplate)}
+            >
+              {BOARD_TEMPLATES.map((template) => (
+                <option key={template} value={template}>{boardTemplates[template].displayName}</option>
+              ))}
+            </select>
+          </div>
         )}
         {currentProject && pendingDelete?.kind === "project" && pendingDelete.id === currentProject.id && (
           <DeleteConfirmation
@@ -757,18 +775,6 @@ export function App() {
         </section>
       ) : (
         <>
-          <div className="template-control">
-            <label htmlFor="board-template">Board type</label>
-            <select
-              id="board-template"
-              value={currentProject.template}
-              onChange={(event) => void changeTemplate(event.target.value as BoardTemplate)}
-            >
-              {BOARD_TEMPLATES.map((template) => (
-                <option key={template} value={template}>{boardTemplates[template].displayName}</option>
-              ))}
-            </select>
-          </div>
           <section
             className={`board${imageDropActive ? " image-drop-active" : ""}`}
             aria-label="Board cards"
@@ -794,6 +800,21 @@ export function App() {
               </div>
             )}
             {visibleItems.map(renderSortableCard)}
+            <div className="board-add-zone" role="group" aria-label="Add a card">
+              <button
+                className="board-add-button"
+                aria-label="Add card"
+                title="Add card"
+                onClick={() => void createCard(currentProject.id)}
+              ><span aria-hidden="true">+</span></button>
+              <button
+                className="board-add-button"
+                aria-label="Capture part of the current page"
+                title="Capture part of the current page"
+                disabled={capturingRegion}
+                onClick={() => void captureRegion()}
+              ><CameraIcon /></button>
+            </div>
             {rejectedItems.length > 0 && (
               <details className="rejected-section">
                 <summary>
@@ -895,16 +916,6 @@ export function App() {
             </section>
 
           <section className="board-controls">
-            <div className="board-add-row">
-              <button className="text-button add-card" onClick={() => void createCard(currentProject.id)}>+ Add card</button>
-              <button
-                className="capture-button"
-                aria-label="Capture part of the current page"
-                title="Capture part of the current page"
-                disabled={capturingRegion}
-                onClick={() => void captureRegion()}
-              ><CameraIcon /></button>
-            </div>
             <button className="copy-button" onClick={copyBoard} disabled={!items.some((item) => item.status !== "rejected" && item.status !== "trash")}>
               <CopyIcon />
               <span>Copy board</span>

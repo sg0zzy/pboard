@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import manifest from "../manifest.json";
+import chromiumManifest from "../manifest.chromium.json";
 import {
   firstSelectedText,
   PIN_PAGE_COMMAND,
@@ -13,6 +14,12 @@ describe("Pboard keyboard shortcuts", () => {
     expect(manifest.commands[PIN_SELECTION_COMMAND].suggested_key.default).toBe(PIN_SELECTION_SHORTCUT);
     expect(manifest.commands[PIN_PAGE_COMMAND].suggested_key.default).toBe(PIN_PAGE_SHORTCUT);
     expect(manifest.permissions).toEqual(expect.arrayContaining(["activeTab", "scripting"]));
+  });
+
+  it("allows Chromium users to grant page access for side-panel capture", () => {
+    expect(chromiumManifest.optional_host_permissions).toEqual(
+      expect.arrayContaining(["<all_urls>"])
+    );
   });
 
   it("uses the first non-empty selection returned from the active tab frames", () => {
