@@ -35,7 +35,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Keep the active Add Card editor fully visible when working with long boards.
 - Adjust and persist the board's text and control size with the −/+ buttons beside the Pboard heading.
 - Optionally connect Google Drive from the top toolbar and asynchronously sync one versioned project snapshot per project to Drive's private app-data folder; local storage remains the immediate source of truth.
-- Read a compact three-row project-status grid beneath the project title: Candidate/Confirmed, Started/To validate, and Done/Rejected. Every card keeps a deterministic hand-drawn cell using the existing status colors and symbols.
+- Read a compact three-row project-status grid beneath the project title: Candidate/Confirmed, Started/To validate, and Done/Rejected. Cards keep deterministic hand-drawn cells using the existing status colors and symbols while a row fits; an overflowing row independently switches to ordered numeric status counts and expands again when space returns.
 - Read the current board scale as a percentage between the size buttons; 100% is the default.
 - Open web addresses in card titles, content, and source metadata as native browser links.
 - Render simple card Markdown: `*`/`-` bullet lists, numbered lists, `**bold**`, `*italic*`, inline code, and `[label](url)` links.

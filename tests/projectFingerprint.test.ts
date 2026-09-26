@@ -2,7 +2,14 @@ import { describe, expect, it } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { BoardItem, BoardItemStatus } from "../src/types";
-import { fingerprintHash, pencilCellPath, ProjectFingerprint, splitFingerprintItems } from "../src/sidebar/components/ProjectFingerprint";
+import {
+  compactFingerprintRows,
+  expandedFingerprintRowWidth,
+  fingerprintHash,
+  pencilCellPath,
+  ProjectFingerprint,
+  splitFingerprintItems
+} from "../src/sidebar/components/ProjectFingerprint";
 
 function item(id: string, status: BoardItemStatus, order: number): BoardItem {
   return {
@@ -42,6 +49,27 @@ describe("project fingerprint", () => {
     const seed = fingerprintHash("project-one:cell:4");
     expect(pencilCellPath(2, 3, 7, seed)).toBe(pencilCellPath(2, 3, 7, seed));
     expect(pencilCellPath(2, 3, 7, seed)).not.toBe(pencilCellPath(2, 3, 7, seed + 1));
+  });
+
+  it("selects compact mode independently for each status row", () => {
+    const rows = splitFingerprintItems([
+      ...Array.from({ length: 12 }, (_, index) => item(`candidate-${index}`, "candidate", index)),
+      ...Array.from({ length: 3 }, (_, index) => item(`started-${index}`, "started", index + 12)),
+      item("done", "done", 15)
+    ]).statusRows;
+    const availableWidth = expandedFingerprintRowWidth(3);
+
+    expect(compactFingerprintRows(rows, availableWidth)).toEqual([true, false, false]);
+  });
+
+  it("returns a compact row to expanded mode when enough width is available", () => {
+    const rows = splitFingerprintItems(Array.from(
+      { length: 8 },
+      (_, index) => item(`candidate-${index}`, "candidate", index)
+    )).statusRows;
+
+    expect(compactFingerprintRows(rows, expandedFingerprintRowWidth(8) - 1)[0]).toBe(true);
+    expect(compactFingerprintRows(rows, expandedFingerprintRowWidth(8))[0]).toBe(false);
   });
 
   it("renders a moving Done cell without embedding a local celebration", () => {

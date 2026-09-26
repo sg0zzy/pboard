@@ -44,8 +44,7 @@ header { border-bottom: 1px solid #deded9; padding-bottom: 14px; }
 h1 { margin: 0; font-size: 1.125em; }
 .project-row { display: flex; align-items: center; gap: 4px; }
 .project-row h1 { flex: 1; }
-.project-fingerprint { display: flex; width: 100%; height: 2.6875em; align-items: center; margin-top: .125em; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
-.project-fingerprint::-webkit-scrollbar { display: none; }
+.project-fingerprint { display: flex; width: 100%; height: 2.6875em; align-items: center; margin-top: .125em; overflow: hidden; }
 .project-fingerprint svg { display: block; height: 2.4375em; flex: 0 0 auto; overflow: visible; }
 .board-summary-row { display: flex; align-items: center; gap: 10px; }
 .board-summary-row .project-fingerprint { width: auto; min-width: 0; flex: 1; }
@@ -71,6 +70,7 @@ h1 { margin: 0; font-size: 1.125em; }
 .fingerprint-state-symbol--confirmed, .fingerprint-state-symbol--started { fill: currentColor; }
 .fingerprint-state-symbol--to-validate { fill: none; }
 .fingerprint-state-symbol--done, .fingerprint-state-symbol--rejected { fill: none; }
+.fingerprint-compact-count { fill: currentColor; font-family: inherit; font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .fingerprint-cell--landing { opacity: 0; }
 .fingerprint-cell--moving { transform-box: view-box; transform-origin: 0 0; }
 .fingerprint-cell--moving-done { animation: fingerprint-land-done 540ms cubic-bezier(.2,.78,.2,1) both; }

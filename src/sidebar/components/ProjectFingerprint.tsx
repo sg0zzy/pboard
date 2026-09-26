@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { statusClassName, WORKFLOW_STATUS_ROWS } from "../../statuses";
 import type { BoardItem, BoardItemStatus } from "../../types";
 
@@ -7,6 +7,7 @@ const CELL_STEP = 10;
 const GRID_X = 4;
 const ROW_Y = [3, 16, 29] as const;
 const SVG_HEIGHT = 39;
+const COMPACT_GROUP_GAP = 6;
 const CLOSED_STATUSES = new Set<BoardItemStatus>(WORKFLOW_STATUS_ROWS[2].map((definition) => definition.id));
 
 type FingerprintStatus = Exclude<BoardItemStatus, "trash">;
@@ -23,6 +24,68 @@ type Props = {
   items: BoardItem[];
   transition: FingerprintTransition | null;
 };
+
+type CompactGroup = {
+  status: FingerprintStatus;
+  count: number;
+};
+
+export function expandedFingerprintRowWidth(itemCount: number): number {
+  return itemCount === 0 ? 0 : GRID_X * 2 + (itemCount - 1) * CELL_STEP + CELL_SIZE;
+}
+
+export function compactFingerprintRows(statusRows: BoardItem[][], availableWidth: number | null): boolean[] {
+  return statusRows.map((row) => availableWidth !== null && expandedFingerprintRowWidth(row.length) > availableWidth);
+}
+
+function compactGroups(row: BoardItem[]): CompactGroup[] {
+  return row.reduce<CompactGroup[]>((groups, item) => {
+    const status = item.status as FingerprintStatus;
+    const last = groups.at(-1);
+    if (last?.status === status) last.count += 1;
+    else groups.push({ status, count: 1 });
+    return groups;
+  }, []);
+}
+
+function compactCountWidth(count: number): number {
+  return String(count).length * 6 + 8;
+}
+
+function compactRowWidth(row: BoardItem[]): number {
+  const groups = compactGroups(row);
+  if (groups.length === 0) return 0;
+  return GRID_X * 2 + groups.reduce((width, group) => width + compactCountWidth(group.count) + CELL_SIZE, 0)
+    + (groups.length - 1) * COMPACT_GROUP_GAP;
+}
+
+function useAvailableFingerprintWidth() {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [availableWidth, setAvailableWidth] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    const measure = () => {
+      const width = root.clientWidth;
+      const fontSize = Number.parseFloat(window.getComputedStyle(root).fontSize);
+      if (width > 0 && fontSize > 0) setAvailableWidth(width * 16 / fontSize);
+    };
+    measure();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+
+    const observer = new ResizeObserver(measure);
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+
+  return { rootRef, availableWidth };
+}
 
 export function fingerprintHash(value: string): number {
   let hash = 2166136261;
@@ -114,7 +177,29 @@ function FingerprintCell({ projectId, item, x, y, className = "", style }: {
   );
 }
 
+function CompactFingerprintRow({ row, y }: { row: BoardItem[]; y: number }) {
+  let x = GRID_X;
+  return compactGroups(row).map((group) => {
+    const countWidth = compactCountWidth(group.count);
+    const groupX = x;
+    const symbolX = groupX + countWidth;
+    x += countWidth + CELL_SIZE + COMPACT_GROUP_GAP;
+    return (
+      <g key={group.status} className={`fingerprint-compact-group fingerprint-cell--${statusClassName(group.status)}`}>
+        <title>{group.count} {group.status}</title>
+        <text
+          className="fingerprint-compact-count"
+          x={groupX}
+          y={y + 5.8}
+        >{group.count}×</text>
+        <StateSymbol status={group.status} x={symbolX} y={y} />
+      </g>
+    );
+  });
+}
+
 export function ProjectFingerprint({ projectId, items, transition }: Props) {
+  const { rootRef, availableWidth } = useAvailableFingerprintWidth();
   const split = splitFingerprintItems(items);
   if (split.statusRows.every((row) => row.length === 0)) return null;
 
@@ -130,6 +215,8 @@ export function ProjectFingerprint({ projectId, items, transition }: Props) {
     ? items.map((item) => item.id === transitioningItem.id ? { ...item, status: transition!.fromStatus } : item)
     : items;
   const previousRows = splitFingerprintItems(previousItems).statusRows;
+  const compactRows = compactFingerprintRows(split.statusRows, availableWidth);
+  const previousCompactRows = compactFingerprintRows(previousRows, availableWidth);
   const sourceRowIndex = transitioningItem
     ? previousRows.findIndex((row) => row.some((item) => item.id === transitioningItem.id))
     : -1;
@@ -142,8 +229,20 @@ export function ProjectFingerprint({ projectId, items, transition }: Props) {
   const destinationIndex = destinationRowIndex >= 0 && transitioningItem
     ? split.statusRows[destinationRowIndex].findIndex((item) => item.id === transitioningItem.id)
     : -1;
-  const widestRow = Math.max(...previousRows.map((row) => row.length), ...split.statusRows.map((row) => row.length), 2);
-  const gridWidth = GRID_X * 2 + (widestRow - 1) * CELL_STEP + CELL_SIZE;
+  const animateTransition = Boolean(
+    isClosing &&
+    sourceRowIndex >= 0 &&
+    destinationRowIndex >= 0 &&
+    !previousCompactRows[sourceRowIndex] &&
+    !compactRows[destinationRowIndex]
+  );
+  const renderedRowWidths = split.statusRows.map((row, index) => compactRows[index]
+    ? compactRowWidth(row)
+    : expandedFingerprintRowWidth(row.length));
+  const transitionRowWidths = animateTransition
+    ? [expandedFingerprintRowWidth(previousRows[sourceRowIndex].length)]
+    : [];
+  const gridWidth = Math.max(...renderedRowWidths, ...transitionRowWidths, expandedFingerprintRowWidth(2));
   const svgWidth = gridWidth;
   const destinationX = GRID_X + destinationIndex * CELL_STEP;
   const sourceX = GRID_X + sourceIndex * CELL_STEP;
@@ -151,21 +250,23 @@ export function ProjectFingerprint({ projectId, items, transition }: Props) {
   const sourceY = sourceRowIndex >= 0 ? ROW_Y[sourceRowIndex] : 0;
 
   return (
-    <div className="project-fingerprint" aria-label={`Project status, ${split.active.length} active and ${split.closed.length} closed cards`}>
+    <div ref={rootRef} className="project-fingerprint" aria-label={`Project status, ${split.active.length} active and ${split.closed.length} closed cards`}>
       <svg viewBox={`0 0 ${svgWidth} ${SVG_HEIGHT}`} style={{ width: `${svgWidth / 16}em` }} role="img">
         <title>Project status: candidate and confirmed; started and to validate; done and rejected</title>
         <path className="fingerprint-row-guide" d={`M1 13h${gridWidth - 2}M1 26h${gridWidth - 2}`} aria-hidden="true" />
-        {split.statusRows.flatMap((row, rowIndex) => row.map((item, index) => (
-          <FingerprintCell
-            key={item.id}
-            projectId={projectId}
-            item={item}
-            x={GRID_X + index * CELL_STEP}
-            y={ROW_Y[rowIndex]}
-            className={isClosing && item.id === transitioningItem?.id ? "fingerprint-cell--landing" : ""}
-          />
-        )))}
-        {isClosing && transitioningItem && sourceIndex >= 0 && destinationIndex >= 0 && sourceRowIndex >= 0 && destinationRowIndex >= 0 && (
+        {split.statusRows.flatMap((row, rowIndex) => compactRows[rowIndex]
+          ? <CompactFingerprintRow key={`compact-${rowIndex}`} row={row} y={ROW_Y[rowIndex]} />
+          : row.map((item, index) => (
+            <FingerprintCell
+              key={item.id}
+              projectId={projectId}
+              item={item}
+              x={GRID_X + index * CELL_STEP}
+              y={ROW_Y[rowIndex]}
+              className={animateTransition && item.id === transitioningItem?.id ? "fingerprint-cell--landing" : ""}
+            />
+          )))}
+        {animateTransition && transitioningItem && sourceIndex >= 0 && destinationIndex >= 0 && sourceRowIndex >= 0 && destinationRowIndex >= 0 && (
           <FingerprintCell
             key={`moving-${transition!.revision}`}
             projectId={projectId}
