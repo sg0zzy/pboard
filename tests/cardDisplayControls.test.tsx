@@ -23,12 +23,14 @@ describe("card display controls", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
   const onUpdate = vi.fn(async () => undefined);
+  const onStatusChange = vi.fn();
 
   beforeEach(() => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     onUpdate.mockClear();
+    onStatusChange.mockClear();
   });
 
   afterEach(() => {
@@ -43,7 +45,7 @@ describe("card display controls", () => {
         pendingStatus={item.status}
         template="project"
         onUpdate={onUpdate}
-        onStatusChange={vi.fn()}
+        onStatusChange={onStatusChange}
         onDelete={vi.fn(async () => undefined)}
         onDiscardEmpty={vi.fn(async () => undefined)}
         onDragStart={vi.fn()}
@@ -84,6 +86,30 @@ describe("card display controls", () => {
 
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Compact"]')!.click());
     expect(onUpdate).toHaveBeenLastCalledWith(item.id, { displayMode: "compact" });
+  });
+
+  it("cycles status with unmodified Left and Right arrows", () => {
+    renderCard();
+    const card = container.querySelector<HTMLElement>("article")!;
+
+    act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
+    expect(onStatusChange).toHaveBeenLastCalledWith(item.id, "to validate");
+
+    act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+    expect(onStatusChange).toHaveBeenLastCalledWith(item.id, "confirmed");
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("cycles category with Ctrl+Left and Ctrl+Right without changing status", () => {
+    renderCard();
+    const card = container.querySelector<HTMLElement>("article")!;
+
+    act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", ctrlKey: true, bubbles: true })));
+    expect(onUpdate).toHaveBeenLastCalledWith(item.id, { type: "constraint" });
+
+    act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", ctrlKey: true, bubbles: true })));
+    expect(onUpdate).toHaveBeenLastCalledWith(item.id, { type: "decision" });
+    expect(onStatusChange).not.toHaveBeenCalled();
   });
 
   it("opens the complete content in edit mode regardless of display mode", () => {

@@ -16,7 +16,7 @@ import {
 import { Card } from "./components/Card";
 import { BoardConfetti } from "./components/BoardConfetti";
 import { CopyIcon } from "./components/CopyIcon";
-import { TrashIcon } from "./components/Card";
+import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
@@ -815,95 +815,22 @@ export function App() {
                 onClick={() => void captureRegion()}
               ><CameraIcon /></button>
             </div>
-            {rejectedItems.length > 0 && (
-              <details className="rejected-section">
-                <summary>
-                  <span>Rejected ({rejectedItems.length})</span>
-                  <button
-                    type="button"
-                    className="copy-section-button"
-                    title="Copy rejected cards"
-                    aria-label="Copy rejected cards"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void copySection(rejectedItems, "Rejected cards");
-                    }}
-                  >
-                    <CopyIcon />
-                  </button>
-                  <button
-                    type="button"
-                    className="empty-trash-button"
-                    title="Trash rejected cards"
-                    aria-label="Trash rejected cards"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void trashAllSection(rejectedItems);
-                    }}
-                  >
-                    <TrashIcon />
-                  </button>
-                </summary>
-                {rejectedItems.map(renderSortableCard)}
-              </details>
-            )}
-            {doneItems.length > 0 && (
-              <details className="done-section">
-                <summary>
-                  <span>Done ({doneItems.length})</span>
-                  <button
-                    type="button"
-                    className="copy-section-button"
-                    title="Copy done cards"
-                    aria-label="Copy done cards"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void copySection(doneItems, "Done cards");
-                    }}
-                  >
-                    <CopyIcon />
-                  </button>
-                  <button
-                    type="button"
-                    className="empty-trash-button"
-                    title="Trash done cards"
-                    aria-label="Trash done cards"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      void trashAllSection(doneItems);
-                    }}
-                  >
-                    <TrashIcon />
-                  </button>
-                </summary>
-                {doneItems.map(renderSortableCard)}
-              </details>
-            )}
-            {trashItems.length > 0 && (
-              <details className="trash-section">
-                <summary>
-                  <span>Trash ({trashItems.length})</span>
-                  <button
-                    type="button"
-                    className="empty-trash-button"
-                    title="Empty trash"
-                    aria-label="Empty trash"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      requestEmptyTrash();
-                    }}
-                  >
-                    <TrashIcon />
-                  </button>
-                </summary>
-                {trashItems.map(renderSortableCard)}
-              </details>
-            )}
+            {TERMINAL_SECTION_DEFINITIONS.map((definition) => {
+              const sectionItems = statusSection(definition.status);
+              if (sectionItems.length === 0) return null;
+              const isTrash = definition.status === "trash";
+              return (
+                <TerminalSection
+                  key={definition.status}
+                  definition={definition}
+                  count={sectionItems.length}
+                  onCopy={isTrash ? undefined : () => void copySection(sectionItems, `${definition.label} cards`)}
+                  onTrash={isTrash ? requestEmptyTrash : () => void trashAllSection(sectionItems)}
+                >
+                  {sectionItems.map(renderSortableCard)}
+                </TerminalSection>
+              );
+            })}
 
             {emptyTrashPending && (
               <DeleteConfirmation

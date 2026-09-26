@@ -23,7 +23,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - On a focused card, Left/Right step its status through Candidate → Confirmed → Started → To validate → Done → Trashed → Rejected (wrapping), matching the status-menu order. Ctrl+Left/Ctrl+Right (Command+ on macOS) steps its category through the board template's categories.
 - Use the `─`, `▫`, and `□` controls in a card header to show compact, standard, or expanded text. Press V on a focused, non-editing card to cycle those modes.
 - Delete always moves a focused, non-editing card to its project's Trash, matching the trash icon; each project has its own Trash, and emptying the Trash (trash-can icon in the section title row) or deleting a trash card removes it permanently, with a confirmation.
-- The Rejected and Done section title rows each have a copy button (copies all cards of that section in the same format as "Copy board") and a trash icon (trashes all cards of the section at once).
+- Done, Rejected, and Trash appear as collapsible containers in that visual order. Done and Rejected each have a copy button (copies all cards of that section in the same format as "Copy board") and a trash icon (trashes all cards of the section at once). This presentation order is independent from the unchanged keyboard status cycle.
 - Middle-click a card to compose and insert a new card directly beneath it.
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
@@ -41,7 +41,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Render simple card Markdown: `*`/`-` bullet lists, numbered lists, `**bold**`, `*italic*`, inline code, and `[label](url)` links.
 - Turn `- [ ]` and `- [x]` task lines into clickable checkboxes whose state is persisted back into the card text.
 - Scan semantic card types by accessible, template-specific colors while status remains a separate icon/pill treatment.
-- Hide rejected and done cards in collapsed sections.
+- Hide done, rejected, and trash cards in lightweight collapsed containers.
 - Select text on any HTTP/HTTPS page and use **Pin selection to Pboard** from Firefox's context menu; the new card is added as **Uncategorized** and receives focus in the sidebar.
 - Right-click an image on any HTTP/HTTPS page and choose **Pin image to Pboard** to save the visible image as a local image card with its source URL and page metadata.
 - Pin selected text with `Alt+Shift+C` (**Capture**), or pin the current web page with `Alt+Shift+W`; both are left-hand shortcuts.

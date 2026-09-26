@@ -199,10 +199,11 @@ Implemented behavior:
 - Clicking the trash icon (or pressing Delete on a focused, non-editing card) always moves the card to that project's Trash, undoable by changing its status back. Emptying the trash and removing a card from Trash require the confirmation panel.
 - Deleting a card that is already in Trash removes it permanently.
 - Deleting a card normalizes the remaining order values.
-- Rejected cards are placed in a collapsed **Rejected** section.
-- Done cards are placed in a collapsed **Done** section.
+- Done cards are placed in a collapsed **Done** container.
+- Rejected cards are placed in a collapsed **Rejected** container.
 - Each **Rejected** and **Done** section title row also holds a trash button that moves every card of the section to the project's Trash at once.
-- Trash cards are placed in a collapsed **Trash** section, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
+- Trash cards are placed in a collapsed **Trash** container, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
+- The terminal containers are presented as **Done**, **Rejected**, then **Trash**. This visual order is independent from the canonical status-menu and keyboard-cycling order.
 - Card changes update the card's `updatedAt` timestamp.
 
 Supported card types are supplied by the selected board template rather than a global UI list. The storage union includes the current template types plus the legacy `idea` value so older data can be preserved.

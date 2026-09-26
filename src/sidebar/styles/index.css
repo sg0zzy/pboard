@@ -230,20 +230,32 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .delete-confirmation-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .delete-confirm-button { border-color: #9f4038; background: #9f4038; padding: 5px 9px; font-size: .75em; }
 .delete-confirm-button:hover { border-color: #7d2d27; background: #7d2d27; }
-.rejected-section > summary, .done-section > summary {
+.terminal-section { margin-top: 8px; }
+.terminal-section > summary {
   display: flex;
+  width: 100%;
   align-items: center;
   gap: 8px;
+  border: 1px solid #dedfd9;
+  border-radius: 7px;
+  background: #f1f2ee;
   cursor: pointer;
   color: #6e7069;
   font-size: .8125em;
-  margin: 8px 2px;
+  list-style: none;
+  padding: 8px 9px;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
-.rejected-section .card { margin-top: 9px; }
-.done-section .card { margin-top: 9px; }
-.trash-section > summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: #6e7069; font-size: .8125em; margin: 8px 2px; }
-.trash-section > summary::before { content: ""; }
-.trash-section .card { margin-top: 9px; opacity: .66; }
+.terminal-section > summary::-webkit-details-marker { display: none; }
+.terminal-section > summary:hover { border-color: #cdd0c7; background: #e9ebe5; color: #41433e; }
+.terminal-section > summary:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.terminal-section--trash > summary { border-style: dashed; background: #f3f3f0; }
+.terminal-section-chevron { width: .48em; height: .48em; flex: 0 0 auto; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); transition: transform 120ms ease; }
+.terminal-section[open] .terminal-section-chevron { transform: rotate(45deg); }
+.terminal-section-title { min-width: 0; font-weight: 650; }
+.terminal-section-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.terminal-section .card { margin-top: 9px; }
+.terminal-section--trash .card { opacity: .66; }
 .status-trash .card-status { border-color: #c7c9c1; color: #62645d; }
 .empty-trash-button { align-self: center; margin-left: 2px; display: grid; place-items: center; width: 1.8em; height: 1.8em; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #7a7b74; cursor: pointer; flex-shrink: 0; }
 .empty-trash-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -339,8 +351,10 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .type-picker-option:hover, .type-picker-option:focus-visible { background: #393a36; color: white; }
   .type-picker-check { color: #a3c8a5; }
   .card-status { border-color: #565852; color: #b1b3aa; }
-  .trash-section > summary { color: #a7a9a0; }
-  .trash-section .card { opacity: .8; }
+  .terminal-section > summary { border-color: #454741; background: #30312e; color: #aeb0a8; }
+  .terminal-section > summary:hover { border-color: #5a5c55; background: #383a35; color: #e1e2dc; }
+  .terminal-section--trash > summary { background: #2d2e2b; }
+  .terminal-section--trash .card { opacity: .8; }
   .empty-trash-button { color: #bbbbb5; }
   .empty-trash-button:hover { background: #4b302e; color: #efaaa4; }
   .copy-section-button { color: #bbbbb5; }
