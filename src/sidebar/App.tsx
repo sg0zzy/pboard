@@ -22,7 +22,7 @@ import { DriveSyncControls } from "./components/DriveSyncControls";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
-import { serializeBoard, serializeProject } from "./serialize";
+import { hasCopyableBoardItems, serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
@@ -879,7 +879,7 @@ export function App() {
             </section>
 
           <section className="board-controls">
-            <button className="copy-button" onClick={copyBoard} disabled={!items.some((item) => item.status !== "rejected" && item.status !== "trash")}>
+            <button className="copy-button" onClick={copyBoard} disabled={!hasCopyableBoardItems(items)}>
               <CopyIcon />
               <span>Copy board</span>
             </button>

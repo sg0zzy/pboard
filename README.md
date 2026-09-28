@@ -52,7 +52,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Use the board capture toolbar to create a new card, pin the current page, pin selected text, pin a selected or focused link, or capture a page region. Selection and link buttons are disabled when no matching page target is available. For region capture, drag a rectangle on the page or press Escape to cancel.
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
-- Copy the current non-rejected, non-trash board as a clean, structured prompt; every card carries its category and status tags (e.g., `[issue] [confirmed]`).
+- Copy the current board as a clean, structured prompt: ongoing cards in their board order, then Done cards, then Rejected cards. Trash is excluded; every exported card carries its category and status tags (e.g., `[issue] [confirmed]`).
 - Persist all state in `browser.storage.local` across Firefox restarts.
 
 ## Architecture

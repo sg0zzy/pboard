@@ -342,10 +342,9 @@ The sidebar provides a prominent **Copy board** button, with the same overlappin
 
 Implemented behavior:
 
-- The button is disabled when there are no non-rejected cards.
-- Cards are serialized in their current board order.
-- Rejected and trash cards are excluded.
-- Candidate, confirmed, started, to-validate, and done cards are included.
+- The button is disabled when there are no non-trash cards.
+- Ongoing cards (candidate, confirmed, started, and to-validate) are serialized in their current board order, followed by Done cards and then Rejected cards. Each section retains its own board order.
+- Trash cards are excluded.
 - Every card is prefixed with its category id and status tags in square brackets (for example, `[issue] [confirmed]`); legacy `idea` types are exported as `[core_idea]`.
 - An optional card title appears after the status tag and before the content.
 - The resulting text is written to the clipboard.
