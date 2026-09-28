@@ -49,7 +49,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Right-click a web link to pin its URL and visible label as a reference.
 - Right-click an ordinary page area or use the pin icon in Firefox's address bar to pin the current page.
 - Keep the source page URL on pinned cards.
-- Capture part of the current page as an image card with the camera button beside **Add card**: drag a rectangle on the page, or press Escape to cancel.
+- Use the board capture toolbar to create a new card, pin the current page, pin selected text, pin a selected or focused link, or capture a page region. Selection and link buttons are disabled when no matching page target is available. For region capture, drag a rectangle on the page or press Escape to cancel.
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current non-rejected, non-trash board as a clean, structured prompt; every card carries its category and status tags (e.g., `[issue] [confirmed]`).
@@ -78,7 +78,7 @@ State is stored as one versioned object. Projects are application-owned; a conve
 - `menus` (Firefox) / `contextMenus` (Chromium): expose pin actions for selected text, links, images, and pages.
 - `clipboardWrite`: copy the board prompt after an explicit button click.
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
-- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, and inject the short-lived region-capture overlay when the camera button is used. Chromium asks for optional page access the first time the camera is used because a side-panel click does not grant the `activeTab` access required by `captureVisibleTab()`.
+- `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, inspect selected text and focused links for the capture toolbar, and inject the short-lived region-capture overlay when region capture is used. The toolbar asks for optional page access if it cannot inspect selected text or links through `activeTab`; Chromium also needs optional access for region screenshots from the side panel.
 - `identity`: run the optional Google OAuth authorization-code flow after an explicit **Connect Drive** action.
 - `alarms`: schedule an optional dirty-project Drive sync after roughly 25 seconds of inactivity.
 - Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Firefox region capture uses temporary `activeTab` access; Chromium `<all_urls>` access remains optional and is requested only when the camera is used.
@@ -167,4 +167,4 @@ tests/            domain, serialization, messaging, and adapter tests
 
 ## Privacy
 
-All project and card data is written to local extension storage first. If the user explicitly connects Google Drive, versioned per-project snapshots are also sent asynchronously to that account's private app-data folder. Pboard has no telemetry. Text and URLs are captured only after the user explicitly invokes a context-menu or address-bar pin action.
+All project and card data is written to local extension storage first. If the user explicitly connects Google Drive, versioned per-project snapshots are also sent asynchronously to that account's private app-data folder. Pboard has no telemetry. Text and URLs are stored only after the user explicitly invokes a pin action from the toolbar, context menu, shortcut, or address bar.

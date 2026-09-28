@@ -1,6 +1,6 @@
 import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
-import type { CaptureRegionResponse } from "../messaging/messages";
+import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
 import { repository } from "../storage/browser";
 import { STORAGE_KEY } from "../storage/repository";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
@@ -16,6 +16,7 @@ import {
 import { Card } from "./components/Card";
 import { BoardConfetti } from "./components/BoardConfetti";
 import { CopyIcon } from "./components/CopyIcon";
+import { CaptureToolbar } from "./components/CaptureToolbar";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
@@ -24,7 +25,7 @@ import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
-import { requestPageCaptureAccess } from "../platform/capturePermission";
+import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
 import { focusTargetAfterStatusMove } from "./statusFocus";
@@ -50,6 +51,8 @@ export function App() {
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
   const [imageDropActive, setImageDropActive] = useState(false);
   const [capturingRegion, setCapturingRegion] = useState(false);
+  const [pinning, setPinning] = useState(false);
+  const [pinContext, setPinContext] = useState<ToolbarPinContext>({ page: false, selection: false, link: false, accessible: false });
   const [pendingStatuses, setPendingStatuses] = useState<Record<string, BoardItemStatus>>({});
   const [emptyTrashPending, setEmptyTrashPending] = useState(false);
   const [fingerprintTransition, setFingerprintTransition] = useState<FingerprintTransition | null>(null);
@@ -90,6 +93,27 @@ export function App() {
     browser.storage.onChanged.addListener(listener);
     return () => browser.storage.onChanged.removeListener(listener);
   }, [reload]);
+
+  useEffect(() => {
+    let mounted = true;
+    const refresh = async () => {
+      try {
+        const context = await browser.runtime.sendMessage({ type: "GET_TOOLBAR_PIN_CONTEXT" }) as ToolbarPinContext;
+        if (mounted) setPinContext(context);
+      } catch {
+        if (mounted) setPinContext({ page: false, selection: false, link: false, accessible: false });
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => { if (!document.hidden) void refresh(); }, 1500);
+    const onFocus = () => { void refresh(); };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
 
   function consumePinnedCardFocus(cardId: string) {
     void browser.storage.local.set({ [PINNED_CARD_FOCUS_KEY]: null });
@@ -569,6 +593,26 @@ export function App() {
     }
   }
 
+  async function pinFromToolbar(kind: ToolbarPinKind) {
+    if (pinning) return;
+    setPinning(true);
+    try {
+      if (kind !== "page" && !pinContext.accessible && !await requestPagePinAccess(browser)) {
+        setNotice("Page access is required to pin selected text or a link.");
+        return;
+      }
+      const result = await browser.runtime.sendMessage({ type: "PIN_FROM_TOOLBAR", kind }) as ToolbarPinResponse;
+      setNotice(result.ok ? (kind === "page" ? "Page pinned" : kind === "selection" ? "Selection pinned" : "Link pinned") : result.reason ?? "The page could not be pinned");
+      if (result.ok) window.setTimeout(() => setNotice(""), 2200);
+      const context = await browser.runtime.sendMessage({ type: "GET_TOOLBAR_PIN_CONTEXT" }) as ToolbarPinContext;
+      setPinContext(context);
+    } catch {
+      setNotice("The page could not be pinned");
+    } finally {
+      setPinning(false);
+    }
+  }
+
   async function dropImage(event: DragEvent<HTMLElement>) {
     const file = Array.from(event.dataTransfer.files).find((candidate) => candidate.type.startsWith("image/"));
     if (!file) return;
@@ -800,21 +844,13 @@ export function App() {
               </div>
             )}
             {visibleItems.map(renderSortableCard)}
-            <div className="board-add-zone" role="group" aria-label="Add a card">
-              <button
-                className="board-add-button"
-                aria-label="Add card"
-                title="Add card"
-                onClick={() => void createCard(currentProject.id)}
-              ><span aria-hidden="true">+</span></button>
-              <button
-                className="board-add-button"
-                aria-label="Capture part of the current page"
-                title="Capture part of the current page"
-                disabled={capturingRegion}
-                onClick={() => void captureRegion()}
-              ><CameraIcon /></button>
-            </div>
+            <CaptureToolbar
+              context={pinContext}
+              busy={pinning || capturingRegion}
+              onNewCard={() => void createCard(currentProject.id)}
+              onPin={(kind) => void pinFromToolbar(kind)}
+              onCaptureRegion={() => void captureRegion()}
+            />
             {TERMINAL_SECTION_DEFINITIONS.map((definition) => {
               const sectionItems = statusSection(definition.status);
               if (sectionItems.length === 0) return null;
@@ -886,15 +922,6 @@ function EditIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m5 16.75-.5 3 3-.5L18.25 8.5l-2.5-2.5L5 16.75Zm8.75-8.75 2.5 2.5" />
-    </svg>
-  );
-}
-
-function CameraIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 7.75h3l1.4-2h7.2l1.4 2h3v10.5H4z" />
-      <circle cx="12" cy="13" r="3.25" />
     </svg>
   );
 }

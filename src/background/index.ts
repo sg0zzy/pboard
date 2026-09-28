@@ -1,5 +1,5 @@
 import type { CaptureSelectionResponse } from "../messaging/messages";
-import { isCaptureRegionMessage } from "../messaging/messages";
+import { isCaptureRegionMessage, isToolbarPinMessage } from "../messaging/messages";
 import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
 import type { BoardImage } from "../types";
@@ -14,6 +14,7 @@ import {
 } from "./shortcuts";
 import { firstCaptureImageRegion, findContextImage } from "./regionCapture";
 import { capturePageRegion, type PageCaptureApi } from "./pageCapture";
+import { getToolbarPinContext, pinFromToolbar, type PinApi } from "./toolbarPins";
 import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
 
@@ -159,6 +160,13 @@ browser.commands.onCommand.addListener(async (command: string, tab: any) => {
 
 browser.runtime.onMessage.addListener((message: unknown) => {
   if (isCaptureRegionMessage(message)) return capturePageRegion(browser as unknown as PageCaptureApi);
+  if (isToolbarPinMessage(message)) {
+    if (message.type === "GET_TOOLBAR_PIN_CONTEXT") return getToolbarPinContext(browser as unknown as PinApi);
+    return pinFromToolbar(browser as unknown as PinApi, repository, message.kind).then((result) => {
+      setPinnedCardFocus(result.cardId);
+      return result;
+    });
+  }
   return handleDriveSyncMessage(message);
 });
 

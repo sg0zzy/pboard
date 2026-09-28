@@ -10,3 +10,9 @@ export async function requestPageCaptureAccess(api: CapturePermissionApi): Promi
   if (!api.sidePanel || !api.permissions?.request) return true;
   return api.permissions.request({ origins: ["<all_urls>"] });
 }
+
+/** Reading a generic page from the sidebar needs host access when activeTab has expired. */
+export async function requestPagePinAccess(api: CapturePermissionApi): Promise<boolean> {
+  if (!api.permissions?.request) return false;
+  return api.permissions.request({ origins: ["<all_urls>"] });
+}

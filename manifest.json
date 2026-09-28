@@ -10,6 +10,7 @@
     "https://www.googleapis.com/*",
     "https://oauth2.googleapis.com/*"
   ],
+  "optional_host_permissions": ["<all_urls>"],
   "background": {
     "scripts": ["background.js"]
   },

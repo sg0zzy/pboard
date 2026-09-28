@@ -324,11 +324,11 @@ Link and page behavior:
 
 ### Page region capture
 
-The board controls row exposes a camera button next to **Add card**.
+The board capture toolbar presents **New card**, a vertical separator, **Pin current page**, **Pin selected text**, **Pin link**, and **Capture region**, in that order. Each action has an icon, an accessible label, and a tooltip. Selected text and link buttons are disabled when the page has no matching target; a link target is a selected or focused hyperlink. The pin buttons use the same background pin handlers as context menus and shortcuts.
 
 Implemented behavior:
 
-- Clicking the button injects a short-lived overlay into the active tab. The user drags a rectangle over the page; the rectangle is previewed live and Escape cancels.
+- Clicking **Capture region** injects a short-lived overlay into the active tab. The user drags a rectangle over the page; the rectangle is previewed live and Escape cancels.
 - On release, the visible tab is screenshotted, the selected rectangle is cropped and scaled (longest side at most 1400 px, encoded as WebP), and an image card is created in the current project.
 - The captured page URL and title are stored as the card's source metadata and optional title; the card content is **Page capture**.
 - Drag distances under 8 px are treated as a cancellation. Pointer cancellation removes the overlay and resolves the capture as cancelled, so the sidebar never stays in a capturing state.
