@@ -118,4 +118,37 @@ describe("card display controls", () => {
 
     expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe(item.content);
   });
+
+  it("cycles Tab and Shift+Tab through controls and fields while editing", () => {
+    renderCard();
+    act(() => container.querySelector<HTMLElement>("article")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+
+    const focusable = [...container.querySelectorAll<HTMLElement>("article button, article input, article textarea")];
+    const pressTab = (shiftKey = false) => {
+      const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      act(() => document.activeElement!.dispatchEvent(event));
+      expect(event.defaultPrevented).toBe(true);
+    };
+
+    focusable.at(-1)!.focus();
+    for (const target of focusable) {
+      pressTab();
+      expect(document.activeElement).toBe(target);
+    }
+
+    focusable[0].focus();
+    for (const target of [...focusable].reverse()) {
+      pressTab(true);
+      expect(document.activeElement).toBe(target);
+    }
+  });
+
+  it("leaves normal Tab handling intact outside edit mode", () => {
+    renderCard();
+    const card = container.querySelector<HTMLElement>("article")!;
+    card.focus();
+    const event = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    act(() => card.dispatchEvent(event));
+    expect(event.defaultPrevented).toBe(false);
+  });
 });

@@ -151,6 +151,7 @@ Implemented behavior:
 - Manually created cards default to type `note` and status `candidate`.
 - Cards enter inline editing when the user double-clicks their title or content area.
 - While editing, Enter saves, Shift+Enter inserts a newline, Escape cancels, and another double-click saves.
+- While editing, Tab and Shift+Tab cycle through the card's controls and text fields, wrapping within the card.
 - Ctrl+Enter saves without arming creation of a new card below; Command+Enter is the macOS equivalent. The next Enter therefore edits the same selected card again.
 - Cancelling an edit with Escape restores focus to the same selected card, allowing immediate arrow navigation or Enter-to-edit without selecting it again.
 - After an existing card is saved, focus returns to that card and a second Enter opens a new inline draft directly beneath it.

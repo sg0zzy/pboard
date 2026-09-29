@@ -3,6 +3,7 @@ import type { BoardImage, BoardItem } from "../types";
 
 type Repository = {
   load(): Promise<{ currentProjectId: string | null }>;
+  getCurrentProject?(): Promise<{ id: string } | null>;
   addItem(input: {
     projectId: string;
     content: string;
@@ -14,13 +15,17 @@ type Repository = {
   }): Promise<BoardItem>;
 };
 
+async function selectedProjectId(repository: Repository): Promise<string | null> {
+  return repository.getCurrentProject ? (await repository.getCurrentProject())?.id ?? null : (await repository.load()).currentProjectId;
+}
+
 export async function pinSelection(
   repository: Repository,
   response: CaptureSelectionResponse | undefined,
   fallback: { text?: string; url?: string; provider?: string } = {}
 ): Promise<{ ok: boolean; reason?: string; cardId?: string }> {
-  const state = await repository.load();
-  if (!state.currentProjectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
+  const projectId = await selectedProjectId(repository);
+  if (!projectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
 
   const text = response?.ok ? response.selection.sourceText : fallback.text?.trim();
   if (!text) return { ok: false, reason: response && !response.ok ? response.reason : "No text is selected." };
@@ -28,7 +33,7 @@ export async function pinSelection(
   const conversationUrl = response?.ok ? response.selection.conversationUrl : fallback.url;
 
   const created = await repository.addItem({
-    projectId: state.currentProjectId,
+    projectId,
     content: text,
     type: "note",
     status: "candidate",
@@ -41,13 +46,13 @@ export async function pinWebResource(
   repository: Repository,
   input: { url?: string; pageUrl?: string; title?: string }
 ): Promise<{ ok: boolean; reason?: string }> {
-  const state = await repository.load();
-  if (!state.currentProjectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
+  const projectId = await selectedProjectId(repository);
+  if (!projectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
   if (!input.url || !isWebUrl(input.url)) return { ok: false, reason: "Only HTTP and HTTPS links can be pinned." };
 
   const title = input.title?.trim();
   await repository.addItem({
-    projectId: state.currentProjectId,
+    projectId,
     content: input.url,
     ...(title && title !== input.url ? { title } : {}),
     type: "reference",
@@ -65,15 +70,15 @@ export async function pinImage(
   repository: Repository,
   input: { image: BoardImage; url?: string; pageUrl?: string; alt?: string }
 ): Promise<{ ok: boolean; reason?: string; cardId?: string }> {
-  const state = await repository.load();
-  if (!state.currentProjectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
+  const projectId = await selectedProjectId(repository);
+  if (!projectId) return { ok: false, reason: "Create or select a project in the sidebar first." };
   if (!input.image?.dataUrl) return { ok: false, reason: "The image could not be captured." };
 
   const url = input.url?.trim();
   const alt = input.alt?.trim();
   const content = alt || url || "Pinned image";
   const created = await repository.addItem({
-    projectId: state.currentProjectId,
+    projectId,
     content,
     ...(alt ? { title: alt } : {}),
     type: "reference",

@@ -1,0 +1,5 @@
+# Isolated collaboration storage experiment
+
+Run `npm install` here and then `npm run bench`. This directory is not imported by the extension or its build. The benchmark uses RxDB's free Dexie storage with `fake-indexeddb` under Node, which exercises the API and query/reactivity path but is **not** a Firefox or Chromium disk-performance benchmark. Its database persists across close/reopen within the process only. The benchmark never reads or changes pboard user data.
+
+For the integrated **browser-page** benchmark, from the repository root run `./node_modules/.bin/vite --host 127.0.0.1 --port 5179`, then open `http://127.0.0.1:5179/experiments/collaboration/browser-bench.html` in a browser. The page writes timings to the DOM. It creates uniquely named test databases in that browser origin and uses `navigator.storage.estimate()` for approximate storage deltas. It exercises the new `src/storage/rxdbRepository.ts` code, but does not simulate extension lifecycle or Drive sync. Use a throwaway browser profile; the harness leaves its benchmark data there for inspection.

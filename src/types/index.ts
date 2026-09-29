@@ -64,6 +64,11 @@ export type BoardItem = {
   title?: string;
   content: string;
   image?: BoardImage;
+  /** Local RxDB image reference. Drive snapshots still use `image` at the boundary. */
+  imageId?: string;
+  imageMimeType?: string;
+  imageWidth?: number;
+  imageHeight?: number;
   status: BoardItemStatus;
   displayMode?: CardDisplayMode;
   order: number;

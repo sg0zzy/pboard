@@ -9,6 +9,16 @@ export default defineConfig({
   build: {
     outDir,
     emptyOutDir: false,
-    rollupOptions: { input: "sidebar.html" }
+    rolldownOptions: {
+      input: "sidebar.html",
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: "react", test: /node_modules[\\/](?:react|react-dom|scheduler)[\\/]/ },
+            { name: "storage", test: /node_modules[\\/](?:rxdb|dexie|rxjs)[\\/]/ }
+          ]
+        }
+      }
+    }
   }
 });

@@ -1,13 +1,11 @@
-import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
-import { repository } from "../storage/browser";
-import { STORAGE_KEY } from "../storage/repository";
+import { repository, RXDB_MIGRATION_ERROR_KEY } from "../storage/browser";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import {
   BOARD_TEMPLATES,
   PINNED_CARD_FOCUS_KEY,
-  type AppState,
   type BoardImage,
   type BoardItem,
   type BoardItemStatus,
@@ -28,12 +26,15 @@ import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
-import { focusTargetAfterStatusMove } from "./statusFocus";
+import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
 
 const STATUS_MOVE_DELAY_MS = 800;
 
 export function App() {
-  const [state, setState] = useState<AppState | null>(null);
+  const [projects, setProjects] = useState<import("../types").Project[]>([]);
+  const [currentProject, setCurrentProject] = useState<import("../types").Project | null>(null);
+  const [items, setItems] = useState<BoardItem[]>([]);
+  const [boardReady, setBoardReady] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectTemplate, setNewProjectTemplate] = useState<BoardTemplate>("brainstorming");
   const [addingProject, setAddingProject] = useState(false);
@@ -48,6 +49,7 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
   const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const selectedCardIdRef = useRef<string | null>(null);
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
   const [imageDropActive, setImageDropActive] = useState(false);
   const [capturingRegion, setCapturingRegion] = useState(false);
@@ -65,14 +67,17 @@ export function App() {
   const currentProjectIdRef = useRef<string | null>(null);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
-  const reload = useCallback(async () => {
-  const next = await repository.load();
-  setState(next);
-  return next;
-}, []);
-
   useEffect(() => {
-    void reload().then(() => requestDriveReconciliation());
+    let active = true;
+    let stopProjects: (() => void) | undefined;
+    let stopCurrent: (() => void) | undefined;
+    void repository.subscribeProjects((value) => { if (active) { setProjects(value); setBoardReady(true); } }).then((stop) => {
+      if (active) stopProjects = stop; else stop();
+    });
+    void repository.subscribeCurrentProject((value) => { if (active) setCurrentProject(value); }).then((stop) => {
+      if (active) stopCurrent = stop; else stop();
+    });
+    void requestDriveReconciliation();
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
@@ -80,8 +85,10 @@ export function App() {
       const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
       if (cardId) void consumePinnedCardFocus(cardId);
     });
+    void browser.storage.local.get(RXDB_MIGRATION_ERROR_KEY).then((result: Record<string, unknown>) => {
+      if (result[RXDB_MIGRATION_ERROR_KEY]) setNotice(`RxDB migration failed; legacy data is in use: ${result[RXDB_MIGRATION_ERROR_KEY]}`);
+    });
     const listener = (changes: Record<string, { newValue?: unknown }>, area: string) => {
-      if (area === "local" && changes[STORAGE_KEY]) void reload();
       if (area === "local" && changes[UI_SCALE_STORAGE_KEY]) {
         setUiScale(normalizeUiScale(changes[UI_SCALE_STORAGE_KEY].newValue));
       }
@@ -89,10 +96,24 @@ export function App() {
         const cardId = changes[PINNED_CARD_FOCUS_KEY].newValue as string | null | undefined;
         if (cardId) void consumePinnedCardFocus(cardId);
       }
+      if (area === "local" && changes[RXDB_MIGRATION_ERROR_KEY]?.newValue) {
+        setNotice(`RxDB migration failed; legacy data is in use: ${changes[RXDB_MIGRATION_ERROR_KEY].newValue}`);
+      }
     };
     browser.storage.onChanged.addListener(listener);
-    return () => browser.storage.onChanged.removeListener(listener);
-  }, [reload]);
+    return () => { active = false; stopProjects?.(); stopCurrent?.(); browser.storage.onChanged.removeListener(listener); };
+  }, []);
+
+  useEffect(() => {
+    if (!currentProject?.id) { setItems([]); return; }
+    let active = true;
+    let stop: (() => void) | undefined;
+    setItems([]);
+    void repository.subscribeCards(currentProject.id, (value) => { if (active) setItems(value); }).then((unsubscribe) => {
+      if (active) stop = unsubscribe; else unsubscribe();
+    });
+    return () => { active = false; stop?.(); };
+  }, [currentProject?.id]);
 
   useEffect(() => {
     let mounted = true;
@@ -128,10 +149,6 @@ export function App() {
     void browser.storage.local.set({ [UI_SCALE_STORAGE_KEY]: next });
   }
 
-  const currentProject = state?.projects.find((project) => project.id === state.currentProjectId) ?? null;
-  const items = useMemo(() => state?.boardItems
-    .filter((item) => item.projectId === state.currentProjectId)
-    .sort((a, b) => a.order - b.order) ?? [], [state]);
   itemsRef.current = items;
   const fingerprintItems = items;
   const visibleItems = items.filter((item) =>
@@ -182,6 +199,10 @@ export function App() {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
   }, [items, selectedCardId]);
 
+  useEffect(() => {
+    selectedCardIdRef.current = selectedCardId;
+  }, [selectedCardId]);
+
   useEffect(() => () => {
     statusCommitScheduler.current.cancelAll();
     if (fingerprintTimer.current !== null) window.clearTimeout(fingerprintTimer.current);
@@ -194,7 +215,6 @@ export function App() {
     const project = await repository.createProject(newProjectName, newProjectTemplate);
     setNewProjectName("");
     setAddingProject(false);
-    await reload();
     void createCard(project.id);
   }
 
@@ -231,7 +251,6 @@ export function App() {
     if (!currentProject || !projectNameDraft.trim()) return;
     await repository.renameProject(currentProject.id, projectNameDraft);
     cancelProjectRename();
-    await reload();
   }
 
   function handleProjectFormKeyDown(event: KeyboardEvent<HTMLFormElement>) {
@@ -246,7 +265,6 @@ export function App() {
     clearAllPendingStatuses();
     await repository.deleteProject(currentProject.id);
     setPendingDelete(null);
-    await reload();
   }
 
   function requestProjectDeletion() {
@@ -264,7 +282,6 @@ export function App() {
       if (!accepted) return;
     }
     await repository.changeProjectTemplate(currentProject.id, template);
-    await reload();
   }
 
   async function createCard(projectId: string, afterItemId?: string) {
@@ -274,7 +291,6 @@ export function App() {
       ...(afterItemId ? { afterItemId } : {})
     });
     setSelectedCardId(created.id);
-    await reload();
     setFocusRequest({ id: created.id, startEditing: true });
   }
 
@@ -286,7 +302,6 @@ export function App() {
     const { status, ...immediatePatch } = patch;
     if (Object.keys(immediatePatch).length > 0) {
       await repository.updateItem(itemId, immediatePatch);
-      await reload();
     }
     if (status !== undefined) requestStatusChange(itemId, status);
     if (afterSave === "insert" && currentProject) void createCard(currentProject.id, itemId);
@@ -302,19 +317,16 @@ export function App() {
     setPendingDelete(null);
     if (selectedCardId === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
-    await reload();
   }
 
   async function discardEmptyCard(itemId: string) {
     clearPendingStatus(itemId);
     if (selectedCardId === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
-    await reload();
   }
 
   async function duplicateItem(itemId: string) {
     await repository.duplicateItem(itemId);
-    await reload();
   }
 
   async function requestItemDeletion(itemId: string) {
@@ -365,8 +377,7 @@ export function App() {
     }
     const itemsBeforeCommit = itemsRef.current;
     await repository.updateItem(itemId, { status });
-    const newState = await reload();
-    const afterStatus = newState.boardItems.find((item) => item.id === itemId)?.status;
+    const afterStatus = status;
     if (pendingStatusesRef.current[itemId] === status) clearPendingStatus(itemId);
     if (afterStatus !== undefined && beforeStatus !== afterStatus) {
       applyCommittedStatusChange(itemId, beforeStatus, afterStatus, itemsBeforeCommit);
@@ -380,6 +391,7 @@ export function App() {
     itemsBeforeCommit: BoardItem[]
   ) {
     playFingerprintTransition(itemId, beforeStatus, afterStatus);
+    if (!shouldRestoreStatusFocus(itemId, selectedCardIdRef.current)) return;
     const focusTargetId = focusTargetAfterStatusMove(itemsBeforeCommit, itemId, beforeStatus, afterStatus);
     setSelectedCardId(focusTargetId);
     setFocusRequest(focusTargetId ? { id: focusTargetId, startEditing: false } : null);
@@ -402,7 +414,6 @@ export function App() {
     trashIds.forEach((id) => clearPendingStatus(id));
     if (selectedCardId && trashIds.includes(selectedCardId)) setSelectedCardId(null);
     setEmptyTrashPending(false);
-    await reload();
   }
 
   function requestEmptyTrash() {
@@ -474,15 +485,14 @@ export function App() {
     }
     const ordered = reorderAtTarget(items.map((item) => item.id), draggedId, targetId, position);
     endDrag();
-    await repository.reorderItems(currentProject.id, ordered);
-    await reload();
+    await repository.moveItem(currentProject.id, draggedId, ordered);
   }
 
   async function requestMerge(sourceId: string, targetId: string) {
     const source = items.find((item) => item.id === sourceId);
     const target = items.find((item) => item.id === targetId);
     if (!source || !target) return;
-    if (source.image) {
+    if (source.image || source.imageId) {
       setNotice("Image cards cannot be merged because the image would be lost");
       window.setTimeout(() => setNotice(""), 3000);
       return;
@@ -499,7 +509,6 @@ export function App() {
     await repository.mergeItems(sourceId, targetId);
     setPendingMerge(null);
     setSelectedCardId(targetId);
-    await reload();
     setFocusRequest({ id: targetId, startEditing: false });
   }
 
@@ -529,9 +538,8 @@ export function App() {
     if (!targetId) return;
     const position: DropPosition = direction === -1 ? "before" : "after";
     const ordered = reorderAtTarget(items.map((item) => item.id), itemId, targetId, position);
-    await repository.reorderItems(currentProject.id, ordered);
+    await repository.moveItem(currentProject.id, itemId, ordered);
     setSelectedCardId(itemId);
-    await reload();
     setFocusRequest({ id: itemId, startEditing: false });
   }
 
@@ -565,7 +573,6 @@ export function App() {
       } : {})
     });
     setSelectedCardId(created.id);
-    await reload();
     setFocusRequest({ id: created.id, startEditing: false });
   }
 
@@ -639,6 +646,7 @@ export function App() {
         {showBefore && <DropPlaceholder targetId={item.id} position="before" />}
         <Card
           item={item}
+          getImage={repository.getImage}
           pendingStatus={pendingStatuses[item.id] ?? item.status}
           template={currentProject.template}
           onUpdate={updateItem}
@@ -676,7 +684,7 @@ export function App() {
     );
   }
 
-  if (!state) return <main className="app" style={{ fontSize: `${uiScale}rem` }}><p className="muted">Loading board…</p></main>;
+  if (!boardReady) return <main className="app" style={{ fontSize: `${uiScale}rem` }}><p className="muted">Loading board…</p></main>;
 
   return (
     <main className="app" style={{ fontSize: `${uiScale}rem` }}>
@@ -720,9 +728,9 @@ export function App() {
                 aria-label="Project name"
               />
             </form>
-          ) : state.projects.length && currentProject ? (
+          ) : projects.length && currentProject ? (
             <ProjectPicker
-              projects={state.projects}
+              projects={projects}
               currentProjectId={currentProject.id}
               onSelect={async (projectId) => {
                 const leavingProjectId = currentProject.id;
@@ -733,11 +741,9 @@ export function App() {
                 setRenamingProject(false);
                 void requestProjectSync(leavingProjectId);
                 await repository.selectProject(projectId);
-                await reload();
               }}
               onReorder={async (orderedIds) => {
                 await repository.reorderProjects(orderedIds);
-                await reload();
               }}
             />
           ) : <h1>Your project state</h1>}

@@ -3,6 +3,7 @@ import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/bo
 import { nextCardDisplayMode, normalizeCardDisplayMode } from "../../cardDisplayModes";
 import { statusClassName } from "../../statuses";
 import { type BoardItem, type BoardItemStatus, type BoardTemplate } from "../../types";
+import type { StoredBlob } from "../../storage/blobStore";
 import { stepCardType, stepStatus } from "../cardCycle";
 import { cardTextForClipboard } from "../cardText";
 import { toSafeWebHref } from "../linkify";
@@ -16,6 +17,7 @@ import { StatusPicker } from "./StatusPicker";
 
 type Props = {
   item: BoardItem;
+  getImage?: (imageId: string) => Promise<StoredBlob | null>;
   pendingStatus: BoardItemStatus;
   template: BoardTemplate;
   onUpdate: (itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>, afterSave?: "focus" | "insert") => Promise<void>;
@@ -84,11 +86,13 @@ function ensureCardVisible(card: HTMLElement | null) {
   window.scrollTo({ top: target, behavior: "smooth" });
 }
 
-export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
+export function Card({ item, getImage, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);
   const [copied, setCopied] = useState(false);
+  const [blobImageUrl, setBlobImageUrl] = useState<string | null>(null);
+  const [imageMissing, setImageMissing] = useState(false);
     const cardRef = useRef<HTMLElement>(null);
   const pointerDragRef = useRef<PointerDragSession | null>(null);
   const suppressClickRef = useRef(false);
@@ -110,6 +114,22 @@ export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, 
       setContent(item.content);
     }
   }, [editing, item.content, item.title]);
+
+  useEffect(() => {
+    if (!item.imageId) { setBlobImageUrl(null); setImageMissing(false); return; }
+    if (!getImage) { setImageMissing(true); return; }
+    let active = true;
+    let objectUrl: string | null = null;
+    setBlobImageUrl(null);
+    setImageMissing(false);
+    void getImage(item.imageId).then((entry) => {
+      if (!active) return;
+      if (!entry) { setImageMissing(true); return; }
+      objectUrl = URL.createObjectURL(entry.blob);
+      setBlobImageUrl(objectUrl);
+    }).catch(() => { if (active) setImageMissing(true); });
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [item.imageId, getImage]);
 
   useEffect(() => {
     if (!focusRequested || editing) return;
@@ -267,7 +287,7 @@ export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, 
 
   function cancelEditing() {
     const hasLetter = (value: string | undefined) => value ? /\p{L}/u.test(value) : false;
-    const isEmptyPersistedCard = !item.image && !hasLetter(item.title) && !hasLetter(item.content);
+    const isEmptyPersistedCard = !item.image && !item.imageId && !hasLetter(item.title) && !hasLetter(item.content);
     setTitle(item.title ?? "");
     setContent(item.content);
     setEditing(false);
@@ -353,6 +373,21 @@ export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, 
         else onInsertAfter(item.id);
       }}
       onKeyDown={(event) => {
+        if (editing && event.key === "Tab" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+          const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>(
+            "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], [tabindex]:not([tabindex='-1'])"
+          )];
+          if (focusable.length > 0) {
+            event.preventDefault();
+            const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+            const direction = event.shiftKey ? -1 : 1;
+            const nextIndex = currentIndex === -1
+              ? (event.shiftKey ? focusable.length - 1 : 0)
+              : (currentIndex + direction + focusable.length) % focusable.length;
+            focusable[nextIndex].focus();
+          }
+          return;
+        }
         if (editing || event.target !== event.currentTarget) return;
         if (event.key === "Enter") {
           event.preventDefault();
@@ -424,16 +459,17 @@ export function Card({ item, pendingStatus, template, onUpdate, onStatusChange, 
       ) : (
         <>
           {hasTitle && <h3><MarkdownInline text={item.title!} /></h3>}
-          {item.image && (
+          {(item.image?.dataUrl || blobImageUrl) && (
             <img
               className="card-image"
-              src={item.image.dataUrl}
-              width={item.image.width}
-              height={item.image.height}
+              src={blobImageUrl ?? item.image?.dataUrl}
+              width={item.imageWidth ?? item.image?.width}
+              height={item.imageHeight ?? item.image?.height}
               alt={item.title || item.content || "Board image"}
               draggable={false}
             />
           )}
+          {item.imageId && !blobImageUrl && <div className="muted" role="status">{imageMissing ? "Image unavailable" : "Loading image…"}</div>}
           <MarkdownContent text={content} onTaskToggle={toggleTask} />
           <div className="card-actions" onDoubleClick={(event) => event.stopPropagation()}>
             {sourceHref && (

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BoardItem, BoardItemStatus } from "../src/types";
-import { focusTargetAfterStatusMove } from "../src/sidebar/statusFocus";
+import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "../src/sidebar/statusFocus";
 
 function item(id: string, status: BoardItemStatus, order: number): BoardItem {
   return {
@@ -33,5 +33,11 @@ describe("focus after a status move", () => {
 
   it("keeps focus on the card for a status change within the same container", () => {
     expect(focusTargetAfterStatusMove(items, "middle", "started", "confirmed")).toBe("middle");
+  });
+
+  it("does not pull focus back after keyboard navigation during a pending status save", () => {
+    expect(shouldRestoreStatusFocus("middle", "last")).toBe(false);
+    expect(shouldRestoreStatusFocus("middle", null)).toBe(false);
+    expect(shouldRestoreStatusFocus("middle", "middle")).toBe(true);
   });
 });

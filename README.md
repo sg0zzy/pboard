@@ -29,6 +29,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
 - Double-click a card to edit it; save with Enter or another double-click, and copy its text (tagged by category and status, e.g., `[issue] [confirmed]`) with the overlapping-sheets copy action.
 - Use Ctrl+Enter while editing to save without arming the follow-up Enter shortcut that creates a card below; Command+Enter is the macOS equivalent.
+- While editing a card, Tab and Shift+Tab cycle through its controls and text fields without leaving the card.
 - Cancel card editing with Escape while keeping that card selected for continued keyboard navigation.
 - Add a new card with Enter or a double-click; use Shift+Enter for multiline text.
 - Keep entering points continuously: after each save the empty Add Card editor retains focus for the next card.

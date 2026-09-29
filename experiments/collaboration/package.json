@@ -1,0 +1,14 @@
+{
+  "name": "pboard-collaboration-experiment",
+  "private": true,
+  "type": "module",
+  "description": "Isolated RxDB storage experiment; not used by the extension",
+  "scripts": {
+    "bench": "node rxdb-bench.mjs"
+  },
+  "dependencies": {
+    "dexie": "^4.0.0",
+    "fake-indexeddb": "^6.0.0",
+    "rxdb": "^17.0.0"
+  }
+}

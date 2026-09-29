@@ -146,3 +146,45 @@ export function createProjectSnapshotStore(storage: KeyValueStorage) {
 }
 
 export type ProjectSnapshotStore = ReturnType<typeof createProjectSnapshotStore>;
+
+/** Keeps Drive's v1 wire format while RxDB stores cards/blobs separately. */
+export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getRx: () => Promise<import("../storage/rxdbRepository").RxRepository | null>): ProjectSnapshotStore {
+  const legacy = createProjectSnapshotStore(storage);
+  async function read(projectId: string): Promise<ProjectSnapshot> {
+    const rx = await getRx();
+    if (!rx) return legacy.read(projectId);
+    const { project, items } = await rx.exportProject(projectId);
+    return deserializeProjectSnapshot(serializeProjectSnapshot(project, items));
+  }
+  async function list(): Promise<ProjectSnapshot[]> {
+    const rx = await getRx();
+    if (!rx) return legacy.list();
+    return Promise.all((await rx.listProjects()).map((project) => read(project.id)));
+  }
+  async function apply(snapshot: ProjectSnapshot, canApply?: SnapshotApplyGuard): Promise<boolean> {
+    const rx = await getRx();
+    if (!rx) return legacy.apply(snapshot, canApply);
+    if (canApply && !(await canApply())) return false;
+    await rx.importProject(snapshot.project, snapshot.items);
+    return true;
+  }
+  async function applyIfNewer(snapshot: ProjectSnapshot, canApply?: SnapshotApplyGuard): Promise<SnapshotApplyResult> {
+    const rx = await getRx();
+    if (!rx) return legacy.applyIfNewer(snapshot, canApply);
+    if (canApply && !(await canApply())) return "blocked";
+    const local = await rx.getProject(snapshot.project.id);
+    if (local) {
+      const comparison = compareProjectTimestamps(snapshot.project, local);
+      if (comparison < 0) return "local-newer";
+      if (comparison === 0) return "equal";
+    }
+    await rx.importProject(snapshot.project, snapshot.items);
+    return "applied";
+  }
+  async function remove(projectId: string) {
+    const rx = await getRx();
+    if (!rx) return legacy.remove(projectId);
+    await rx.removeProject(projectId);
+  }
+  return { read, list, apply, applyIfNewer, remove };
+}

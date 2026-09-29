@@ -5,6 +5,10 @@ function statusContainer(status: BoardItemStatus): "active" | "rejected" | "done
   return "active";
 }
 
+export function shouldRestoreStatusFocus(itemId: string, selectedCardId: string | null): boolean {
+  return selectedCardId === itemId;
+}
+
 export function focusTargetAfterStatusMove(
   items: BoardItem[],
   itemId: string,

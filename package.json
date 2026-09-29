@@ -18,14 +18,18 @@
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build"
   },
   "dependencies": {
+    "dexie": "^4.4.6",
+    "fractional-indexing": "^3.4.0",
     "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "react-dom": "^19.3.0",
+    "rxdb": "^17.5.0"
   },
   "devDependencies": {
     "@types/firefox-webext-browser": "^143.0.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.0",

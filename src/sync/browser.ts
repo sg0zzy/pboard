@@ -3,10 +3,11 @@ import { createDriveTransport } from "./driveTransport";
 import { createGoogleAuthProvider } from "./googleAuth";
 import { createChromiumGoogleAuthProvider } from "./googleChromeAuth";
 import { createGoogleDriveProvider } from "./googleDriveProvider";
-import { createProjectSnapshotStore } from "./snapshot";
+import { createBackendProjectSnapshotStore } from "./snapshot";
 import { createDriveSyncStateStore, createDriveTombstoneStore } from "./state";
 import { toFirefoxLoopbackRedirect } from "./redirectUri";
 import { googleDriveConfig, type GoogleDriveBrowser, type GoogleDriveStage } from "./googleDriveConfig";
+import type { RxRepository } from "../storage/rxdbRepository";
 
 const extensionOrigin = browser.runtime.getURL("");
 const isFirefox = extensionOrigin.startsWith("moz-extension://");
@@ -36,7 +37,11 @@ export const googleAuth = isFirefox
       clientId: GOOGLE_DRIVE_CLIENT_ID,
       identity: browser.identity
     });
-export const projectSnapshots = createProjectSnapshotStore(browser.storage.local);
+let rxRepositoryResolver: () => Promise<RxRepository | null> = async () => null;
+export function registerRxRepositoryResolver(resolver: () => Promise<RxRepository | null>) {
+  rxRepositoryResolver = resolver;
+}
+export const projectSnapshots = createBackendProjectSnapshotStore(browser.storage.local, () => rxRepositoryResolver());
 export const driveTransport = createDriveTransport(googleAuth);
 export const googleDrive = createGoogleDriveProvider({
   auth: googleAuth,
