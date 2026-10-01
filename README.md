@@ -1,3 +1,5 @@
+Licensed under the GNU General Public License v3.0. See LICENSE
+
 # Pboard
 
 Pboard is a local-first Firefox and Chromium extension that keeps the current state of a project alongside AI conversations and ordinary web research. Conversations remain the place for exploration; Pboard stores the goals, ideas, decisions, constraints, questions, risks, references, and notes that still matter.
