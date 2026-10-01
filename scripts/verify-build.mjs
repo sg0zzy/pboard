@@ -25,8 +25,14 @@ async function verifyVariant(directory, manifest, kind) {
   }
 
   if (kind === "firefox") {
-    if (!manifest.sidebar_action || !manifest.background?.scripts || manifest.side_panel) {
-      throw new Error("Firefox build does not have the expected sidebar/background manifest");
+    if (
+      !manifest.sidebar_action ||
+      !manifest.action ||
+      !manifest.background?.scripts ||
+      !manifest.commands?.["_execute_sidebar_action"] ||
+      manifest.side_panel
+    ) {
+      throw new Error("Firefox build does not have the expected sidebar/action/background manifest");
     }
   } else if (!manifest.side_panel || !manifest.action || !manifest.background?.service_worker || manifest.sidebar_action) {
     throw new Error("Chromium build does not have the expected side_panel/service-worker manifest");

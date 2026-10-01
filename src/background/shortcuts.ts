@@ -2,6 +2,8 @@ export const PIN_SELECTION_COMMAND = "pin-selection-to-pboard";
 export const PIN_PAGE_COMMAND = "pin-page-to-pboard";
 export const PIN_SELECTION_SHORTCUT = "Alt+Shift+C";
 export const PIN_PAGE_SHORTCUT = "Alt+Shift+W";
+export const OPEN_PBOARD_COMMAND = "_execute_sidebar_action";
+export const OPEN_PBOARD_SHORTCUT = "Alt+Shift+P";
 
 export function firstSelectedText(results: Array<{ result?: unknown }>): string | undefined {
   for (const { result } of results) {

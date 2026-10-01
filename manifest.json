@@ -24,6 +24,10 @@
     "default_icon": "icons/pin.svg",
     "show_matches": ["http://*/*", "https://*/*"]
   },
+  "action": {
+    "default_title": "Open Pboard",
+    "default_icon": "icons/pin.svg"
+  },
   "content_scripts": [
     {
       "matches": [
@@ -46,6 +50,12 @@
         "default": "Alt+Shift+W"
       },
       "description": "Pin the current web page to Pboard"
+    },
+    "_execute_sidebar_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+P"
+      },
+      "description": "Open the Pboard sidebar"
     }
   },
   "browser_specific_settings": {

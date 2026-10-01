@@ -15,6 +15,7 @@ import {
 import { firstCaptureImageRegion, findContextImage } from "./regionCapture";
 import { capturePageRegion, type PageCaptureApi } from "./pageCapture";
 import { getToolbarPinContext, pinFromToolbar, type PinApi } from "./toolbarPins";
+import { togglePboardSidebar } from "./sidebar";
 import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
 
@@ -30,6 +31,12 @@ registerDriveBackgroundSync();
 
 if (browser.sidePanel?.setPanelBehavior) {
   void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+}
+
+if (browser.sidebarAction && browser.action?.onClicked) {
+  browser.action.onClicked.addListener(() => {
+    void togglePboardSidebar(browser);
+  });
 }
 
 async function registerMenus() {
