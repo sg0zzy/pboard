@@ -1,7 +1,18 @@
 import type { KeyValueStorage } from "../storage/repository";
 import { DRIVE_AUTH_STORAGE_KEY } from "./state";
 
-export const DRIVE_APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+/**
+ * Both scopes are requested together:
+ *  - `drive.appdata` — the private per-user sync path (app-data folder), unchanged.
+ *  - `drive.file` — required to create **visible** shared files and manage their
+ *    permissions (the collaboration ACL).
+ * `drive.appdata` alone cannot create or share visible files, and `drive.file` alone
+ * cannot reach the app-data folder, so both must be granted.
+ */
+export const DRIVE_SCOPE = [
+  "https://www.googleapis.com/auth/drive.appdata",
+  "https://www.googleapis.com/auth/drive.file"
+].join(" ");
 const AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke";
@@ -122,7 +133,7 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       client_id: options.clientId,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: DRIVE_APPDATA_SCOPE,
+      scope: DRIVE_SCOPE,
       code_challenge: challenge,
       code_challenge_method: "S256",
       access_type: "offline",

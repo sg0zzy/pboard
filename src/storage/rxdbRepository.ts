@@ -3,6 +3,7 @@ import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
 import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
+import type { CollaborationRole } from "../collab/manager";
 import { blobToDataUrl, createIndexedDbBlobStore, imageToBlob, type BlobStore } from "./blobStore";
 import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
@@ -31,6 +32,15 @@ export async function createRxRepository(options: {
   blobs?: BlobStore;
   events?: RepositoryEvents;
   storage?: ReturnType<typeof getRxStorageDexie>;
+  /**
+   * Collaboration write-gate. When the caller is a Viewer of the active shared
+   * project, board/project mutations are rejected at the storage layer so no
+   * local write can exist to be replicated. WebRTC picks master/slave by token
+   * hash, not role, and the master streams its change log unconditionally, so a
+   * viewer that is the master would otherwise leak its local writes to peers.
+   * The push modifier alone does not cover that path; this gate does.
+   */
+  mutatorRole?: CollaborationRole;
 } = {}) {
   const db: RxDatabase<RxCollections> = await createRxDatabase<RxCollections>({
     name: options.name ?? "pboardlocalv1",
@@ -48,6 +58,26 @@ export async function createRxRepository(options: {
     return run;
   }
   async function changed(projectId: string) { await events.projectChanged?.(projectId); }
+  /**
+   * Per-project collaboration write-gate. Set by the collaboration manager when
+   * it starts a shared project: "viewer" means the caller has read-only Drive
+   * access. The gate rejects per-project content mutations for viewers so no
+   * local write can exist to be replicated. WebRTC picks master/slave by token
+   * hash, not role, and the master streams its change log unconditionally — so
+   * a viewer that is the master would otherwise leak its local writes to peers.
+   * The replication push modifier only covers the slave→master path; this gate
+   * is the authoritative enforcement the spec requires.
+   */
+  const mutatorRoles = new Map<string, CollaborationRole>();
+  function setMutatorRole(projectId: string, role: CollaborationRole | null) {
+    if (role === null) mutatorRoles.delete(projectId);
+    else mutatorRoles.set(projectId, role);
+  }
+  function assertCanMutate(projectId: string) {
+    if (mutatorRoles.get(projectId) === "viewer") {
+      throw new Error("You have view-only access to this shared project");
+    }
+  }
   async function touchProject(projectId: string, timestamp = now(), appendedKey?: string) {
     const project = await projects.findOne(projectId).exec();
     if (!project) return;
@@ -190,6 +220,7 @@ export async function createRxRepository(options: {
     if (!trimmed) throw new Error("Project name is required");
     const doc = await projects.findOne(projectId).exec();
     if (!doc) throw new Error("Project not found");
+    assertCanMutate(projectId);
     if (doc.name === trimmed) return;
     await doc.incrementalPatch({ name: trimmed });
     await touchProject(projectId);
@@ -198,6 +229,7 @@ export async function createRxRepository(options: {
   async function deleteProject(projectId: string) { return locked(async () => {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) return;
+    assertCanMutate(projectId);
     await events.projectDeleting?.(projectValue(doc.toJSON()));
     for (const card of await projectCardRecords(projectId)) {
       await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
@@ -211,6 +243,7 @@ export async function createRxRepository(options: {
   async function changeProjectTemplate(projectId: string, template: BoardTemplate): Promise<number> { return locked(async () => {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) throw new Error("Project not found");
+    assertCanMutate(projectId);
     if (doc.template === template) return 0;
     let remapped = 0;
     const timestamp = now();
@@ -227,6 +260,7 @@ export async function createRxRepository(options: {
     const projectDoc = await projects.findOne(input.projectId).exec();
     if (!projectDoc) throw new Error("Project not found");
     const project = projectValue(projectDoc.toJSON());
+    assertCanMutate(input.projectId);
     let beforeKey: string | null = null;
     let afterKey: string | null = null;
     if (input.afterItemId) {
@@ -268,6 +302,7 @@ export async function createRxRepository(options: {
   async function updateItem(itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>) { return locked(async () => {
     const doc = await cards.findOne(itemId).exec();
     if (!doc || doc.deletedAt) throw new Error("Card not found");
+    assertCanMutate(doc.projectId);
     const project = await getProject(doc.projectId);
     if (patch.type && project && !isTypeSupported(project.template, patch.type)) throw new Error("Card type is not supported by this board template");
     const changedFields = Object.entries(patch).filter(([key, value]) => doc.get(key as keyof CardRecord) !== value);
@@ -280,11 +315,13 @@ export async function createRxRepository(options: {
   async function deleteItem(itemId: string) { return locked(async () => {
     const doc = await cards.findOne(itemId).exec();
     if (!doc || doc.deletedAt) return;
+    assertCanMutate(doc.projectId);
     await doc.incrementalPatch({ deletedAt: now() });
     await touchProject(doc.projectId);
     await changed(doc.projectId);
   }); }
   async function emptyTrash(projectId: string): Promise<number> { return locked(async () => {
+    assertCanMutate(projectId);
     const trash = (await projectCardRecords(projectId)).filter((item) => item.status === "trash");
     for (const item of trash) await (await cards.findOne(item.id).exec())?.incrementalPatch({ deletedAt: now() });
     if (trash.length) { await touchProject(projectId); await changed(projectId); }
@@ -293,6 +330,7 @@ export async function createRxRepository(options: {
   async function duplicateItem(itemId: string): Promise<BoardItem> { return locked(async () => {
     const source = await cards.findOne(itemId).exec();
     if (!source || source.deletedAt) throw new Error("Card not found");
+    assertCanMutate(source.projectId);
     const ordered = await projectCardRecords(source.projectId);
     const index = ordered.findIndex((item) => item.id === itemId);
     const timestamp = now();
@@ -309,6 +347,7 @@ export async function createRxRepository(options: {
     const target = await cards.findOne(targetId).exec();
     if (!source || !target || source.deletedAt || target.deletedAt) throw new Error("Card not found");
     if (source.projectId !== target.projectId) throw new Error("Cards must belong to the same project");
+    assertCanMutate(source.projectId);
     if (source.imageId) throw new Error("Image cards cannot be merged without losing the image");
     const appended = [source.title?.trim(), source.content.trim()].filter(Boolean).join("\n");
     const timestamp = now();
@@ -318,6 +357,7 @@ export async function createRxRepository(options: {
     await changed(source.projectId);
   }); }
   async function reorderItems(projectId: string, orderedIds: string[]) { return locked(async () => {
+    assertCanMutate(projectId);
     const current = await projectCardRecords(projectId);
     const requested = new Set(orderedIds);
     if (orderedIds.length !== current.length || requested.size !== current.length || current.some((item) => !requested.has(item.id))) throw new Error("Reorder list must contain every project card exactly once");
@@ -353,6 +393,7 @@ export async function createRxRepository(options: {
     await touchProject(projectId, now(), keys.at(-1)); await changed(projectId);
   }); }
   async function moveItem(projectId: string, itemId: string, orderedIds: string[]) { return locked(async () => {
+    assertCanMutate(projectId);
     const position = orderedIds.indexOf(itemId);
     if (position < 0 || orderedIds.lastIndexOf(itemId) !== position) throw new Error("Moved card must occur exactly once");
     const item = await cards.findOne(itemId).exec();
@@ -369,6 +410,7 @@ export async function createRxRepository(options: {
     await changed(projectId);
   }); }
   async function rebalanceProject(projectId: string) { return locked(async () => {
+    assertCanMutate(projectId);
     const ranked = rebalanceOrderKeys(await projectCardRecords(projectId));
     for (const [id, orderKey] of ranked) await (await cards.findOne(id).exec())?.incrementalPatch({ orderKey });
     const project = await projects.findOne(projectId).exec();
@@ -400,7 +442,7 @@ export async function createRxRepository(options: {
     subscribe(cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }), () => listCards(projectId), listener);
   const subscribeCard = (id: string, listener: (value: BoardItem | null) => void) => subscribe(cards.findOne(id), () => getCard(id), listener);
   async function load(): Promise<AppState> { return exportAll(); } // Compatibility for old command callers; not a reactive read path.
-  return { db, blobs, load, exportAll, exportProject, importProject, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete,
+  return { db, blobs, load, exportAll, exportProject, importProject, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
     createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,

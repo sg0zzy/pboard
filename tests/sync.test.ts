@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { KeyValueStorage } from "../src/storage/repository";
-import { createGoogleAuthProvider, DRIVE_APPDATA_SCOPE } from "../src/sync/googleAuth";
+import { createGoogleAuthProvider, DRIVE_SCOPE } from "../src/sync/googleAuth";
 import { createChromiumGoogleAuthProvider } from "../src/sync/googleChromeAuth";
 import { createDriveTransport } from "../src/sync/driveTransport";
 import { createGoogleDriveProvider } from "../src/sync/googleDriveProvider";
@@ -76,7 +76,7 @@ describe("project snapshots", () => {
 });
 
 describe("Google OAuth", () => {
-  it("uses PKCE, account selection, and only the Drive app-data scope", async () => {
+  it("uses PKCE, account selection, and the Drive app-data + drive.file scopes", async () => {
     const storage = new MemoryStorage();
     let authorizationUrl = "";
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -106,7 +106,7 @@ describe("Google OAuth", () => {
 
     const params = new URL(authorizationUrl).searchParams;
     expect(params.get("prompt")).toBe("select_account");
-    expect(params.get("scope")).toBe(DRIVE_APPDATA_SCOPE);
+    expect(params.get("scope")).toBe(DRIVE_SCOPE);
     expect(params.get("code_challenge_method")).toBe("S256");
     expect(params.get("code_challenge")).toBeTruthy();
     expect((fetchMock.mock.calls[0][1]?.body as URLSearchParams).get("client_secret")).toBe("desktop-secret");
