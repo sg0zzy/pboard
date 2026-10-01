@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
 import { repository, RXDB_MIGRATION_ERROR_KEY } from "../storage/browser";
@@ -12,6 +12,8 @@ import {
   type BoardTemplate
 } from "../types";
 import { Card } from "./components/Card";
+import { dedupe } from "./minWidth";
+import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
 import { CopyIcon } from "./components/CopyIcon";
 import { CaptureToolbar } from "./components/CaptureToolbar";
@@ -49,6 +51,30 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
   const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const activeTemplate = currentProject ? boardTemplates[currentProject.template] : undefined;
+  const knownTypeIds = useMemo(
+    () => new Set(activeTemplate?.cardTypes?.map((cardType) => cardType.id) ?? []),
+    [activeTemplate]
+  );
+  const legacyTypeLabels = useMemo<string[]>(
+    () =>
+      dedupe(
+        items
+          .filter((item) => item.projectId === currentProject?.id)
+          .map((item) => item.type)
+          .filter((type) => !knownTypeIds.has(type))
+      ),
+    [items, knownTypeIds]
+  );
+  const sourceProviders = useMemo<string[]>(
+    () =>
+      dedupe(
+        items
+          .filter((item) => item.projectId === currentProject?.id)
+          .map((item) => item.source?.provider ?? "")
+      ).filter(Boolean),
+    [items, currentProject]
+  );
   const selectedCardIdRef = useRef<string | null>(null);
   const [focusRequest, setFocusRequest] = useState<{ id: string; startEditing: boolean } | null>(null);
   const [imageDropActive, setImageDropActive] = useState(false);
@@ -688,6 +714,14 @@ export function App() {
 
   return (
     <main className="app" style={{ fontSize: `${uiScale}rem` }}>
+      {currentProject && (
+        <MinWidthMeasurer
+          template={currentProject.template}
+          uiScale={uiScale}
+          legacyTypeLabels={legacyTypeLabels}
+          sourceProviders={sourceProviders}
+        />
+      )}
       <header>
         <div className="app-title-row">
           <p className="eyebrow">Pboard</p>

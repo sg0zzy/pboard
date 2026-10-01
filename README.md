@@ -55,6 +55,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current board as a clean, structured prompt: ongoing cards in their board order, then Done cards, then Rejected cards. Trash is excluded; every exported card carries its category and status tags (e.g., `[issue] [confirmed]`).
 - Persist all state in `browser.storage.local` across Firefox restarts.
+- Reopen the Pboard sidebar from Firefox's toolbar button or `Alt+Shift+P`, even after it has been closed or replaced by another sidebar such as Bookmarks.
 
 ## Architecture
 
@@ -93,7 +94,7 @@ Google Drive support requires separate OAuth clients for Chromium and Firefox. T
 
 The integration requests only `https://www.googleapis.com/auth/drive.appdata` and explicitly shows Google's account selector. Access/refresh token state stays in extension-local storage. Project content continues to save locally first; Drive writes run asynchronously after manual sync, project switching, a debounced visibility loss, or about 25 seconds of dirty idle time. A Drive failure never rolls back local data.
 
-The Firefox build uses the native `sidebar_action` and Firefox page action. The Chromium build uses the MV3 `side_panel` and `action` APIs. Shared code goes through `src/platform/browser.ts`, which normalizes the runtime namespace and context-menu namespace.
+The Firefox build uses the native `sidebar_action`, a toolbar `action` that opens the Pboard sidebar, and the Firefox page action. The Chromium build uses the MV3 `side_panel` and `action` APIs. Shared code goes through `src/platform/browser.ts`, which normalizes the runtime namespace and context-menu namespace.
 
 ## Develop and build
 
@@ -126,7 +127,7 @@ The development page can render the UI, but WebExtension storage APIs are availa
 5. Open the extension sidebar from **View → Sidebar → Pboard** (or Firefox's sidebar picker).
 6. Create a project, open any web page, select text, right-click, and choose **Pin selection to Pboard**.
 
-The default shortcuts are `Alt+Shift+C` for capturing selected text and `Alt+Shift+W` for the current page. They can be reassigned from Firefox's **Manage Extension Shortcuts** screen.
+The default shortcuts are `Alt+Shift+C` for capturing selected text, `Alt+Shift+W` for the current page, and `Alt+Shift+P` to open the Pboard sidebar. They can be reassigned from Firefox's **Manage Extension Shortcuts** screen.
 
 Temporary add-ons are removed when Firefox restarts. Reload the add-on from the same debugging page after rebuilding.
 
