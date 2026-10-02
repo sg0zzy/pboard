@@ -3,11 +3,13 @@ import { createDriveTransport } from "./driveTransport";
 import { createGoogleAuthProvider } from "./googleAuth";
 import { createChromiumGoogleAuthProvider } from "./googleChromeAuth";
 import { createGoogleDriveProvider } from "./googleDriveProvider";
-import { createBackendProjectSnapshotStore, serializeProjectSnapshot } from "./snapshot";
+import { createBackendProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "./snapshot";
 import { createDriveSyncStateStore, createDriveTombstoneStore } from "./state";
 import { toFirefoxLoopbackRedirect } from "./redirectUri";
 import { googleDriveConfig, type GoogleDriveBrowser, type GoogleDriveStage } from "./googleDriveConfig";
-import { createDrivePermissionTransport, createDrivePermissionService, type DrivePermissionService, type DriveSharedProjectRecord, type DriveSharedProjectStore } from "./drivePermissions";
+import { createDrivePermissionTransport, createDrivePermissionService, createDriveSignalStore, type DrivePermissionService, type DriveSharedProjectRecord, type DriveSharedProjectStore } from "./drivePermissions";
+import { createCollaborationManager } from "../collab/manager";
+import { createDriveSignaling, createMemorySignalingScope } from "../collab/signaling";
 import type { KeyValueStorage } from "../storage/repository";
 import type { RxRepository } from "../storage/rxdbRepository";
 const extensionOrigin = browser.runtime.getURL("");
@@ -88,8 +90,9 @@ function createSharedProjectStore(storage: KeyValueStorage): DriveSharedProjectS
 
 export const sharedProjects = createSharedProjectStore(browser.storage.local);
 
+const permissionTransport = createDrivePermissionTransport(googleAuth);
 export const drivePermissions = createDrivePermissionService({
-  transport: createDrivePermissionTransport(googleAuth),
+  transport: permissionTransport,
   sharedProjects,
   readSnapshot: async (projectId) => {
     const rx = await rxRepositoryResolver();
@@ -98,3 +101,88 @@ export const drivePermissions = createDrivePermissionService({
     return serializeProjectSnapshot(project, items);
   }
 });
+
+/**
+ * One stable peer id per session/tab. Each tab gets its own signaling file in
+ * the shared project's realtime/ folder, so concurrent tabs never write the
+ * same file. A reloaded tab gets a fresh id; the old id's file goes stale past
+ * the presence TTL and is filtered out of the roster.
+ */
+const sessionPeerId = crypto.randomUUID();
+
+/** `pboard-collab-<projectId>-<collection>` → the project it belongs to. */
+const TOPIC_REGEX = /^pboard-collab-(.+)-(cards|projects)$/;
+function parseCollabTopic(
+  topic: string,
+): { projectId: string; collection: "cards" | "projects" } | null {
+  const match = TOPIC_REGEX.exec(topic);
+  if (!match) return null;
+  return { projectId: match[1], collection: match[2] as "cards" | "projects" };
+}
+
+const collaborationManager = createCollaborationManager({
+  myRole: (projectId) => drivePermissions.myRole(projectId),
+  getSharedFileId: (projectId) => drivePermissions.projectFileId(projectId),
+  bootstrapFromDrive: async (projectId) => {
+    const rx = await rxRepositoryResolver();
+    if (!rx) return false;
+    try {
+      const { project, items } = deserializeProjectSnapshot(await drivePermissions.readSharedSnapshot(projectId));
+      await rx.importProject(project, items);
+      return true;
+    } catch {
+      // No (valid) shared snapshot yet, or Drive unavailable. Nothing to import;
+      // live replication still pulls whatever the owner has published.
+      return false;
+    }
+  },
+  signalingFor: (topic) => {
+    const parsed = parseCollabTopic(topic);
+    if (!parsed) {
+      // A topic we don't recognize joins an inert in-process room instead of
+      // hitting Drive. The manager only ever passes well-formed topics, so this
+      // is purely defensive.
+      return createMemorySignalingScope().create(topic);
+    }
+    return createDriveSignaling({
+      store: createDriveSignalStore({
+        transport: permissionTransport,
+        sharedProjects,
+        projectId: parsed.projectId,
+        peerId: sessionPeerId,
+        topic,
+        realtimeFolderId: () => drivePermissions.realtimeFolderId(parsed.projectId),
+      }),
+    });
+  },
+  getRepository: rxRepositoryResolver,
+});
+
+export { collaborationManager };
+
+/**
+ * Imports any shared project this account can access (discovered from Drive) that
+ * has no local copy yet, so shared projects appear in the project picker. Safe
+ * to call on every load; only missing projects are imported. Returns the ids
+ * that were imported.
+ */
+export async function loadSharedProjects(): Promise<string[]> {
+  const rx = await rxRepositoryResolver();
+  if (!rx) return [];
+  const imported: string[] = [];
+  for (const entry of await drivePermissions.discoverSharedProjects()) {
+    const existing = await rx.getProject(entry.projectId);
+    if (existing) continue;
+    try {
+      const { project, items } = deserializeProjectSnapshot(
+        await drivePermissions.readSharedSnapshot(entry.projectId),
+      );
+      await rx.importProject(project, items);
+      imported.push(entry.projectId);
+    } catch {
+      // A project whose snapshot can't be bootstrapped is skipped rather than
+      // failing the whole batch.
+    }
+  }
+  return imported;
+}

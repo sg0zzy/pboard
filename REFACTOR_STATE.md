@@ -101,11 +101,16 @@ Core collaboration layer is **built and unit-tested in isolation**:
   Drive-backed `PboardDriveSignalStore`.
 - `src/storage/rxdbRepository.ts` — viewer write-gate (`mutatorRole`,
   `setMutatorRole`, `assertCanMutate` on all content mutations).
-- `src/sync/browser.ts` — exports `sharedProjects` (local `DriveSharedProjectStore`)
-  and `drivePermissions` (`createDrivePermissionService` wired to the transport +
-  a `readSnapshot` that exports the RxDB project and serializes it).
+- `src/sync/browser.ts` — exports `sharedProjects` (local `DriveSharedProjectStore`),
+  `drivePermissions` (`createDrivePermissionService` wired to the transport + a
+  `readSnapshot` that exports the RxDB project and serializes it), the module-level
+  `collaborationManager` singleton (`myRole`, `getSharedFileId`, `bootstrapFromDrive`,
+  `signalingFor`, `getRepository`), `sessionPeerId`, `parseCollabTopic`, and
+  `loadSharedProjects` (imports only missing shared projects).
 - `src/sync/googleAuth.ts` — `DRIVE_SCOPE` (appdata + drive.file).
 - `tests/collaborationManager.test.ts` — manager start/stop/role/gate tests.
+- `tests/browserCollaboration.test.ts` — browser-layer wiring tests (`loadSharedProjects`
+  import/skip behavior + `collaborationManager` API).
 - `tests/sync.test.ts` — scope assertion updated to the new two-scope set.
 - `docs/collaboration.md` — architecture doc (sharing, permissions, signaling,
   offline/reconnect, security, testing).
@@ -122,35 +127,32 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 - Drive-backed + memory + WebSocket signaling. ✅
 - Isolated unit tests for the manager. ✅
 - Architecture documentation. ✅
+- Browser-layer wiring (`src/sync/browser.ts`) + wiring test
+  (`tests/browserCollaboration.test.ts`). ✅
 
 ---
 
 # Current state
 
-- Immediately before this checkpoint I was **planning the app-layer wiring**
-  (manager singleton + `bootstrapFromDrive` + `signalingFor` factory in
-  `src/sync/browser.ts`, and the Share button + dialog in `src/sidebar/App.tsx`).
-  **No edits were made this turn** — only reading/planning. The work in progress
-  is therefore **not started**; the repo is at a clean boundary.
-- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (166/166, 33 files,
-  `vitest run`). Build: not re-run this turn, but the type-checked source set is
-  green and the prior `npm run build:all` passed.
-- Git: branch `main`. Checkpoint commit created for this state (see log). Working
-  tree clean after the commit.
-- The `PboardSignaling` / manager / permission pieces are complete and tested but
-  **not yet reachable from the running extension** — nothing calls
-  `createCollaborationManager` or the `drivePermissions` service outside
-  `src/sync/browser.ts` yet.
+- The **browser-layer wiring is complete** (`src/sync/browser.ts` now exports a
+  module-level `collaborationManager` singleton — `myRole`, `getSharedFileId`,
+  `bootstrapFromDrive`, `signalingFor`, `getRepository` — plus `sessionPeerId`,
+  `parseCollabTopic`, and `loadSharedProjects`). It is unit-tested in
+  `tests/browserCollaboration.test.ts` and **not yet reachable from the running
+  extension**: nothing in `src/sidebar/App.tsx` calls `start()`/`stop()` yet.
+- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (184/184, 36 files,
+  `vitest run`). Build: not re-run this turn; the type-checked source is green.
+- Git: branch `agent/bonsai`. Working tree clean after the Milestone 1 commit.
+- The `PboardSignaling` / manager / permission pieces are complete and tested; the
+  `collaborationManager` singleton and `drivePermissions` service are now
+  instantiated in `src/sync/browser.ts` (reachable for the App). The App-level
+  wiring (Milestone 2) is the next step.
 
 ---
 
 # Known issues
 
 - No failing tests.
-- **Temporary / not wired**: the manager, Drive signaling store, and permission
-  service exist but are not instantiated by the app (no `collaborationManager`
-  singleton, no `bootstrapFromDrive`, no `signalingFor` factory in
-  `src/sync/browser.ts`). This is expected — it is the next phase.
 - **Not implemented yet**: Share button + "Share Project" dialog UI; the
   `drivePermissions` service test; the Drive signaling test; a Share UI test.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
@@ -163,16 +165,12 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 # Remaining work (dependency order)
 
 **Required (the actual feature):**
-1. **Wire the manager + Drive signaling + bootstrap into the browser layer**
-   (`src/sync/browser.ts`): create a module-level `collaborationManager`
-   singleton with
-   `myRole: drivePermissions.myRole`,
-   `getSharedFileId: (id) => drivePermissions.projectFileId(id)`,
-   `bootstrapFromDrive` (download `readSharedSnapshot`, deserialize,
-   `rxRepository.importProject`), and a `signalingFor(topic)` factory that
-   builds a `createDriveSignalStore` + `createDriveSignaling` per topic (parse the
-   topic → projectId; one stable peer id per session; cache the realtime folder
-   id). Export `start/stop/state/refreshRole` for the App.
+
+1. ✅ **Wire the manager + Drive signaling + bootstrap into the browser layer**
+   (`src/sync/browser.ts`): done — `collaborationManager` singleton (`myRole`,
+   `getSharedFileId`, `bootstrapFromDrive`, `signalingFor`, `getRepository`) +
+   `sessionPeerId`, `parseCollabTopic`, and `loadSharedProjects` exported, plus
+   `tests/browserCollaboration.test.ts` unit tests.
 2. **Wire the manager into the App** (`src/sidebar/App.tsx`): `start(projectId)`
    when a shared project is selected, `stop()` on change/unselect; load discovered
    shared projects on startup so they appear in the picker; bootstrap (import) a
@@ -195,20 +193,24 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 
 # Recommended next step
 
-**First task: wire the collaboration manager into `src/sync/browser.ts`.**
+**First task: wire the collaboration manager into the App (`src/sidebar/App.tsx`).**
 
-Inspect in this order before editing:
-- `src/collab/manager.ts` — the `CollaborationManagerOptions` + returned API
-  (lines ~32–58) so you match the option names exactly.
-- `src/collab/signaling.ts` — `PboardSignaling`, `createDriveSignaling` options,
-  and the `PboardDriveSignalStore` shape.
-- `src/sync/drivePermissions.ts` — `DrivePermissionService` (lines ~260–283) and
-  `createDriveSignalStore` (line ~478) — these are the building blocks.
-- `src/sync/browser.ts` — where `drivePermissions`, `sharedProjects`, and
-  `rxRepositoryResolver` already live (add the manager singleton + factories here).
-- `src/sidebar/App.tsx` — the toolbar (`app-title-row`, the `DriveSyncControls`
-  at line ~694) for the Share button, and the project-select lifecycle for
-  start/stop.
+Milestone 1 is complete — `src/sync/browser.ts` exports the `collaborationManager`
+singleton (`myRole`, `getSharedFileId`, `bootstrapFromDrive`, `signalingFor`,
+`getRepository`), plus `sessionPeerId`, `parseCollabTopic`, and `loadSharedProjects`
+(all unit-tested in `tests/browserCollaboration.test.ts`). The manager is instantiated
+in the browser layer but not yet reachable from the App.
 
-Keep the manager a module-level singleton; `start()` must run `stop()` first.
-Do NOT expand scope (no public links, no backend server) in this phase.
+Inspect before editing:
+- `src/sidebar/App.tsx` — the toolbar (`app-title-row`, `DriveSyncControls` at
+  line ~728) for the Share button (insert immediately **left** of it), and the
+  project-select lifecycle (lines ~769–778) for `start()`/`stop()`.
+- `src/sidebar/components/DriveSyncControls.tsx` — model the "Share Project"
+  dialog on it.
+
+Wire `loadSharedProjects()` on mount, `collaborationManager.start(projectId)` on
+shared-project select, and `stop()` on change/unselect/unmount. Then build the
+Share button + dialog (Invite: email + role + Invite; Collaborators: list + role
+selector + remove; owner cannot remove themselves). Keep the manager a module-level
+singleton; `start()` must run `stop()` first. Do NOT expand scope (no public links,
+no backend server).
