@@ -21,11 +21,13 @@ import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/Term
 import { DriveSyncControls } from "./components/DriveSyncControls";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
+import { ShareProjectDialog } from "./components/ShareProjectDialog";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { hasCopyableBoardItems, serializeBoard, serializeProject } from "./serialize";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
+import { collaborationManager, loadSharedProjects } from "../sync/browser";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
@@ -51,6 +53,7 @@ export function App() {
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
   const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [showShareDialog, setShowShareDialog] = useState(false);
   const activeTemplate = currentProject ? boardTemplates[currentProject.template] : undefined;
   const knownTypeIds = useMemo(
     () => new Set(activeTemplate?.cardTypes?.map((cardType) => cardType.id) ?? []),
@@ -103,6 +106,7 @@ export function App() {
     void repository.subscribeCurrentProject((value) => { if (active) setCurrentProject(value); }).then((stop) => {
       if (active) stopCurrent = stop; else stop();
     });
+    void loadSharedProjects();
     void requestDriveReconciliation();
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
@@ -188,6 +192,18 @@ export function App() {
 
   useEffect(() => {
     currentProjectIdRef.current = currentProject?.id ?? null;
+  }, [currentProject?.id]);
+
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (!projectId) return;
+    void collaborationManager.start(projectId).catch(() => {
+      // Collaboration is best-effort: a private project short-circuits, and a
+      // disconnected Drive simply means no live replication.
+    });
+    return () => {
+      void collaborationManager.stop();
+    };
   }, [currentProject?.id]);
 
   useEffect(() => {
@@ -725,6 +741,17 @@ export function App() {
       <header>
         <div className="app-title-row">
           <p className="eyebrow">Pboard</p>
+          {currentProject && (
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Share project"
+              title="Share project"
+              onClick={() => setShowShareDialog(true)}
+            >
+              <ShareIcon />
+            </button>
+          )}
           <DriveSyncControls projectId={currentProject?.id ?? null} />
           <div className="font-scale-controls" aria-label="Board font size">
             <button
@@ -851,6 +878,14 @@ export function App() {
         )}
       </header>
 
+      {showShareDialog && currentProject && (
+        <ShareProjectDialog
+          projectId={currentProject.id}
+          projectName={currentProject.name}
+          onClose={() => setShowShareDialog(false)}
+        />
+      )}
+
       {!currentProject ? (
         <section className="empty-state">
           <h2>No project yet</h2>
@@ -962,6 +997,14 @@ function EditIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="m5 16.75-.5 3 3-.5L18.25 8.5l-2.5-2.5L5 16.75Zm8.75-8.75 2.5 2.5" />
+    </svg>
+  );
+}
+
+function ShareIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 12v7a2 2 0 012 2h12a2 2 0 012-2v-7M8 12l4-8 4 8M12 12v9" />
     </svg>
   );
 }

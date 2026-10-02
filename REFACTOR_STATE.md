@@ -130,31 +130,40 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 - Browser-layer wiring (`src/sync/browser.ts`) + wiring test
   (`tests/browserCollaboration.test.ts`). ✅
 
+- App-level manager wiring (`src/sidebar/App.tsx`) + Share Project dialog
+  (`src/sidebar/components/ShareProjectDialog.tsx`) + light/dark styles. ✅
 ---
 
 # Current state
 
-- The **browser-layer wiring is complete** (`src/sync/browser.ts` now exports a
+- The **browser-layer wiring is complete** (`src/sync/browser.ts` exports the
   module-level `collaborationManager` singleton — `myRole`, `getSharedFileId`,
   `bootstrapFromDrive`, `signalingFor`, `getRepository` — plus `sessionPeerId`,
   `parseCollabTopic`, and `loadSharedProjects`). It is unit-tested in
-  `tests/browserCollaboration.test.ts` and **not yet reachable from the running
-  extension**: nothing in `src/sidebar/App.tsx` calls `start()`/`stop()` yet.
+  `tests/browserCollaboration.test.ts` and is now **reachable from the running
+  extension**: `src/sidebar/App.tsx` drives `start()`/`stop()` on shared-project
+  select.
+- **App-level wiring (Milestone 2) is complete**: `loadSharedProjects()` fires on
+  mount so discovered projects appear in the picker; a manager lifecycle `useEffect`
+  runs `collaborationManager.start(projectId)` on shared-project select and `stop()`
+  on change/unselect/unmount; the Share button is in the `app-title-row` immediately
+  left of the cloud icon and opens the `ShareProjectDialog` (Invite + Collaborators
+  sections, light + dark CSS).
 - **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (184/184, 36 files,
-  `vitest run`). Build: not re-run this turn; the type-checked source is green.
-- Git: branch `agent/bonsai`. Working tree clean after the Milestone 1 commit.
-- The `PboardSignaling` / manager / permission pieces are complete and tested; the
-  `collaborationManager` singleton and `drivePermissions` service are now
-  instantiated in `src/sync/browser.ts` (reachable for the App). The App-level
-  wiring (Milestone 2) is the next step.
+  `vitest run`). **Build: PASS** (`npm run build` — all modules transformed, no
+  errors).
+- Git: branch `agent/bonsai`; the working tree is clean after the Milestone 2
+  commit (see "Phases complete").
+- Remaining work is **Milestone 3 tests** (`drivePermissions` service, Drive
+  signaling, Share UI) and the **Milestone 5 full verification**.
 
 ---
 
 # Known issues
 
 - No failing tests.
-- **Not implemented yet**: Share button + "Share Project" dialog UI; the
-  `drivePermissions` service test; the Drive signaling test; a Share UI test.
+- **Not implemented yet** (Milestone 3 tests): the `drivePermissions` service
+  test; the Drive signaling test; a Share UI test.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
   not covered by the suite).
 - Verify-on-next-session: that `discoverSharedProjects` + `myRole` behave
@@ -171,15 +180,16 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
    `getSharedFileId`, `bootstrapFromDrive`, `signalingFor`, `getRepository`) +
    `sessionPeerId`, `parseCollabTopic`, and `loadSharedProjects` exported, plus
    `tests/browserCollaboration.test.ts` unit tests.
-2. **Wire the manager into the App** (`src/sidebar/App.tsx`): `start(projectId)`
-   when a shared project is selected, `stop()` on change/unselect; load discovered
-   shared projects on startup so they appear in the picker; bootstrap (import) a
-   selected project that has no local copy.
-3. **Share button + Share Project dialog** (`src/sidebar/App.tsx` + a new
-   component, modeled on `DriveSyncControls.tsx`): button immediately LEFT of the
-   cloud icon; dialog with two sections — Invite (email + Viewer/Editor role +
-   Invite) and Collaborators (list with role selector + remove; owner cannot
-   remove themselves). Uses the `drivePermissions` service.
+2. ✅ **Wire the manager into the App** (`src/sidebar/App.tsx`): done —
+   `start(projectId)` on shared-project select, `stop()` on change/unselect/
+   unmount; `loadSharedProjects()` on mount so discovered projects appear in the
+   picker.
+3. ✅ **Share button + Share Project dialog** (`src/sidebar/App.tsx` +
+   `src/sidebar/components/ShareProjectDialog.tsx`): done — button in the
+   `app-title-row` immediately left of the cloud icon; dialog with Invite
+   (email + Viewer/Editor role + Invite) and Collaborators (list with role
+   selector + remove; owner cannot remove themselves) sections, styled for light
+   and dark.
 4. **Tests**: `drivePermissions` service (mock transport), Drive signaling
    (mock store + injected `now`), Share UI.
 5. **Verify**: full suite + typecheck + `npm run build:all` +
@@ -193,24 +203,31 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 
 # Recommended next step
 
-**First task: wire the collaboration manager into the App (`src/sidebar/App.tsx`).**
+**First task: add the missing tests (Milestone 3) for the collaboration layer.**
 
-Milestone 1 is complete — `src/sync/browser.ts` exports the `collaborationManager`
+Milestone 2 is complete — `src/sidebar/App.tsx` wires the `collaborationManager`
 singleton (`myRole`, `getSharedFileId`, `bootstrapFromDrive`, `signalingFor`,
-`getRepository`), plus `sessionPeerId`, `parseCollabTopic`, and `loadSharedProjects`
-(all unit-tested in `tests/browserCollaboration.test.ts`). The manager is instantiated
-in the browser layer but not yet reachable from the App.
+`getRepository`) into the running extension (`loadSharedProjects()` on mount,
+`start(projectId)`/`stop()` on shared-project select), and the Share button +
+`ShareProjectDialog` (Invite + Collaborators sections, light + dark CSS) render.
+`src/sync/browser.ts` exports `sessionPeerId`, `parseCollabTopic`,
+`loadSharedProjects`, `drivePermissions`, `driveTransport`, and
+`loadSharedProjects` (all unit-tested in `tests/browserCollaboration.test.ts` /
+`tests/collaborationManager.test.ts`).
 
-Inspect before editing:
-- `src/sidebar/App.tsx` — the toolbar (`app-title-row`, `DriveSyncControls` at
-  line ~728) for the Share button (insert immediately **left** of it), and the
-  project-select lifecycle (lines ~769–778) for `start()`/`stop()`.
-- `src/sidebar/components/DriveSyncControls.tsx` — model the "Share Project"
-  dialog on it.
+Remaining items (in dependency order):
+- **`drivePermissions` service tests** — mock the `DrivePermissionTransport`;
+  cover `myRole`, `projectFileId`, `listCollaborators` (owner-first sort),
+  `invite` (email validation + the single ACL write), `updateRole` (owner
+  throws), `removeCollaborator` (owner throws), and the shared-layout cache.
+- **Drive signaling tests** — `createDriveSignalStore`: read/write own `realtime/`
+  record with injected `now()`, at-least-once relay of other peers' records,
+  outbox TTL, and the memory/WebSocket seams it bridges.
+- **Share UI test** — render `ShareProjectDialog`: owner row (no select/remove),
+  non-owner rows (role select + remove), Invite form (disabled until connected),
+  Escape/× close, empty states, and error/status surfacing.
 
-Wire `loadSharedProjects()` on mount, `collaborationManager.start(projectId)` on
-shared-project select, and `stop()` on change/unselect/unmount. Then build the
-Share button + dialog (Invite: email + role + Invite; Collaborators: list + role
-selector + remove; owner cannot remove themselves). Keep the manager a module-level
-singleton; `start()` must run `stop()` first. Do NOT expand scope (no public links,
-no backend server).
+After Milestone 3, run the final verification (Milestone 5): full suite +
+typecheck + `npm run build:all` + `npm run verify:build all`. Keep the manager a
+module-level singleton; `start()` must run `stop()` first. Do NOT expand scope
+(no public links, no backend server).
