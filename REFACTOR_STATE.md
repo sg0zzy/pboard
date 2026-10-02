@@ -112,6 +112,15 @@ Core collaboration layer is **built and unit-tested in isolation**:
 - `tests/browserCollaboration.test.ts` — browser-layer wiring tests (`loadSharedProjects`
   import/skip behavior + `collaborationManager` API).
 - `tests/sync.test.ts` — scope assertion updated to the new two-scope set.
+- `tests/drivePermissions.test.ts` — permission service (mock transport):
+  `myRole`, `listCollaborators` (owner-first sort), `invite` (single ACL write),
+  `updateRole`/`removeCollaborator` (owner throws), and the shared-layout cache.
+- `tests/client.test.ts` — `requestProjectSync` + `requestDriveReconciliation`
+  (forwarding, success pass-through, `Error` → `reason`, generic reason fallback).
+- `tests/background.test.ts` — `handleDriveSyncMessage` (reconcile/sync messages,
+  not-connected gating, `Error`/non-Error → `reason`) +
+  `registerDriveBackgroundSync` (storage-change listener, idle-sync alarm,
+  alarm listener prefix/edge cases).
 - `docs/collaboration.md` — architecture doc (sharing, permissions, signaling,
   offline/reconnect, security, testing).
 - `experiments/collab/*.mjs` — WebRTC / simple-peer / node-datachannel spikes.
@@ -149,21 +158,21 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   on change/unselect/unmount; the Share button is in the `app-title-row` immediately
   left of the cloud icon and opens the `ShareProjectDialog` (Invite + Collaborators
   sections, light + dark CSS).
-- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (184/184, 36 files,
+- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (256/256, 41 files,
   `vitest run`). **Build: PASS** (`npm run build` — all modules transformed, no
   errors).
 - Git: branch `agent/bonsai`; the working tree is clean after the Milestone 2
   commit (see "Phases complete").
-- Remaining work is **Milestone 3 tests** (`drivePermissions` service, Drive
-  signaling, Share UI) and the **Milestone 5 full verification**.
+- Remaining work is **Milestone 3 tests** (Drive signaling, Share UI) and the
+  **Milestone 5 full verification**.
 
 ---
 
 # Known issues
 
 - No failing tests.
-- **Not implemented yet** (Milestone 3 tests): the `drivePermissions` service
-  test; the Drive signaling test; a Share UI test.
+- **Not implemented yet** (Milestone 3 tests): the Drive signaling test; a
+  Share UI test.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
   not covered by the suite).
 - Verify-on-next-session: that `discoverSharedProjects` + `myRole` behave
@@ -190,7 +199,8 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
    (email + Viewer/Editor role + Invite) and Collaborators (list with role
    selector + remove; owner cannot remove themselves) sections, styled for light
    and dark.
-4. **Tests**: `drivePermissions` service (mock transport), Drive signaling
+4. ✅ **Tests** (Milestone 3): `drivePermissions` service (mock transport),
+   `client`, `background` — done. Remaining: Drive signaling
    (mock store + injected `now`), Share UI.
 5. **Verify**: full suite + typecheck + `npm run build:all` +
    `npm run verify:build all`; update `docs/collaboration.md` if anything shifts.
@@ -216,10 +226,13 @@ singleton (`myRole`, `getSharedFileId`, `bootstrapFromDrive`, `signalingFor`,
 `tests/collaborationManager.test.ts`).
 
 Remaining items (in dependency order):
-- **`drivePermissions` service tests** — mock the `DrivePermissionTransport`;
+- ✅ **`drivePermissions` service tests** — mock the `DrivePermissionTransport`;
   cover `myRole`, `projectFileId`, `listCollaborators` (owner-first sort),
   `invite` (email validation + the single ACL write), `updateRole` (owner
   throws), `removeCollaborator` (owner throws), and the shared-layout cache.
+- ✅ **`client.test.ts` / `background.test.ts`** — `requestProjectSync`,
+  `requestDriveReconciliation`, `handleDriveSyncMessage`, and
+  `registerDriveBackgroundSync`.
 - **Drive signaling tests** — `createDriveSignalStore`: read/write own `realtime/`
   record with injected `now()`, at-least-once relay of other peers' records,
   outbox TTL, and the memory/WebSocket seams it bridges.
