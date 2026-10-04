@@ -1,576 +1,387 @@
-// Drive-backed sharing service. The transport (Drive API) and the shared-layout
-// store are both faked; no live Drive, no RxDB. Asserts the service is the only
-// place that writes collaborator ACLs: invite is the sole `createPermission`
-// entry point, role changes are `updatePermission`, removals are
-// `deletePermission`, and everything else is read-only.
-
 import { describe, expect, it, vi } from "vitest";
 import {
   createDrivePermissionService,
-  type Collaborator,
-  type DriveFileRef,
+  createDrivePermissionTransport,
   type DrivePermission,
   type DrivePermissionTransport,
   type DriveSharedProjectRecord,
-  type DriveSharedProjectStore,
-  type PboardCollaboratorRole,
+  type DriveSharedProjectStore
 } from "../src/sync/drivePermissions";
+import type { GoogleAuthProvider } from "../src/sync/googleAuth";
 
-// ---------------------------------------------------------------------------
-// Test doubles
-// ---------------------------------------------------------------------------
-const FOLDER_MIME = "application/vnd.google-apps.folder";
-const JSON_MIME = "application/json";
+describe("Drive account identity", () => {
+  function auth(): GoogleAuthProvider {
+    return {
+      connect: async () => {}, disconnect: async () => {},
+      getConnectionState: async () => "connected",
+      isConfigured: () => true,
+      getAccessToken: vi.fn(async () => "drive-token")
+    };
+  }
 
-function folderRef(id: string, name: string): DriveFileRef {
-  return { id, name, mimeType: FOLDER_MIME, parents: [] };
-}
-function fileRef(id: string, name: string): DriveFileRef {
-  return { id, name, mimeType: JSON_MIME, parents: [] };
-}
-function userPerm(
-  id: string,
-  role: "reader" | "writer" | "owner",
-  emailAddress: string,
-  displayName?: string,
-): DrivePermission {
-  return { id, type: "user", role, emailAddress, displayName };
-}
-function nonUserPerm(
-  id: string,
-  type: "group" | "anyone",
-  role: "reader" | "writer",
-): DrivePermission {
-  return { id, type, role };
-}
+  it("reads the account using Drive authorization instead of People API scopes", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
+      user: { emailAddress: "owner@example.com", displayName: "Owner" }
+    })));
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+    expect(await transport.currentIdentity()).toEqual({ email: "owner@example.com", name: "Owner" });
+    expect(fetcher.mock.calls[0][0]).toBe("https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)");
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get("Authorization")).toBe("Bearer drive-token");
+  });
 
-/** Fake `DrivePermissionTransport`. All reads resolve; every `vi.fn` is
-    * recorded so callers can inspect which Drive API calls the service made. */
-function makeTransport(opts: {
-  identity?: { email: string; name?: string } | null;
-  sharedRoot?: DriveFileRef | null;
-  filesById?: Record<string, DriveFileRef>;
-  fileParents?: Record<string, string[]>;
-  findFile?: (name: string, parentId: string) => DriveFileRef | null;
-  listFilesByNameResult?: DriveFileRef[];
-  listPermissions?: (fileId: string) => DrivePermission[];
-  snapshot?: string;
-} = {}) {
-  return {
-    currentIdentity: vi
-      .fn()
-      .mockResolvedValue(opts.identity !== undefined ? opts.identity : { email: "me@example.com", name: "Me" }),
-    findSharedRoot: vi.fn().mockResolvedValue(opts.sharedRoot ?? null),
-    createFolder: vi.fn(async (name: string, parentId: string = "") => ({
-      id: name,
-      name,
-      mimeType: FOLDER_MIME,
-      parents: parentId ? [parentId] : [],
-    })),
-    findFile: vi.fn(async (name: string, parentId: string) =>
-      opts.findFile?.(name, parentId) ?? null,
-    ),
-    createJsonFile: vi.fn(async (name: string, parentId: string) =>
-      fileRef(`${name}@${parentId}`, name),
-    ),
-    uploadJsonFile: vi.fn().mockResolvedValue(
-      ({ id: "uploaded", name: "project.json", mimeType: JSON_MIME } as const),
-    ),
-    downloadFile: vi.fn().mockResolvedValue("{}"),
-    downloadFileOrNull: vi.fn().mockResolvedValue(null),
-    getFile: vi.fn(async (fileId: string) => opts.filesById?.[fileId] ?? folderRef(fileId, "f")),
-    listFiles: vi.fn().mockResolvedValue([]),
-    deleteFile: vi.fn().mockResolvedValue(undefined),
-    getFileParents: vi.fn(async (fileId: string) => opts.fileParents?.[fileId] ?? []),
-    listFilesByName: vi.fn(async (name: string, mimeType: string) => {
-      if (name !== "project.json" || mimeType !== JSON_MIME) {
-        throw new Error(`unexpected listFilesByName(${name}, ${mimeType})`);
+  it("reports account lookup failures instead of silently returning no role", async () => {
+    const transport = createDrivePermissionTransport(auth(), async () => new Response("{}", { status: 403 }));
+    await expect(transport.currentIdentity()).rejects.toThrow("403");
+  });
+
+  it("limits every sharing file search to the Drive space", async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get("spaces") !== "drive") {
+        return new Response(JSON.stringify({ error: { errors: [{ reason: "insufficientScopes" }] } }), { status: 403 });
       }
-      return opts.listFilesByNameResult ?? [];
-    }),
-    listPermissions: vi.fn(async (fileId: string) => opts.listPermissions?.(fileId) ?? []),
-    createPermission: vi
-      .fn(async (fileId: string, role: PboardCollaboratorRole, email: string): Promise<DrivePermission> => ({
-        id: `perm-${fileId}-${email}`,
+      return new Response(JSON.stringify({ files: [] }));
+    });
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+    expect(await transport.findSharedRoot()).toBeNull();
+    expect(await transport.findFile("project.json", "folder")).toBeNull();
+    expect(await transport.listFiles("folder")).toEqual([]);
+    expect(await transport.listFilesByName("project.json", "application/json")).toEqual([]);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("explains how to recover when sharing authorization is missing", async () => {
+    const transport = createDrivePermissionTransport(auth(), async () => new Response(JSON.stringify({
+      error: { errors: [{ reason: "insufficientScopes" }], message: "The granted scopes do not give access to all of the requested spaces." }
+    }), { status: 403 }));
+    await expect(transport.listFilesByName("project.json", "application/json")).rejects.toThrow(/reconnect Google Drive and allow project sharing access/);
+  });
+});
+
+// In-memory fake of the Drive permission transport. It models the shared
+// layout (Pboard/<projectId>/project.json + realtime/) and per-folder
+// permission lists, which is all the service depends on.
+function makeFakeTransport(initial: { identity?: string | null } = {}) {
+  const state = {
+    folders: new Map<string, { id: string; name: string; parents: string[] }>(),
+    files: new Map<string, { id: string; name: string; mimeType: string; parents: string[]; body: string }>(),
+    permissions: new Map<string, DrivePermission[]>()
+  };
+  let seq = 0;
+  const nextId = (prefix: string) => `${prefix}${++seq}`;
+  let identity: { email: string } | null = initial.identity === null ? null : { email: initial.identity ?? "me@example.com" };
+
+  function permissionsFor(fileId: string): DrivePermission[] {
+    return state.permissions.get(fileId) ?? [];
+  }
+
+  const transport: DrivePermissionTransport = {
+    currentIdentity: async () => identity,
+    findSharedRoot: async () => {
+      const pboard = [...state.folders.values()].find((f) => f.name === "Pboard" && f.parents.length === 0);
+      return pboard ? { id: pboard.id, name: "Pboard", mimeType: "application/vnd.google-apps.folder" } : null;
+    },
+    createFolder: async (name, parentId) => {
+      const id = nextId("f");
+      state.folders.set(id, { id, name, parents: parentId ? [parentId] : [] });
+      return { id, name, mimeType: "application/vnd.google-apps.folder" };
+    },
+    findFile: async (name, parentId) => {
+      const folder = [...state.folders.values()].find((entry) => entry.name === name && entry.parents.includes(parentId));
+      if (folder) return { id: folder.id, name, mimeType: "application/vnd.google-apps.folder" };
+      const file = [...state.files.values()].find((entry) => entry.name === name && entry.parents.includes(parentId));
+      if (file) return { id: file.id, name, mimeType: file.mimeType };
+      return null;
+    },
+    createJsonFile: async (name, parentId, contents) => {
+      const id = nextId("file");
+      state.files.set(id, { id, name, mimeType: "application/json", parents: [parentId], body: contents });
+      return { id, name, mimeType: "application/json" };
+    },
+    uploadJsonFile: async (fileId, contents) => {
+      const file = state.files.get(fileId)!;
+      file.body = contents;
+      return { id: file.id, name: file.name, mimeType: file.mimeType };
+    },
+    downloadFile: async (fileId) => state.files.get(fileId)!.body,
+    downloadFileOrNull: async (fileId) => state.files.get(fileId)?.body ?? null,
+    getFile: async (fileId) => {
+      const folder = state.folders.get(fileId);
+      if (folder) return { id: folder.id, name: folder.name, mimeType: "application/vnd.google-apps.folder", parents: folder.parents };
+      const file = state.files.get(fileId)!;
+      return { id: file.id, name: file.name, mimeType: file.mimeType, parents: file.parents };
+    },
+    listFiles: async (parentId) => [
+      ...[...state.folders.values()].filter((f) => f.parents.includes(parentId)).map((f) => ({ id: f.id, name: f.name, mimeType: "application/vnd.google-apps.folder" })),
+      ...[...state.files.values()].filter((f) => f.parents.includes(parentId)).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType }))
+    ],
+    deleteFile: async (fileId) => {
+      state.folders.delete(fileId);
+      state.files.delete(fileId);
+    },
+    getFileParents: async (fileId) => state.folders.get(fileId)?.parents ?? state.files.get(fileId)?.parents ?? [],
+    listFilesByName: async (name, mimeType) =>
+      [...state.files.values()].filter((f) => f.name === name && f.mimeType === mimeType).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType })),
+    listPermissions: async (fileId) => permissionsFor(fileId).map((p) => ({ ...p })),
+    createPermission: async (fileId, role, email) => {
+      const permission: DrivePermission = {
+        id: nextId("perm"),
         type: "user",
         role: role === "editor" ? "writer" : "reader",
-        emailAddress: email,
-      })),
-    updatePermission: vi
-      .fn(async (fileId: string, permissionId: string, role: PboardCollaboratorRole): Promise<DrivePermission> => ({
-        id: permissionId,
-        type: "user",
-        role: role === "editor" ? "writer" : "reader",
-      })),
-    deletePermission: vi.fn().mockResolvedValue(undefined),
-  } satisfies DrivePermissionTransport;
+        emailAddress: email
+      };
+      const list = permissionsFor(fileId);
+      list.push(permission);
+      state.permissions.set(fileId, list);
+      return { ...permission };
+    },
+    updatePermission: async (fileId, permissionId, role) => {
+      const permission = permissionsFor(fileId).find((p) => p.id === permissionId)!;
+      permission.role = role === "editor" ? "writer" : "reader";
+      return { ...permission };
+    },
+    deletePermission: async (fileId, permissionId) => {
+      state.permissions.set(fileId, permissionsFor(fileId).filter((p) => p.id !== permissionId));
+    }
+  };
+  return { transport, state, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
 }
 
-/** Fake `DriveSharedProjectStore`, seeded with an optional initial layout. */
-function makeStore(seed: Record<string, DriveSharedProjectRecord> = {}) {
-  const map: Record<string, DriveSharedProjectRecord> = { ...seed };
+// In-memory fake of the local shared-layout cache (browser.storage.local in the app).
+function makeFakeStore(): DriveSharedProjectStore & { records: Map<string, DriveSharedProjectRecord> } {
+  const records = new Map<string, DriveSharedProjectRecord>();
+  const empty: DriveSharedProjectRecord = { folderId: null, projectFileId: null, realtimeFolderId: null };
   return {
-    get: vi.fn(async (projectId: string) =>
-      map[projectId] ?? { folderId: null, projectFileId: null, realtimeFolderId: null },
-    ),
-    set: vi.fn(async (projectId: string, patch: Partial<DriveSharedProjectRecord>) => {
-      map[projectId] = { ...map[projectId], ...patch };
-    }),
-    delete: vi.fn(async (projectId: string) => {
-      delete map[projectId];
-    }),
-    // Test-only: synchronous view of the store's current state.
-    state: () => ({ ...map }),
+    records,
+    get: async (projectId) => records.get(projectId) ?? { ...empty },
+    set: async (projectId, patch) => {
+      const current = records.get(projectId) ?? { ...empty };
+      records.set(projectId, { ...current, ...patch });
+    },
+    delete: async (projectId) => {
+      records.delete(projectId);
+    }
   };
 }
 
-/** Build a service, and hand back the service + its doubles for assertions. */
-function makeService(opts: {
-  identity?: { email: string; name?: string } | null;
-  layout?: { folderId: string; projectFileId: string; realtimeFolderId: string };
-  sharedRoot?: DriveFileRef | null;
-  filesById?: Record<string, DriveFileRef>;
-  fileParents?: Record<string, string[]>;
-  findFile?: (name: string, parentId: string) => DriveFileRef | null;
-  listFilesByNameResult?: DriveFileRef[];
-  listPermissions?: (fileId: string) => DrivePermission[];
-  snapshot?: string;
-} = {}) {
-  const sharedProjects = makeStore(
-    opts.layout
-      ? { p1: { ...opts.layout } }
-      : {},
-  );
-  const transport = makeTransport({
-    identity: opts.identity,
-    sharedRoot: opts.sharedRoot,
-    filesById: opts.filesById,
-    fileParents: opts.fileParents,
-    findFile: opts.findFile,
-    listFilesByNameResult: opts.listFilesByNameResult,
-    listPermissions: opts.listPermissions,
-    snapshot: opts.snapshot ?? '{"id":"p1"}',
-  });
+function makeService(initial: { identity?: string | null } = {}) {
+  const fake = makeFakeTransport(initial);
+  const store = makeFakeStore();
   const service = createDrivePermissionService({
-    transport,
-    sharedProjects,
-    readSnapshot: async (projectId: string) => opts.snapshot ?? JSON.stringify({ id: projectId }),
+    transport: fake.transport,
+    sharedProjects: store,
+    readSnapshot: async (projectId) => JSON.stringify({ projectId })
   });
-  return { service, transport, store: sharedProjects };
+  return { service, fake, store };
 }
 
-// ---------------------------------------------------------------------------
-// myRole
-// ---------------------------------------------------------------------------
-describe("myRole", () => {
-  it("returns null when the project is not shared", async () => {
-    const { service, transport } = makeService();
-    await expect(service.myRole("p1")).resolves.toBeNull();
-    expect(transport.listPermissions).not.toHaveBeenCalled();
+describe("createDrivePermissionService", () => {
+  it("persists shared image assets in the project's folder and isolates private projects", async () => {
+    const { service, fake } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    const imageId = "a".repeat(64);
+    const image = { dataUrl: "data:image/png;base64,AAECAwQ=", mimeType: "image/png", width: 1, height: 1 };
+    expect(await service.readSharedImage("proj1", imageId)).toBeNull();
+    await service.writeSharedImage("proj1", imageId, image);
+    const asset = [...fake.state.files.values()].find((file) => file.name === `image-${imageId}.json`)!;
+    expect(asset.parents).toEqual([folderId]);
+    expect(await service.readSharedImage("proj1", imageId)).toEqual(image);
+    expect(await service.readSharedImage("private-project", imageId)).toBeNull();
+    await expect(service.readSharedImage("proj1", "invalid-id")).rejects.toThrow("Invalid shared image id");
+  });
+  it("ensures the shared layout (folder + project.json + realtime) and caches it", async () => {
+    const { service, fake, store } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+
+    const folder = fake.state.folders.get(folderId)!;
+    expect(folder.name).toBe("proj1");
+    expect(folder.parents).toEqual([[...fake.state.folders.values()].find((f) => f.name === "Pboard")!.id]);
+    const projectFile = [...fake.state.files.values()].find((f) => f.name === "project.json" && f.parents.includes(folderId))!;
+    expect(projectFile.body).toBe(JSON.stringify({ projectId: "proj1" }));
+    const realtime = [...fake.state.folders.values()].find((f) => f.name === "realtime" && f.parents.includes(folderId))!;
+
+    expect(await service.projectFileId("proj1")).toBe(projectFile.id);
+    expect(await service.realtimeFolderId("proj1")).toBe(realtime.id);
+    expect(store.records.get("proj1")).toMatchObject({ folderId, projectFileId: projectFile.id, realtimeFolderId: realtime.id });
   });
 
-  it('returns "owner" when the account is the file owner', async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) => (id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : []),
-    });
-    await expect(service.myRole("p1")).resolves.toBe("owner");
+  it("reuses an existing shared layout instead of creating duplicates", async () => {
+    const { service, fake } = makeService();
+    const first = await service.ensureSharedProject("proj1");
+    const fileCount = fake.state.files.size;
+    const folderCount = fake.state.folders.size;
+
+    const second = await service.ensureSharedProject("proj1");
+
+    expect(second).toBe(first);
+    expect(fake.state.files.size).toBe(fileCount);
+    expect(fake.state.folders.size).toBe(folderCount);
   });
 
-  it('returns "editor" for a Drive writer permission', async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) => (id === "proj" ? [userPerm("w", "writer", "me@example.com", "Me")] : []),
-    });
-    await expect(service.myRole("p1")).resolves.toBe("editor");
-  });
-
-  it('returns "viewer" for a Drive reader permission', async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) => (id === "proj" ? [userPerm("r", "reader", "me@example.com", "Me")] : []),
-    });
-    await expect(service.myRole("p1")).resolves.toBe("viewer");
-  });
-
-  it("returns null when the account has no permission of its own", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) => (id === "proj" ? [userPerm("x", "writer", "other@example.com")] : []),
-    });
-    await expect(service.myRole("p1")).resolves.toBeNull();
-  });
-
-  it("returns null when there is no signed-in identity", async () => {
-    const { service } = makeService({
-      identity: null,
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) => (id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : []),
-    });
-    await expect(service.myRole("p1")).resolves.toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// projectFileId
-// ---------------------------------------------------------------------------
-describe("projectFileId", () => {
-  it("returns null when the project is not shared", async () => {
+  it("reads and writes the shared snapshot", async () => {
     const { service } = makeService();
-    await expect(service.projectFileId("p1")).resolves.toBeNull();
+    await service.ensureSharedProject("proj1");
+    expect(await service.readSharedSnapshot("proj1")).toBe(JSON.stringify({ projectId: "proj1" }));
+
+    await service.writeSharedSnapshot("proj1", JSON.stringify({ projectId: "proj1", cards: [1] }));
+    expect(await service.readSharedSnapshot("proj1")).toBe(JSON.stringify({ projectId: "proj1", cards: [1] }));
   });
 
-  it("returns the cached file id when the project is shared", async () => {
-    const { service } = makeService({ layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" } });
-    await expect(service.projectFileId("p1")).resolves.toBe("pf");
+  it("resolves the caller role from the folder ACL", async () => {
+    const { service, fake } = makeService({ identity: "me@example.com" });
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "p1", type: "user", role: "writer", emailAddress: "me@example.com" }]);
+    expect(await service.myRole("proj1")).toBe("editor");
+
+    fake.state.permissions.set(folderId, [{ id: "p1", type: "user", role: "reader", emailAddress: "me@example.com" }]);
+    expect(await service.myRole("proj1")).toBe("viewer");
+
+    fake.setIdentity(null);
+    expect(await service.myRole("proj1")).toBeNull();
   });
 
-  it("discovers and caches the file id when only discoverable", async () => {
-    const { service, store } = makeService({
-      fileParents: { "f1": ["p1-folder"] },
-      filesById: { "p1-folder": folderRef("p1-folder", "p1") },
-      listFilesByNameResult: [fileRef("f1", "project.json")],
-    });
-    await expect(service.projectFileId("p1")).resolves.toBe("f1");
-    expect(store.set).toHaveBeenCalledOnce();
-    expect(store.set).toHaveBeenCalledWith(
-      "p1",
-      expect.objectContaining({ folderId: "p1-folder", projectFileId: "f1" }),
-    );
-    expect(store.state()).toEqual({ p1: { folderId: "p1-folder", projectFileId: "f1" } });
-  });
-});
+  it("returns owner for the file owner and null for a project with no permission", async () => {
+    const { service, fake } = makeService({ identity: "owner@example.com" });
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "own", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
+    expect(await service.myRole("proj1")).toBe("owner");
 
-// ---------------------------------------------------------------------------
-// listCollaborators
-// ---------------------------------------------------------------------------
-describe("listCollaborators", () => {
-  it("returns [] when the project is not shared", async () => {
-    const { service } = makeService();
-    await expect(service.listCollaborators("p1")).resolves.toEqual([]);
+    fake.state.permissions.set(folderId, [{ id: "other", type: "user", role: "writer", emailAddress: "other@example.com" }]);
+    expect(await service.myRole("proj1")).toBeNull();
+
+    expect(await service.myRole("neverShared")).toBeNull();
   });
 
-  it("orders owner first, then editors, then viewers; alphabetically within a role", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj"
-          ? [
-              userPerm("o", "owner", "me@example.com", "Me"),
-              userPerm("e-a", "writer", "a@y.com", "E A"),
-              userPerm("e-b", "writer", "b@y.com", "E B"),
-              userPerm("v-a", "reader", "a@x.com", "V A"),
-              userPerm("v-b", "reader", "b@x.com", "V B"),
-            ]
-          : [],
-    });
-    await expect(service.listCollaborators("p1")).resolves.toEqual(
-      [
-        { email: "me@example.com", role: "owner", name: "Me", permissionId: "o" },
-        { email: "a@y.com", role: "editor", name: "E A", permissionId: "e-a" },
-        { email: "b@y.com", role: "editor", name: "E B", permissionId: "e-b" },
-        { email: "a@x.com", role: "viewer", name: "V A", permissionId: "v-a" },
-        { email: "b@x.com", role: "viewer", name: "V B", permissionId: "v-b" },
-      ] as Collaborator[],
-    );
+  it("matches the owner's email without case or surrounding whitespace differences", async () => {
+    const { service, fake } = makeService({ identity: "Owner@Example.com" });
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "own", type: "user", role: "owner", emailAddress: " owner@example.com " }]);
+    expect(await service.myRole("proj1")).toBe("owner");
   });
 
-  it("skips non-user permission types", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj"
-          ? [
-              userPerm("e", "writer", "a@y.com", "E A"),
-              nonUserPerm("g", "group", "reader"),
-              nonUserPerm("a", "anyone", "reader"),
-            ]
-          : [],
-    });
-    await expect(service.listCollaborators("p1")).resolves.toEqual([
-      { email: "a@y.com", role: "editor", name: "E A", permissionId: "e" },
+  it("lists collaborators sorted owner, editors, viewers (alphabetical within role)", async () => {
+    const { service, fake } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [
+      { id: "p1", type: "user", role: "reader", emailAddress: "zed@example.com" },
+      { id: "p2", type: "user", role: "writer", emailAddress: "bob@example.com" },
+      { id: "p3", type: "user", role: "owner", emailAddress: "owner@example.com" },
+      { id: "p4", type: "user", role: "reader", emailAddress: "amy@example.com" },
+      { id: "p5", type: "user", role: "writer", emailAddress: "amy2@example.com" },
+      { id: "link", type: "anyone", role: "reader" }
     ]);
-  });
-});
 
-// ---------------------------------------------------------------------------
-// invite
-// ---------------------------------------------------------------------------
-describe("invite", () => {
-  it("rejects an invalid email and creates no permission", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      sharedRoot: folderRef("Pboard", "Pboard"),
-    });
-    for (const bad of ["", "no-at-sign", "a@b", "a b@c.com", "@x.com"]) {
-      await expect(service.invite("p1", bad, "editor")).rejects.toThrow("Enter a valid email address");
+    const collaborators = await service.listCollaborators("proj1");
+    expect(collaborators.map((c) => c.email)).toEqual(["owner@example.com", "amy2@example.com", "bob@example.com", "amy@example.com", "zed@example.com"]);
+    expect(collaborators.map((c) => c.role)).toEqual(["owner", "editor", "editor", "viewer", "viewer"]);
+  });
+
+  it("invites a collaborator, granting the project role plus realtime write access", async () => {
+    const { service, fake, store } = makeService();
+    await service.invite("proj1", "New@Example.com", "editor");
+
+    const layout = store.records.get("proj1")!;
+    const folderPerms = fake.state.permissions.get(layout.folderId!)!;
+    expect(folderPerms).toHaveLength(1);
+    expect(folderPerms[0]).toMatchObject({ role: "writer", emailAddress: "new@example.com" });
+
+    const realtimePerms = fake.state.permissions.get(layout.realtimeFolderId!);
+    expect(realtimePerms).toHaveLength(1);
+    expect(realtimePerms![0]).toMatchObject({ role: "writer", emailAddress: "new@example.com" });
+  });
+
+  it("rejects an invalid invite email without creating any permission", async () => {
+    const { service, fake, store } = makeService();
+    await expect(service.invite("proj1", "not-an-email", "viewer")).rejects.toThrow(/valid email/i);
+    expect(fake.state.permissions.size).toBe(0);
+    expect(store.records.has("proj1")).toBe(false);
+  });
+
+  it("does not duplicate a collaborator's realtime access on a second invite", async () => {
+    const { service, fake, store } = makeService();
+    await service.invite("proj1", "x@example.com", "viewer");
+    await service.invite("proj1", "x@example.com", "editor");
+
+    const layout = store.records.get("proj1")!;
+    const realtimePerms = fake.state.permissions.get(layout.realtimeFolderId!);
+    expect(realtimePerms).toHaveLength(1);
+  });
+
+  it("updates a collaborator's role", async () => {
+    const { service, fake, store } = makeService();
+    await service.invite("proj1", "x@example.com", "viewer");
+    const layout = store.records.get("proj1")!;
+    const permission = fake.state.permissions.get(layout.folderId!)![0];
+
+    await service.updateRole("proj1", "x@example.com", "editor");
+    expect(fake.state.permissions.get(layout.folderId!)!.find((p) => p.id === permission.id)!.role).toBe("writer");
+  });
+
+  it("rejects updating the owner's role and an unknown collaborator", async () => {
+    const { service, fake } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "own", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
+    await expect(service.updateRole("proj1", "owner@example.com", "viewer")).rejects.toThrow(/owner/i);
+    await expect(service.updateRole("proj1", "ghost@example.com", "viewer")).rejects.toThrow(/not found/i);
+  });
+
+  it("removes a collaborator, revoking both the project and realtime access", async () => {
+    const { service, fake, store } = makeService();
+    await service.invite("proj1", "x@example.com", "editor");
+    const layout = store.records.get("proj1")!;
+    expect(fake.state.permissions.get(layout.folderId!)!.length).toBe(1);
+    expect(fake.state.permissions.get(layout.realtimeFolderId!)!.length).toBe(1);
+
+    await service.removeCollaborator("proj1", "x@example.com");
+    expect(fake.state.permissions.get(layout.folderId!)!.length).toBe(0);
+    expect(fake.state.permissions.get(layout.realtimeFolderId!)!.length).toBe(0);
+  });
+
+  it("rejects removing the owner or an unknown collaborator", async () => {
+    const { service, fake } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "own", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
+    await expect(service.removeCollaborator("proj1", "owner@example.com")).rejects.toThrow(/owner/i);
+    await expect(service.removeCollaborator("proj1", "ghost@example.com")).rejects.toThrow(/not found/i);
+  });
+
+  it("discovers shared projects this account can reach, keyed by the parent folder name", async () => {
+    const { service, fake } = makeService();
+    await service.ensureSharedProject("projA");
+    await service.ensureSharedProject("projB");
+    const strayId = "stray";
+    fake.state.files.set(strayId, { id: strayId, name: "project.json", mimeType: "application/json", parents: [], body: "{}" });
+
+    const discovered = await service.discoverSharedProjects();
+    expect(discovered.map((d) => d.projectId).sort()).toEqual(["projA", "projB"]);
+    for (const entry of discovered) {
+      expect(entry.fileId).toBe((await service.projectFileId(entry.projectId))!);
     }
-    expect(transport.createPermission).not.toHaveBeenCalled();
   });
 
-  it("creates the shared layout, then grants both ACLs for a fresh project", async () => {
-    const { service, transport, store } = makeService({
-      snapshot: '{"id":"p1"}',
-    });
-    await expect(service.invite("p1", "new@x.com", "editor")).resolves.toBeUndefined();
-    // bootstrap created the shared layout
-    expect(transport.createFolder).toHaveBeenCalledTimes(3);
-    expect(transport.createJsonFile).toHaveBeenCalledTimes(1);
-    expect(transport.createJsonFile).toHaveBeenCalledWith("project.json", "p1", '{"id":"p1"}');
-    expect(store.set).toHaveBeenCalledOnce();
-    expect(store.set).toHaveBeenCalledWith(
-      "p1",
-      expect.objectContaining({
-        folderId: "p1",
-        projectFileId: "project.json@p1",
-        realtimeFolderId: "realtime",
-      }),
-    );
-    // the project ACL uses the requested role; the realtime ACL is always Drive "editor".
-    expect(transport.createPermission).toHaveBeenCalledTimes(2);
-    expect(transport.createPermission).toHaveBeenCalledWith("p1", "editor", "new@x.com");
-    expect(transport.createPermission).toHaveBeenCalledWith("realtime", "editor", "new@x.com");
+  it("resolves a collaborator's layout by discovery when the local cache is empty", async () => {
+    const { service, fake, store } = makeService({ identity: "owner@example.com" });
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "c", type: "user", role: "writer", emailAddress: "collab@example.com" }]);
+
+    // A collaborator's browser has no local shared-layout cache.
+    await store.delete("proj1");
+    fake.setIdentity("collab@example.com");
+    expect(await service.myRole("proj1")).toBe("editor");
+    expect(await service.readSharedSnapshot("proj1")).toBe(JSON.stringify({ projectId: "proj1" }));
+    // Discovery result is cached for subsequent calls.
+    expect(store.records.get("proj1")!.projectFileId).toBe(await service.projectFileId("proj1"));
   });
 
-  it("normalizes the email (trim + lowercase) for every ACL write", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      sharedRoot: folderRef("Pboard", "Pboard"),
-    });
-    await service.invite("p1", "  New@X.COM  ", "viewer");
-    expect(transport.createPermission).toHaveBeenCalledTimes(2);
-    expect(transport.createPermission).toHaveBeenCalledWith("proj", "viewer", "new@x.com");
-    expect(transport.createPermission).toHaveBeenCalledWith("rt", "editor", "new@x.com");
-  });
-
-  it("does not double-grant the realtime ACL when it already exists", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      sharedRoot: folderRef("Pboard", "Pboard"),
-      listPermissions: (fileId) =>
-        fileId === "rt" ? [userPerm("rt-c", "writer", "new@x.com", "New")] : [],
-    });
-    await service.invite("p1", "new@x.com", "editor");
-    expect(transport.createPermission).toHaveBeenCalledTimes(1);
-    expect(transport.createPermission).toHaveBeenCalledWith("proj", "editor", "new@x.com");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// updateRole
-// ---------------------------------------------------------------------------
-describe("updateRole", () => {
-  it("rejects changing the owner's role", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : [],
-    });
-    await expect(service.updateRole("p1", "me@example.com", "viewer")).rejects.toThrow(
-      "Collaborator not found or is the owner",
-    );
-    expect(transport.updatePermission).not.toHaveBeenCalled();
-  });
-
-  it("rejects updating a collaborator that is not found", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : [],
-    });
-    await expect(service.updateRole("p1", "ghost@x.com", "viewer")).rejects.toThrow(
-      "Collaborator not found or is the owner",
-    );
-    expect(transport.updatePermission).not.toHaveBeenCalled();
-  });
-
-  it("updates a non-owner collaborator's role", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj"
-          ? [userPerm("o", "owner", "me@example.com", "Me"), userPerm("c", "reader", "c@x.com", "C")]
-          : [],
-    });
-    await service.updateRole("p1", "c@x.com", "editor");
-    expect(transport.updatePermission).toHaveBeenCalledWith("proj", "c", "editor");
-  });
-
-  it("matches collaborator emails case-insensitively", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj"
-          ? [userPerm("o", "owner", "me@example.com", "Me"), userPerm("c", "reader", "c@x.com", "C")]
-          : [],
-    });
-    await service.updateRole("p1", "C@X.COM", "viewer");
-    expect(transport.updatePermission).toHaveBeenCalledWith("proj", "c", "viewer");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// removeCollaborator
-// ---------------------------------------------------------------------------
-describe("removeCollaborator", () => {
-  it("rejects removing the owner", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : [],
-    });
-    await expect(service.removeCollaborator("p1", "me@example.com")).rejects.toThrow(
-      "Collaborator not found or is the owner",
-    );
-    expect(transport.deletePermission).not.toHaveBeenCalled();
-  });
-
-  it("rejects removing a non-existent collaborator", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : [],
-    });
-    await expect(service.removeCollaborator("p1", "ghost@x.com")).rejects.toThrow(
-      "Collaborator not found or is the owner",
-    );
-    expect(transport.deletePermission).not.toHaveBeenCalled();
-  });
-
-  it("removes a non-owner collaborator from both the project and realtime ACLs", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (fileId) =>
-        fileId === "proj"
-          ? [userPerm("o", "owner", "me@example.com", "Me"), userPerm("c", "reader", "c@x.com", "C")]
-          : fileId === "rt"
-            ? [userPerm("rt-c", "writer", "c@x.com", "C")]
-            : [],
-    });
-    await service.removeCollaborator("p1", "c@x.com");
-    expect(transport.deletePermission).toHaveBeenCalledTimes(2);
-    expect(transport.deletePermission).toHaveBeenCalledWith("proj", "c");
-    expect(transport.deletePermission).toHaveBeenCalledWith("rt", "rt-c");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// discoverSharedProjects
-// ---------------------------------------------------------------------------
-describe("discoverSharedProjects", () => {
-  it("returns one entry per reachable project.json, named after the parent folder", async () => {
-    const { service } = makeService({
-      fileParents: { f1: ["proj1-folder"], f2: ["proj2-folder"] },
-      filesById: {
-        "proj1-folder": folderRef("proj1-folder", "p1"),
-        "proj2-folder": folderRef("proj2-folder", "p2"),
-      },
-      listFilesByNameResult: [fileRef("f1", "project.json"), fileRef("f2", "project.json")],
-    });
-    const result = await service.discoverSharedProjects();
-    expect(result).toEqual([
-      { projectId: "p1", name: "p1", fileId: "f1" },
-      { projectId: "p2", name: "p2", fileId: "f2" },
-    ]);
-  });
-
-  it("dedupes multiple project.json files in the same folder (first wins)", async () => {
-    const { service } = makeService({
-      fileParents: { f1: ["p-folder"], f1b: ["p-folder"] },
-      filesById: { "p-folder": folderRef("p-folder", "p1") },
-      listFilesByNameResult: [fileRef("f1", "project.json"), fileRef("f1b", "project.json")],
-    });
-    const result = await service.discoverSharedProjects();
-    expect(result).toEqual([{ projectId: "p1", name: "p1", fileId: "f1" }]);
-  });
-
-  it("skips files whose parent is not a folder", async () => {
-    const { service } = makeService({
-      fileParents: { f1: ["file-parent"] },
-      filesById: { "file-parent": fileRef("file-parent", "notes.md") },
-      listFilesByNameResult: [fileRef("f1", "project.json")],
-    });
-    const result = await service.discoverSharedProjects();
-    expect(result).toEqual([]);
-  });
-
-  it("returns an empty list when no project.json files are reachable", async () => {
-    const { service } = makeService();
-    const result = await service.discoverSharedProjects();
-    expect(result).toEqual([]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// ensureSharedProject
-// ---------------------------------------------------------------------------
-describe("ensureSharedProject", () => {
-  it("creates the shared layout for a fresh project and caches it", async () => {
-    const { service, transport, store } = makeService({ snapshot: '{"id":"p1"}' });
-    const folderId = await service.ensureSharedProject("p1");
-    expect(folderId).toBe("p1");
-    expect(transport.createFolder).toHaveBeenCalledTimes(3);
-    expect(transport.createJsonFile).toHaveBeenCalledWith("project.json", "p1", '{"id":"p1"}');
-    expect(store.set).toHaveBeenCalledOnce();
-    expect(store.state()).toEqual({
-      p1: { folderId: "p1", projectFileId: "project.json@p1", realtimeFolderId: "realtime" },
-    });
-  });
-
-  it("is idempotent when the project is already shared", async () => {
-    const { service, transport } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      sharedRoot: folderRef("Pboard", "Pboard"),
-    });
-    expect(await service.ensureSharedProject("p1")).toBe("proj");
-    expect(await service.ensureSharedProject("p1")).toBe("proj");
-    expect(transport.createFolder).not.toHaveBeenCalled();
-    expect(transport.createJsonFile).not.toHaveBeenCalled();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// myRole
-// ---------------------------------------------------------------------------
-describe("myRole", () => {
-  it("returns null when the project is not shared", async () => {
-    const { service } = makeService();
-    expect(await service.myRole("p1")).toBeNull();
-  });
-
-  it("returns owner when the account owns the project", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "me@example.com", "Me")] : [],
-    });
-    expect(await service.myRole("p1")).toBe("owner");
-  });
-
-  it("returns editor for a writer permission", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("w", "writer", "me@example.com", "Me")] : [],
-    });
-    expect(await service.myRole("p1")).toBe("editor");
-  });
-
-  it("returns viewer for a reader permission", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("r", "reader", "me@example.com", "Me")] : [],
-    });
-    expect(await service.myRole("p1")).toBe("viewer");
-  });
-
-  it("returns null when the account has no permission", async () => {
-    const { service } = makeService({
-      layout: { folderId: "proj", projectFileId: "pf", realtimeFolderId: "rt" },
-      listPermissions: (id) =>
-        id === "proj" ? [userPerm("o", "owner", "other@example.com", "Other")] : [],
-    });
-    expect(await service.myRole("p1")).toBeNull();
+  it("reuses the realtime folder across repeated calls without creating a second one", async () => {
+    const { service, fake, store } = makeService();
+    await service.ensureSharedProject("proj1");
+    const realtime1 = await service.realtimeFolderId("proj1");
+    const realtime2 = await service.realtimeFolderId("proj1");
+    expect(realtime2).toBe(realtime1);
+    expect(store.records.get("proj1")!.realtimeFolderId).toBe(realtime1);
+    const projFolderId = [...fake.state.folders.values()].find((f) => f.name === "proj1")!.id;
+    const realtimeFolders = [...fake.state.folders.values()].filter((f) => f.name === "realtime" && f.parents.includes(projFolderId));
+    expect(realtimeFolders).toHaveLength(1);
   });
 });

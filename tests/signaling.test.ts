@@ -313,13 +313,13 @@ describe("createDriveSignaling", () => {
     expect(bInfo.peers).toEqual([]);
 
     factory.advance(100);
-    const aInfo = await a.join();
+    const aInfo = await a.join(() => {});
     expect(aInfo.peerId).toBe("a");
     expect(aInfo.peers).toEqual(["b"]);
 
     const state = factory.state();
-    expect(state.get("a").updatedAt).toBe(factory.now());
-    expect(state.get("b").updatedAt).toBe(factory.now() - 100);
+    expect(state.get("a")!.updatedAt).toBe(factory.now());
+    expect(state.get("b")!.updatedAt).toBe(factory.now() - 100);
 
     await a.leave();
     await b.leave();
@@ -430,7 +430,7 @@ describe("createDriveSignaling", () => {
       updatedAt: now - 5_000,
       peers: [],
       outbox: [
-        { id: crypto.randomUUID(), payload: { kind: 99 }, sentAt: now - 2 * 240_000 - 10_000 },
+        { id: crypto.randomUUID(), toPeerId: "b", payload: { kind: 99 }, sentAt: now - 2 * 240_000 - 10_000 },
       ],
     });
 

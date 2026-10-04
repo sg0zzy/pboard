@@ -76,7 +76,7 @@ describe("project snapshots", () => {
 });
 
 describe("Google OAuth", () => {
-  it("uses PKCE, account selection, and the Drive app-data + drive.file scopes", async () => {
+  it("uses PKCE, account selection, and the Drive app-data + full drive scopes", async () => {
     const storage = new MemoryStorage();
     let authorizationUrl = "";
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -105,7 +105,8 @@ describe("Google OAuth", () => {
     await auth.connect();
 
     const params = new URL(authorizationUrl).searchParams;
-    expect(params.get("prompt")).toBe("select_account");
+    expect(params.get("prompt")).toBe("consent select_account");
+    expect(params.get("include_granted_scopes")).toBe("true");
     expect(params.get("scope")).toBe(DRIVE_SCOPE);
     expect(params.get("code_challenge_method")).toBe("S256");
     expect(params.get("code_challenge")).toBeTruthy();
@@ -124,11 +125,66 @@ describe("Google OAuth", () => {
     });
 
     await auth.connect();
-    expect(getAuthToken).toHaveBeenCalledWith({ interactive: true });
+    expect(getAuthToken).toHaveBeenCalledWith({ interactive: true, scopes: DRIVE_SCOPE.split(" ") });
     expect(await auth.getAccessToken()).toBe("interactive-token");
 
     expect(await auth.getAccessToken(true)).toBe("cached-token");
     expect(removeCachedAuthToken).toHaveBeenCalledWith({ token: "interactive-token" });
+  });
+
+  it("replaces an old Firefox refresh grant and retains sharing scopes after renewal", async () => {
+    const storage = new MemoryStorage();
+    await storage.set({ [DRIVE_AUTH_STORAGE_KEY]: { accessToken: "old", refreshToken: "old-refresh", scope: "https://www.googleapis.com/auth/drive.appdata" } });
+    const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
+      const body = init?.body as URLSearchParams;
+      if (body.get("grant_type") === "refresh_token") {
+        expect(body.get("refresh_token")).toBe("new-refresh");
+        return new Response(JSON.stringify({ access_token: "renewed", expires_in: 3600, scope: DRIVE_SCOPE }));
+      }
+      return new Response(JSON.stringify({ access_token: "new", refresh_token: "new-refresh", expires_in: 3600, scope: DRIVE_SCOPE }));
+    });
+    const auth = createGoogleAuthProvider({ clientId: "client", storage, fetch: fetcher, identity: {
+      getRedirectURL: () => "https://extension.example/auth",
+      launchWebAuthFlow: async ({ url }) => `https://extension.example/auth?code=new-code&state=${new URL(url).searchParams.get("state")}`
+    } });
+    await auth.connect();
+    expect(storage.data[DRIVE_AUTH_STORAGE_KEY]).toMatchObject({ refreshToken: "new-refresh", scope: DRIVE_SCOPE });
+    expect(await auth.getAccessToken(true)).toBe("renewed");
+  });
+
+  it.each([
+    { access_token: "partial", refresh_token: "partial-refresh", expires_in: 3600, scope: "https://www.googleapis.com/auth/drive.appdata" },
+    { access_token: "no-refresh", expires_in: 3600, scope: DRIVE_SCOPE }
+  ])("does not accept an incomplete Firefox authorization or reuse an old refresh grant", async (token) => {
+    const storage = new MemoryStorage();
+    const original = { refreshToken: "old-refresh" };
+    await storage.set({ [DRIVE_AUTH_STORAGE_KEY]: original });
+    const auth = createGoogleAuthProvider({ clientId: "client", storage,
+      fetch: async () => new Response(JSON.stringify(token)),
+      identity: {
+        getRedirectURL: () => "https://extension.example/auth",
+        launchWebAuthFlow: async ({ url }) => `https://extension.example/auth?code=new-code&state=${new URL(url).searchParams.get("state")}`
+      }
+    });
+    await expect(auth.connect()).rejects.toThrow(/grant|consent/);
+    expect(storage.data[DRIVE_AUTH_STORAGE_KEY]).toEqual(original);
+  });
+
+  it("rejects a Chrome token that grants private sync without sharing access", async () => {
+    const getAuthToken = vi.fn(async () => ({ token: "old-token", grantedScopes: ["https://www.googleapis.com/auth/drive.appdata"] }));
+    const removeCachedAuthToken = vi.fn(async () => undefined);
+    const auth = createChromiumGoogleAuthProvider({ clientId: "client", identity: { getAuthToken, removeCachedAuthToken } });
+    await expect(auth.connect()).rejects.toThrow(/allow both private sync and project sharing/);
+    expect(removeCachedAuthToken).toHaveBeenCalledWith({ token: "old-token" });
+    expect(await auth.getConnectionState()).toBe("disconnected");
+  });
+
+  it("accepts Chrome authorization when both requested scopes are granted", async () => {
+    const getAuthToken = vi.fn(async () => ({ token: "sharing-token", grantedScopes: DRIVE_SCOPE.split(" ") }));
+    const auth = createChromiumGoogleAuthProvider({ clientId: "client", identity: { getAuthToken, removeCachedAuthToken: async () => {} } });
+    await auth.connect();
+    expect(await auth.getAccessToken()).toBe("sharing-token");
+    expect(await auth.getConnectionState()).toBe("connected");
   });
 });
 
@@ -147,6 +203,32 @@ describe("Drive sync state", () => {
 });
 
 describe("Google Drive provider", () => {
+  it("discovers invitations before reconciliation and keeps shared boards out of private uploads and pulls", async () => {
+    const storage = new MemoryStorage();
+    storage.data.projectBoardState = stateWithProject();
+    const snapshots = createProjectSnapshotStore(storage);
+    const syncState = createDriveSyncStateStore(storage);
+    await syncState.markDirty(project.id);
+    const beforeReconcile = vi.fn(async () => {});
+    const upload = vi.fn(async () => ({ id: "unexpected", name: "unexpected" }));
+    const provider = createGoogleDriveProvider({ auth: connectedAuth(), snapshots, syncState,
+      tombstones: createDriveTombstoneStore(storage), beforeReconcile,
+      isSharedProject: async (id) => id === project.id,
+      transport: {
+        listProjectFiles: async () => {
+          expect(beforeReconcile).toHaveBeenCalledOnce();
+          return [{ id: "old-private-copy", name: "project-project-1.pboard" }];
+        },
+        findProjectFile: async () => null,
+        download: async () => serializeProjectSnapshot({ ...project, name: "Old private name" }, []),
+        upload, delete: async () => {}
+      }
+    });
+    expect(await provider.syncProject(project.id)).toBe("not-dirty");
+    await provider.reconcileAll();
+    expect(upload).not.toHaveBeenCalled();
+    expect((await snapshots.read(project.id)).project.name).toBe(project.name);
+  });
   it("pushes one app-data snapshot only when the project is dirty", async () => {
     const storage = new MemoryStorage();
     storage.data.projectBoardState = stateWithProject();
@@ -291,6 +373,39 @@ describe("Google Drive provider", () => {
     expect(await provider.reconcileAll()).toMatchObject({ deleted: 1, imported: 0 });
     expect(deleteFile).toHaveBeenCalledWith("file-1");
     expect(await tombstones.get(project.id)).toBeNull();
+  });
+  it("keeps a shared board tombstone so discovery cannot re-import it after local deletion", async () => {
+    const storage = new MemoryStorage();
+    const tombstones = createDriveTombstoneStore(storage);
+    await tombstones.add({
+      projectId: project.id,
+      deletedAt: "2026-01-03T00:00:00.000Z",
+      projectUpdatedAt: project.updatedAt,
+      revision: project.revision
+    });
+    const deleteFile = vi.fn(async () => undefined);
+    const provider = createGoogleDriveProvider({
+      auth: connectedAuth(),
+      transport: {
+        listProjectFiles: async () => [],
+        findProjectFile: async () => null,
+        download: vi.fn(),
+        upload: vi.fn(),
+        delete: deleteFile
+      },
+      snapshots: createProjectSnapshotStore(storage),
+      syncState: createDriveSyncStateStore(storage),
+      tombstones,
+      isSharedProject: async () => true
+    });
+
+    expect(await provider.deleteProject(project.id)).toBe("deleted");
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(await tombstones.get(project.id)).toBeTruthy();
+
+    expect(await provider.reconcileAll()).toMatchObject({ status: "reconciled", deleted: 0 });
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(await tombstones.get(project.id)).toBeTruthy();
   });
 });
 

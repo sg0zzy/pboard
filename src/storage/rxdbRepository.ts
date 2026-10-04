@@ -4,7 +4,7 @@ import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
 import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
 import type { CollaborationRole } from "../collab/manager";
-import { blobToDataUrl, createIndexedDbBlobStore, imageToBlob, type BlobStore } from "./blobStore";
+import { blobToDataUrl, createIndexedDbBlobStore, hashBlob, imageToBlob, type BlobStore } from "./blobStore";
 import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
 import type { RepositoryEvents } from "./repository";
@@ -93,11 +93,30 @@ export async function createRxRepository(options: {
   async function allProjectRecords() {
     return (await projects.find().exec()).map((doc) => doc.toJSON()).sort(compareOrdered);
   }
+  let projectOrderAccount: string | null = null;
+  const localOrderId = "localProjectOrder";
+  const accountOrderId = (account: string) => `projectOrder:${account}`;
+  async function orderedProjects() {
+    const records = await allProjectRecords();
+    const preference = (projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null)
+      ?? await settings.findOne(localOrderId).exec();
+    if (!preference) return records;
+    const ids = JSON.parse(preference.value) as string[];
+    const ranks = new Map(ids.map((id, index) => [id, index]));
+    return records.sort((a, b) => (ranks.get(a.id) ?? ids.length) - (ranks.get(b.id) ?? ids.length));
+  }
+  async function setProjectOrderAccount(account: string | null) {
+    const ids = (await orderedProjects()).map((record) => record.id);
+    projectOrderAccount = account;
+    // Preserve local ordering before shared project documents can arrive, and
+    // retain the last visible order when disconnecting or changing accounts.
+    await settings.upsert({ id: localOrderId, value: JSON.stringify(ids) });
+  }
   async function projectCardRecords(projectId: string, includeDeleted = false) {
     const records = (await cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }).exec()).map((doc) => doc.toJSON()).sort(compareOrdered);
     return includeDeleted ? records : records.filter(isVisible);
   }
-  async function listProjects(): Promise<Project[]> { return (await allProjectRecords()).map(projectValue); }
+  async function listProjects(): Promise<Project[]> { return (await orderedProjects()).map(projectValue); }
   async function getProject(id: string): Promise<Project | null> {
     const doc = await projects.findOne(id).exec();
     return doc ? projectValue(doc.toJSON()) : null;
@@ -122,7 +141,7 @@ export async function createRxRepository(options: {
   async function hydrateCard(card: BoardItem): Promise<BoardItem> {
     if (!card.imageId) return card;
     const image = await blobs.getBlob(card.imageId);
-    if (!image) return card;
+    if (!image) throw new Error(`Image data is missing for card ${card.id}; wait for image sync before exporting`);
     return { ...card, image: { dataUrl: await blobToDataUrl(image.blob), mimeType: image.mimeType, width: image.width, height: image.height } };
   }
   async function exportProject(projectId: string): Promise<{ project: Project; items: BoardItem[] }> {
@@ -138,6 +157,15 @@ export async function createRxRepository(options: {
   }
   async function putImage(image: BoardImage): Promise<string> {
     return blobs.putBlob(await imageToBlob(image.dataUrl), image);
+  }
+  async function importImages(projectId: string, items: BoardItem[]): Promise<void> {
+    for (const item of items) {
+      if (item.projectId !== projectId || !item.image?.dataUrl.startsWith("data:image/")) continue;
+      const doc = await cards.findOne(item.id).exec();
+      if (!doc || doc.projectId !== projectId || !doc.imageId || await blobs.hasBlob(doc.imageId)) continue;
+      const blob = await imageToBlob(item.image.dataUrl);
+      if (await hashBlob(blob) === doc.imageId) await blobs.putBlob(blob, item.image);
+    }
   }
   async function deleteImage(imageId: string): Promise<void> {
     // Tombstoned cards retain references for rollback and future replication.
@@ -172,6 +200,8 @@ export async function createRxRepository(options: {
     for (const [index, project] of state.projects.entries()) {
       await importProject(project, state.boardItems.filter((item) => item.projectId === project.id), projectKeys[index]);
     }
+    await settings.upsert({ id: projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId,
+      value: JSON.stringify(state.projects.map((project) => project.id)) });
     await settings.upsert({ id: "currentProjectId", value: state.currentProjectId ?? "" });
     const importedProjects = await listProjects();
     if (importedProjects.length !== state.projects.length || importedProjects.some((project) => !state.projects.some((original) => original.id === project.id))) {
@@ -209,11 +239,7 @@ export async function createRxRepository(options: {
   async function reorderProjects(orderedIds: string[]) { return locked(async () => {
     const current = await allProjectRecords();
     if (orderedIds.length !== current.length || new Set(orderedIds).size !== current.length || current.some((record) => !orderedIds.includes(record.id))) throw new Error("Project list must contain every project exactly once");
-    const keys = initialOrderKeys(current.length);
-    for (let index = 0; index < orderedIds.length; index++) {
-      const doc = await projects.findOne(orderedIds[index]).exec();
-      if (doc && doc.orderKey !== keys[index]) await doc.incrementalPatch({ orderKey: keys[index] });
-    }
+    await settings.upsert({ id: projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId, value: JSON.stringify(orderedIds) });
   }); }
   async function renameProject(projectId: string, name: string) {
     const trimmed = name.trim();
@@ -430,7 +456,11 @@ export async function createRxRepository(options: {
     refresh();
     return () => { active = false; sub.unsubscribe(); };
   }
-  const subscribeProjects = (listener: (value: Project[]) => void) => subscribe(projects.find(), listProjects, listener);
+  const subscribeProjects = (listener: (value: Project[]) => void) => {
+    const stopProjects = subscribe(projects.find(), listProjects, listener);
+    const stopSettings = subscribe(settings.find(), listProjects, listener);
+    return () => { stopProjects(); stopSettings(); };
+  };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
     const emit = () => { void getCurrentProject().then(listener); };
     const first = settings.findOne("currentProjectId").$.subscribe(emit);
@@ -443,11 +473,12 @@ export async function createRxRepository(options: {
   const subscribeCard = (id: string, listener: (value: BoardItem | null) => void) => subscribe(cards.findOne(id), () => getCard(id), listener);
   async function load(): Promise<AppState> { return exportAll(); } // Compatibility for old command callers; not a reactive read path.
   return { db, blobs, load, exportAll, exportProject, importProject, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
-    createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate,
+    createProject, selectProject, reorderProjects, setProjectOrderAccount, renameProject, deleteProject, changeProjectTemplate,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,
     subscribeProjects, subscribeCurrentProject, subscribeCards, subscribeCard,
-    putImage, getImage: blobs.getBlob, hasImage: blobs.hasBlob, imageAvailability: blobs.imageAvailability, deleteImage };
+    putImage, getImage: blobs.getBlob, hasImage: blobs.hasBlob, imageAvailability: blobs.imageAvailability, deleteImage,
+    subscribeImages: blobs.subscribe, importImages };
 }
 
 export type RxRepository = Awaited<ReturnType<typeof createRxRepository>>;

@@ -35,11 +35,14 @@ type Dependencies = {
   snapshots: ProjectSnapshotStore;
   syncState: DriveSyncStateStore;
   tombstones: DriveTombstoneStore;
+  beforeReconcile?: () => Promise<void>;
+  isSharedProject?: (projectId: string) => Promise<boolean>;
 };
 
 type RemoteSnapshot = { file: DriveAppDataFile; snapshot: ProjectSnapshot };
 
-export function createGoogleDriveProvider({ auth, transport, snapshots, syncState, tombstones }: Dependencies): GoogleDriveProvider {
+export function createGoogleDriveProvider({ auth, transport, snapshots, syncState, tombstones, beforeReconcile,
+  isSharedProject = async () => false }: Dependencies): GoogleDriveProvider {
   const syncInFlight = new Map<string, Promise<ProjectSyncResult>>();
   let reconciliationInFlight: Promise<DriveReconcileResult> | null = null;
 
@@ -108,6 +111,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   }
 
   async function performProjectSync(projectId: string): Promise<ProjectSyncResult> {
+    if (await isSharedProject(projectId)) return "not-dirty";
     if (await tombstones.get(projectId)) return "not-dirty";
     const state = await syncState.get(projectId);
     if (!state.dirty) return "not-dirty";
@@ -166,6 +170,10 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     }
     const tombstone = await tombstones.get(projectId);
     if (!tombstone) return "deleted";
+    // A shared board's content lives in a Drive folder owned by the sharer.
+    // Deleting locally only hides it for this account (the folder is not removed),
+    // so the tombstone must persist to stop discovery from importing it back.
+    if (await isSharedProject(projectId)) return "deleted";
     if (await auth.getConnectionState() !== "connected") return "pending";
     try {
       const fileId = tombstone.remoteFileId ?? (await resolveFile(projectId))?.id;
@@ -180,21 +188,28 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
 
   async function performReconciliation(): Promise<DriveReconcileResult> {
     const pendingTombstones = await tombstones.getAll();
+    // Shared boards keep a permanent local tombstone (their Drive folder is not
+    // deleted); it only hides the project, so reconcile must not delete it.
+    const privateTombstones: typeof pendingTombstones = [];
+    for (const tombstone of pendingTombstones) {
+      if (!await isSharedProject(tombstone.projectId)) privateTombstones.push(tombstone);
+    }
     // Explicit local deletes stay hidden even when Drive is unavailable.
-    for (const tombstone of pendingTombstones) await snapshots.remove(tombstone.projectId);
+    for (const tombstone of privateTombstones) await snapshots.remove(tombstone.projectId);
     const empty: DriveReconcileResult = { status: "disconnected", imported: 0, pulled: 0, pushed: 0, deleted: 0 };
     if (await auth.getConnectionState() !== "connected") return empty;
+    await beforeReconcile?.();
 
     // A failed list is allowed to reject the whole reconciliation. It must never
     // be converted into an empty remote set.
     const listedFiles = await transport.listProjectFiles();
-    const tombstonedIds = new Set(pendingTombstones.map((entry) => entry.projectId));
-    const deletionSucceeded = new Map(pendingTombstones.map((entry) => [entry.projectId, true]));
+    const tombstonedIds = new Set(privateTombstones.map((entry) => entry.projectId));
+    const deletionSucceeded = new Map(privateTombstones.map((entry) => [entry.projectId, true]));
     const knownTombstoneFileIds = new Map(
-      pendingTombstones.flatMap((entry) => entry.remoteFileId ? [[entry.remoteFileId, entry.projectId] as const] : [])
+      privateTombstones.flatMap((entry) => entry.remoteFileId ? [[entry.remoteFileId, entry.projectId] as const] : [])
     );
 
-    for (const tombstone of pendingTombstones) {
+    for (const tombstone of privateTombstones) {
       if (!tombstone.remoteFileId) continue;
       try {
         await transport.delete(tombstone.remoteFileId);
@@ -224,6 +239,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     const remoteByProject = new Map<string, RemoteSnapshot>();
     for (const entry of remoteEntries) {
       const projectId = entry.snapshot.project.id;
+      if (await isSharedProject(projectId)) continue;
       if (tombstonedIds.has(projectId)) continue;
       const current = remoteByProject.get(projectId);
       if (!current || compareProjectTimestamps(entry.snapshot.project, current.snapshot.project) > 0) {
@@ -233,7 +249,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
 
     const localByProject = new Map((await snapshots.list()).map((snapshot) => [snapshot.project.id, snapshot]));
     const result: DriveReconcileResult = { status: "reconciled", imported: 0, pulled: 0, pushed: 0, deleted: 0 };
-    result.deleted = pendingTombstones.filter((entry) => deletionSucceeded.get(entry.projectId)).length;
+    result.deleted = privateTombstones.filter((entry) => deletionSucceeded.get(entry.projectId)).length;
 
     for (const [projectId, remote] of remoteByProject) {
       if (await tombstones.get(projectId)) {
@@ -276,6 +292,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     }
 
     for (const [projectId] of localByProject) {
+      if (await isSharedProject(projectId)) continue;
       if (tombstonedIds.has(projectId)) continue;
       if (await tombstones.get(projectId)) {
         await snapshots.remove(projectId);
@@ -286,6 +303,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
       if (await syncProject(projectId) === "pushed") result.pushed += 1;
     }
     for (const tombstone of await tombstones.getAll()) {
+      if (await isSharedProject(tombstone.projectId)) continue;
       await snapshots.remove(tombstone.projectId);
       if (await deleteProject(tombstone.projectId) === "deleted") result.deleted += 1;
     }

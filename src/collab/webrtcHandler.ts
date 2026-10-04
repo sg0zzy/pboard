@@ -1,4 +1,6 @@
-import Peer from "simple-peer";
+// The package root requires Node globals and stream APIs. Use the bundled
+// browser entry, as RxDB's own WebRTC handler does, in extension contexts.
+import Peer from "simple-peer/simplepeer.min.js";
 import { Subject } from "rxjs";
 import { newRxError } from "rxdb";
 import type { RxError, RxTypeError } from "rxdb";
@@ -82,12 +84,11 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       const peer = new Peer({ initiator: remotePeerId > ownPeerId, wrtc, config, trickle }) as PboardPeer;
       peer.id = remotePeerId;
       peers.set(remotePeerId, peer);
-      const buffered = pendingSignals.get(remotePeerId);
-      if (buffered) {
-        pendingSignals.delete(remotePeerId);
-        for (const signal of buffered) peer.signal(signal as Parameters<PboardPeer["signal"]>[0]);
-      }
-      peer.on("signal", (signal) => { void signaling.sendSignal(remotePeerId, signal); });
+      peer.on("signal", (signal) => {
+        void signaling.sendSignal(remotePeerId, signal).catch((error) => {
+          error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+        });
+      });
       peer.on("data", (payload) => {
         const parsed = JSON.parse(payload.toString());
         if (parsed && typeof parsed === "object" && "result" in parsed) response$.next({ peer, response: { ...parsed, result: scopeResult(parsed.result) } });
@@ -105,6 +106,11 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         pendingSignals.delete(remotePeerId);
         createPeerConnection(remotePeerId);
       });
+      const buffered = pendingSignals.get(remotePeerId);
+      if (buffered) {
+        pendingSignals.delete(remotePeerId);
+        for (const signal of buffered) peer.signal(signal as Parameters<PboardPeer["signal"]>[0]);
+      }
     }
 
     function handleRoster(roster: string[]) {
@@ -121,6 +127,9 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         list.push(data);
         pendingSignals.set(from, list);
       }
+    });
+    signaling.onError?.((error) => {
+      if (!closed) error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
     });
 
     void (async () => {

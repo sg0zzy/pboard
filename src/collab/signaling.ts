@@ -32,6 +32,8 @@ export interface PboardSignaling {
   sendSignal(toPeerId: string, signal: PboardSignal): Promise<void>;
   /** Install the handler for signals relayed to us. Called with the sender's peer id. */
   onSignal(handler: (fromPeerId: string, signal: PboardSignal) => void): void;
+  /** Report transport failures after join, such as a failed presence poll. */
+  onError?(handler: (error: unknown) => void): void;
   /** Leave the room and release transport resources. */
   leave(): Promise<void>;
 }
@@ -199,7 +201,7 @@ export function createWebSocketSignaling(topic: string, url: string, webSocket: 
 // ---------------------------------------------------------------------------
 
 /** One outbox signal: an opaque simple-peer signal plus a stable id for dedupe. */
-export type PboardDriveSignal = { id: string; payload: PboardSignal; sentAt?: number };
+export type PboardDriveSignal = { id: string; toPeerId: string; payload: PboardSignal; sentAt?: number };
 
 /** The JSON body of a single peer's realtime record. */
 export type PboardDriveSignalRecord = {
@@ -217,7 +219,7 @@ export type PboardDriveSignalRecord = {
  * injectable so tests can advance the clock deterministically.
  */
 export interface PboardDriveSignalStore {
-  /** The authenticated peer id (stable across sessions, unique per account). */
+  /** A unique browser-session id; two sessions of the same account are separate peers. */
   readonly peerId: string;
   now(): number;
   /** Read a peer's record; null when the file does not exist (fresh peer). */
@@ -264,6 +266,24 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   let lastRoster = "";
   let started = false;
   let polling = false;
+  let onError: ((error: unknown) => void) | null = null;
+  let writes: Promise<unknown> = Promise.resolve();
+  function writeExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const run = writes.then(task);
+    writes = run.catch(() => undefined);
+    return run;
+  }
+
+  function schedulePoll() {
+    if (!started || timer !== null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void tick().catch((error) => {
+        if (onError) onError(error);
+        else console.error("Pboard live collaboration signaling failed", error);
+      });
+    }, pollMs);
+  }
   // Outbound signals already handed to onSignal, keyed by sender peer id.
   const delivered = new Map<string, Set<string>>();
 
@@ -284,20 +304,24 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   }
 
   async function tick(): Promise<void> {
-    if (polling) return;
+    if (polling || !started) return;
     polling = true;
     try {
       const now = store.now();
       // (a) Refresh our own presence (heartbeat) and drop expired outbox signals.
-      const own = await readOwn();
-      const pruned = own.outbox.filter((s) => now - (s.sentAt ?? own.updatedAt) < signalTtlMs);
-      await store.writeOwn({ updatedAt: now, peers: own.peers, outbox: pruned });
+      await writeExclusive(async () => {
+        const own = await readOwn();
+        const pruned = own.outbox.filter((s) => now - (s.sentAt ?? own.updatedAt) < signalTtlMs);
+        await store.writeOwn({ updatedAt: now, peers: own.peers, outbox: pruned });
+      });
       // (b) Read every peer, deliver new signals, then reconcile presence.
       const all = await store.listPeers();
+      if (!started) return;
       for (const [peerId, record] of Object.entries(all)) {
-        if (peerId === me || !record) continue;
+        if (peerId === me || !record || now - record.updatedAt >= presenceTtlMs) continue;
         const seen = delivered.get(peerId) ?? new Set<string>();
         for (const signal of record.outbox) {
+          if (signal.toPeerId !== me || now - (signal.sentAt ?? record.updatedAt) >= signalTtlMs) continue;
           if (seen.has(signal.id)) continue;
           seen.add(signal.id);
           onSignal?.(peerId, signal.payload);
@@ -307,7 +331,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       await refreshRoster(now, all);
     } finally {
       polling = false;
-      if (started && timer === null) timer = setTimeout(() => { void tick(); }, pollMs);
+      schedulePoll();
     }
   }
 
@@ -316,20 +340,28 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
     async join(rosterHandler) {
       onRoster = rosterHandler;
       started = true;
-      await tick();
+      try { await tick(); }
+      catch (error) {
+        // Keep the session identity usable while the scheduled poll retries.
+        // Otherwise the connection handler never learns its own id and cannot
+        // connect when Drive recovers and a later poll discovers peers.
+        if (onError) onError(error); else throw error;
+      }
       return { peerId: me, peers: lastRoster ? lastRoster.split("\n") : [] };
     },
-    async sendSignal(to, signal) {
+    sendSignal(to, signal) { return writeExclusive(async () => {
+      if (!started) return;
       const now = store.now();
       const own = await readOwn();
-      own.outbox.push({ id: crypto.randomUUID(), payload: signal, sentAt: now });
+      own.outbox.push({ id: crypto.randomUUID(), toPeerId: to, payload: signal, sentAt: now });
       own.outbox = own.outbox.slice(-16); // bound the outbox
       own.peers = Array.from(new Set([...own.peers, to]));
       await store.writeOwn({ updatedAt: now, peers: own.peers, outbox: own.outbox });
-    },
+    }); },
     onSignal(handler) {
       onSignal = handler;
     },
+    onError(handler) { onError = handler; },
     async leave() {
       started = false;
       if (timer) {
@@ -338,11 +370,11 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       }
       onRoster = null;
       onSignal = null;
+      onError = null;
       delivered.clear();
       lastRoster = "";
-      await store.deleteOwn().catch(() => {});
+      await writeExclusive(() => store.deleteOwn()).catch(() => {});
     }
   };
   return signaling;
 }
-

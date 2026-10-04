@@ -8,9 +8,9 @@ import {
   type DriveProjectSyncState
 } from "../../sync/state";
 
-type Props = { projectId: string | null };
+type Props = { projectId: string | null; onConnectionChanged?: () => void };
 
-export function DriveSyncControls({ projectId }: Props) {
+export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
   const [connected, setConnected] = useState(false);
   const [syncState, setSyncState] = useState<DriveProjectSyncState | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
@@ -38,6 +38,7 @@ export function DriveSyncControls({ projectId }: Props) {
     setLocalError("");
     try {
       await googleAuth.connect();
+      onConnectionChanged?.();
       await refresh();
       void requestDriveReconciliation();
     } catch (error) {
@@ -52,6 +53,7 @@ export function DriveSyncControls({ projectId }: Props) {
     setAuthBusy(true);
     setLocalError("");
     await googleAuth.disconnect();
+    onConnectionChanged?.();
     await refresh();
     setAuthBusy(false);
   }

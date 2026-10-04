@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createIndexedDbBlobStore } from "../src/storage/blobStore";
 import { createRxRepository } from "../src/storage/rxdbRepository";
 import { serializeProjectSnapshot } from "../src/sync/snapshot";
@@ -34,16 +34,22 @@ vi.mock("../src/platform/browser", () => {
 import {
   collaborationManager,
   drivePermissions,
-  loadSharedProjects,
+  googleAuth,
+  discoverSharedBoards,
   registerRxRepositoryResolver,
 } from "../src/sync/browser";
 
-afterEach(() => {
-  vi.clearAllMocks();
+beforeEach(() => {
+  vi.spyOn(googleAuth, "getConnectionState").mockResolvedValue("connected");
+  vi.spyOn(drivePermissions, "myRole").mockResolvedValue("editor");
 });
 
-describe("loadSharedProjects", () => {
-  it("imports a missing shared project and returns its id", async () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("discoverSharedBoards", () => {
+  it("imports a missing shared project", async () => {
     const rx = await createRxRepository({
       name: "load-missing",
       blobs: createIndexedDbBlobStore("load-missingimages"),
@@ -75,8 +81,7 @@ describe("loadSharedProjects", () => {
       serializeProjectSnapshot(project, items),
     );
 
-    const imported = await loadSharedProjects();
-    expect(imported).toEqual(["shared-1"]);
+    await discoverSharedBoards();
     expect(await rx.getProject("shared-1")).not.toBeNull();
   });
 
@@ -112,12 +117,12 @@ describe("loadSharedProjects", () => {
     ]);
     const readSpy = vi.spyOn(drivePermissions, "readSharedSnapshot");
 
-    await loadSharedProjects();
+    await discoverSharedBoards();
 
     expect(readSpy).not.toHaveBeenCalled();
   });
 
-  it("skips a project with an invalid snapshot without failing the batch", async () => {
+  it("reports an invalid snapshot without importing the project", async () => {
     const rx = await createRxRepository({
       name: "load-broken",
       blobs: createIndexedDbBlobStore("load-brokenimages"),
@@ -131,8 +136,7 @@ describe("loadSharedProjects", () => {
       "not-a-snapshot",
     );
 
-    const imported = await loadSharedProjects();
-    expect(imported).toEqual([]);
+    await expect(discoverSharedBoards()).rejects.toThrow("Could not import some shared boards");
     expect(await rx.getProject("shared-2")).toBeNull();
   });
 
@@ -194,17 +198,16 @@ describe("loadSharedProjects", () => {
       return Promise.reject(new Error("no snapshot"));
     });
 
-    const imported = await loadSharedProjects();
-    expect(imported).toEqual(["shared-2"]);
+    await expect(discoverSharedBoards()).rejects.toThrow("no snapshot");
     expect(await rx.getProject("shared-2")).not.toBeNull();
     expect(await rx.getProject("shared-3")).toBeNull();
   });
 
-  it("returns empty when no repository is registered", async () => {
+  it("finishes when no repository is registered", async () => {
     registerRxRepositoryResolver(async () => null);
     vi.spyOn(drivePermissions, "discoverSharedProjects").mockResolvedValue([]);
 
-    expect(await loadSharedProjects()).toEqual([]);
+    expect(await discoverSharedBoards()).toBeUndefined();
   });
 });
 

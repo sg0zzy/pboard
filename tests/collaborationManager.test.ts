@@ -4,9 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createSimplePeerWrtc } from "rxdb/plugins/replication-webrtc";
 import { createCollaborationManager, type CollaborationManager } from "../src/collab/manager";
 import type { PboardRole } from "../src/sync/drivePermissions";
-import { createMemorySignalingScope, type PboardSignaling } from "../src/collab/signaling";
+import { createDriveSignaling, createMemorySignalingScope, type PboardDriveSignalRecord, type PboardSignaling } from "../src/collab/signaling";
 import { createRxRepository } from "../src/storage/rxdbRepository";
 import { createIndexedDbBlobStore } from "../src/storage/blobStore";
+import type { SharedImageTransport } from "../src/collab/imageSync";
+import type { BoardImage } from "../src/types";
 
 const wrtc = createSimplePeerWrtc(NodeDataChannel);
 const unique = () => `pboardcollab${crypto.randomUUID().replaceAll("-", "")}`;
@@ -49,7 +51,9 @@ describe("createCollaborationManager", () => {
     repo: Awaited<ReturnType<typeof open>>,
     overrides: { role: PboardRole | null; fileId: string | null },
     sharedSource: Awaited<ReturnType<typeof open>>,
-    scope: { create(topic: string): PboardSignaling }
+    scope: { create(topic: string): PboardSignaling },
+    imageTransport?: SharedImageTransport,
+    account?: string
   ) {
     let bootstrapped = false;
     const manager = createCollaborationManager({
@@ -63,11 +67,117 @@ describe("createCollaborationManager", () => {
       },
       signalingFor: (topic) => scope.create(topic),
       getRepository: async () => repo,
-      wrtc
+      wrtc,
+      imageTransport,
+      getAccountId: async () => account ?? null
     });
     managers.push(manager);
     return { manager, get bootstrapped() { return bootstrapped; } };
   }
+
+  it("syncs the whole project order only between sessions of the same account, including private projects", { timeout: 20000 }, async () => {
+    const firstRepo = await makeRepo();
+    const secondRepo = await makeRepo();
+    const otherRepo = await makeRepo();
+    const a = await firstRepo.createProject("A");
+    const b = await firstRepo.createProject("B");
+    const c = await firstRepo.createProject("C");
+    for (const repo of [secondRepo, otherRepo]) {
+      for (const project of [a, b, c]) {
+        const snapshot = await firstRepo.exportProject(project.id);
+        await repo.importProject(snapshot.project, snapshot.items);
+      }
+    }
+    const scope = createMemorySignalingScope();
+    const access = { role: null, fileId: null };
+    const first = makeManager(firstRepo, access, firstRepo, scope, undefined, "pippo");
+    const second = makeManager(secondRepo, access, firstRepo, scope, undefined, "pippo");
+    const other = makeManager(otherRepo, access, firstRepo, scope, undefined, "pluto");
+    // Account order does not depend on having the same current project or a shared board.
+    await first.manager.start(a.id);
+    await secondRepo.selectProject(b.id);
+    await second.manager.start(b.id);
+    await other.manager.start(c.id);
+    const order = async (repo: typeof firstRepo) => (await repo.listProjects()).map((project) => project.id).join(",");
+    const reordered = [c.id, a.id, b.id];
+    await firstRepo.reorderProjects(reordered);
+    await waitUntil(async () => await order(secondRepo) === reordered.join(","));
+    expect(await order(otherRepo)).toBe([a.id, b.id, c.id].join(","));
+    const reverse = [b.id, c.id, a.id];
+    await secondRepo.reorderProjects(reverse);
+    await waitUntil(async () => await order(firstRepo) === reverse.join(","));
+    await otherRepo.reorderProjects([b.id, a.id, c.id]);
+    await observeFor(500);
+    expect(await order(firstRepo)).toBe(reverse.join(","));
+    expect(await otherRepo.db.settings.findOne("projectOrder:pippo").exec()).toBeNull();
+    expect(await firstRepo.db.settings.findOne("projectOrder:pluto").exec()).toBeNull();
+    expect((await secondRepo.getCurrentProject())?.id).toBe(b.id);
+    await second.manager.stop();
+    expect(await order(secondRepo)).toBe(reverse.join(","));
+  });
+
+  it("connects two owner sessions through periodic Drive signaling when the second browser opens later", { timeout: 20000 }, async () => {
+    const firstRepo = await makeRepo();
+    const secondRepo = await makeRepo();
+    const rooms = new Map<string, Map<string, PboardDriveSignalRecord>>();
+    function scope(peerId: string) {
+      return { create(topic: string) {
+        const records = rooms.get(topic) ?? new Map<string, PboardDriveSignalRecord>();
+        rooms.set(topic, records);
+        return createDriveSignaling({ pollMs: 50, store: {
+          peerId, now: Date.now,
+          readPeer: async (id) => structuredClone(records.get(id) ?? null),
+          writeOwn: async (record) => { records.set(peerId, structuredClone(record)); },
+          listPeers: async () => structuredClone(Object.fromEntries(records)),
+          deleteOwn: async () => { records.delete(peerId); }
+        } });
+      } };
+    }
+    const project = await firstRepo.createProject("Same account in two browsers");
+    const images = new Map<string, BoardImage>();
+    const imageTransport: SharedImageTransport = {
+      readImage: async (_projectId, imageId) => structuredClone(images.get(imageId) ?? null),
+      writeImage: async (_projectId, imageId, image) => { images.set(imageId, structuredClone(image)); }
+    };
+    const first = makeManager(firstRepo, { role: "owner", fileId: "same-account-file" }, firstRepo, scope("firefox-session"), imageTransport);
+    const second = makeManager(secondRepo, { role: "owner", fileId: "same-account-file" }, firstRepo, scope("chrome-session"), imageTransport);
+    await first.manager.start(project.id);
+    await observeFor(250);
+    await second.manager.start(project.id);
+    await waitUntil(() => first.manager.state().connectedPeers.length > 0 && second.manager.state().connectedPeers.length > 0);
+    const firstCard = await firstRepo.addItem({ projectId: project.id, content: "Created after connection in Firefox" });
+    await waitUntil(async () => (await secondRepo.getCard(firstCard.id))?.content === firstCard.content);
+    const secondCard = await secondRepo.addItem({ projectId: project.id, content: "Created after connection in Chrome" });
+    await waitUntil(async () => (await firstRepo.getCard(secondCard.id))?.content === secondCard.content);
+    const firstImage = await firstRepo.addItem({ projectId: project.id, content: "Image added while connected", image: {
+      dataUrl: "data:image/png;base64,AAECAwQ=", mimeType: "image/png", width: 1, height: 1
+    } });
+    await waitUntil(async () => (await secondRepo.getCard(firstImage.id))?.imageId === firstImage.imageId && await secondRepo.hasImage(firstImage.imageId!));
+    expect((await secondRepo.exportProject(project.id)).items.find((card) => card.id === firstImage.id)?.image?.dataUrl).toBe("data:image/png;base64,AAECAwQ=");
+    const secondImage = await secondRepo.addItem({ projectId: project.id, content: "Image from the other browser", image: {
+      dataUrl: "data:image/png;base64,BQQDAgEA", mimeType: "image/png", width: 1, height: 1
+    } });
+    await waitUntil(async () => (await firstRepo.getCard(secondImage.id))?.imageId === secondImage.imageId && await firstRepo.hasImage(secondImage.imageId!));
+  });
+
+  it("starts live pools when a private project's access becomes shared without switching projects", { timeout: 20000 }, async () => {
+    const firstRepo = await makeRepo();
+    const secondRepo = await makeRepo();
+    const project = await firstRepo.createProject("Enable live later");
+    const access: { role: PboardRole | null; fileId: string | null } = { role: null, fileId: null };
+    const scope = createMemorySignalingScope();
+    const first = makeManager(firstRepo, access, firstRepo, scope);
+    const second = makeManager(secondRepo, { role: "owner", fileId: "enabled-file" }, firstRepo, scope);
+    await first.manager.start(project.id);
+    expect(first.manager.state().role).toBe("private");
+    access.role = "owner"; access.fileId = "enabled-file";
+    await first.manager.refreshRole();
+    await second.manager.start(project.id);
+    await waitUntil(() => first.manager.state().connectedPeers.length > 0 && second.manager.state().connectedPeers.length > 0);
+    expect(first.manager.state().role).toBe("owner");
+    const card = await firstRepo.addItem({ projectId: project.id, content: "Live after enabling" });
+    await waitUntil(async () => (await secondRepo.getCard(card.id))?.content === card.content);
+  });
 
   it("replicates bidirectionally over real WebRTC and scopes out private projects", { timeout: 20000 }, async () => {
     const ownerRepo = await makeRepo();

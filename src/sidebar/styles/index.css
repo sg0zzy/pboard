@@ -115,7 +115,6 @@ button:disabled { cursor: not-allowed; opacity: .42; }
 .project-action-button { display: inline-grid; width: 1.75em; height: 1.75em; flex: 0 0 auto; place-items: center; border: 0; border-radius: 6px; background: transparent; color: #5e6159; padding: .3em; }
 .project-action-button:hover, .project-action-button.active { background: #ecece7; color: #171816; }
 .project-action-button svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-.icon-button svg { width: 1.1em; height: 1.1em; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .compact-form { display: grid; gap: 9px; margin-top: 8px; }
 input, textarea, select { border: 1px solid #d3d4ce; border-radius: 7px; background: #fff; color: #202124; padding: 8px; }
 input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px solid #dfe2d8; }
@@ -231,6 +230,23 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .delete-confirmation-actions { display: flex; justify-content: flex-end; gap: 6px; }
 .delete-confirm-button { border-color: #9f4038; background: #9f4038; padding: 5px 9px; font-size: .75em; }
 .delete-confirm-button:hover { border-color: #7d2d27; background: #7d2d27; }
+.share-dialog { position: absolute; z-index: 30; top: 44px; left: 12px; right: 12px; display: grid; gap: 10px; border: 1px solid #caccc4; border-radius: 10px; background: #fff; padding: 11px 12px; box-shadow: 0 10px 28px rgb(30 32 27 / 20%); }
+.share-dialog-head { display: flex; align-items: center; justify-content: space-between; }
+.share-dialog-head strong { font-size: .8125em; }
+.share-invite { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+.share-invite label { display: grid; gap: 3px; }
+.share-invite label span { font-size: .6875em; color: #7a7c74; }
+.share-invite input, .share-invite select, .share-role-select { width: 100%; border: 1px solid #d6d7d1; border-radius: 6px; background: #fff; padding: 5px 7px; font-size: .75em; color: #2b2c28; }
+.share-invite-button { border-color: #3f5a37; background: #3f5a37; color: #fff; padding: 6px 10px; font-size: .75em; }
+.share-invite-button:hover { border-color: #33492e; background: #33492e; }
+.share-note { margin: 0; font-size: .7em; color: #7a7c74; }
+.share-collaborators { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.share-collaborator { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; font-size: .75em; }
+.share-collaborator-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-collaborator-role { color: #7a7c74; font-size: .9em; }
+.share-collaborator-empty { color: #7a7c74; font-size: .7em; }
+.share-remove-button { color: #9f4038; }
+.share-error { margin: 0; color: #9f4038; font-size: .7em; }
 .terminal-section { margin-top: 8px; }
 .terminal-section > summary {
   display: flex;
@@ -292,57 +308,6 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .copy-button svg { width: 1.05em; height: 1.05em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .notice { margin: 8px 0 0; color: #4f6f54; font-size: .75em; text-align: center; }
 .muted { color: #777970; }
-
-.share-dialog {
-  position: fixed;
-  top: 14px;
-  right: 14px;
-  z-index: 900;
-  width: 320px;
-  max-width: calc(100vw - 28px);
-  max-height: calc(100vh - 28px);
-  overflow-y: auto;
-  display: grid;
-  gap: 14px;
-  border: 1px solid #d3d4ce;
-  border-radius: 8px;
-  background: #fff;
-  color: #202124;
-  padding: 14px;
-  box-shadow: 0 8px 28px rgb(0 0 0 / 9%);
-  font-size: .9em;
-}
-.share-dialog-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
-.share-dialog h2 { margin: 0; font-size: 1em; }
-.share-sub { margin: 0; color: #656660; font-size: .78em; }
-.share-section { display: grid; gap: 8px; }
-.share-section h3 { margin: 0; font-size: .72em; text-transform: uppercase; letter-spacing: .06em; color: #656660; }
-.share-form { display: grid; gap: 7px; }
-.share-form-row { display: flex; gap: 7px; align-items: stretch; }
-.share-form input { min-width: 0; flex: 1; padding: 6px; }
-.share-form select { width: 120px; padding: 6px; }
-.share-hint { margin: 0; font-size: .75em; color: #656660; }
-.collab-list { list: none; margin: 0; padding: 0; display: grid; gap: 6px; }
-.collab-row {
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 6px;
-  align-items: center;
-  border: 1px solid #dedfd9;
-  border-radius: 8px;
-  padding: 6px 8px;
-}
-.collab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.collab-name small { display: block; color: #656660; font-size: .75em; }
-.collab-row select { width: 90px; padding: 4px 6px; font-size: .9em; border-radius: 6px; }
-.collab-remove { border: 0; background: transparent; color: #944740; padding: 4px; font-size: .8em; font-weight: 700; cursor: pointer; }
-.collab-remove:hover { color: #a03d35; }
-.collab-owner { color: #656660; font-size: .8em; }
-.share-status { margin: 0; font-size: .8em; min-height: 1.2em; }
-.share-status.error { color: #944740; }
-.share-status.ok { color: #3a6b3a; }
-.share-close { border: 0; background: transparent; color: #656660; padding: 4px; font-size: 1.1em; cursor: pointer; }
-.share-close:hover { background: #ecece7; }
 
 @media (prefers-color-scheme: dark) {
   :root { color: #e7e7e3; background: #20211f; }
@@ -434,23 +399,6 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
   .display-mode-button:hover, .display-mode-button:focus-visible { background: #393a36; color: #d7d8d2; }
   .display-mode-button:focus-visible { box-shadow: 0 0 0 1px #899681; }
   .display-mode-button.selected { background: #444640; color: #f0f0ec; }
-
-  .share-dialog {
-    border-color: #50514c;
-    background: #282926;
-    color: #ededeb;
-    box-shadow: 0 8px 28px rgb(0 0 0 / 30%);
-  }
-  .share-sub,
-  .share-section h3,
-  .collab-name small { color: #a8aaa2; }
-  .collab-row { border-color: #41423e; }
-  .collab-remove { color: #e39a92; }
-  .collab-remove:hover { color: #f3b8b2; }
-  .share-status.error { color: #e39a92; }
-  .share-status.ok { color: #79a879; }
-  .share-close { color: #a8aaa2; }
-  .share-close:hover { background: #363733; }
 }
 
 @media (prefers-reduced-motion: reduce) {

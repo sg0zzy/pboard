@@ -20,4 +20,10 @@ describe("release metadata", () => {
     );
     expect(chromiumManifest.commands).not.toHaveProperty("_execute_sidebar_action");
   });
+  it("requests Chromium permissions for both private sync and project sharing", () => {
+    expect(chromiumManifest.oauth2.scopes).toEqual([
+      "https://www.googleapis.com/auth/drive.appdata",
+      "https://www.googleapis.com/auth/drive"
+    ]);
+  });
 });

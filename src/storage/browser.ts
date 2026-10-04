@@ -181,6 +181,8 @@ export const repository = {
   exportAll: async () => { const rx = await selectedRxRepository(); return rx ? rx.exportAll() : legacyRepository.load(); },
   putImage: async (image: BoardItem["image"]) => { if (!image) throw new Error("Image required"); return (await getRxRepository()).putImage(image); },
   getImage: async (imageId: string) => (await getRxRepository()).getImage(imageId),
+  subscribeImage: async (imageId: string, listener: () => void) =>
+    (await getRxRepository()).subscribeImages((changedId) => { if (changedId === imageId) listener(); }),
   hasImage: async (imageId: string) => (await getRxRepository()).hasImage(imageId),
   imageAvailability: async (imageId: string) => (await getRxRepository()).imageAvailability(imageId),
   deleteImage: async (imageId: string) => (await getRxRepository()).deleteImage(imageId)
