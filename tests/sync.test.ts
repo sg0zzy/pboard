@@ -76,7 +76,7 @@ describe("project snapshots", () => {
 });
 
 describe("Google OAuth", () => {
-  it("uses PKCE, account selection, and the Drive app-data + drive.file scopes", async () => {
+  it("uses PKCE, account selection, and the Drive app-data + full drive scopes", async () => {
     const storage = new MemoryStorage();
     let authorizationUrl = "";
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
