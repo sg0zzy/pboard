@@ -73,8 +73,10 @@ snapshot when a peer has no local copy; viewers cannot mutate.
   master would otherwise leak local writes. The gate is the authoritative
   enforcement; the replication push modifier alone does not cover that path.
 - **OAuth** — `src/sync/googleAuth.ts` now requests `DRIVE_SCOPE` =
-  `drive.appdata` + `drive.file` (the private app-data path is unchanged;
-  `drive.file` is required to create visible shared files + manage their ACL).
+  `drive.appdata` + the full `drive` scope (the private app-data path is
+  unchanged; the full `drive` scope is required because a recipient's
+  collaboration targets files this account does not own, which `drive.file`
+  cannot reliably find or manage, including incoming permission invitations).
 - **Rejected / not done**: public "anyone with link" sharing; a permanent pboard
   signaling/backend server (Drive signaling is the shipped path; a low-latency
   WebSocket fallback is documented, not implemented, for the first usable
@@ -128,6 +130,38 @@ Core collaboration layer is **built and unit-tested in isolation**:
 - `tests/sync.test.ts` — scope assertion updated to the new two-scope set.
 - `docs/collaboration.md` — architecture doc (sharing, permissions, signaling,
   offline/reconnect, security, testing).
+- `src/sync/sharedDiscovery.ts` — `createSharedBoardDiscovery`: imports newly
+  invited boards (`rx.importProject` + `setMutatorRole`) without touching local
+  edits or selection; single-flight, per-entry failure isolation, skips
+  disconnected/no-repo/tombstoned/already-local boards and rejects snapshots
+  whose project id does not match. Wired in `src/sync/browser.ts`
+  (`discoverSharedBoards`, tombstone-aware via the drive tombstone store) and run
+  from `App.tsx` (on load, every 30 s, on window focus, on Drive connect and
+  shared-state change) and from `googleDrive.beforeReconcile`.
+- `src/collab/imageSync.ts` — shared image sync: owners/editors publish local
+  card images into the shared Drive folder, viewers fetch missing ones; a 2 s
+  poll + card/image subscription trigger fetches; integrity verification
+  (size + hash) rejects bad assets. Also repairs pre-existing missing blobs
+  whose hash matches a current card.
+- Account-scoped project list order — `reorderProjects`/
+  `setProjectOrderAccount` in `src/storage/rxdbRepository.ts` persist the order
+  under an account-keyed setting; the manager runs an independent
+  `pboard-account-<hash>-order` WebRTC settings pool (push-only own id via a
+  scoped push modifier) with `account-signal-<hash>-<peer>.pboard` rendezvous
+  records in `appDataFolder`.
+- `src/sync/googleDriveProvider.ts` — shared projects are excluded from private
+  snapshot push/pull; deleting a shared board locally keeps a permanent
+  tombstone (the owner's Drive folder is not removed) so discovery cannot
+  re-import it; reconciliation skips shared tombstones.
+- `src/sidebar/components/ShareControls.tsx` also surfaces the live-
+  collaboration status and the "Enable live collaboration" toggle for
+  same-account, cross-browser runs.
+- `tests/sharedDiscovery.test.ts` — discovery/import (skip rules, invalid
+  snapshot isolation, role application, reactive list + selection preserved).
+- `tests/imageSync.test.ts` — image publish/fetch/repair + integrity rejection.
+- `tests/accountSignaling.test.ts` — account-order signaling store + pool.
+- `src/types/simple-peer-browser.d.ts` — type shim for the `simple-peer` min
+  bundle used by `src/collab/webrtcHandler.ts`.
 - `experiments/collab/*.mjs` — WebRTC / simple-peer / node-datachannel spikes.
 - `package.json` — `node-datachannel` devDependency (used by the spikes).
 - `LICENSE.md` + README — GPLv3 notice.
@@ -147,6 +181,10 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   `src/sidebar/components/ShareControls.tsx`, wired into the toolbar). ✅
 - **Full test coverage** (permission service, Drive signaling, Share UI,
   manager, write-gate). ✅
+- **Shared board discovery/import** (connect, sidebar load, 30 s interval,
+  focus, background reconcile) + deletion-resurrection fix. ✅
+- **Shared image sync** over Drive with integrity verification. ✅
+- **Account-scoped project order** over a dedicated WebRTC pool. ✅
 
 ---
 
@@ -157,13 +195,22 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   getSharedFileId → `drivePermissions.projectFileId`, `bootstrapFromDrive`
   downloads the shared snapshot and imports it, `signalingFor` builds a Drive
   signal store + `createDriveSignaling` per topic with one stable peer id per
-  session). `App.tsx` starts/stops it on the current project. The manager now
-  serializes start/stop so a rapid switch or unmount can't race the pool list.
-- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (208/208, 38 files,
-  `vitest run`). **Build: PASS** (`npm run build:all` + `verify-build.mjs all`).
+  session, `imageTransport` for shared image sync, `getAccountId` for the
+  account-order pool). `App.tsx` starts/stops it on the current project. The
+  manager now serializes start/stop so a rapid switch or unmount can't race the
+  pool list.
+- **Shared board discovery/import is wired**: `discoverSharedBoards` runs on
+  sidebar load, every 30 s, on window focus, on Drive connect / shared-state
+  change, and from `googleDrive.beforeReconcile`; imported boards appear in the
+  local project list with their role applied. Deleting a shared board keeps a
+  permanent local tombstone so discovery never re-imports it.
+- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (242/242, 41
+  files, `vitest run`). **Build: PASS** (`npm run build:all` + `npm run
+  verify:build`).
 - The **full collaboration feature is implemented and wired**: the manager is
   live (App drives it on project selection), the permission service + Drive
-  signaling are connected, and the Share button + "Share Project" dialog
+  signaling are connected, shared images sync over Drive, project order syncs
+  per account, and the Share button + "Share Project" dialog
   (`src/sidebar/components/ShareControls.tsx`) is in the toolbar, left of the
   Drive cloud icon.
 
@@ -176,23 +223,25 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   with mocked seams (transport/store); real-Drive behavior is not covered.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
   not covered by the suite).
-- Verify-on-next-session: that `discoverSharedProjects` + `myRole` + Drive
-  signaling behave correctly against real Drive (only unit-mocked here), and the
-  manager end-to-end across two browser instances over WebRTC.
+- Verified in code + unit tests: `discoverSharedProjects` skip rules and import,
+  `myRole` resolution, and the manager lifecycle. Still to exercise manually:
+  real-Drive behavior (latency, ACL edge cases) and a two-browser WebRTC run.
 
 ---
 
 # Remaining work (dependency order)
 
 The required feature (sharing + permissions + WebRTC realtime replication +
-Share UI + tests) is implemented. Remaining work is verification and optional
-cleanup:
+Share UI + discovery/import + image sync + account order + tests) is
+implemented and verified (typecheck + 242 tests + both builds + build
+verification). Remaining work:
 
-1. **Real-Drive verification**: exercise `discoverSharedProjects`, `myRole`,
-   invite/update/remove, Drive signaling, and the manager end-to-end across two
-   browser instances over WebRTC (unit-mocked only so far).
-2. **Verify**: full suite + typecheck + `npm run build:all` +
-   `npm run verify:build all`; update `docs/collaboration.md` if anything shifts.
+1. **Real-Drive verification** (manual): exercise `discoverSharedProjects`,
+   `myRole`, invite/update/remove, Drive signaling, and the manager
+   end-to-end across two browser instances over WebRTC (unit-mocked only so
+   far).
+2. **Docs drift**: `docs/collaboration.md` is current as of the scope fix;
+   update it if the architecture shifts again.
 
 **Optional cleanup:**
 - Decide whether `experiments/collab/*.mjs` spikes should be kept or removed once
