@@ -28,6 +28,16 @@ Private projects keep the current single-user layout (`appDataFolder` snapshot +
 project LWW Drive sync). When a project is **shared**, it gets a visible app-managed
 Drive file whose Drive permissions are the access-control source.
 
+**App wiring.** `src/sync/browser.ts` builds a module-level `collaborationManager`
+(manager options bound to `drivePermissions`, a `bootstrapFromDrive` that imports
+the Drive snapshot, and a `signalingFor` factory that constructs a Drive-backed
+`PboardSignaling` per topic). `App.tsx` starts the manager on the current project
+and stops it on unselect/unmount; the manager serializes start/stop so a rapid
+switch can't race the pool list. The Share button + "Share Project" dialog
+(`src/sidebar/components/ShareControls.tsx`) sits left of the Drive cloud icon and
+drives the permission service (invite / role change / remove; owner not removable;
+viewer read-only).
+
 ## Data model and storage
 
 Local state is unchanged: the shared RxDB database `pboardlocalv1` with `projects`,
@@ -40,6 +50,7 @@ My Drive/
   Pboard/                       (app-managed folder, created on first share)
     <projectId>/                (one folder per shared project)
       project.json              (v1 pboard-project snapshot: project + cards + inline images)
+      image-<SHA256>.json        (immutable image assets, fetched by connected browsers)
       realtime/                 (ephemeral WebRTC signaling records, best-effort)
         offer-<peer>.json
         answer-<peer>.json
@@ -65,11 +76,35 @@ clobber fine-grained WebRTC merges on a shared board. So for **shared** projects
 
 - **Bootstrap** (user has no local cards for the project): import `project.json` once.
 - **Live**: WebRTC merges card/project documents (RxDB conflict handling).
-- **Persistence**: the local snapshot is uploaded to `project.json` on the existing idle
-  sync cadence (backup + new-peer bootstrap source), but a shared project does **not**
-  auto-import a remote snapshot over existing local cards (no LWW clobber while peers
-  are live).
+- **Images**: owners and editors publish local images as hash-addressed assets in
+  the shared Drive folder. All roles fetch missing images while the board is open
+  and cards refresh when bytes arrive. Existing inline snapshot images remain a
+  fallback; restoring a matching image never replaces newer card text.
+- **Persistence**: `project.json` is the bootstrap source for new collaborators and is
+  re-uploaded whenever a collaborator is invited. It is **not** refreshed on the idle
+  sync cadence (shared projects are skipped there), so a board that receives no new
+  invites keeps its invite-time snapshot in Drive while live edits flow via WebRTC.
+  A shared project does **not** auto-import a remote snapshot over existing local
+  cards (no LWW clobber while peers are live).
 - Private projects keep the existing auto-pull LWW behavior.
+
+### Account-specific project list order
+
+Project list positions are preferences, not shared project content. Reordering
+writes a `projectOrder:<account-hash>` setting rather than project documents.
+The account hash derives from the trimmed, lowercase Google Drive email address.
+An independent WebRTC room replicates only that account's order setting, using
+ephemeral `account-signal-<account-hash>-<peer>.pboard` records in private
+`appDataFolder` for rendezvous. Project snapshot discovery excludes these records.
+
+Sessions of the same account can display different projects and still exchange
+the full list order, including private projects. Different accounts never join the
+same order room. Viewers can change their own list order without obtaining board
+editing rights. Other settings, including current project selection, stay local.
+The local list uses the account preference for known project IDs and appends
+projects absent from that preference; it does not create or delete projects from
+an order received from another session. Disconnecting preserves the last visible
+order locally. Both sidebars must be open for WebRTC preference synchronization.
 
 ## Permissions model
 
@@ -141,8 +176,12 @@ interface SignalingProvider {
 - `DriveSignaling` (Phase 2, primary for the extension): ephemeral JSON records under
   `Pboard/<projectId>/realtime/`. Uses **non-trickle ICE** (`trickle:false`) so an offer
   and answer each carry all candidates in a single record — this keeps the Drive API
-  call count bounded. Stale records are pruned by `modifiedTime` on open and on
-  publish. Offer/answer/ICE are coordination data, never project content, and are never
+  call count bounded. Polling continues while the board is open, including after
+  transient Drive failures. Each browser session has a distinct peer id even when
+  both use the same Google account. Signals carry a recipient peer id, and heartbeat
+  and signal writes are serialized so they cannot overwrite one another. Presence
+  and signal TTLs ignore expired peers and prune old outbox entries; leaving removes
+  the session's own record. Offer/answer/ICE are coordination data, never project content, and are never
   logged.
 - `DevWebSocketSignaling` (Phase 1, tests/dev): points the simple-peer handler at a
   signaling endpoint (RxDB's `startSignalingServerSimplePeer` in Node tests). This is
@@ -152,6 +191,13 @@ interface SignalingProvider {
 `WebRTCConnectionHandler` (connect$/disconnect$/message$/response$/send) built on
 `simple-peer` + the injected `SignalingProvider`. Replication logic never references a
 specific signaling service.
+
+The Share dialog offers **Enable live collaboration** for a private project, allowing
+two browsers on the same account to start live replication without an email invite.
+Drive connection and sharing changes restart the current board's collaboration;
+access is also checked periodically to discover sharing enabled by another browser.
+The dialog reports connected browsers and transport errors. Tests exercise late peer
+discovery and bidirectional replication over real WebRTC with simulated Drive records.
 
 **Limitation (documented, not silent):** Drive-based signaling has real latency (each
 record is a Drive read/write; polling-based). Connection setup can take seconds. Once
@@ -208,10 +254,9 @@ The existing cloud/auth icon is untouched; the Share button is separate.
   fallback. Not a pboard backend.
 - Same-card character-level concurrent text editing is out of scope (whole-field merge
   via the RxDB default conflict handler).
-- WebRTC image transfer is **not** used; images reach collaborators via the Drive
-  snapshot (bootstrap) and, once both peers have the blob locally, via the existing
-  blob store. A peer who has never seen an image gets it on the next Drive bootstrap.
-  (RxDB's WebRTC plugin does not document attachment replication.)
-- OAuth scope widened from `drive.appdata` to `drive.file` (required to create/share
-  visible files and manage their permissions). If permission management is rejected
-  under `drive.file`, widen to `drive`.
+- Image bytes travel through Drive rather than WebRTC. A new image may appear a
+  few seconds after its card reference, depending on upload and polling latency.
+- OAuth scope widened from `drive.appdata` to the full `drive` scope: a shared
+  board's files are not owned by the recipient, and `drive.file` cannot reliably
+  find or manage other users' files (including incoming permission invitations),
+  so discovery and collaboration use `drive` rather than `drive.file`.

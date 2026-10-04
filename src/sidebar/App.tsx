@@ -28,6 +28,9 @@ import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
+import { collaborationManager, drivePermissions, discoverSharedBoards, SHARED_PROJECTS_KEY } from "../sync/browser";
+import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
+import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
 
 const STATUS_MOVE_DELAY_MS = 800;
@@ -37,6 +40,9 @@ export function App() {
   const [currentProject, setCurrentProject] = useState<import("../types").Project | null>(null);
   const [items, setItems] = useState<BoardItem[]>([]);
   const [boardReady, setBoardReady] = useState(false);
+  const [collaborationRevision, setCollaborationRevision] = useState(0);
+  const [liveStatus, setLiveStatus] = useState("Checking live collaboration…");
+  const refreshCollaboration = () => setCollaborationRevision((value) => value + 1);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectTemplate, setNewProjectTemplate] = useState<BoardTemplate>("brainstorming");
   const [addingProject, setAddingProject] = useState(false);
@@ -131,6 +137,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    const discover = () => { void discoverSharedBoards().catch((error) => {
+      if (active) setNotice(error instanceof Error ? error.message : "Could not discover shared boards");
+    }); };
+    discover();
+    const timer = window.setInterval(discover, 30_000);
+    window.addEventListener("focus", discover);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", discover); };
+  }, [collaborationRevision]);
+
+  useEffect(() => {
     if (!currentProject?.id) { setItems([]); return; }
     let active = true;
     let stop: (() => void) | undefined;
@@ -140,6 +157,41 @@ export function App() {
     });
     return () => { active = false; stop?.(); };
   }, [currentProject?.id]);
+
+  useEffect(() => {
+    const projectId = currentProject?.id;
+    if (!projectId) { void collaborationManager.stop().catch(console.error); return; }
+    let active = true;
+    const updateStatus = () => {
+      if (!active) return;
+      const state = collaborationManager.state();
+      setLiveStatus(state.error ? `Live collaboration: ${state.error}`
+        : !state.ready ? "Checking live collaboration…"
+        : state.role === "private" ? "Live collaboration is not enabled for this project."
+        : state.connectedPeers.length ? `Live collaboration: ${state.connectedPeers.length} connected browser${state.connectedPeers.length === 1 ? "" : "s"}.`
+        : "Live collaboration: waiting for another browser with this board open.");
+    };
+    void collaborationManager.start(projectId).catch(() => {}).finally(updateStatus);
+    const statusTimer = window.setInterval(updateStatus, 1000);
+    // A second browser can enable this project remotely while this view stays
+    // open. Re-resolve its role without recreating healthy WebRTC pools.
+    const accessTimer = window.setInterval(() => {
+      void collaborationManager.refreshRole().catch((error) => {
+        if (active) setLiveStatus(`Live collaboration: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, 10_000);
+    const onStorage = (changes: Record<string, unknown>, area: string) => {
+      if (area === "local" && (DRIVE_AUTH_STORAGE_KEY in changes || SHARED_PROJECTS_KEY in changes)) refreshCollaboration();
+    };
+    browser.storage.onChanged.addListener(onStorage);
+    return () => {
+      active = false;
+      window.clearInterval(statusTimer);
+      window.clearInterval(accessTimer);
+      browser.storage.onChanged.removeListener(onStorage);
+      void collaborationManager.stop().catch(console.error);
+    };
+  }, [currentProject?.id, collaborationRevision]);
 
   useEffect(() => {
     let mounted = true;
@@ -673,6 +725,7 @@ export function App() {
         <Card
           item={item}
           getImage={repository.getImage}
+          subscribeImage={repository.subscribeImage}
           pendingStatus={pendingStatuses[item.id] ?? item.status}
           template={currentProject.template}
           onUpdate={updateItem}
@@ -725,7 +778,8 @@ export function App() {
       <header>
         <div className="app-title-row">
           <p className="eyebrow">Pboard</p>
-          <DriveSyncControls projectId={currentProject?.id ?? null} />
+          <ShareControls projectId={currentProject?.id ?? null} permissions={drivePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
+          <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
           <div className="font-scale-controls" aria-label="Board font size">
             <button
               className="scale-button"

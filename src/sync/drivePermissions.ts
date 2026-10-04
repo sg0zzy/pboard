@@ -1,5 +1,6 @@
 import type { GoogleAuthProvider } from "./googleAuth";
 import type { PboardDriveSignalRecord, PboardDriveSignalStore } from "../collab/signaling";
+import type { BoardImage } from "../types";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -79,6 +80,9 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
     } catch {
       // Non-JSON intermediary failures.
     }
+    if (response.status === 403 && /insufficientScopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes/i.test(detail)) {
+      detail += "; reconnect Google Drive and allow project sharing access";
+    }
     return new Error(`Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
 
@@ -94,6 +98,7 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
 
   async function findFile(name: string, parentId: string): Promise<DriveFileRef | null> {
     const params = new URLSearchParams({
+      spaces: "drive",
       q: `name = '${escapeDriveQuery(name)}' and '${escapeDriveQuery(parentId)}' in parents and trashed = false`,
       fields: "files(id,name,mimeType,modifiedTime)",
       pageSize: "2"
@@ -105,16 +110,13 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
 
   return {
     async currentIdentity() {
-      const token = await auth.getAccessToken().catch(() => null);
-      if (!token) return null;
-      const response = await fetcher("https://www.googleapis.com/people/v1/people/me?personFields=names,emailAddresses", {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!response.ok) return null;
-      const body = (await response.json()) as { names?: Array<{ displayName?: string }>; emailAddresses?: Array<{ value?: string }> };
-      const email = body.emailAddresses?.find((entry) => entry.value)?.value;
+      // Drive's user resource is available with the scopes we already request;
+      // People API profile fields require separate authorization.
+      const response = await authorizedFetch(`${DRIVE_API}/about?fields=user(emailAddress,displayName)`);
+      const body = (await response.json()) as { user?: { emailAddress?: string; displayName?: string } };
+      const email = body.user?.emailAddress;
       if (!email) return null;
-      return { email, name: body.names?.[0]?.displayName };
+      return { email, name: body.user?.displayName };
     },
     findSharedRoot: () => findFile(SHARED_ROOT_NAME, "root"),
     async createFolder(name, parentId) {
@@ -163,6 +165,7 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
     },
     async listFiles(parentId) {
       const params = new URLSearchParams({
+        spaces: "drive",
         q: `'${encodeURIComponent(parentId)}' in parents and trashed = false`,
         fields: "files(id,name,mimeType,modifiedTime)",
         pageSize: "100"
@@ -190,6 +193,7 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
     },
     async listFilesByName(name, mimeType) {
       const params = new URLSearchParams({
+        spaces: "drive",
         q: `name = '${escapeDriveQuery(name)}' and mimeType = '${escapeDriveQuery(mimeType)}' and trashed = false`,
         fields: "files(id,name,mimeType,modifiedTime)",
         pageSize: "100"
@@ -264,6 +268,8 @@ export interface DrivePermissionService {
   readSharedSnapshot(projectId: string): Promise<string>;
   /** Overwrite the shared project.json snapshot in Drive (backup / bootstrap source). */
   writeSharedSnapshot(projectId: string, snapshot: string): Promise<void>;
+  readSharedImage(projectId: string, imageId: string): Promise<BoardImage | null>;
+  writeSharedImage(projectId: string, imageId: string, image: BoardImage): Promise<void>;
   /** The shared project.json file id (null when the project is not shared). */
   projectFileId(projectId: string): Promise<string | null>;
   /** The shared project's realtime signaling folder id, created if missing. */
@@ -286,6 +292,10 @@ const roleRank = (role: PboardRole) => (role === "owner" ? 0 : role === "editor"
 
 export function createDrivePermissionService(options: DrivePermissionServiceOptions): DrivePermissionService {
   const { transport, sharedProjects } = options;
+  function imageFileName(imageId: string) {
+    if (!/^[a-f0-9]{64}$/.test(imageId)) throw new Error("Invalid shared image id");
+    return `image-${imageId}.json`;
+  }
 
   async function ensureSharedRoot(): Promise<string> {
     const existing = await transport.findSharedRoot();
@@ -318,6 +328,10 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
       if (folder.mimeType !== FOLDER_MIME) continue;
       // The folder is named after the projectId (see ensureSharedProject).
       const projectId = folder.name;
+      const cached = await sharedProjects.get(projectId);
+      if (cached.folderId !== folderId || cached.projectFileId !== file.id) {
+        await sharedProjects.set(projectId, { folderId, projectFileId: file.id });
+      }
       if (!byProject.has(projectId)) byProject.set(projectId, { projectId, name: projectId, fileId: file.id });
     }
     return [...byProject.values()];
@@ -365,8 +379,9 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     const identity = await transport.currentIdentity();
     if (!identity) return null;
     const permissions = await transport.listPermissions(layout.folderId);
-    if (permissions.some((p) => p.role === "owner" && p.emailAddress === identity.email)) return "owner";
-    const mine = permissions.find((p) => p.type === "user" && p.emailAddress === identity.email);
+    const email = identity.email.trim().toLowerCase();
+    if (permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email)) return "owner";
+    const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email);
     if (!mine) return null;
     return mine.role === "writer" ? "editor" : "viewer";
   }
@@ -417,6 +432,7 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new Error("Enter a valid email address");
     await ensureSharedProject(projectId);
     const layout = await resolveLayout(projectId);
+    await transport.uploadJsonFile(layout.projectFileId!, await options.readSnapshot(projectId));
     await transport.createPermission(layout.folderId ?? "", role, normalized);
     await grantRealtimeAccess(projectId, normalized);
   }
@@ -454,6 +470,25 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
       const layout = await sharedProjects.get(projectId);
       if (!layout.projectFileId) throw new Error("Project is not shared");
       await transport.uploadJsonFile(layout.projectFileId, snapshot);
+    },
+    async readSharedImage(projectId, imageId) {
+      const name = imageFileName(imageId);
+      const layout = await resolveLayout(projectId);
+      if (!layout.folderId) return null;
+      const file = await transport.findFile(name, layout.folderId);
+      if (!file) return null;
+      const saved = JSON.parse(await transport.downloadFile(file.id)) as { format?: string; imageId?: string; image?: BoardImage };
+      if (saved.format !== "pboard-image" || saved.imageId !== imageId || !saved.image) throw new Error("Invalid shared image asset");
+      return saved.image;
+    },
+    async writeSharedImage(projectId, imageId, image) {
+      const name = imageFileName(imageId);
+      const layout = await resolveLayout(projectId);
+      if (!layout.folderId) throw new Error("Project is not shared");
+      const contents = JSON.stringify({ format: "pboard-image", imageId, image });
+      const existing = await transport.findFile(name, layout.folderId);
+      if (existing) await transport.uploadJsonFile(existing.id, contents);
+      else await transport.createJsonFile(name, layout.folderId, contents);
     },
     async projectFileId(projectId) {
       return (await resolveLayout(projectId)).projectFileId;

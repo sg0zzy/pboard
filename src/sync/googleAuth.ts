@@ -4,14 +4,14 @@ import { DRIVE_AUTH_STORAGE_KEY } from "./state";
 /**
  * Both scopes are requested together:
  *  - `drive.appdata` — the private per-user sync path (app-data folder), unchanged.
- *  - `drive.file` — required to create **visible** shared files and manage their
- *    permissions (the collaboration ACL).
- * `drive.appdata` alone cannot create or share visible files, and `drive.file` alone
- * cannot reach the app-data folder, so both must be granted.
+ *  - `drive` — discovery and collaboration on boards shared by another user.
+ *    `drive.file` only covers app-authorized files and cannot reliably discover
+ *    incoming invitations without a Picker step. Automatic discovery needs Drive
+ *    access; the app still limits content operations to Pboard board files.
  */
 export const DRIVE_SCOPE = [
   "https://www.googleapis.com/auth/drive.appdata",
-  "https://www.googleapis.com/auth/drive.file"
+  "https://www.googleapis.com/auth/drive"
 ].join(" ");
 const AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
@@ -21,12 +21,14 @@ type StoredGoogleAuth = {
   accessToken?: string;
   refreshToken?: string;
   expiresAt?: number;
+  scope?: string;
 };
 
 type TokenResponse = {
   access_token: string;
   expires_in: number;
   refresh_token?: string;
+  scope?: string;
 };
 
 type GoogleOAuthErrorResponse = {
@@ -100,6 +102,14 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
     return Boolean(options.clientId.trim());
   }
 
+  function assertGrantedScopes(scope: string | undefined): void {
+    if (scope === undefined) return; // OAuth may omit scope when it matches the request.
+    const granted = new Set(scope.split(/\s+/));
+    if (!DRIVE_SCOPE.split(" ").every((required) => granted.has(required))) {
+      throw new Error("Google Drive sharing access was not granted. Reconnect and allow both private sync and project sharing access");
+    }
+  }
+
   async function exchange(params: URLSearchParams): Promise<TokenResponse> {
     const clientSecret = options.clientSecret?.trim();
     if (clientSecret) params.set("client_secret", clientSecret);
@@ -137,7 +147,8 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       code_challenge: challenge,
       code_challenge_method: "S256",
       access_type: "offline",
-      prompt: "select_account",
+      prompt: "consent select_account",
+      include_granted_scopes: "true",
       state
     }).toString();
 
@@ -150,7 +161,6 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
     const code = result.searchParams.get("code");
     if (!code) throw new Error("Google Drive authorization returned no code");
 
-    const existing = await load();
     const token = await exchange(new URLSearchParams({
       client_id: options.clientId,
       code,
@@ -158,10 +168,15 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       redirect_uri: redirectUri,
       grant_type: "authorization_code"
     }));
+    assertGrantedScopes(token.scope);
+    // A refresh token from a previous authorization can still have only the
+    // old scopes. Fresh consent must provide the refresh token for this grant.
+    if (!token.refresh_token) throw new Error("Google did not return a new offline grant. Reconnect Google Drive and approve the consent screen");
     await store({
       accessToken: token.access_token,
-      refreshToken: token.refresh_token ?? existing.refreshToken,
-      expiresAt: now() + token.expires_in * 1000
+      refreshToken: token.refresh_token,
+      expiresAt: now() + token.expires_in * 1000,
+      scope: token.scope ?? DRIVE_SCOPE
     });
   }
 
@@ -178,10 +193,12 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       if (error instanceof GoogleOAuthError && error.code === "invalid_grant") await store(null);
       throw error;
     }
+    assertGrantedScopes(token.scope ?? auth.scope);
     await store({
       accessToken: token.access_token,
       refreshToken: token.refresh_token ?? auth.refreshToken,
-      expiresAt: now() + token.expires_in * 1000
+      expiresAt: now() + token.expires_in * 1000,
+      scope: token.scope ?? auth.scope
     });
     return token.access_token;
   }
@@ -189,6 +206,7 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
   async function getAccessToken(forceRefresh = false): Promise<string> {
     if (!isConfigured()) throw new Error("Google Drive OAuth client ID is not configured");
     const auth = await load();
+    assertGrantedScopes(auth.scope);
     if (!forceRefresh && auth.accessToken && (auth.expiresAt ?? 0) > now() + 60_000) return auth.accessToken;
     refreshPromise ??= refresh(auth).finally(() => { refreshPromise = null; });
     return refreshPromise;

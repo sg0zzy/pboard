@@ -8,7 +8,7 @@
   "optional_host_permissions": ["<all_urls>"],
   "oauth2": {
     "client_id": "337977813621-fng9g7fu9jelmjcunq2mth8p1kt78u1u.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/drive.appdata"]
+    "scopes": ["https://www.googleapis.com/auth/drive.appdata", "https://www.googleapis.com/auth/drive"]
   },
   "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*", "https://www.googleapis.com/*", "https://oauth2.googleapis.com/*"],
   "background": { "service_worker": "background.js" },

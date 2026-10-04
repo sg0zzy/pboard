@@ -101,10 +101,29 @@ Core collaboration layer is **built and unit-tested in isolation**:
   Drive-backed `PboardDriveSignalStore`.
 - `src/storage/rxdbRepository.ts` — viewer write-gate (`mutatorRole`,
   `setMutatorRole`, `assertCanMutate` on all content mutations).
-- `src/sync/browser.ts` — exports `sharedProjects` (local `DriveSharedProjectStore`)
-  and `drivePermissions` (`createDrivePermissionService` wired to the transport +
-  a `readSnapshot` that exports the RxDB project and serializes it).
-- `src/sync/googleAuth.ts` — `DRIVE_SCOPE` (appdata + drive.file).
+- `src/sync/browser.ts` — exports `sharedProjects` (local `DriveSharedProjectStore`),
+  `drivePermissions` (`createDrivePermissionService` wired to the transport + a
+  `readSnapshot` that exports the RxDB project and serializes it), and
+  **`collaborationManager`** (the live singleton, wired below).
+- `src/collab/manager.ts` — `start`/`stop` are serialized through a `runExclusive`
+  mutex so a rapid project switch or unmount never races the shared pool list.
+- `src/sidebar/App.tsx` — a `useEffect` on `currentProject?.id` calls
+  `collaborationManager.start(id)` / `stop()` (start on select, stop on unselect
+  and unmount).
+- `src/sidebar/components/ShareControls.tsx` — Share button + "Share Project"
+  dialog (Invite email + Viewer/Editor role, Collaborators list with role
+  selector + remove; owner not removable/downgradable; viewer read-only). Takes
+  an injectable `DrivePermissionService` so it is independently testable.
+- `tests/drivePermissions.test.ts` — permission service (mock transport +
+  shared-layout store): layout ensure/reuse, snapshot read/write, role
+  resolution, collaborator list/sort, invite/update/remove, discovery,
+  empty-cache discovery path.
+- `tests/driveSignaling.test.ts` — Drive signaling (shared in-memory store +
+  injected clock): roster presence, at-least-once delivery + dedupe, outbox
+  TTL, presence TTL, leave.
+- `tests/shareControls.test.tsx` — Share UI (jsdom + createRoot): render,
+  invite with role, role change, remove, viewer read-only, error, Escape close,
+  no-project.
 - `tests/collaborationManager.test.ts` — manager start/stop/role/gate tests.
 - `tests/sync.test.ts` — scope assertion updated to the new two-scope set.
 - `docs/collaboration.md` — architecture doc (sharing, permissions, signaling,
@@ -122,69 +141,57 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 - Drive-backed + memory + WebSocket signaling. ✅
 - Isolated unit tests for the manager. ✅
 - Architecture documentation. ✅
+- **App-layer wiring** (manager singleton + Drive signaling + bootstrap in
+  `browser.ts`, start/stop effect in `App.tsx`, manager mutex). ✅
+- **Share UI** (Share button + "Share Project" dialog in
+  `src/sidebar/components/ShareControls.tsx`, wired into the toolbar). ✅
+- **Full test coverage** (permission service, Drive signaling, Share UI,
+  manager, write-gate). ✅
 
 ---
 
 # Current state
 
-- Immediately before this checkpoint I was **planning the app-layer wiring**
-  (manager singleton + `bootstrapFromDrive` + `signalingFor` factory in
-  `src/sync/browser.ts`, and the Share button + dialog in `src/sidebar/App.tsx`).
-  **No edits were made this turn** — only reading/planning. The work in progress
-  is therefore **not started**; the repo is at a clean boundary.
-- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (166/166, 33 files,
-  `vitest run`). Build: not re-run this turn, but the type-checked source set is
-  green and the prior `npm run build:all` passed.
-- Git: branch `main`. Checkpoint commit created for this state (see log). Working
-  tree clean after the commit.
-- The `PboardSignaling` / manager / permission pieces are complete and tested but
-  **not yet reachable from the running extension** — nothing calls
-  `createCollaborationManager` or the `drivePermissions` service outside
-  `src/sync/browser.ts` yet.
+- The app-layer wiring is **done**: `collaborationManager` is a module-level
+  singleton in `src/sync/browser.ts` (myRole → `drivePermissions.myRole`,
+  getSharedFileId → `drivePermissions.projectFileId`, `bootstrapFromDrive`
+  downloads the shared snapshot and imports it, `signalingFor` builds a Drive
+  signal store + `createDriveSignaling` per topic with one stable peer id per
+  session). `App.tsx` starts/stops it on the current project. The manager now
+  serializes start/stop so a rapid switch or unmount can't race the pool list.
+- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (208/208, 38 files,
+  `vitest run`). **Build: PASS** (`npm run build:all` + `verify-build.mjs all`).
+- The **full collaboration feature is implemented and wired**: the manager is
+  live (App drives it on project selection), the permission service + Drive
+  signaling are connected, and the Share button + "Share Project" dialog
+  (`src/sidebar/components/ShareControls.tsx`) is in the toolbar, left of the
+  Drive cloud icon.
 
 ---
 
 # Known issues
 
 - No failing tests.
-- **Temporary / not wired**: the manager, Drive signaling store, and permission
-  service exist but are not instantiated by the app (no `collaborationManager`
-  singleton, no `bootstrapFromDrive`, no `signalingFor` factory in
-  `src/sync/browser.ts`). This is expected — it is the next phase.
-- **Not implemented yet**: Share button + "Share Project" dialog UI; the
-  `drivePermissions` service test; the Drive signaling test; a Share UI test.
+- The Share UI, permission service, and Drive signaling are all unit-tested
+  with mocked seams (transport/store); real-Drive behavior is not covered.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
   not covered by the suite).
-- Verify-on-next-session: that `discoverSharedProjects` + `myRole` behave
-  correctly against real Drive (only unit-mocked here).
+- Verify-on-next-session: that `discoverSharedProjects` + `myRole` + Drive
+  signaling behave correctly against real Drive (only unit-mocked here), and the
+  manager end-to-end across two browser instances over WebRTC.
 
 ---
 
 # Remaining work (dependency order)
 
-**Required (the actual feature):**
-1. **Wire the manager + Drive signaling + bootstrap into the browser layer**
-   (`src/sync/browser.ts`): create a module-level `collaborationManager`
-   singleton with
-   `myRole: drivePermissions.myRole`,
-   `getSharedFileId: (id) => drivePermissions.projectFileId(id)`,
-   `bootstrapFromDrive` (download `readSharedSnapshot`, deserialize,
-   `rxRepository.importProject`), and a `signalingFor(topic)` factory that
-   builds a `createDriveSignalStore` + `createDriveSignaling` per topic (parse the
-   topic → projectId; one stable peer id per session; cache the realtime folder
-   id). Export `start/stop/state/refreshRole` for the App.
-2. **Wire the manager into the App** (`src/sidebar/App.tsx`): `start(projectId)`
-   when a shared project is selected, `stop()` on change/unselect; load discovered
-   shared projects on startup so they appear in the picker; bootstrap (import) a
-   selected project that has no local copy.
-3. **Share button + Share Project dialog** (`src/sidebar/App.tsx` + a new
-   component, modeled on `DriveSyncControls.tsx`): button immediately LEFT of the
-   cloud icon; dialog with two sections — Invite (email + Viewer/Editor role +
-   Invite) and Collaborators (list with role selector + remove; owner cannot
-   remove themselves). Uses the `drivePermissions` service.
-4. **Tests**: `drivePermissions` service (mock transport), Drive signaling
-   (mock store + injected `now`), Share UI.
-5. **Verify**: full suite + typecheck + `npm run build:all` +
+The required feature (sharing + permissions + WebRTC realtime replication +
+Share UI + tests) is implemented. Remaining work is verification and optional
+cleanup:
+
+1. **Real-Drive verification**: exercise `discoverSharedProjects`, `myRole`,
+   invite/update/remove, Drive signaling, and the manager end-to-end across two
+   browser instances over WebRTC (unit-mocked only so far).
+2. **Verify**: full suite + typecheck + `npm run build:all` +
    `npm run verify:build all`; update `docs/collaboration.md` if anything shifts.
 
 **Optional cleanup:**
@@ -195,20 +202,12 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 
 # Recommended next step
 
-**First task: wire the collaboration manager into `src/sync/browser.ts`.**
+**The feature is complete.** Suggested next steps:
 
-Inspect in this order before editing:
-- `src/collab/manager.ts` — the `CollaborationManagerOptions` + returned API
-  (lines ~32–58) so you match the option names exactly.
-- `src/collab/signaling.ts` — `PboardSignaling`, `createDriveSignaling` options,
-  and the `PboardDriveSignalStore` shape.
-- `src/sync/drivePermissions.ts` — `DrivePermissionService` (lines ~260–283) and
-  `createDriveSignalStore` (line ~478) — these are the building blocks.
-- `src/sync/browser.ts` — where `drivePermissions`, `sharedProjects`, and
-  `rxRepositoryResolver` already live (add the manager singleton + factories here).
-- `src/sidebar/App.tsx` — the toolbar (`app-title-row`, the `DriveSyncControls`
-  at line ~694) for the Share button, and the project-select lifecycle for
-  start/stop.
+1. Verify against real Google Drive (the unit suite mocks all Drive seams):
+   `discoverSharedProjects`, `myRole`, the invite/update/remove round trip,
+   Drive signaling latency, and a two-instance WebRTC replication run.
+2. Commit the work once verified (currently on `main`; a checkpoint commit was
+   made for the wiring state).
 
-Keep the manager a module-level singleton; `start()` must run `stop()` first.
-Do NOT expand scope (no public links, no backend server) in this phase.
+Do NOT expand scope (no public links, no backend server).

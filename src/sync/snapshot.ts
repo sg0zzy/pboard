@@ -148,7 +148,8 @@ export function createProjectSnapshotStore(storage: KeyValueStorage) {
 export type ProjectSnapshotStore = ReturnType<typeof createProjectSnapshotStore>;
 
 /** Keeps Drive's v1 wire format while RxDB stores cards/blobs separately. */
-export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getRx: () => Promise<import("../storage/rxdbRepository").RxRepository | null>): ProjectSnapshotStore {
+export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getRx: () => Promise<import("../storage/rxdbRepository").RxRepository | null>,
+  includeInList: (projectId: string) => Promise<boolean> = async () => true): ProjectSnapshotStore {
   const legacy = createProjectSnapshotStore(storage);
   async function read(projectId: string): Promise<ProjectSnapshot> {
     const rx = await getRx();
@@ -158,8 +159,14 @@ export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getR
   }
   async function list(): Promise<ProjectSnapshot[]> {
     const rx = await getRx();
-    if (!rx) return legacy.list();
-    return Promise.all((await rx.listProjects()).map((project) => read(project.id)));
+    if (!rx) {
+      const snapshots = await legacy.list();
+      const included = await Promise.all(snapshots.map((snapshot) => includeInList(snapshot.project.id)));
+      return snapshots.filter((_, index) => included[index]);
+    }
+    const projects = await rx.listProjects();
+    const included = await Promise.all(projects.map((project) => includeInList(project.id)));
+    return Promise.all(projects.filter((_, index) => included[index]).map((project) => read(project.id)));
   }
   async function apply(snapshot: ProjectSnapshot, canApply?: SnapshotApplyGuard): Promise<boolean> {
     const rx = await getRx();
@@ -175,6 +182,9 @@ export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getR
     const local = await rx.getProject(snapshot.project.id);
     if (local) {
       const comparison = compareProjectTimestamps(snapshot.project, local);
+      // WebRTC may already have delivered the latest documents without their
+      // image bytes. Repair matching blobs even when card state is equal/newer.
+      if (comparison <= 0) await rx.importImages(snapshot.project.id, snapshot.items);
       if (comparison < 0) return "local-newer";
       if (comparison === 0) return "equal";
     }

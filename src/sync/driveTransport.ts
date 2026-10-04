@@ -25,10 +25,10 @@ type GoogleDriveErrorResponse = {
   };
 };
 
-const projectFileName = (projectId: string) => `project-${projectId.replace(/[^a-zA-Z0-9_-]/g, "_")}.pboard`;
 const escapeDriveQuery = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 
-export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch): DriveTransport {
+export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, filePrefix = "project-"): DriveTransport {
+  const projectFileName = (projectId: string) => `${filePrefix}${projectId.replace(/[^a-zA-Z0-9_-]/g, "_")}.pboard`;
   async function requestError(response: Response): Promise<Error> {
     let detail = "";
     try {
@@ -70,7 +70,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     do {
       const params = new URLSearchParams({
         spaces: "appDataFolder",
-        q: "name contains 'project-' and trashed = false",
+        q: `name contains '${escapeDriveQuery(filePrefix)}' and trashed = false`,
         fields: "nextPageToken,files(id,name,modifiedTime)",
         pageSize: "100"
       });

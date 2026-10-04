@@ -30,6 +30,30 @@ describe("fractional order keys", () => {
 });
 
 describe("RxDB local repository", () => {
+  it("persists account-specific project order without changing shared documents or viewer permissions", async () => {
+    const name = unique();
+    const rx = await open(name);
+    const a = await rx.createProject("A");
+    const b = await rx.createProject("B");
+    await rx.setProjectOrderAccount("pippo");
+    rx.setMutatorRole(a.id, "viewer");
+    const before = (await rx.db.projects.find().exec()).map((doc) => doc.toJSON());
+    await rx.reorderProjects([b.id, a.id]);
+    expect((await rx.listProjects()).map((project) => project.id)).toEqual([b.id, a.id]);
+    expect((await rx.db.projects.find().exec()).map((doc) => doc.toJSON())).toEqual(before);
+    await expect(rx.renameProject(a.id, "Forbidden")).rejects.toThrow("view-only");
+    await rx.setProjectOrderAccount("pluto");
+    await rx.reorderProjects([a.id, b.id]);
+    await rx.setProjectOrderAccount("pippo");
+    expect((await rx.listProjects()).map((project) => project.id)).toEqual([b.id, a.id]);
+    await rx.setProjectOrderAccount(null);
+    await rx.db.close();
+    const reopened = await open(name);
+    expect((await reopened.listProjects()).map((project) => project.id)).toEqual([b.id, a.id]);
+    await reopened.setProjectOrderAccount("pluto");
+    expect((await reopened.listProjects()).map((project) => project.id)).toEqual([a.id, b.id]);
+    await reopened.db.close();
+  });
   it("persists CRUD, subscriptions, one-card moves and restart", async () => {
     const name = unique();
     const rx = await open(name);
@@ -90,6 +114,14 @@ describe("RxDB local repository", () => {
     const image = { dataUrl: "data:image/webp;base64,AAAA", mimeType: "image/webp", width: 2, height: 2 };
     const card = await rx.addItem({ projectId: project.id, content: "Image", image });
     const snapshot = await adapter.read(project.id);
+    await rx.blobs.deleteBlob(card.imageId!);
+    expect(await adapter.applyIfNewer(snapshot)).toBe("equal");
+    expect(await rx.hasImage(card.imageId!)).toBe(true);
+    await rx.updateItem(card.id, { content: "Keep newer live text" });
+    await rx.blobs.deleteBlob(card.imageId!);
+    expect(await adapter.applyIfNewer(snapshot)).toBe("local-newer");
+    expect(await rx.hasImage(card.imageId!)).toBe(true);
+    expect((await rx.getCard(card.id))?.content).toBe("Keep newer live text");
     expect(deserializeProjectSnapshot(serializeProjectSnapshot(snapshot.project, snapshot.items)).items[0].image).toEqual(image);
     expect((await rx.db.cards.findOne(card.id).exec())?.toJSON()).not.toHaveProperty("image");
     const remote = { ...snapshot, project: { ...snapshot.project, updatedAt: "2099-01-01T00:00:00.000Z", revision: 50 }, items: snapshot.items.map((item) => ({ ...item, content: "Remote image" })) };

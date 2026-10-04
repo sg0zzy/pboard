@@ -3,13 +3,25 @@ import { createDriveTransport } from "./driveTransport";
 import { createGoogleAuthProvider } from "./googleAuth";
 import { createChromiumGoogleAuthProvider } from "./googleChromeAuth";
 import { createGoogleDriveProvider } from "./googleDriveProvider";
-import { createBackendProjectSnapshotStore, serializeProjectSnapshot } from "./snapshot";
+import { createBackendProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "./snapshot";
 import { createDriveSyncStateStore, createDriveTombstoneStore } from "./state";
 import { toFirefoxLoopbackRedirect } from "./redirectUri";
 import { googleDriveConfig, type GoogleDriveBrowser, type GoogleDriveStage } from "./googleDriveConfig";
-import { createDrivePermissionTransport, createDrivePermissionService, type DrivePermissionService, type DriveSharedProjectRecord, type DriveSharedProjectStore } from "./drivePermissions";
+import {
+  createDrivePermissionTransport,
+  createDrivePermissionService,
+  createDriveSignalStore,
+  type DrivePermissionService,
+  type DriveSharedProjectRecord,
+  type DriveSharedProjectStore
+} from "./drivePermissions";
+import { createCollaborationManager, type CollaborationManager } from "../collab/manager";
+import { createDriveSignaling, type PboardSignaling } from "../collab/signaling";
 import type { KeyValueStorage } from "../storage/repository";
 import type { RxRepository } from "../storage/rxdbRepository";
+import { hashBlob, imageToBlob } from "../storage/blobStore";
+import { createAccountSignalStore } from "./accountSignaling";
+import { createSharedBoardDiscovery } from "./sharedDiscovery";
 const extensionOrigin = browser.runtime.getURL("");
 const isFirefox = extensionOrigin.startsWith("moz-extension://");
 const browserKey: GoogleDriveBrowser = isFirefox ? "firefox" : "chromium";
@@ -42,17 +54,21 @@ let rxRepositoryResolver: () => Promise<RxRepository | null> = async () => null;
 export function registerRxRepositoryResolver(resolver: () => Promise<RxRepository | null>) {
   rxRepositoryResolver = resolver;
 }
-export const projectSnapshots = createBackendProjectSnapshotStore(browser.storage.local, () => rxRepositoryResolver());
+const isSharedProject = async (projectId: string) => Boolean((await sharedProjects.get(projectId)).projectFileId);
+export const projectSnapshots = createBackendProjectSnapshotStore(browser.storage.local, () => rxRepositoryResolver(),
+  async (projectId) => !await isSharedProject(projectId));
 export const driveTransport = createDriveTransport(googleAuth);
 export const googleDrive = createGoogleDriveProvider({
   auth: googleAuth,
   transport: driveTransport,
   snapshots: projectSnapshots,
   syncState: driveSyncState,
-  tombstones: driveTombstones
+  tombstones: driveTombstones,
+  beforeReconcile: () => discoverSharedBoards(),
+  isSharedProject
 });
 
-const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
+export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
 
 function createSharedProjectStore(storage: KeyValueStorage): DriveSharedProjectStore {
   async function readAll(): Promise<Record<string, DriveSharedProjectRecord>> {
@@ -97,4 +113,96 @@ export const drivePermissions = createDrivePermissionService({
     const { project, items } = await rx.exportProject(projectId);
     return serializeProjectSnapshot(project, items);
   }
+});
+
+export const discoverSharedBoards = createSharedBoardDiscovery({
+  connected: async () => await googleAuth.getConnectionState() === "connected",
+  permissions: drivePermissions,
+  getRepository: () => rxRepositoryResolver(),
+  isDeleted: async (projectId) => Boolean(await driveTombstones.get(projectId))
+});
+
+/**
+ * Live collaboration for shared projects, driven by the RxDB repository.
+ *
+ * The manager is a module-level singleton. The App calls `start(projectId)`
+ * when a project becomes current and `stop()` on unmount; `start()` stops the
+ * previous project first. Private projects have no content replication pool;
+ * an independent account room can still synchronize the project list order.
+ *
+ * Signaling is Drive-hosted (ephemeral per-peer records in the shared project's
+ * `realtime/` folder). Each pool's connection handler owns one signaling
+ * instance. Account-order signaling instead uses private appDataFolder records;
+ * `pool.cancel()` (on `stop()`) closes the handler, which calls
+ * `signaling.leave()` and stops the poll loop.
+ */
+
+/** Stable per-session peer id shared by both of a project's signaling pools. */
+const collaborationPeerId = crypto.randomUUID();
+
+/**
+ * One Drive-signaling instance per pool (cards + projects). The manager creates
+ * a fresh one per `signalingFor` call; `pool.cancel()` on `stop()` closes the
+ * handler, which calls `signaling.leave()` and stops the poll loop. Both pools
+ * of one start share `collaborationPeerId` so they identify as the same peer.
+ */
+function driveSignalingFor(topic: string): PboardSignaling {
+  if (topic.startsWith("pboard-account-")) {
+    const account = topic.slice("pboard-account-".length, -"-order".length);
+    return createDriveSignaling({ store: createAccountSignalStore({
+      transport: createDriveTransport(googleAuth, fetch, "account-signal-"),
+      account, peerId: collaborationPeerId
+    }) });
+  }
+  const projectId = topic.split("-").slice(2, -1).join("-");
+  const store = createDriveSignalStore({
+    transport: createDrivePermissionTransport(googleAuth),
+    sharedProjects,
+    projectId,
+    peerId: collaborationPeerId,
+    topic,
+    realtimeFolderId: () => drivePermissions.realtimeFolderId(projectId)
+  });
+  return createDriveSignaling({ store });
+}
+
+/** Import a shared project's snapshot from Drive when there is no local copy yet. */
+async function bootstrapFromDrive(projectId: string): Promise<boolean> {
+  const rx = await rxRepositoryResolver();
+  if (!rx) throw new Error("Collaboration requires the RxDB storage backend");
+  if (await rx.getProject(projectId)) return false;
+  const snapshot = deserializeProjectSnapshot(await drivePermissions.readSharedSnapshot(projectId));
+  await rx.importProject(snapshot.project, snapshot.items);
+  return true;
+}
+
+/** Drive I/O only when connected; private/unconnected projects resolve null locally. */
+const driveConnected = async () => (await googleAuth.getConnectionState()) === "connected";
+
+export const collaborationManager: CollaborationManager = createCollaborationManager({
+  getAccountId: async () => {
+    if (!await driveConnected()) return null;
+    const identity = await createDrivePermissionTransport(googleAuth).currentIdentity();
+    if (!identity) throw new Error("Could not identify the Google Drive account");
+    return hashBlob(new Blob([identity.email.trim().toLowerCase()]));
+  },
+  myRole: async (projectId) => (await driveConnected() ? drivePermissions.myRole(projectId) : null),
+  getSharedFileId: async (projectId) => (await driveConnected() ? drivePermissions.projectFileId(projectId) : null),
+  bootstrapFromDrive,
+  signalingFor: driveSignalingFor,
+  imageTransport: {
+    readImage: async (projectId, imageId) => {
+      const asset = await drivePermissions.readSharedImage(projectId, imageId);
+      if (asset) return asset;
+      // Recover images from snapshots written before shared image assets existed.
+      const snapshot = deserializeProjectSnapshot(await drivePermissions.readSharedSnapshot(projectId));
+      if (snapshot.project.id !== projectId) throw new Error("Shared snapshot belongs to a different project");
+      for (const card of snapshot.items) {
+        if (card.image?.dataUrl.startsWith("data:image/") && await hashBlob(await imageToBlob(card.image.dataUrl)) === imageId) return card.image;
+      }
+      return null;
+    },
+    writeImage: (projectId, imageId, image) => drivePermissions.writeSharedImage(projectId, imageId, image)
+  },
+  getRepository: () => rxRepositoryResolver()
 });

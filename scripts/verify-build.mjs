@@ -1,5 +1,6 @@
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { runInNewContext } from "node:vm";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const requestedVariant = process.argv[2] ?? "all";
@@ -11,6 +12,41 @@ async function readJson(path) {
 
 async function assertFile(path) {
   await access(resolve(root, path));
+}
+
+function verifyBackgroundStartup(source, kind) {
+  const listeners = new Map();
+  const event = (name) => ({
+    addListener(listener) { listeners.set(name, listener); },
+    removeListener() {}
+  });
+  const api = {
+    runtime: {
+      getURL: () => `${kind === "firefox" ? "moz" : "chrome"}-extension://pboard/`,
+      onInstalled: event("installed"), onMessage: event("message")
+    },
+    storage: {
+      local: { get: async () => ({}), set: async () => {} },
+      onChanged: event("storage")
+    },
+    identity: {},
+    menus: { removeAll: async () => {}, create() {}, onClicked: event("menu") },
+    commands: { onCommand: event("command") },
+    alarms: { onAlarm: event("alarm") }
+  };
+  // Evaluate the production bundle without Node's global/process/Buffer.
+  // Merely checking that files exist misses browser-incompatible imports.
+  runInNewContext(source, {
+    [kind === "firefox" ? "browser" : "chrome"]: api,
+    console, crypto: globalThis.crypto, setTimeout, clearTimeout,
+    setInterval, clearInterval, queueMicrotask, TextEncoder, TextDecoder,
+    URL, URLSearchParams, AbortController, performance, structuredClone,
+    Headers, Request, Response, Blob, atob, btoa,
+    fetch: async () => { throw new Error("Unexpected network request during startup verification"); }
+  }, { filename: `${kind}/background.js`, timeout: 5000 });
+  for (const name of ["installed", "message", "menu", "command", "alarm"]) {
+    if (!listeners.has(name)) throw new Error(`${kind} background did not register ${name}`);
+  }
 }
 
 async function verifyVariant(directory, manifest, kind) {
@@ -36,7 +72,7 @@ async function verifyVariant(directory, manifest, kind) {
     }
   } else if (!manifest.side_panel || !manifest.action || !manifest.background?.service_worker || manifest.sidebar_action) {
     throw new Error("Chromium build does not have the expected side_panel/service-worker manifest");
-  } else if (!manifest.oauth2?.client_id || !manifest.oauth2?.scopes?.includes("https://www.googleapis.com/auth/drive.appdata")) {
+  } else if (!manifest.oauth2?.client_id || !["drive.appdata", "drive"].every((scope) => manifest.oauth2?.scopes?.includes(`https://www.googleapis.com/auth/${scope}`))) {
     throw new Error("Chromium build does not have the expected Google Drive OAuth configuration");
   }
 
@@ -44,6 +80,7 @@ async function verifyVariant(directory, manifest, kind) {
   if (!background.includes("OffscreenCanvas")) {
     throw new Error(`${kind} background bundle is missing the service-worker image path`);
   }
+  verifyBackgroundStartup(background, kind);
 }
 
 if (requestedVariant === "firefox" || requestedVariant === "all") {

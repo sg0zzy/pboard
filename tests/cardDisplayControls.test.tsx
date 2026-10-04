@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Card } from "../src/sidebar/components/Card";
@@ -38,7 +38,7 @@ describe("card display controls", () => {
     container.remove();
   });
 
-  function renderCard() {
+  function renderCard(extra: Partial<ComponentProps<typeof Card>> = {}) {
     act(() => root.render(
       <Card
         item={item}
@@ -64,9 +64,39 @@ describe("card display controls", () => {
         focusRequested={false}
         startEditingOnFocus={false}
         onFocusHandled={vi.fn()}
+        {...extra}
       />
     ));
   }
+
+  it("renders an image that arrives after its card was already displayed as unavailable", async () => {
+    const createObjectURL = vi.fn(() => "blob:downloaded-image");
+    const revokeObjectURL = vi.fn();
+    const NativeURL = URL;
+    vi.stubGlobal("URL", class extends NativeURL {
+      static createObjectURL = createObjectURL;
+      static revokeObjectURL = revokeObjectURL;
+    });
+    let available = false;
+    let notify: (() => void) | undefined;
+    const stop = vi.fn();
+    const getImage = vi.fn(async () => available ? {
+      imageId: "image-id", blob: new Blob(["image"], { type: "image/png" }), mimeType: "image/png", width: 1, height: 1, size: 5
+    } : null);
+    try {
+      await act(async () => renderCard({ item: { ...item, imageId: "image-id" }, getImage,
+        subscribeImage: async (_id, listener) => { notify = listener; return stop; }
+      }));
+      expect(container.textContent).toContain("Image unavailable");
+      available = true;
+      await act(async () => { notify!(); });
+      expect(container.querySelector<HTMLImageElement>(".card-image")?.getAttribute("src")).toBe("blob:downloaded-image");
+      expect(container.textContent).not.toContain("Image unavailable");
+      act(() => root.unmount());
+      expect(stop).toHaveBeenCalled();
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:downloaded-image");
+    } finally { act(() => root.unmount()); vi.unstubAllGlobals(); }
+  });
 
   it("renders direct accessible controls and marks the active mode", () => {
     renderCard();

@@ -7,6 +7,7 @@ export interface BlobStore {
   hasBlob(imageId: string): Promise<boolean>;
   deleteBlob(imageId: string): Promise<void>;
   imageAvailability(imageId: string): Promise<ImageAvailability>;
+  subscribe(listener: (imageId: string) => void): () => void;
 }
 
 const STORE = "images";
@@ -17,6 +18,16 @@ export async function hashBlob(blob: Blob): Promise<string> {
 }
 
 export function createIndexedDbBlobStore(name = "pboard-images-v1"): BlobStore {
+  const listeners = new Set<(imageId: string) => void>();
+  let channel: BroadcastChannel | null = null;
+  const notify = (imageId: string) => { for (const listener of listeners) listener(imageId); };
+  function changed(imageId: string) {
+    notify(imageId);
+    // The background and sidebar may use separate instances of the same store.
+    const sender = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(`pboard:images:${name}`);
+    sender?.postMessage(imageId);
+    sender?.close();
+  }
   let opening: Promise<IDBDatabase> | null = null;
   function open(): Promise<IDBDatabase> {
     return opening ??= new Promise((resolve, reject) => {
@@ -48,11 +59,26 @@ export function createIndexedDbBlobStore(name = "pboard-images-v1"): BlobStore {
         store.put({ imageId, blob, mimeType: metadata.mimeType, width: metadata.width, height: metadata.height, size: blob.size } satisfies StoredBlob);
         done();
       });
+      changed(imageId);
       return imageId;
     },
     getBlob,
     async hasBlob(imageId) { return (await getBlob(imageId)) !== null; },
-    async deleteBlob(imageId) { await transaction<void>("readwrite", (store, done) => { store.delete(imageId); done(); }); },
+    async deleteBlob(imageId) {
+      await transaction<void>("readwrite", (store, done) => { store.delete(imageId); done(); });
+      changed(imageId);
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      if (!channel && typeof BroadcastChannel !== "undefined") {
+        channel = new BroadcastChannel(`pboard:images:${name}`);
+        channel.onmessage = (event) => { if (typeof event.data === "string") notify(event.data); };
+      }
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0) { channel?.close(); channel = null; }
+      };
+    },
     async imageAvailability(imageId) {
       const entry = await getBlob(imageId);
       if (!entry) return "missing";

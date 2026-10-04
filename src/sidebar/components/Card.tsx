@@ -18,6 +18,7 @@ import { StatusPicker } from "./StatusPicker";
 type Props = {
   item: BoardItem;
   getImage?: (imageId: string) => Promise<StoredBlob | null>;
+  subscribeImage?: (imageId: string, listener: () => void) => Promise<() => void>;
   pendingStatus: BoardItemStatus;
   template: BoardTemplate;
   onUpdate: (itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>, afterSave?: "focus" | "insert") => Promise<void>;
@@ -86,7 +87,7 @@ function ensureCardVisible(card: HTMLElement | null) {
   window.scrollTo({ top: target, behavior: "smooth" });
 }
 
-export function Card({ item, getImage, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
+export function Card({ item, getImage, subscribeImage, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);
@@ -120,16 +121,29 @@ export function Card({ item, getImage, pendingStatus, template, onUpdate, onStat
     if (!getImage) { setImageMissing(true); return; }
     let active = true;
     let objectUrl: string | null = null;
+    let unsubscribe: (() => void) | undefined;
+    let revision = 0;
     setBlobImageUrl(null);
     setImageMissing(false);
-    void getImage(item.imageId).then((entry) => {
-      if (!active) return;
-      if (!entry) { setImageMissing(true); return; }
-      objectUrl = URL.createObjectURL(entry.blob);
-      setBlobImageUrl(objectUrl);
+    const reload = () => {
+      const request = ++revision;
+      void getImage(item.imageId!).then((entry) => {
+        if (!active || request !== revision) return;
+        if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+        if (!entry) { setBlobImageUrl(null); setImageMissing(true); return; }
+        objectUrl = URL.createObjectURL(entry.blob);
+        setImageMissing(false);
+        setBlobImageUrl(objectUrl);
+      }).catch(() => { if (active && request === revision) setImageMissing(true); });
+    };
+    reload();
+    if (subscribeImage) void subscribeImage(item.imageId, reload).then((stop) => {
+      if (!active) { stop(); return; }
+      unsubscribe = stop;
+      reload(); // Cover an arrival while the subscription was being opened.
     }).catch(() => { if (active) setImageMissing(true); });
-    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [item.imageId, getImage]);
+    return () => { active = false; unsubscribe?.(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [item.imageId, getImage, subscribeImage]);
 
   useEffect(() => {
     if (!focusRequested || editing) return;

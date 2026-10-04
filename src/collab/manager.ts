@@ -3,10 +3,11 @@ import type { RxWebRTCReplicationPool } from "rxdb/plugins/replication-webrtc";
 import type { RxCollection, WithDeleted } from "rxdb";
 import type { PboardRole } from "../sync/drivePermissions";
 import type { RxRepository } from "../storage/rxdbRepository";
-import type { CardRecord, ProjectRecord } from "../storage/rxdbSchemas";
+import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
 import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
+import { createProjectImageSync, type SharedImageTransport } from "./imageSync";
 
 /**
  * pboard role as resolved for a project, used to gate replication direction and
@@ -23,10 +24,11 @@ export type CollaborationState = {
   role: CollaborationRole;
   /** Shared file id the owner has created, if any (owner/editors only). */
   sharedFileId: string | null;
-  /** Signaling peer ids currently connected to at least one of the two pools. */
+  /** Signaling peer ids connected to the current project's shared-content pools. */
   connectedPeers: string[];
   /** True once the manager has resolved a role for the current start() call. */
   ready: boolean;
+  error: string | null;
 };
 
 export interface CollaborationManagerOptions {
@@ -48,6 +50,9 @@ export interface CollaborationManagerOptions {
   signalingFor: (topic: string) => PboardSignaling;
   getRepository: () => Promise<RxRepository | null>;
   wrtc?: PboardWrtc;
+  imageTransport?: SharedImageTransport;
+  /** Stable normalized account identity hash; null when Drive is disconnected. */
+  getAccountId?: () => Promise<string | null>;
 }
 
 export interface CollaborationManager {
@@ -61,7 +66,7 @@ const topicFor = (projectId: string, collection: SharedCollection) => `pboard-co
 const isEditorRole = (role: CollaborationRole) => role === "owner" || role === "editor";
 
 /**
- * One shared project's live collaboration.
+ * One shared project's live collaboration plus account-only project ordering.
  *
  * The manager owns the full lifecycle for a single project:
  *   1. resolve the caller's role from Drive permissions (the authoritative ACL);
@@ -83,22 +88,29 @@ const isEditorRole = (role: CollaborationRole) => role === "owner" || role === "
  *   instead crash `persistFromMaster`), and the push modifier returns `null` for
  *   out-of-project docs on send (the push path, which does filter nulls).
  *
- * Images: card documents replicate live; image blobs travel in the Drive snapshot
- *   at bootstrap. A card whose image is added *after* a peer is already
- *   connected appears on the next Drive sync/refresh, not over WebRTC.
+ * Images: card references replicate live; a separate image sync uploads and
+ *   downloads immutable assets through the shared Drive folder. Blob arrivals
+ *   refresh cards without replacing their newer document data.
+ *
+ * Project list order: an independent account room replicates only its own
+ *   projectOrder setting. It remains available on private projects and to
+ *   viewers, and never replicates current selection or another account's settings.
  */
 export function createCollaborationManager(options: CollaborationManagerOptions): CollaborationManager {
   let role: CollaborationRole = "private";
   let sharedFileId: string | null = null;
   let ready = false;
+  let error: string | null = null;
   let startedProjectId: string | null = null;
   let startedRepo: RxRepository | null = null;
-  type SharedPool = RxWebRTCReplicationPool<CardRecord, PboardPeer> | RxWebRTCReplicationPool<ProjectRecord, PboardPeer>;
+  type SharedPool = RxWebRTCReplicationPool<CardRecord, PboardPeer> | RxWebRTCReplicationPool<ProjectRecord, PboardPeer> | RxWebRTCReplicationPool<SettingRecord, PboardPeer>;
   const pools: SharedPool[] = [];
+  let imageSync: ReturnType<typeof createProjectImageSync> | null = null;
 
   function collectPeers(): string[] {
     const ids = new Set<string>();
     for (const pool of pools) {
+      if (pool.collection.name === "settings") continue;
       for (const peer of pool.peerStates$.getValue().keys()) ids.add(String(peer.id));
     }
     return Array.from(ids).sort();
@@ -132,6 +144,10 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       ...(editable ? { push: { batchSize: 100, modifier: (doc: WithDeleted<T>) => (scopeProjectDoc(doc) ? doc : null) } } : {})
     })) as SharedPool;
     pools.push(pool);
+    pool.subs.push(pool.error$.subscribe((err) => {
+      error = String(err.parameters?.errorText ?? err.message ?? err);
+    }));
+    pool.subs.push(pool.connectionHandler.connect$.subscribe(() => { error = null; }));
   }
 
   async function applyRole(projectId: string): Promise<void> {
@@ -141,17 +157,47 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     ready = true;
   }
 
-  async function start(projectId: string): Promise<void> {
-    await stop();
+  async function startAccountOrder(rx: RxRepository): Promise<void> {
+    const account = await options.getAccountId?.() ?? null;
+    await rx.setProjectOrderAccount(account);
+    if (!account) return;
+    const id = `projectOrder:${account}`;
+    const topic = `pboard-account-${account}-order`;
+    const scoped = (doc: unknown) => !!doc && typeof doc === "object" && "id" in doc && doc.id === id;
+    const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
+      collection: rx.db.settings, topic,
+      connectionHandlerCreator: createPboardWebRTCConnectionHandler({
+        signaling: options.signalingFor(topic), scopeDocument: scoped,
+        ...(options.wrtc ? { wrtc: options.wrtc } : {})
+      }),
+      isPeerValid: () => true,
+      pull: { batchSize: 100 },
+      push: { batchSize: 100, modifier: (doc) => scoped(doc) ? doc : null }
+    });
+    pools.push(pool);
+    pool.subs.push(pool.error$.subscribe((err) => { error = String(err.parameters?.errorText ?? err.message ?? err); }));
+  }
+
+  /** Serialize start/stop so a rapid project switch or unmount never races the shared pool list. */
+  let opChain: Promise<unknown> = Promise.resolve();
+  function runExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const run = opChain.then(task, task);
+    opChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  async function doStart(projectId: string): Promise<void> {
+    await doStop();
     startedProjectId = projectId;
     await applyRole(projectId);
-    if (role === "private") return;
 
     // A viewer/editor with no local copy pulls the full snapshot (cards + blobs)
     // from the shared Drive file so the board renders before live replication.
     const rx = await options.getRepository();
     if (!rx) return;
     startedRepo = rx;
+    await startAccountOrder(rx);
+    if (role === "private") return;
     // Authoritative viewer write-restriction. WebRTC picks master/slave by token
     // hash, not role, and the master streams its change log unconditionally, so a
     // viewer that is the master would otherwise leak local writes to peers even
@@ -163,29 +209,54 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     }
     await startPool("cards", projectId, rx.db.cards);
     await startPool("projects", projectId, rx.db.projects);
+    if (options.imageTransport) {
+      imageSync = createProjectImageSync({ projectId, repository: rx, transport: options.imageTransport,
+        canWrite: isEditorRole(role), onError: (err) => { error = err instanceof Error ? err.message : String(err); } });
+      imageSync.start();
+    }
   }
 
-  async function stop(): Promise<void> {
+  async function doStop(): Promise<void> {
+    await imageSync?.stop();
+    imageSync = null;
     while (pools.length > 0) await (pools.pop() as SharedPool).cancel();
+    await startedRepo?.setProjectOrderAccount(null);
     if (startedProjectId) startedRepo?.setMutatorRole(startedProjectId, null);
     startedRepo = null;
     role = "private";
     sharedFileId = null;
     ready = false;
+    error = null;
     startedProjectId = null;
   }
 
-  async function refreshRole(): Promise<void> {
+  const refreshRole = () => runExclusive(async () => {
     if (!startedProjectId) return;
-    await applyRole(startedProjectId);
-    // Role changes take effect on the next start() (pools are already running with
-    // the previous direction). Re-resolving here keeps state() current for the UI.
-  }
+    const previousRole = role;
+    const previousFileId = sharedFileId;
+    try {
+      await applyRole(startedProjectId);
+      if (role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
+        await doStart(startedProjectId);
+      }
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
+  });
 
   return {
-    start,
-    stop,
+    start: (projectId) => runExclusive(async () => {
+      try { await doStart(projectId); }
+      catch (err) {
+        await doStop();
+        startedProjectId = projectId;
+        error = err instanceof Error ? err.message : String(err);
+        throw err;
+      }
+    }),
+    stop: () => runExclusive(doStop),
     refreshRole,
-    state: () => ({ role, sharedFileId, connectedPeers: collectPeers(), ready })
+    state: () => ({ role, sharedFileId, connectedPeers: collectPeers(), ready, error })
   };
 }
