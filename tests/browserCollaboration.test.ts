@@ -31,6 +31,11 @@ vi.mock("../src/platform/browser", () => {
   };
 });
 
+// Account-preference persistence is covered by accountPreferences.test.ts;
+// this discovery suite must not perform real Drive I/O for it.
+vi.mock("../src/sync/accountPreferences", () => ({
+  createAccountPreferenceSync: () => (async () => {})
+}));
 import {
   collaborationManager,
   drivePermissions,
