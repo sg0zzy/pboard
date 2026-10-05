@@ -260,3 +260,15 @@ verification). Remaining work:
    made for the wiring state).
 
 Do NOT expand scope (no public links, no backend server).
+
+## PR #1 conflict resolution
+
+Merged the current main implementation into the Bonsai PR, preserving the
+sharing UI, shared image transfer, account-scoped order, discovery safeguards,
+OAuth scope handling, and browser-safe WebRTC entry point. The PR's extra
+background, client, message, configuration, permission-service, discovery, and
+signaling coverage is retained. Discovery tests use `discoverSharedBoards`;
+signaling fixtures include the recipient id required by directed delivery.
+
+Validation: typecheck, all 333 tests across 48 files (including native WebRTC
+manager tests), both production builds, and build verification pass.
