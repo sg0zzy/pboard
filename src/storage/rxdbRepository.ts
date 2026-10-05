@@ -1,4 +1,4 @@
-import { createRxDatabase, type RxCollection, type RxDatabase } from "rxdb";
+import { createRxDatabase, defaultConflictHandler, type RxCollection, type RxDatabase } from "rxdb";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
@@ -6,6 +6,7 @@ import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, B
 import type { CollaborationRole } from "../collab/manager";
 import { blobToDataUrl, createIndexedDbBlobStore, hashBlob, imageToBlob, type BlobStore } from "./blobStore";
 import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
+import { mergeProjectOrder, parseProjectOrder, type ProjectOrderPreference } from "./projectOrder";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
 import type { RepositoryEvents } from "./repository";
 
@@ -41,13 +42,28 @@ export async function createRxRepository(options: {
    * The push modifier alone does not cover that path; this gate does.
    */
   mutatorRole?: CollaborationRole;
+  /** Recheck Drive ownership before writing shared content deletion records. */
+  resolveDeletionRole?: (projectId: string) => Promise<CollaborationRole>;
 } = {}) {
   const db: RxDatabase<RxCollections> = await createRxDatabase<RxCollections>({
     name: options.name ?? "pboardlocalv1",
     storage: options.storage ?? getRxStorageDexie(),
     multiInstance: true
   });
-  await db.addCollections({ projects: { schema: projectSchema }, cards: { schema: cardSchema }, settings: { schema: settingSchema } });
+  await db.addCollections({ projects: { schema: projectSchema }, cards: { schema: cardSchema }, settings: {
+    schema: settingSchema,
+    conflictHandler: {
+      isEqual: defaultConflictHandler.isEqual,
+      async resolve(input) {
+        const master = input.realMasterState;
+        const incoming = input.newDocumentState;
+        if (master.id.startsWith("projectOrder:") && !master._deleted && !incoming._deleted) {
+          return { ...master, value: JSON.stringify(mergeProjectOrder(parseProjectOrder(master.value), parseProjectOrder(incoming.value))) };
+        }
+        return master;
+      }
+    }
+  } });
   const { projects, cards, settings } = db;
   const blobs = options.blobs ?? createIndexedDbBlobStore();
   const events = options.events ?? {};
@@ -74,7 +90,7 @@ export async function createRxRepository(options: {
     else mutatorRoles.set(projectId, role);
   }
   function assertCanMutate(projectId: string) {
-    if (mutatorRoles.get(projectId) === "viewer") {
+    if ((mutatorRoles.get(projectId) ?? options.mutatorRole) === "viewer") {
       throw new Error("You have view-only access to this shared project");
     }
   }
@@ -91,26 +107,60 @@ export async function createRxRepository(options: {
     });
   }
   async function allProjectRecords() {
-    return (await projects.find().exec()).map((doc) => doc.toJSON()).sort(compareOrdered);
+    const deleted = await deletedProjectIds();
+    return (await projects.find().exec()).map((doc) => doc.toJSON()).filter((doc) => !deleted.includes(doc.id)).sort(compareOrdered);
   }
   let projectOrderAccount: string | null = null;
   const localOrderId = "localProjectOrder";
   const accountOrderId = (account: string) => `projectOrder:${account}`;
+  async function deletedProjectIds(): Promise<string[]> {
+    let preference = projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null;
+    if (!preference) {
+      const source = await settings.findOne("localProjectOrderAccount").exec();
+      if (projectOrderAccount && source && source.value !== projectOrderAccount) return [];
+      preference = await settings.findOne(localOrderId).exec();
+    }
+    return preference ? parseProjectOrder(preference.value).deletedProjectIds ?? [] : [];
+  }
+  async function isDeletedProject(projectId: string): Promise<boolean> {
+    return (await deletedProjectIds()).includes(projectId);
+  }
   async function orderedProjects() {
     const records = await allProjectRecords();
     const preference = (projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null)
       ?? await settings.findOne(localOrderId).exec();
     if (!preference) return records;
-    const ids = JSON.parse(preference.value) as string[];
+    const ids = parseProjectOrder(preference.value).ids;
     const ranks = new Map(ids.map((id, index) => [id, index]));
     return records.sort((a, b) => (ranks.get(a.id) ?? ids.length) - (ranks.get(b.id) ?? ids.length));
   }
   async function setProjectOrderAccount(account: string | null) {
-    const ids = (await orderedProjects()).map((record) => record.id);
+    const preference = (projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null)
+      ?? await settings.findOne(localOrderId).exec();
+    const value = preference?.value ?? JSON.stringify((await orderedProjects()).map((record) => record.id));
+    if (projectOrderAccount) await settings.upsert({ id: "localProjectOrderAccount", value: projectOrderAccount });
     projectOrderAccount = account;
     // Preserve local ordering before shared project documents can arrive, and
     // retain the last visible order when disconnecting or changing accounts.
-    await settings.upsert({ id: localOrderId, value: JSON.stringify(ids) });
+    await settings.upsert({ id: localOrderId, value });
+  }
+  async function getProjectOrder(account: string): Promise<ProjectOrderPreference | null> {
+    const preference = await settings.findOne(accountOrderId(account)).exec();
+    return preference ? parseProjectOrder(preference.value) : null;
+  }
+  async function applyProjectOrder(account: string, preference: ProjectOrderPreference) {
+    return locked(async () => {
+      // Keep ids for boards not imported yet; they receive their saved rank as
+      // soon as discovery/reconciliation adds them to the local repository.
+      const id = accountOrderId(account);
+      const doc = await settings.findOne(id).exec();
+      if (!doc) {
+        await settings.upsert({ id, value: JSON.stringify(preference) });
+        return;
+      }
+      await doc.incrementalModify((current) => ({ ...current,
+        value: JSON.stringify(mergeProjectOrder(parseProjectOrder(current.value), preference)) }));
+    });
   }
   async function projectCardRecords(projectId: string, includeDeleted = false) {
     const records = (await cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }).exec()).map((doc) => doc.toJSON()).sort(compareOrdered);
@@ -118,14 +168,17 @@ export async function createRxRepository(options: {
   }
   async function listProjects(): Promise<Project[]> { return (await orderedProjects()).map(projectValue); }
   async function getProject(id: string): Promise<Project | null> {
+    if (await isDeletedProject(id)) return null;
     const doc = await projects.findOne(id).exec();
     return doc ? projectValue(doc.toJSON()) : null;
   }
   async function getCurrentProject(): Promise<Project | null> {
     const setting = await settings.findOne("currentProjectId").exec();
-    return setting?.value ? getProject(setting.value) : null;
+    if (!setting?.value) return null;
+    return await getProject(setting.value) ?? (await listProjects())[0] ?? null;
   }
   async function listCards(projectId: string): Promise<BoardItem[]> {
+    if (await isDeletedProject(projectId)) return [];
     return (await projectCardRecords(projectId)).map(cardValue);
   }
   async function listCardsByStatus(projectId: string, status: BoardItemStatus): Promise<BoardItem[]> {
@@ -173,6 +226,7 @@ export async function createRxRepository(options: {
     await blobs.deleteBlob(imageId);
   }
   async function importProject(project: Project, items: BoardItem[], preserveOrderKey?: string) {
+    if (await isDeletedProject(project.id)) return;
     const existing = await projects.findOne(project.id).exec();
     const orderKey = preserveOrderKey ?? existing?.orderKey ?? orderKeyBetween((await allProjectRecords()).at(-1)?.orderKey ?? null, null);
     const sorted = [...items].sort((a, b) => a.order - b.order);
@@ -239,7 +293,13 @@ export async function createRxRepository(options: {
   async function reorderProjects(orderedIds: string[]) { return locked(async () => {
     const current = await allProjectRecords();
     if (orderedIds.length !== current.length || new Set(orderedIds).size !== current.length || current.some((record) => !orderedIds.includes(record.id))) throw new Error("Project list must contain every project exactly once");
-    await settings.upsert({ id: projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId, value: JSON.stringify(orderedIds) });
+    const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+    const existing = await settings.findOne(id).exec();
+    const previous = existing ? Date.parse(parseProjectOrder(existing.value).updatedAt) : 0;
+    const updatedAt = new Date(Math.max(Date.parse(now()), previous + 1)).toISOString();
+    const deletedProjectIds = existing ? parseProjectOrder(existing.value).deletedProjectIds : undefined;
+    await settings.upsert({ id, value: JSON.stringify({ ids: orderedIds, updatedAt,
+      ...(deletedProjectIds ? { deletedProjectIds } : {}) }) });
   }); }
   async function renameProject(projectId: string, name: string) {
     const trimmed = name.trim();
@@ -252,20 +312,40 @@ export async function createRxRepository(options: {
     await touchProject(projectId);
     await changed(projectId);
   }
-  async function deleteProject(projectId: string) { return locked(async () => {
-    const doc = await projects.findOne(projectId).exec();
-    if (!doc) return;
-    assertCanMutate(projectId);
-    await events.projectDeleting?.(projectValue(doc.toJSON()));
-    for (const card of await projectCardRecords(projectId)) {
-      await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
-    }
-    await doc.remove();
-    if ((await getCurrentProject())?.id === projectId || (await settings.findOne("currentProjectId").exec())?.value === projectId) {
-      await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
-    }
-    await events.projectDeleted?.(projectId);
-  }); }
+  async function deleteProject(projectId: string) {
+    const role = await locked(async () => {
+      const doc = await projects.findOne(projectId).exec();
+      if (!doc) return;
+      const role = options.resolveDeletionRole ? await options.resolveDeletionRole(projectId)
+        : mutatorRoles.get(projectId) ?? options.mutatorRole ?? "owner";
+      if (role === "owner") await events.projectDeleting?.(projectValue(doc.toJSON()));
+      const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+      const preference = await settings.findOne(id).exec();
+      const previous = preference ? parseProjectOrder(preference.value)
+        : { ids: (await listProjects()).map((project) => project.id), updatedAt: "1970-01-01T00:00:00.000Z" };
+      await settings.upsert({ id, value: JSON.stringify({
+        ids: previous.ids.filter((id) => id !== projectId),
+        updatedAt: new Date(Math.max(Date.parse(now()), Date.parse(previous.updatedAt) + 1)).toISOString(),
+        deletedProjectIds: [...new Set([...(previous.deletedProjectIds ?? []), projectId])].sort()
+      }) });
+      // Shared collections replicate to every collaborator. Non-owners may only
+      // hide the board through their own account preference, never delete content.
+      if (role === "owner") {
+        for (const card of await projectCardRecords(projectId)) {
+          await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
+        }
+        await doc.remove();
+      }
+      if ((await getCurrentProject())?.id === projectId || (await settings.findOne("currentProjectId").exec())?.value === projectId) {
+        await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
+      }
+      return role;
+    });
+    // Preference sync can itself queue repository writes. Release the mutation
+    // lock before notifying listeners so removing a board cannot deadlock sync.
+    if (role === "owner") await events.projectDeleted?.(projectId);
+    else if (role) await events.projectHidden?.(projectId);
+  }
   async function changeProjectTemplate(projectId: string, template: BoardTemplate): Promise<number> { return locked(async () => {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) throw new Error("Project not found");
@@ -463,7 +543,7 @@ export async function createRxRepository(options: {
   };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
     const emit = () => { void getCurrentProject().then(listener); };
-    const first = settings.findOne("currentProjectId").$.subscribe(emit);
+    const first = settings.find().$.subscribe(emit);
     const second = projects.find().$.subscribe(emit);
     emit();
     return () => { first.unsubscribe(); second.unsubscribe(); };
@@ -473,7 +553,7 @@ export async function createRxRepository(options: {
   const subscribeCard = (id: string, listener: (value: BoardItem | null) => void) => subscribe(cards.findOne(id), () => getCard(id), listener);
   async function load(): Promise<AppState> { return exportAll(); } // Compatibility for old command callers; not a reactive read path.
   return { db, blobs, load, exportAll, exportProject, importProject, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
-    createProject, selectProject, reorderProjects, setProjectOrderAccount, renameProject, deleteProject, changeProjectTemplate,
+    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, renameProject, deleteProject, changeProjectTemplate,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,
     subscribeProjects, subscribeCurrentProject, subscribeCards, subscribeCard,

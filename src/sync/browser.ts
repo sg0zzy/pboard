@@ -22,6 +22,8 @@ import type { RxRepository } from "../storage/rxdbRepository";
 import { hashBlob, imageToBlob } from "../storage/blobStore";
 import { createAccountSignalStore } from "./accountSignaling";
 import { createSharedBoardDiscovery } from "./sharedDiscovery";
+import { createSharedProjectSync } from "./sharedSync";
+import { createAccountPreferenceSync } from "./accountPreferences";
 const extensionOrigin = browser.runtime.getURL("");
 const isFirefox = extensionOrigin.startsWith("moz-extension://");
 const browserKey: GoogleDriveBrowser = isFirefox ? "firefox" : "chromium";
@@ -64,8 +66,11 @@ export const googleDrive = createGoogleDriveProvider({
   snapshots: projectSnapshots,
   syncState: driveSyncState,
   tombstones: driveTombstones,
-  beforeReconcile: () => discoverSharedBoards(),
-  isSharedProject
+  beforeReconcile: () => discoverSharedBoardSnapshots(),
+  isSharedProject,
+  syncSharedProject: (projectId, changeToken) => syncSharedProject(projectId, changeToken),
+  syncPreferences: () => syncAccountPreferences(),
+  isDeletedProject: async (projectId) => await (await rxRepositoryResolver())?.isDeletedProject(projectId) ?? false
 });
 
 export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
@@ -115,12 +120,25 @@ export const drivePermissions = createDrivePermissionService({
   }
 });
 
-export const discoverSharedBoards = createSharedBoardDiscovery({
+const syncSharedProject = createSharedProjectSync({
+  permissions: drivePermissions,
+  snapshots: projectSnapshots,
+  syncState: driveSyncState,
+  getRepository: () => rxRepositoryResolver()
+});
+
+const discoverSharedBoardSnapshots = createSharedBoardDiscovery({
   connected: async () => await googleAuth.getConnectionState() === "connected",
   permissions: drivePermissions,
   getRepository: () => rxRepositoryResolver(),
-  isDeleted: async (projectId) => Boolean(await driveTombstones.get(projectId))
+  isDeleted: async (projectId) => Boolean(await driveTombstones.get(projectId)) ||
+    Boolean(await (await rxRepositoryResolver())?.isDeletedProject(projectId))
 });
+
+export async function discoverSharedBoards() {
+  await syncAccountPreferences();
+  await discoverSharedBoardSnapshots();
+}
 
 /**
  * Live collaboration for shared projects, driven by the RxDB repository.
@@ -179,13 +197,21 @@ async function bootstrapFromDrive(projectId: string): Promise<boolean> {
 /** Drive I/O only when connected; private/unconnected projects resolve null locally. */
 const driveConnected = async () => (await googleAuth.getConnectionState()) === "connected";
 
+async function connectedAccountId(): Promise<string | null> {
+  if (!await driveConnected()) return null;
+  const identity = await createDrivePermissionTransport(googleAuth).currentIdentity();
+  if (!identity) throw new Error("Could not identify the Google Drive account");
+  return hashBlob(new Blob([identity.email.trim().toLowerCase()]));
+}
+
+export const syncAccountPreferences = createAccountPreferenceSync({
+  transport: createDriveTransport(googleAuth, fetch, "account-preferences-"),
+  getAccountId: connectedAccountId,
+  getRepository: () => rxRepositoryResolver()
+});
+
 export const collaborationManager: CollaborationManager = createCollaborationManager({
-  getAccountId: async () => {
-    if (!await driveConnected()) return null;
-    const identity = await createDrivePermissionTransport(googleAuth).currentIdentity();
-    if (!identity) throw new Error("Could not identify the Google Drive account");
-    return hashBlob(new Blob([identity.email.trim().toLowerCase()]));
-  },
+  getAccountId: connectedAccountId,
   myRole: async (projectId) => (await driveConnected() ? drivePermissions.myRole(projectId) : null),
   getSharedFileId: async (projectId) => (await driveConnected() ? drivePermissions.projectFileId(projectId) : null),
   bootstrapFromDrive,

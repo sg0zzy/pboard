@@ -37,12 +37,16 @@ type Dependencies = {
   tombstones: DriveTombstoneStore;
   beforeReconcile?: () => Promise<void>;
   isSharedProject?: (projectId: string) => Promise<boolean>;
+  syncSharedProject?: (projectId: string, changeToken: number) => Promise<ProjectSyncResult>;
+  syncPreferences?: () => Promise<void>;
+  isDeletedProject?: (projectId: string) => Promise<boolean>;
 };
 
 type RemoteSnapshot = { file: DriveAppDataFile; snapshot: ProjectSnapshot };
 
 export function createGoogleDriveProvider({ auth, transport, snapshots, syncState, tombstones, beforeReconcile,
-  isSharedProject = async () => false }: Dependencies): GoogleDriveProvider {
+  isSharedProject = async () => false, syncSharedProject, syncPreferences,
+  isDeletedProject = async () => false }: Dependencies): GoogleDriveProvider {
   const syncInFlight = new Map<string, Promise<ProjectSyncResult>>();
   let reconciliationInFlight: Promise<DriveReconcileResult> | null = null;
 
@@ -62,7 +66,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   }
 
   async function canApplyRemote(projectId: string): Promise<boolean> {
-    return (await tombstones.get(projectId)) === null;
+    return (await tombstones.get(projectId)) === null && !await isDeletedProject(projectId);
   }
 
   async function uploadSnapshot(
@@ -111,13 +115,18 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   }
 
   async function performProjectSync(projectId: string): Promise<ProjectSyncResult> {
-    if (await isSharedProject(projectId)) return "not-dirty";
+    await syncPreferences?.();
+    if (await isDeletedProject(projectId)) return "not-dirty";
     if (await tombstones.get(projectId)) return "not-dirty";
     const state = await syncState.get(projectId);
     if (!state.dirty) return "not-dirty";
     if (await auth.getConnectionState() !== "connected") throw new Error("Google Drive is not connected");
     await syncState.markSyncing(projectId);
     try {
+      if (await isSharedProject(projectId)) {
+        if (!syncSharedProject) throw new Error("Shared project sync is unavailable");
+        return await syncSharedProject(projectId, state.changeToken ?? 0);
+      }
       const local = await snapshots.read(projectId);
       const remoteFile = await resolveFile(projectId);
       if (remoteFile) {
@@ -198,6 +207,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     for (const tombstone of privateTombstones) await snapshots.remove(tombstone.projectId);
     const empty: DriveReconcileResult = { status: "disconnected", imported: 0, pulled: 0, pushed: 0, deleted: 0 };
     if (await auth.getConnectionState() !== "connected") return empty;
+    await syncPreferences?.();
     await beforeReconcile?.();
 
     // A failed list is allowed to reject the whole reconciliation. It must never
@@ -239,6 +249,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
     const remoteByProject = new Map<string, RemoteSnapshot>();
     for (const entry of remoteEntries) {
       const projectId = entry.snapshot.project.id;
+      if (await isDeletedProject(projectId)) continue;
       if (await isSharedProject(projectId)) continue;
       if (tombstonedIds.has(projectId)) continue;
       const current = remoteByProject.get(projectId);

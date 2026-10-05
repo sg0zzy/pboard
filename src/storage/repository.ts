@@ -14,6 +14,7 @@ export type RepositoryEvents = {
   projectChanged?: (projectId: string) => void | Promise<void>;
   projectDeleting?: (project: Project) => void | Promise<void>;
   projectDeleted?: (projectId: string) => void | Promise<void>;
+  projectHidden?: (projectId: string) => void | Promise<void>;
 };
 
 export const EMPTY_STATE: AppState = {

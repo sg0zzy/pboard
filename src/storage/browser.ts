@@ -1,6 +1,7 @@
 import { createRepository, STORAGE_KEY } from "./repository";
 import { browser } from "../platform/browser";
-import { driveSyncState, driveTombstones, googleDrive, registerRxRepositoryResolver } from "../sync/browser";
+import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences } from "../sync/browser";
+import { createProjectDeletionRoleResolver } from "../sync/projectDeletion";
 import { createRxRepository, type RxRepository } from "./rxdbRepository";
 import type { AppState, BoardItem, BoardItemStatus, Project } from "../types";
 
@@ -26,8 +27,11 @@ export const legacyRepository = createRepository(browser.storage.local, {
 
 let rxRepositoryPromise: Promise<RxRepository> | null = null;
 let migrationPromise: Promise<RxRepository> | null = null;
+const resolveDeletionRole = createProjectDeletionRoleResolver({ sharedProjects, permissions: drivePermissions,
+  connected: async () => await googleAuth.getConnectionState() === "connected" });
 async function openRxRepository(): Promise<RxRepository> {
-  if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ events: {
+  if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ resolveDeletionRole, events: {
+    projectHidden: async () => { await syncAccountPreferences(); },
     projectChanged: (projectId) => driveSyncState.markDirty(projectId),
     projectDeleting: async (project) => {
       const syncState = await driveSyncState.get(project.id);
@@ -35,7 +39,10 @@ async function openRxRepository(): Promise<RxRepository> {
         ...(syncState.remoteFileId ? { remoteFileId: syncState.remoteFileId } : {}),
         deletedAt: new Date().toISOString(), projectUpdatedAt: project.updatedAt, revision: project.revision });
     },
-    projectDeleted: (projectId) => { void googleDrive.deleteProject(projectId); }
+    projectDeleted: async (projectId) => {
+      await syncAccountPreferences();
+      await googleDrive.deleteProject(projectId);
+    }
   } }).catch((error) => { rxRepositoryPromise = null; throw error; });
   return rxRepositoryPromise;
 }
@@ -113,7 +120,10 @@ export const repository = {
   load: async (): Promise<AppState> => (await chosen()).load(),
   createProject: async (...args: Parameters<typeof legacyRepository.createProject>) => (await chosen()).createProject(...args),
   selectProject: async (...args: Parameters<typeof legacyRepository.selectProject>) => (await chosen()).selectProject(...args),
-  reorderProjects: async (...args: Parameters<typeof legacyRepository.reorderProjects>) => (await chosen()).reorderProjects(...args),
+  reorderProjects: async (...args: Parameters<typeof legacyRepository.reorderProjects>) => {
+    await (await chosen()).reorderProjects(...args);
+    await syncAccountPreferences();
+  },
   renameProject: async (...args: Parameters<typeof legacyRepository.renameProject>) => (await chosen()).renameProject(...args),
   deleteProject: async (...args: Parameters<typeof legacyRepository.deleteProject>) => (await chosen()).deleteProject(...args),
   changeProjectTemplate: async (...args: Parameters<typeof legacyRepository.changeProjectTemplate>) => (await chosen()).changeProjectTemplate(...args),

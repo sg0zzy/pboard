@@ -341,8 +341,10 @@ export function App() {
   async function removeCurrentProject() {
     if (!currentProject) return;
     clearAllPendingStatuses();
-    await repository.deleteProject(currentProject.id);
-    setPendingDelete(null);
+    try { await repository.deleteProject(currentProject.id); }
+    catch (error) {
+      setNotice(`Could not finish project deletion: ${error instanceof Error ? error.message : String(error)}`);
+    } finally { setPendingDelete(null); }
   }
 
   function requestProjectDeletion() {
@@ -831,7 +833,10 @@ export function App() {
                 await repository.selectProject(projectId);
               }}
               onReorder={async (orderedIds) => {
-                await repository.reorderProjects(orderedIds);
+                try { await repository.reorderProjects(orderedIds); }
+                catch (error) {
+                  setNotice(`Project order saved locally. Drive sync failed: ${error instanceof Error ? error.message : String(error)}`);
+                }
               }}
             />
           ) : <h1>Your project state</h1>}
@@ -873,8 +878,9 @@ export function App() {
         )}
         {currentProject && pendingDelete?.kind === "project" && pendingDelete.id === currentProject.id && (
           <DeleteConfirmation
-            message={`Delete “${currentProject.name}”?`}
-            detail="All cards in this project will also be deleted."
+            message={`Remove “${currentProject.name}”?`}
+            detail="Projects shared with you are removed only from your list. Projects you own and their cards are deleted."
+            confirmLabel="Remove"
             onCancel={() => setPendingDelete(null)}
             onConfirm={() => void removeCurrentProject()}
           />

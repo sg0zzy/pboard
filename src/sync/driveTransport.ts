@@ -45,7 +45,10 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     const token = await auth.getAccessToken(!retry);
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
-    const response = await fetcher(input, { ...init, headers });
+    // Account signaling/preferences and snapshots must observe writes made
+    // by another browser, including when the URL is unchanged between polls.
+    const response = await fetcher(input, { ...init, headers,
+      ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
     if (response.status === 401 && retry) return authorizedFetch(input, init, false);
     if (!response.ok) throw await requestError(response);
     return response;

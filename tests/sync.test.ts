@@ -211,9 +211,11 @@ describe("Google Drive provider", () => {
     await syncState.markDirty(project.id);
     const beforeReconcile = vi.fn(async () => {});
     const upload = vi.fn(async () => ({ id: "unexpected", name: "unexpected" }));
+    const syncSharedProject = vi.fn(async () => "pushed" as const);
     const provider = createGoogleDriveProvider({ auth: connectedAuth(), snapshots, syncState,
       tombstones: createDriveTombstoneStore(storage), beforeReconcile,
       isSharedProject: async (id) => id === project.id,
+      syncSharedProject,
       transport: {
         listProjectFiles: async () => {
           expect(beforeReconcile).toHaveBeenCalledOnce();
@@ -224,7 +226,8 @@ describe("Google Drive provider", () => {
         upload, delete: async () => {}
       }
     });
-    expect(await provider.syncProject(project.id)).toBe("not-dirty");
+    expect(await provider.syncProject(project.id)).toBe("pushed");
+    expect(syncSharedProject).toHaveBeenCalledWith(project.id, 1);
     await provider.reconcileAll();
     expect(upload).not.toHaveBeenCalled();
     expect((await snapshots.read(project.id)).project.name).toBe(project.name);

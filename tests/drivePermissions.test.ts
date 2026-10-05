@@ -56,6 +56,27 @@ describe("Drive account identity", () => {
     }), { status: 403 }));
     await expect(transport.listFilesByName("project.json", "application/json")).rejects.toThrow(/reconnect Google Drive and allow project sharing access/);
   });
+
+  it("observes new peers and updated handshake records instead of cached Drive responses", async () => {
+    const cache = new Map<string, string>();
+    let files: { id: string; name: string; mimeType: string }[] = [];
+    let record = JSON.stringify({ updatedAt: 1, peers: [], outbox: [] });
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const contents = new URL(url).searchParams.get("alt") === "media" ? record : JSON.stringify({ files });
+      if (init?.cache === "no-store") return new Response(contents);
+      if (!cache.has(url)) cache.set(url, contents);
+      return new Response(cache.get(url)!);
+    };
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+    expect(await transport.listFiles("room")).toEqual([]);
+    files = [{ id: "peer-file", name: "sig-topic-peer.json", mimeType: "application/json" }];
+    expect(await transport.listFiles("room")).toEqual(files);
+    expect(await transport.findFile("sig-topic-peer.json", "room")).toEqual(files[0]);
+    expect(JSON.parse(await transport.downloadFile("peer-file")).updatedAt).toBe(1);
+    record = JSON.stringify({ updatedAt: 2, peers: [], outbox: [{ id: "offer", toPeerId: "other", payload: "offer" }] });
+    expect(JSON.parse(await transport.downloadFile("peer-file"))).toMatchObject({ updatedAt: 2, outbox: [{ id: "offer" }] });
+  });
 });
 
 // In-memory fake of the Drive permission transport. It models the shared

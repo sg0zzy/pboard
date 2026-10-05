@@ -14,6 +14,7 @@
     "release:all": "npm run typecheck && npm test && npm run build:all && node scripts/verify-build.mjs all",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build"
   },

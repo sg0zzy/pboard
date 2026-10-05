@@ -4,6 +4,22 @@ import { createDriveTransport, type DriveTransport } from "../src/sync/driveTran
 import type { PboardDriveSignalRecord } from "../src/collab/signaling";
 
 describe("account-only signaling", () => {
+  it("reads changed account signaling records at the same URL without HTTP cache reuse", async () => {
+    let contents = "old-presence";
+    const cache = new Map<string, string>();
+    const transport = createDriveTransport({
+      connect: async () => {}, disconnect: async () => {}, getConnectionState: async () => "connected",
+      getAccessToken: async () => "token", isConfigured: () => true
+    }, async (input, init) => {
+      const url = String(input);
+      if (init?.cache === "no-store") return new Response(contents);
+      if (!cache.has(url)) cache.set(url, contents);
+      return new Response(cache.get(url)!);
+    }, "account-signal-");
+    expect(await transport.download("signal-file")).toBe("old-presence");
+    contents = "new-offer";
+    expect(await transport.download("signal-file")).toBe("new-offer");
+  });
   it("stores rendezvous records in appDataFolder with a namespace separate from project snapshots", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ files: [], id: "signal-file" })));
     const transport = createDriveTransport({

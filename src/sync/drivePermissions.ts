@@ -90,7 +90,10 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
     const token = await auth.getAccessToken(!retry);
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
-    const response = await fetcher(input, { ...init, headers });
+    // Presence, offers and answers change at the same URLs. A cached empty
+    // file search or older peer record can prevent two browsers rendezvousing.
+    const response = await fetcher(input, { ...init, headers,
+      ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
     if (response.status === 401 && retry) return authorizedFetch(input, init, false);
     if (!response.ok) throw await requestError(response);
     return response;

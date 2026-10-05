@@ -231,6 +231,12 @@ describe("createCollaborationManager", () => {
     expect((await ownerRepo.listProjects()).map((project) => project.id)).toEqual(
       expect.arrayContaining([shared.id, privateProject.id])
     );
+    await collabRepo.deleteProject(shared.id);
+    expect(await collabRepo.getProject(shared.id)).toBeNull();
+    await observeFor(500);
+    expect((await ownerRepo.getProject(shared.id))?.name).toBe("Shared");
+    expect((await ownerRepo.listCards(shared.id)).map((card) => card.id)).toEqual(expect.arrayContaining([a.id, b.id, c.id]));
+    expect(await collabRepo.db.projects.findOne(shared.id).exec()).not.toBeNull();
   });
 
   it("keeps a viewer pull-only: receives remote changes, cannot publish local writes", { timeout: 20000 }, async () => {
@@ -270,5 +276,11 @@ describe("createCollaborationManager", () => {
     // The owner's board is unchanged: no stray viewer card ever arrives.
     await observeFor(500);
     expect((await ownerRepo.listCards(shared.id)).map((card) => card.content)).not.toContain("local only");
+    await viewerRepo.deleteProject(shared.id);
+    expect(await viewerRepo.getProject(shared.id)).toBeNull();
+    await observeFor(500);
+    expect((await ownerRepo.getProject(shared.id))?.name).toBe("Shared");
+    expect((await ownerRepo.listCards(shared.id)).map((card) => card.id)).toEqual(expect.arrayContaining([seed.id, next.id]));
+    expect(await viewerRepo.db.projects.findOne(shared.id).exec()).not.toBeNull();
   });
 });

@@ -7,6 +7,10 @@ vi.mock("../src/sync/browser", () => ({
   driveSyncState: { markDirty: async () => undefined, get: async () => ({}) },
   driveTombstones: { add: async () => undefined },
   googleDrive: { deleteProject: async () => undefined },
+  googleAuth: { getConnectionState: async () => "disconnected" },
+  drivePermissions: { myRole: async () => null },
+  sharedProjects: { get: async () => ({ folderId: null, projectFileId: null, realtimeFolderId: null }) },
+  syncAccountPreferences: async () => undefined,
   registerRxRepositoryResolver: () => undefined
 }));
 

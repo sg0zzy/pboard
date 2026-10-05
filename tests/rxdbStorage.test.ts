@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
-import { createRxRepository } from "../src/storage/rxdbRepository";
+import { createRxRepository, type RxRepository } from "../src/storage/rxdbRepository";
 import { createIndexedDbBlobStore } from "../src/storage/blobStore";
 import { compareOrdered, initialOrderKeys, orderKeyBetween } from "../src/storage/orderKey";
 import { createBackendProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "../src/sync/snapshot";
@@ -30,6 +30,78 @@ describe("fractional order keys", () => {
 });
 
 describe("RxDB local repository", () => {
+  it.each(["editor", "viewer"] as const)("removes a %s's shared project from their account without touching shared content", async (role) => {
+    const name = unique();
+    const hidden: string[] = [];
+    const deleting: string[] = [];
+    const deleted: string[] = [];
+    const rx: RxRepository = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      events: { projectHidden: async (id) => {
+          hidden.push(id);
+          await rx.applyProjectOrder("collaborator", { ids: [], updatedAt: new Date().toISOString() });
+        },
+        projectDeleting: (project) => { deleting.push(project.id); },
+        projectDeleted: (id) => { deleted.push(id); } } });
+    try {
+      const shared = await rx.createProject("Shared");
+      const card = await rx.addItem({ projectId: shared.id, content: "Owner content" });
+      const fallback = await rx.createProject("Personal");
+      await rx.selectProject(shared.id);
+      await rx.setProjectOrderAccount("collaborator");
+      rx.setMutatorRole(shared.id, role);
+      const beforeProject = (await rx.db.projects.findOne(shared.id).exec())!.toJSON();
+      const beforeCard = (await rx.db.cards.findOne(card.id).exec())!.toJSON();
+      await rx.deleteProject(shared.id);
+      expect(await rx.getProject(shared.id)).toBeNull();
+      expect(await rx.listCards(shared.id)).toEqual([]);
+      expect((await rx.getCurrentProject())?.id).toBe(fallback.id);
+      expect((await rx.db.projects.findOne(shared.id).exec())!.toJSON()).toEqual(beforeProject);
+      expect((await rx.db.cards.findOne(card.id).exec())!.toJSON()).toEqual(beforeCard);
+      expect(hidden).toEqual([shared.id]);
+      expect(deleting).toEqual([]);
+      expect(deleted).toEqual([]);
+      // An account preference must never hide the original in another account.
+      await rx.setProjectOrderAccount("owner");
+      expect((await rx.getProject(shared.id))?.name).toBe("Shared");
+      expect((await rx.listCards(shared.id))[0].content).toBe("Owner content");
+      await rx.setProjectOrderAccount("collaborator");
+      expect(await rx.getProject(shared.id)).toBeNull();
+    } finally { await rx.db.close(); }
+  });
+
+  it("rechecks ownership when an editor role replaces a cached owner role", async () => {
+    const name = unique();
+    const rx = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      resolveDeletionRole: async () => "editor" });
+    try {
+      const shared = await rx.createProject("Shared");
+      rx.setMutatorRole(shared.id, "owner");
+      await rx.deleteProject(shared.id);
+      expect(await rx.getProject(shared.id)).toBeNull();
+      expect(await rx.db.projects.findOne(shared.id).exec()).not.toBeNull();
+    } finally { await rx.db.close(); }
+  });
+
+  it("allows a verified owner to delete shared records and invokes deletion callbacks", async () => {
+    const name = unique();
+    const deleted: string[] = [];
+    const rx: RxRepository = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      resolveDeletionRole: async () => "owner",
+      events: { projectDeleted: async (id) => {
+        deleted.push(id);
+        await rx.applyProjectOrder("owner", { ids: [], updatedAt: new Date().toISOString() });
+      } } });
+    try {
+      const shared = await rx.createProject("Shared");
+      const card = await rx.addItem({ projectId: shared.id, content: "Owner content" });
+      rx.setMutatorRole(shared.id, "owner");
+      await rx.deleteProject(shared.id);
+      expect(await rx.db.projects.findOne(shared.id).exec()).toBeNull();
+      expect((await rx.db.cards.findOne(card.id).exec())?.deletedAt).toBeTruthy();
+      expect(deleted).toEqual([shared.id]);
+    } finally { await rx.db.close(); }
+  });
+
   it("persists account-specific project order without changing shared documents or viewer permissions", async () => {
     const name = unique();
     const rx = await open(name);

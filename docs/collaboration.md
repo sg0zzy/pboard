@@ -81,9 +81,11 @@ clobber fine-grained WebRTC merges on a shared board. So for **shared** projects
   and cards refresh when bytes arrive. Existing inline snapshot images remain a
   fallback; restoring a matching image never replaces newer card text.
 - **Persistence**: `project.json` is the bootstrap source for new collaborators and is
-  re-uploaded whenever a collaborator is invited. It is **not** refreshed on the idle
-  sync cadence (shared projects are skipped there), so a board that receives no new
-  invites keeps its invite-time snapshot in Drive while live edits flow via WebRTC.
+  re-uploaded whenever a collaborator is invited and when an owner/editor syncs
+  pending changes (manually or on the idle cadence). Shared sync writes to the
+  shared file rather than private app data and updates the toolbar sync status.
+  Viewers only restore matching image bytes. A newer remote backup is never
+  overwritten by an older local board; that situation reports a sync error.
   A shared project does **not** auto-import a remote snapshot over existing local
   cards (no LWW clobber while peers are live).
 - Private projects keep the existing auto-pull LWW behavior.
@@ -105,6 +107,24 @@ The local list uses the account preference for known project IDs and appends
 projects absent from that preference; it does not create or delete projects from
 an order received from another session. Disconnecting preserves the last visible
 order locally. Both sidebars must be open for WebRTC preference synchronization.
+Project order is also saved in private Drive app data under the separate
+`account-preferences-` namespace. Reordering saves that preference; startup
+reconciliation and project sync restore or update it using its timestamp. A new
+browser restores saved ranks even before all private/shared boards are imported,
+so it does not depend on the original browser remaining open. Selected projects
+remain local to each browser. The same account preference carries permanent
+`deletedProjectIds`. Those markers replicate live, merge even when a concurrent
+order update is newer, and persist in Drive. They hide the board and its cards,
+move a deleted selection to a remaining project, and block stale snapshot imports
+and shared-board rediscovery. Offline deletions merge back into the account
+preference on reconnect. Other accounts retain their own preferences.
+
+Only the owner deletes shared project and card records. An editor or viewer
+removing a shared project writes only their account's removal marker; the
+shared collections and the owner's board remain intact. This removal syncs to
+the collaborator's other sessions and blocks rediscovery. Deletion checks Drive
+ownership again at the time of the action. If a known shared project's ownership
+cannot be verified (including offline), removal affects only the account list.
 
 ## Permissions model
 
@@ -114,8 +134,8 @@ pboard ACL.
 | pboard role   | Drive role | can |
 |---------------|-----------|-----|
 | owner         | owner     | read, write, manage members, delete project |
-| Editor        | `writer`  | read, write (replication push + Drive push) |
-| Viewer        | `reader`  | read (replication pull only; no push) |
+| Editor        | `writer`  | read, write (replication push + Drive push), remove from own list |
+| Viewer        | `reader`  | read (replication pull only; no push), remove from own list |
 
 Role mapping: Viewer→`reader`, Editor→`writer`. The owner is the authenticated account
 that owns the file. A lightweight in-memory cache of members exists for UI
@@ -260,3 +280,17 @@ The existing cloud/auth icon is untouched; the Share button is separate.
   board's files are not owned by the recipient, and `drive.file` cannot reliably
   find or manage other users' files (including incoming permission invitations),
   so discovery and collaboration use `drive` rather than `drive.file`.
+
+### Native browser signaling regression
+
+`npm run test:webrtc:browser` runs two isolated headless Chromium profiles as
+the same project owner, using real IndexedDB, WebRTC and RxDB replication. A
+local HTTP server simulates Drive with cacheable presence/handshake responses.
+The test verifies peer discovery, edits in both directions, live account project
+order, deletion after switching projects, protection against stale snapshot
+resurrection, and exactly one presence file per session/collection. It needs Chromium on PATH (or
+`PBOARD_CHROMIUM_BIN`) and makes no authenticated Google requests.
+
+Drive reads bypass the HTTP cache in both the shared-folder and private-account
+transports. Otherwise cached file searches or media downloads can hide peers,
+lose handshake updates, and create duplicate presence files.
