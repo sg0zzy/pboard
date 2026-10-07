@@ -119,14 +119,63 @@ try {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const first = await browser(origin);
-  await until(() => first("window.probe?.done"), "Session 1 failed to start");
+  await until(async () => { const e = await first("window.probe?.errors"); if (e?.length) throw new Error("Session 1 raised: " + e.join("; ")); return await first("window.probe?.done"); }, "Session 1 failed to start");
   const second = await browser(origin);
   await until(async () => {
     const states = await Promise.all([first("window.probe?.manager.state()"), second("window.probe?.manager.state()")]);
     return states.every((state) => state?.connectedPeers.length);
   }, "Native browser peers did not connect through cacheable HTTP signaling");
+  const conflictWinner = "idea";
+  const agreedWrite = "2026-01-03T00:00:00.000Z";
+  const masterWrite = "2026-01-04T00:00:00.000Z";
+  const forkWrite = "2026-01-05T00:00:00.000Z";
+  const projectWrite = (side, template, updatedAt, name) => side(`probe.rx.importProject({id:"shared-project",name:${JSON.stringify(name)},template:${JSON.stringify(template)},revision:1,createdAt:"2026-01-01T00:00:00Z",updatedAt:${JSON.stringify(updatedAt)}},[])`);
+  // RxDB hashes the two storage tokens to decide which peer is the master, and only the fork runs the
+  // replication protocol, so only the fork can resolve a conflict. Master-wins and last-write-wins
+  // agree whenever the fork's own write is the older of the two states it saw, so the newer write has
+  // to land on the fork for this proof to be discriminating.
+  const secondToken = await second("window.probe.rx.db.storageToken");
+  const forkIsFirst = await first(`probe.conflict.isFork(${JSON.stringify(secondToken)})`);
+  const fork = forkIsFirst ? first : second;
+  const master = forkIsFirst ? second : first;
+  // A push is accepted whenever the pushing side's assumed master state still matches the peer's real
+  // state, so a conflict needs a genuinely stale assumed state: the fork records the agreed version in
+  // its meta row, then writes a newer version while disconnected, where the failed push cannot write
+  // one.
+  await projectWrite(master, "project", agreedWrite, "agreed");
+  await until(async () => (await fork('probe.rx.getProject("shared-project")'))?.updatedAt === agreedWrite,
+    "The agreed version did not replicate to the fork", 10000);
+  await fork("probe.manager.stop()");
+  await projectWrite(master, "project", masterWrite, "master divergence");
+  await projectWrite(fork, conflictWinner, forkWrite, "fork divergence");
+  await fork('probe.manager.start("shared-project")');
+  await until(async () => {
+    const states = await Promise.all([fork("window.probe?.manager.state()"), master("window.probe?.manager.state()")]);
+    return states.every((state) => state?.connectedPeers.length);
+  }, "The fork did not reconnect through native WebRTC", 30000);
+  let forkObservation = null, masterObservation = null;
+  for (let attempt = 0; attempt < 150; attempt++) {
+    forkObservation = await fork("probe.conflict.observe()");
+    masterObservation = await master("probe.conflict.observe()");
+    if (forkObservation.records.length && forkObservation.template === conflictWinner && masterObservation.template === conflictWinner) break;
+    await pause(100);
+  }
+  const records = forkObservation.records;
+  if (!records.length)
+    throw new Error(`The fork did not resolve a conflict for its own write: ${JSON.stringify([forkObservation, masterObservation])}`);
+  // Every conflict must come from an assumed master state that is stale, not from a refreshed one.
+  if (!records.every((record) => record.assumedUpdatedAt !== record.realUpdatedAt))
+    throw new Error(`A conflict was resolved from a fresh assumed master state: ${JSON.stringify(records)}`);
+  if (!records.every((record) => Date.parse(record.resolvedUpdatedAt) === Math.max(Date.parse(record.realUpdatedAt), Date.parse(record.newUpdatedAt))))
+    throw new Error(`The handler did not resolve to the newer write: ${JSON.stringify(records)}`);
+  if (!records.some((record) => Date.parse(record.newUpdatedAt) > Date.parse(record.realUpdatedAt)))
+    throw new Error(`No conflict was resolved against the fork's newer write: ${JSON.stringify(records)}`);
+  if (forkObservation.template !== conflictWinner || masterObservation.template !== conflictWinner)
+    throw new Error(`The newer write did not win on both sides in native Chromium: ${JSON.stringify([forkObservation, masterObservation])}`);
+  const created = {};
   for (const [source, target, content] of [[first, second, "Live from session 1"], [second, first, "Live from session 2"]]) {
     const card = await source(`probe.rx.addItem({projectId:"shared-project",content:${JSON.stringify(content)}})`);
+    created[content] = card.id;
     await until(async () => (await target(`probe.rx.getCard(${JSON.stringify(card.id)})`))?.content === content,
       "A live edit failed to replicate", 5000);
   }
@@ -134,6 +183,28 @@ try {
   await until(async () => JSON.stringify(await second('(async()=> (await probe.rx.listProjects()).map(project=>project.id))()'))
     === '["private-project","shared-project"]', "Account project order failed to replicate", 5000);
   if (files.size !== 6) throw new Error(`Expected six presence records, got ${files.size}`);
+  const cardOne = created["Live from session 1"];
+  const cardTwo = created["Live from session 2"];
+  await first('probe.rx.changeProjectTemplate("shared-project","software_project")');
+  await until(async () => (await second('probe.rx.getProject("shared-project")'))?.template === "software_project",
+    "Project category failed to replicate", 5000);
+  await first(`probe.rx.updateItem(${JSON.stringify(cardOne)},{status:"done"})`);
+  await until(async () => (await second(`probe.rx.getCard(${JSON.stringify(cardOne)})`))?.status === "done",
+    "Card state failed to replicate", 5000);
+  await second(`probe.rx.updateItem(${JSON.stringify(cardTwo)},{status:"rejected"})`);
+  await until(async () => (await first(`probe.rx.getCard(${JSON.stringify(cardTwo)})`))?.status === "rejected",
+    "Card state failed to replicate in the reverse direction", 5000);
+  await first(`probe.rx.updateItem(${JSON.stringify(cardOne)},{type:"issue"})`);
+  await until(async () => (await second(`probe.rx.getCard(${JSON.stringify(cardOne)})`))?.type === "issue",
+    "Card category failed to replicate", 5000);
+  await second(`probe.rx.updateItem(${JSON.stringify(cardTwo)},{type:"feature"})`);
+  await until(async () => (await first(`probe.rx.getCard(${JSON.stringify(cardTwo)})`))?.type === "feature",
+    "Card category failed to replicate in the reverse direction", 5000);
+  await first(`probe.rx.deleteItem(${JSON.stringify(cardOne)})`);
+  await until(async () => await second(`(async()=>{const doc=await probe.rx.db.cards.findOne(${JSON.stringify(cardOne)}).exec();return doc?.deletedAt??null})()`),
+    "Card deletion failed to replicate", 5000);
+  if (await second(`(async()=>(await probe.rx.listCards("shared-project")).some(card=>card.id===${JSON.stringify(cardOne)}))()`))
+    throw new Error("Deleted card still appears in the live card list");
   await first('probe.rx.deleteProject("shared-project")');
   await first('probe.manager.start("private-project")');
   await until(async () => await second('probe.rx.isDeletedProject("shared-project")'),
@@ -142,7 +213,19 @@ try {
   if ((await second('probe.rx.getCurrentProject()'))?.id !== "private-project") throw new Error("Selection did not move to the remaining project");
   await second('probe.rx.importProject({id:"shared-project",name:"Stale Drive backup",template:"project",revision:1,createdAt:"2026-01-01T00:00:00Z",updatedAt:"2026-01-01T00:00:00Z"},[])');
   if (await second('probe.rx.getProject("shared-project")')) throw new Error("Stale snapshot resurrected a deleted project");
-  console.log("Two isolated Chromium profiles replicated live edits, account order, and project deletion without snapshot resurrection.");
+  const gate = await first("probe.gate.run()");
+  if (gate.connected.length !== 2) throw new Error(`Gate proof did not connect both instances: ${JSON.stringify(gate)}`);
+  if (gate.handshakeErrors.length) throw new Error(`Gate handshake raised errors: ${gate.handshakeErrors.join("; ")}`);
+  if (gate.replayErrors.length) throw new Error(`Replayed answer raised errors: ${gate.replayErrors.join("; ")}`);
+  if (gate.replayPublishedAnswer) throw new Error("The gate applied an answer that answered no offer from this instance");
+  if (!gate.answerFrom) throw new Error(`The handshake published no answer to replay: ${JSON.stringify(gate)}`);
+  if (!gate.nativeRemoteAnswerError.includes("InvalidStateError"))
+    throw new Error(`Applying an answer without a pending offer did not raise InvalidStateError: ${gate.nativeRemoteAnswerError}`);
+  if (!gate.nativeCreateAnswerError.includes("InvalidStateError"))
+    throw new Error(`Generating an answer without a pending offer did not raise InvalidStateError: ${gate.nativeCreateAnswerError}`);
+  console.log(`Native Chromium JSEP: ${gate.nativeCreateAnswerError} | ${gate.nativeRemoteAnswerError}`);
+  console.log(`The gate dropped the replayed answer from ${gate.answerFrom}; the replay instance stayed healthy.`);
+  console.log("Two isolated Chromium profiles replicated project category, card state, card category, card creation, card deletion, account order and project deletion without snapshot resurrection, and the fork resolved an independent write by write time, converging both sides.");
 } finally {
   for (const socket of sockets) socket.close();
   await Promise.all(browsers.map(async (child) => {

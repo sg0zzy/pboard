@@ -57,7 +57,9 @@ snapshot when a peer has no local copy; viewers cannot mutate.
     = `{ peerId, now(), readPeer, writeOwn, listPeers }`.
 - **`src/collab/webrtcHandler.ts`** — `createPboardWebRTCConnectionHandler`, a
   simple-peer handler scoped to one shared project (buffers signals before a data
-  channel exists; dedupes by handshake).
+  channel exists; tracks each peer's JSEP signaling state and applies a remote
+  description only when that state permits it, so a stale answer that answers no
+  offer this instance sent is dropped instead of raising `InvalidStateError`).
 - **`src/collab/manager.ts`** — `createCollaborationManager`. One manager drives a
   single shared project: runs the two RxWebRTC pools, resolves the role,
   bootstraps if needed, and sets the viewer write-gate. `CollaborationManagerOptions`
@@ -103,6 +105,26 @@ Core collaboration layer is **built and unit-tested in isolation**:
   Drive-backed `PboardDriveSignalStore`.
 - `src/storage/rxdbRepository.ts` — viewer write-gate (`mutatorRole`,
   `setMutatorRole`, `assertCanMutate` on all content mutations).
+- `src/storage/rxdbRepository.ts` — cross-peer conflict policy for `projects` and
+  `cards`: last-write-wins on the document's write time `max(updatedAt, deletedAt)`
+  (`lastWriteWins` + `ConflictInput`), wired as the collection `conflictHandler` with
+  `defaultConflictHandler.isEqual` kept for the fast path. RxDB's default handler drops a
+  fork write whenever the fork's assumed master state is absent or stale, which is the
+  normal state for a document both peers created independently (one bootstrapped the Drive
+  snapshot, the other created it), so an editor's first change was silently lost.
+  `settings` keeps its `projectOrder` merge.
+- `tests/conflictResolution.test.ts` — regression coverage for that policy: a fork's first
+  write to a master-held document wins, an older fork write loses to a newer master write,
+  and a newer card deletion beats the master's edit of the same card.
+- `experiments/collaboration/webrtc-browser-smoke.mjs` — native-Chromium proof of the same policy.
+  Only the fork runs the replication protocol, so the driver resolves the master/fork roles from the
+  storage-token hash, replicates an agreed version, lets the fork diverge while disconnected, then
+  reconnects and asserts that the fork resolved to the newer write and both sides converged. Making
+  `resolve` return `input.realMasterState` instead of `lastWriteWins` makes that run fail on the
+  fork's record, so the assertion is discriminating rather than restating the Node test.
+- The browser harness polls for the handshake answer from either instance before the native JSEP
+  checks; it previously read only the second instance's published signals and failed intermittently
+  against an empty SessionDescription.
 - `src/sync/browser.ts` — exports `sharedProjects` (local `DriveSharedProjectStore`),
   `drivePermissions` (`createDrivePermissionService` wired to the transport + a
   `readSnapshot` that exports the RxDB project and serializes it), and
@@ -185,6 +207,8 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   focus, background reconcile) + deletion-resurrection fix. ✅
 - **Shared image sync** over Drive with integrity verification. ✅
 - **Account-scoped project order** over a dedicated WebRTC pool. ✅
+- **Cross-peer conflict policy** (last-write-wins on `projects` + `cards`) with
+  regression coverage. ✅
 
 ---
 
@@ -204,7 +228,7 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
   change, and from `googleDrive.beforeReconcile`; imported boards appear in the
   local project list with their role applied. Deleting a shared board keeps a
   permanent local tombstone so discovery never re-imports it.
-- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (242/242, 41
+- **Typecheck: PASS** (`tsc --noEmit` exit 0). **Tests: PASS** (373/373, 54
   files, `vitest run`). **Build: PASS** (`npm run build:all` + `npm run
   verify:build`).
 - The **full collaboration feature is implemented and wired**: the manager is
@@ -218,14 +242,18 @@ Note: `experiments/collaboration/` is a **pre-existing, separate** experiment
 
 # Known issues
 
-- No failing tests.
+- No failing tests. `tests/collaborationManager.test.ts` previously failed intermittently
+  (a fork's `changeProjectTemplate` never reached the other peer); that was the dropped
+  fork write described above and is fixed by the last-write-wins handler.
 - The Share UI, permission service, and Drive signaling are all unit-tested
   with mocked seams (transport/store); real-Drive behavior is not covered.
 - `experiments/collab/*.mjs` are throwaway spikes (not imported by the extension,
   not covered by the suite).
 - Verified in code + unit tests: `discoverSharedProjects` skip rules and import,
-  `myRole` resolution, and the manager lifecycle. Still to exercise manually:
-  real-Drive behavior (latency, ACL edge cases) and a two-browser WebRTC run.
+  `myRole` resolution, and the manager lifecycle. `npm run test:webrtc:browser`
+  exercises two isolated headless Chromium profiles over real WebRTC, including
+  the JSEP gate. Still to exercise manually: real-Drive behavior (latency, ACL
+  edge cases).
 
 ---
 
@@ -237,9 +265,8 @@ implemented and verified (typecheck + 242 tests + both builds + build
 verification). Remaining work:
 
 1. **Real-Drive verification** (manual): exercise `discoverSharedProjects`,
-   `myRole`, invite/update/remove, Drive signaling, and the manager
-   end-to-end across two browser instances over WebRTC (unit-mocked only so
-   far).
+   `myRole`, invite/update/remove and Drive signaling against a real account;
+   the two-instance WebRTC run is automated by `npm run test:webrtc:browser`.
 2. **Docs drift**: `docs/collaboration.md` is current as of the scope fix;
    update it if the architecture shifts again.
 

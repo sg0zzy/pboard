@@ -283,4 +283,67 @@ describe("createCollaborationManager", () => {
     expect((await ownerRepo.listCards(shared.id)).map((card) => card.id)).toEqual(expect.arrayContaining([seed.id, next.id]));
     expect(await viewerRepo.db.projects.findOne(shared.id).exec()).not.toBeNull();
   });
+
+  it("replicates project category, card state, card category, card creation and card deletion between two sessions of the same account in both directions", { timeout: 120000 }, async () => {
+    const firstRepo = await makeRepo();
+    const secondRepo = await makeRepo();
+    const scope = createMemorySignalingScope();
+    const first = makeManager(firstRepo, { role: "owner", fileId: "file-3" }, firstRepo, scope, undefined, "pippo");
+    const second = makeManager(secondRepo, { role: "owner", fileId: "file-3" }, firstRepo, scope, undefined, "pippo");
+    const shared = await firstRepo.createProject("Shared", "project");
+    await first.manager.start(shared.id);
+    await second.manager.start(shared.id);
+    // Gate on the live data channel per collection: `state().connectedPeers` skips the
+    // settings pool and each collection has its own connection, so two peers per session
+    // proves both the cards and the projects rooms are live. Every assertion below can
+    // then only be satisfied by replication over those connections, not by the bootstrap
+    // snapshot.
+    await waitUntil(
+      async () =>
+        first.manager.state().connectedPeers.length >= 2 && second.manager.state().connectedPeers.length >= 2,
+      30000
+    );
+    const cardIn = async (repo: typeof firstRepo, id: string) => (await repo.listCards(shared.id)).find((card) => card.id === id);
+    const tombstoneIn = async (repo: typeof firstRepo, id: string) => (await repo.db.cards.findOne(id).exec())?.toJSON();
+    async function replicated(read: () => Promise<unknown>, expected: unknown, timeoutMs = 15000): Promise<void> {
+      await waitUntil(async () => (await read()) === expected, timeoutMs);
+      expect(await read()).toBe(expected);
+    }
+
+    // Project category: a card type the new template does not support is remapped, and
+    // both the template and the remapped card have to arrive on the other session.
+    const remapped = await firstRepo.addItem({ projectId: shared.id, content: "goal card", type: "goal" });
+    await firstRepo.changeProjectTemplate(shared.id, "idea");
+    // Both rooms are already connected by the gate, so this is replication latency.
+    await replicated(async () => (await secondRepo.getProject(shared.id))?.template, "idea");
+    await replicated(async () => (await cardIn(secondRepo, remapped.id))?.type, "note");
+    await secondRepo.changeProjectTemplate(shared.id, "software_project");
+    await replicated(async () => (await firstRepo.getProject(shared.id))?.template, "software_project");
+
+    // Card creation.
+    const one = await firstRepo.addItem({ projectId: shared.id, content: "from the first session" });
+    await replicated(async () => (await cardIn(secondRepo, one.id))?.content, "from the first session");
+    const two = await secondRepo.addItem({ projectId: shared.id, content: "from the second session" });
+    await replicated(async () => (await cardIn(firstRepo, two.id))?.content, "from the second session");
+
+    // Card state.
+    await firstRepo.updateItem(one.id, { status: "done" });
+    await replicated(async () => (await cardIn(secondRepo, one.id))?.status, "done");
+    await secondRepo.updateItem(two.id, { status: "rejected" });
+    await replicated(async () => (await cardIn(firstRepo, two.id))?.status, "rejected");
+
+    // Card category.
+    await firstRepo.updateItem(one.id, { type: "issue" });
+    await replicated(async () => (await cardIn(secondRepo, one.id))?.type, "issue");
+    await secondRepo.updateItem(two.id, { type: "feature" });
+    await replicated(async () => (await cardIn(firstRepo, two.id))?.type, "feature");
+
+    // Card deletion: the tombstone, not just the live list, has to replicate.
+    await firstRepo.deleteItem(one.id);
+    await replicated(async () => Boolean((await tombstoneIn(secondRepo, one.id))?.deletedAt), true);
+    expect((await secondRepo.listCards(shared.id)).map((card) => card.id)).not.toContain(one.id);
+    await secondRepo.deleteItem(two.id);
+    await replicated(async () => Boolean((await tombstoneIn(firstRepo, two.id))?.deletedAt), true);
+    expect((await firstRepo.listCards(shared.id)).map((card) => card.id)).not.toContain(two.id);
+  });
 });

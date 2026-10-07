@@ -1,4 +1,4 @@
-import { createRxDatabase, defaultConflictHandler, type RxCollection, type RxDatabase } from "rxdb";
+import { createRxDatabase, defaultConflictHandler, type RxCollection, type RxDatabase, type WithDeleted } from "rxdb";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
@@ -28,6 +28,37 @@ const cardValue = (record: CardRecord, order: number): BoardItem => {
   return { ...card, order, displayMode: normalizeCardDisplayMode(card.displayMode) };
 };
 
+/** Conflict-handler view of a document: schema fields plus the tombstone flag. */
+type ConflictInput<T extends { updatedAt: string; deletedAt?: string }> = {
+  realMasterState: WithDeleted<T>;
+  newDocumentState: WithDeleted<T>;
+};
+
+/**
+ * Shared-board conflict policy for the replicated collections: last-write-wins by the
+ * document's own write time.
+ *
+ * RxDB's default handler keeps the master state whenever `isEqual(realMasterState,
+ * assumedMasterState)` fails — the fork's assumption is either absent (the master created
+ * the document first) or stale (both peers created the same project independently, one by
+ * bootstrap import and one by create). The fork write is then dropped and never re-applied.
+ * WebRTC picks the master by storage-token hash, not by who edited, so that policy loses an
+ * editor's change to the document arbitrarily. Resolving by write time keeps the edit; the
+ * losing side converges on the next upstream pass, because a conflict response writes the
+ * resolved state plus a meta row for the document.
+ *
+ * `updatedAt` is monotonic per instance (the write path bumps it past the previous value),
+ * so it is a usable ordering across peers. A soft delete does not bump it, so the effective
+ * write time is `max(updatedAt, deletedAt)`. `Date.parse("")` is `NaN` and would poison
+ * `Math.max`, hence the explicit guards. Ties keep the master state.
+ */
+function lastWriteWins<T extends { updatedAt: string; deletedAt?: string }>(
+  input: ConflictInput<T>
+): WithDeleted<T> {
+  const writeTime = (doc: WithDeleted<T>) => Math.max(Date.parse(doc.updatedAt) || 0, doc.deletedAt ? (Date.parse(doc.deletedAt) || 0) : 0);
+  return writeTime(input.newDocumentState) > writeTime(input.realMasterState) ? input.newDocumentState : input.realMasterState;
+}
+
 export async function createRxRepository(options: {
   name?: string;
   blobs?: BlobStore;
@@ -50,20 +81,36 @@ export async function createRxRepository(options: {
     storage: options.storage ?? getRxStorageDexie(),
     multiInstance: true
   });
-  await db.addCollections({ projects: { schema: projectSchema }, cards: { schema: cardSchema }, settings: {
-    schema: settingSchema,
-    conflictHandler: {
-      isEqual: defaultConflictHandler.isEqual,
-      async resolve(input) {
-        const master = input.realMasterState;
-        const incoming = input.newDocumentState;
-        if (master.id.startsWith("projectOrder:") && !master._deleted && !incoming._deleted) {
-          return { ...master, value: JSON.stringify(mergeProjectOrder(parseProjectOrder(master.value), parseProjectOrder(incoming.value))) };
+  await db.addCollections({
+    projects: {
+      schema: projectSchema,
+      conflictHandler: {
+        isEqual: defaultConflictHandler.isEqual,
+        async resolve(input) { return lastWriteWins(input); }
+      }
+    },
+    cards: {
+      schema: cardSchema,
+      conflictHandler: {
+        isEqual: defaultConflictHandler.isEqual,
+        async resolve(input) { return lastWriteWins(input); }
+      }
+    },
+    settings: {
+      schema: settingSchema,
+      conflictHandler: {
+        isEqual: defaultConflictHandler.isEqual,
+        async resolve(input) {
+          const master = input.realMasterState;
+          const incoming = input.newDocumentState;
+          if (master.id.startsWith("projectOrder:") && !master._deleted && !incoming._deleted) {
+            return { ...master, value: JSON.stringify(mergeProjectOrder(parseProjectOrder(master.value), parseProjectOrder(incoming.value))) };
+          }
+          return master;
         }
-        return master;
       }
     }
-  } });
+  });
   const { projects, cards, settings } = db;
   const blobs = options.blobs ?? createIndexedDbBlobStore();
   const events = options.events ?? {};
@@ -313,12 +360,11 @@ export async function createRxRepository(options: {
     await changed(projectId);
   }
   async function deleteProject(projectId: string) {
-    const role = await locked(async () => {
-      const doc = await projects.findOne(projectId).exec();
-      if (!doc) return;
-      const role = options.resolveDeletionRole ? await options.resolveDeletionRole(projectId)
-        : mutatorRoles.get(projectId) ?? options.mutatorRole ?? "owner";
-      if (role === "owner") await events.projectDeleting?.(projectValue(doc.toJSON()));
+    const doc = await projects.findOne(projectId).exec();
+    if (!doc) return;
+    // Commit the account-visible removal first so the board disappears without
+    // waiting for Drive ownership verification or the per-card tombstone pass.
+    await locked(async () => {
       const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
       const preference = await settings.findOne(id).exec();
       const previous = preference ? parseProjectOrder(preference.value)
@@ -328,19 +374,23 @@ export async function createRxRepository(options: {
         updatedAt: new Date(Math.max(Date.parse(now()), Date.parse(previous.updatedAt) + 1)).toISOString(),
         deletedProjectIds: [...new Set([...(previous.deletedProjectIds ?? []), projectId])].sort()
       }) });
-      // Shared collections replicate to every collaborator. Non-owners may only
-      // hide the board through their own account preference, never delete content.
-      if (role === "owner") {
+      if ((await getCurrentProject())?.id === projectId || (await settings.findOne("currentProjectId").exec())?.value === projectId) {
+        await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
+      }
+    });
+    const role = options.resolveDeletionRole ? await options.resolveDeletionRole(projectId)
+      : mutatorRoles.get(projectId) ?? options.mutatorRole ?? "owner";
+    // Shared collections replicate to every collaborator. Non-owners may only
+    // hide the board through their own account preference, never delete content.
+    if (role === "owner") {
+      await events.projectDeleting?.(projectValue(doc.toJSON()));
+      await locked(async () => {
         for (const card of await projectCardRecords(projectId)) {
           await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
         }
         await doc.remove();
-      }
-      if ((await getCurrentProject())?.id === projectId || (await settings.findOne("currentProjectId").exec())?.value === projectId) {
-        await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
-      }
-      return role;
-    });
+      });
+    }
     // Preference sync can itself queue repository writes. Release the mutation
     // lock before notifying listeners so removing a board cannot deadlock sync.
     if (role === "owner") await events.projectDeleted?.(projectId);

@@ -338,13 +338,16 @@ export function App() {
     cancelProjectCreation();
   }
 
-  async function removeCurrentProject() {
+  function removeCurrentProject() {
     if (!currentProject) return;
+    const projectId = currentProject.id;
     clearAllPendingStatuses();
-    try { await repository.deleteProject(currentProject.id); }
-    catch (error) {
+    // The repository commits the account removal immediately; Drive ownership
+    // verification and content deletion continue in the background.
+    setPendingDelete(null);
+    void repository.deleteProject(projectId).catch((error) => {
       setNotice(`Could not finish project deletion: ${error instanceof Error ? error.message : String(error)}`);
-    } finally { setPendingDelete(null); }
+    });
   }
 
   function requestProjectDeletion() {
@@ -882,7 +885,7 @@ export function App() {
             detail="Projects shared with you are removed only from your list. Projects you own and their cards are deleted."
             confirmLabel="Remove"
             onCancel={() => setPendingDelete(null)}
-            onConfirm={() => void removeCurrentProject()}
+            onConfirm={removeCurrentProject}
           />
         )}
         {addingProject && (

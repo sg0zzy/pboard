@@ -9,6 +9,15 @@ import type { AppState } from "../src/types";
 
 const unique = () => `pboardtest${crypto.randomUUID().replaceAll("-", "")}`;
 const open = (name: string) => createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`) });
+// Gate for tests that must observe an intermediate state: the awaited promise
+// stays pending until the test releases it, so no wall-clock timer is involved.
+type Gate<T> = { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void };
+function gate<T>(): Gate<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 
 describe("fractional order keys", () => {
   it("inserts at either end and repeatedly inside one gap", () => {
@@ -99,6 +108,51 @@ describe("RxDB local repository", () => {
       expect(await rx.db.projects.findOne(shared.id).exec()).toBeNull();
       expect((await rx.db.cards.findOne(card.id).exec())?.deletedAt).toBeTruthy();
       expect(deleted).toEqual([shared.id]);
+    } finally { await rx.db.close(); }
+  });
+
+  it("commits the account marker and selection before resolving Drive ownership", async () => {
+    const name = unique();
+    const entered = gate<void>();
+    const propagation = gate<void>();
+    let markerCommitted = false;
+    let selectedProject: string | undefined;
+    const rx = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      resolveDeletionRole: async (projectId) => {
+        markerCommitted = await rx.isDeletedProject(projectId);
+        selectedProject = (await rx.getCurrentProject())?.id;
+        entered.resolve();
+        await propagation.promise;
+        return "owner";
+      } });
+    try {
+      const fallback = await rx.createProject("Personal");
+      const shared = await rx.createProject("Shared");
+      const card = await rx.addItem({ projectId: shared.id, content: "Owner content" });
+      await rx.selectProject(shared.id);
+      const pending = rx.deleteProject(shared.id);
+      await entered.promise;
+      expect(markerCommitted).toBe(true);
+      expect(selectedProject).toBe(fallback.id);
+      // Shared content is untouched while ownership is still being verified.
+      expect((await rx.db.cards.findOne(card.id).exec())?.deletedAt).toBeUndefined();
+      propagation.resolve();
+      await pending;
+      expect((await rx.db.cards.findOne(card.id).exec())?.deletedAt).toBeTruthy();
+      expect((await rx.db.projects.findOne(shared.id).exec())).toBeNull();
+    } finally { await rx.db.close(); }
+  });
+
+  it("keeps the committed account removal when the ownership check fails afterwards", async () => {
+    const name = unique();
+    const rx = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      resolveDeletionRole: async () => { throw new Error("Drive role check failed"); } });
+    try {
+      const shared = await rx.createProject("Shared");
+      await rx.selectProject(shared.id);
+      await expect(rx.deleteProject(shared.id)).rejects.toThrow("Drive role check failed");
+      expect(await rx.isDeletedProject(shared.id)).toBe(true);
+      expect((await rx.db.projects.findOne(shared.id).exec())).not.toBeNull();
     } finally { await rx.db.close(); }
   });
 

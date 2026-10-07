@@ -126,6 +126,14 @@ the collaborator's other sessions and blocks rediscovery. Deletion checks Drive
 ownership again at the time of the action. If a known shared project's ownership
 cannot be verified (including offline), removal affects only the account list.
 
+Confirming a deletion commits the account marker and the current-project switch
+first, then resolves Drive ownership, so the board disappears from the confirming
+user's sidebar without waiting for the network. Ownership verification and the
+per-card tombstone pass continue in the background; a failure there is reported to
+the user but does not undo the committed account marker. RxDB's update plugin
+applies changes per document, so the tombstone pass is O(cards) and is kept off
+the user-blocking path.
+
 ## Permissions model
 
 Google Drive v3 `permissions` API is the **authoritative** ACL. There is no independent
@@ -173,12 +181,24 @@ drop a document (a `null` pull modifier would crash `persistFromMaster`):
   mutations at the storage layer (see above).
 - `isPeerValid` runs the role/authorization check on connect (see below).
 
-RxDB's default conflict handler is used. **Rationale:** RxDB's default resolves a
-document write conflict deterministically (it does not silently drop work the way a
-naive last-write-wins on the whole string would; it operates per document with the
-`_meta` revision). For v1 we keep that rather than introducing a CRDT, and we document
-that same-card *character-level* concurrent text editing is out of scope (whole-field
-merge). This is intentional, not an oversight.
+Conflict policy: `projects` and `cards` resolve document conflicts by last write wins on
+the document's own write time (`max(updatedAt, deletedAt)`); `settings` merges
+`projectOrder` values and otherwise keeps the master state. **Rationale:** RxDB's default
+handler keeps the master state whenever the fork's assumed master state is absent or
+differs from the real one, and a dropped fork write is never re-applied. That is the normal
+state for a document both peers created independently — one peer bootstrapped the Drive
+snapshot, the other created it — so under the default policy an editor's first change to
+that document is silently lost. WebRTC picks the master by storage-token hash, not by who
+edited, so the default policy decides authorship arbitrarily. `updatedAt` is monotonic per
+instance, so it is a usable cross-peer ordering; ties keep the master state, and the losing
+side converges on the next upstream pass. Whole-field merge (no CRDT) and character-level
+concurrent text editing remain out of scope. Covered by `tests/conflictResolution.test.ts`.
+
+Conflicts are resolved only on the fork: the master peer just serves `masterWrite` and never runs
+the replication protocol, so the fork's own write is the state the handler sees.
+`experiments/collaboration/webrtc-browser-smoke.mjs` verifies this in native Chromium — an agreed
+version is replicated to the fork, the fork then diverges while disconnected (a failed push writes
+no meta row, so its assumed master state stays stale), and the newer write wins on both sides.
 
 ## Signaling
 
@@ -211,6 +231,17 @@ interface SignalingProvider {
 `WebRTCConnectionHandler` (connect$/disconnect$/message$/response$/send) built on
 `simple-peer` + the injected `SignalingProvider`. Replication logic never references a
 specific signaling service.
+
+The handler tracks each peer's JSEP signaling state and validates every
+description before applying it: an `offer` is accepted only by the answerer
+(`remotePeerId > ownPeerId`) while the state is `new`, `stable` or
+`have-remote-pranswer`; an `answer`/`pranswer` only in `have-local-offer`.
+State advances on the description this instance emits *and* on the one it
+applies, so a duplicated or replayed answer from the Drive outbox is dropped
+instead of raising `InvalidStateError: Cannot set a local answer in 0`. ICE
+candidates always pass because `simple-peer` holds them until a remote
+description exists; signals from a sender that is not yet known are buffered
+and re-validated when the peer is created.
 
 The Share dialog offers **Enable live collaboration** for a private project, allowing
 two browsers on the same account to start live replication without an email invite.
@@ -286,9 +317,17 @@ The existing cloud/auth icon is untouched; the Share button is separate.
 `npm run test:webrtc:browser` runs two isolated headless Chromium profiles as
 the same project owner, using real IndexedDB, WebRTC and RxDB replication. A
 local HTTP server simulates Drive with cacheable presence/handshake responses.
-The test verifies peer discovery, edits in both directions, live account project
-order, deletion after switching projects, protection against stale snapshot
-resurrection, and exactly one presence file per session/collection. It needs Chromium on PATH (or
+The test verifies peer discovery and replication of the five mutation types in
+both directions — project category (board template, including the card-type
+remap it forces), card state, card category, card creation and card deletion
+(tombstone, not only the live card list) — plus live account project order,
+deletion after switching projects, protection against stale snapshot
+resurrection, and exactly one presence file per session/collection. It also
+runs the JSEP gate inside a single page over an in-process signaling scope: two
+handler instances negotiate, the answer captured from that handshake is replayed
+to a third instance that never sent an offer, and the test asserts the replayed
+answer is dropped rather than applied while native Chromium raises
+`InvalidStateError` for the same description. It needs Chromium on PATH (or
 `PBOARD_CHROMIUM_BIN`) and makes no authenticated Google requests.
 
 Drive reads bypass the HTTP cache in both the shared-folder and private-account

@@ -61,9 +61,12 @@ Implemented behavior:
 - The selected project is global to the extension; it is not tied to the current ChatGPT conversation.
 - A user can delete the current project after confirming the destructive action in a panel directly beneath the project row.
 - The project confirmation panel participates in layout and never covers the project selector.
+- Confirming closes the panel immediately: the account removal marker and the current-project switch commit before Drive ownership is verified, so the board disappears without waiting for network work.
 - Deleting a project also deletes all cards belonging to it.
 - When the selected project is deleted, the first remaining project becomes current; otherwise no project is selected.
+- Ownership verification and the per-card tombstone pass continue in the background; a failure there is reported as a notice and does not undo the committed account removal.
 - A project's template can be changed after creation without deleting any cards.
+- Changing a template remaps cards whose type the new template does not support to `note`.
 
 Project data:
 
@@ -206,6 +209,7 @@ Implemented behavior:
 - Trash cards are placed in a collapsed **Trash** container, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
 - The terminal containers are presented as **Done**, **Rejected**, then **Trash**. This visual order is independent from the canonical status-menu and keyboard-cycling order.
 - Card changes update the card's `updatedAt` timestamp.
+- Card creation, deletion, status and category changes replicate live between two sessions of the same account over WebRTC, in both directions; see `docs/collaboration.md`.
 
 Supported card types are supplied by the selected board template rather than a global UI list. The storage union includes the current template types plus the legacy `idea` value so older data can be preserved.
 
@@ -508,7 +512,7 @@ Version 0.1 does not implement:
 - import or export;
 - automatic summarization;
 - custom user-defined templates or card types;
-- accounts, server sync, collaboration, comments, or permissions;
+- comments, custom user-defined templates, and server sync beyond the collaboration model in `docs/collaboration.md`;
 - AI APIs, billing, or telemetry.
 
 Any future ChatGPT-to-board writing flow should preserve the safety rule:

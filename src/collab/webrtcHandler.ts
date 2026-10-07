@@ -42,6 +42,43 @@ export type PboardWebRTCConnectionOptions = {
   scopeDocument?: (doc: unknown) => boolean;
 };
 
+type HandshakeState = {
+  initiator: boolean;
+  jsepState: string;
+};
+
+/** Signal type: `offer`/`answer`/`pranswer`/`rollback`, or `null` for an ICE candidate. */
+function signalType(signal: unknown): string | null {
+  if (signal && typeof signal === "object" && "type" in signal && typeof signal.type === "string") return signal.type;
+  return null;
+}
+
+/**
+ * Whether a signal may be applied to the connection for a remote peer.
+ *
+ * JSEP state check: an offer is only accepted by the peer that does not open it, and
+ * an answer only answers the offer this instance itself sent. Without the check, a
+ * stale answer replayed into a recreated instance makes the engine apply an answer
+ * with no pending offer — the `InvalidStateError` the sidebar shows. The state has to
+ * be advanced when a description is *applied* (`markApplied`), not only when this
+ * instance emits one: an instance that only ever emits offers would otherwise stay in
+ * `have-local-offer` forever and accept every answer that follows its first.
+ */
+function signalIsValid(state: HandshakeState, signal: unknown): boolean {
+  const type = signalType(signal);
+  if (!type) return true; // ICE candidate: simple-peer buffers it until a remote description exists
+  if (type === "offer") return !state.initiator && ["new", "stable", "have-remote-pranswer"].includes(state.jsepState);
+  if (type === "answer" || type === "pranswer") return state.jsepState === "have-local-offer";
+  return true; // rollback
+}
+
+/** Advance the tracked JSEP state for a description this instance applies. */
+function markApplied(state: HandshakeState, type: string | null): void {
+  if (type === "offer") state.jsepState = "have-remote-offer";
+  else if (type === "pranswer") state.jsepState = "have-remote-pranswer";
+  else if (type === "answer" || type === "rollback") state.jsepState = "stable";
+}
+
 /**
  * Builds an RxDB `WebRTCConnectionHandler` creator for a single project+collection
  * room. The data channel is simple-peer; rendezvous and signal relay come from the
@@ -49,11 +86,16 @@ export type PboardWebRTCConnectionOptions = {
  * replication logic.
  *
  * Deterministic initiator: the peer with the greater signaling id opens the offer,
- * so both peers always agree on who initiates. Signals that arrive before a peer
- * connection exists are buffered and flushed on creation (a late answer/ICE must not
- * be dropped just because the handshake raced).
+ * so both peers always agree on who initiates. Signals are gated by the JSEP state of
+ * the instance that would handle them (`signalIsValid`): a stale answer from an
+ * instance that already completed its handshake is dropped, not applied to a fresh
+ * instance. Signals that arrive before a connection exists are buffered when they are
+ * valid for the prospective instance and flushed on creation.
  */
-export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnectionOptions): WebRTCConnectionHandlerCreator<PboardPeer> {
+// RxDB passes its sync options to the creator; this handler is fully configured by
+// `options`, so the argument is optional for direct use. The zero-arg form still
+// satisfies `WebRTCConnectionHandlerCreator<PboardPeer>`.
+export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnectionOptions): () => Promise<WebRTCConnectionHandler<PboardPeer>> {
   const { signaling, wrtc, config, trickle = false, scopeDocument } = options;
   // The master streams its whole collection; a received response may carry docs
   // from projects outside this room. Drop them here so they never reach RxDB's
@@ -75,6 +117,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     const error$ = new Subject<RxError | RxTypeError>();
     const peers = new Map<string, PboardPeer>();
     const pendingSignals = new Map<string, unknown[]>();
+    const handshake = new Map<string, HandshakeState>();
     let closed = false;
     let ownPeerId: string | null = null;
 
@@ -84,7 +127,12 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       const peer = new Peer({ initiator: remotePeerId > ownPeerId, wrtc, config, trickle }) as PboardPeer;
       peer.id = remotePeerId;
       peers.set(remotePeerId, peer);
+      const state: HandshakeState = { initiator: remotePeerId > ownPeerId, jsepState: "new" };
+      handshake.set(remotePeerId, state);
       peer.on("signal", (signal) => {
+        const type = signalType(signal);
+        if (type === "offer") state.jsepState = "have-local-offer";
+        else if (type === "answer" || type === "pranswer") state.jsepState = "stable";
         void signaling.sendSignal(remotePeerId, signal).catch((error) => {
           error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
         });
@@ -99,17 +147,24 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         peer.destroy();
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
       });
-      peer.on("connect", () => connect$.next(peer));
+      peer.on("connect", () => {
+        connect$.next(peer);
+      });
       peer.on("close", () => {
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
         if (peers.get(remotePeerId) === peer) peers.delete(remotePeerId);
         pendingSignals.delete(remotePeerId);
+        handshake.delete(remotePeerId);
         createPeerConnection(remotePeerId);
       });
       const buffered = pendingSignals.get(remotePeerId);
       if (buffered) {
         pendingSignals.delete(remotePeerId);
-        for (const signal of buffered) peer.signal(signal as Parameters<PboardPeer["signal"]>[0]);
+        for (const signal of buffered) {
+          if (!signalIsValid(state, signal)) continue;
+          markApplied(state, signalType(signal));
+          peer.signal(signal as Parameters<PboardPeer["signal"]>[0]);
+        }
       }
     }
 
@@ -120,13 +175,20 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
 
     signaling.onSignal((from, data) => {
       if (closed) return;
-      const peer = peers.get(from);
-      if (peer) peer.signal(data as Parameters<PboardPeer["signal"]>[0]);
-      else {
+      const state = handshake.get(from);
+      if (!state) {
+        // No connection yet. Buffer only what a fresh connection could accept; an
+        // answer can never answer an offer we have not sent, so stale answers are
+        // dropped. Before `join()` resolves the role is unknown, so buffer everything.
+        if (ownPeerId && !signalIsValid({ initiator: from > ownPeerId, jsepState: "new" }, data)) return;
         const list = pendingSignals.get(from) ?? [];
         list.push(data);
         pendingSignals.set(from, list);
+        return;
       }
+      if (!signalIsValid(state, data)) return;
+      markApplied(state, signalType(data));
+      peers.get(from)?.signal(data as Parameters<PboardPeer["signal"]>[0]);
     });
     signaling.onError?.((error) => {
       if (!closed) error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
@@ -157,6 +219,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       async close() {
         closed = true;
         for (const peer of peers.values()) peer.destroy();
+        handshake.clear();
         peers.clear();
         await signaling.leave().catch(() => {});
         connect$.complete(); disconnect$.complete(); message$.complete(); response$.complete(); error$.complete();
