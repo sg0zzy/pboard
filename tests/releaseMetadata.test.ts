@@ -13,8 +13,15 @@ describe("release metadata", () => {
   it("declares a Firefox toolbar action and sidebar command", () => {
     expect(firefoxManifest.action).toEqual({
       default_title: "Open Pboard",
-      default_icon: "icons/pin.svg",
+      default_icon: {
+        16: "icons/logo-16.png",
+        32: "icons/logo-32.png",
+        48: "icons/logo-48.png",
+        128: "icons/logo-128.png",
+      },
     });
+    expect(chromiumManifest.action.default_icon).toEqual(firefoxManifest.action.default_icon);
+    expect(chromiumManifest.icons).toEqual(firefoxManifest.icons);
     expect(firefoxManifest.commands["_execute_sidebar_action"].suggested_key.default).toBe(
       OPEN_PBOARD_SHORTCUT
     );

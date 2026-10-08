@@ -782,7 +782,7 @@ export function App() {
       )}
       <header>
         <div className="app-title-row">
-          <p className="eyebrow">Pboard</p>
+          <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
           <ShareControls projectId={currentProject?.id ?? null} permissions={drivePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
           <div className="font-scale-controls" aria-label="Board font size">

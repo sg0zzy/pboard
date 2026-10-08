@@ -23,6 +23,7 @@ button { cursor: pointer; }
 header { border-bottom: 1px solid #deded9; padding-bottom: 14px; }
 .app-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .eyebrow { margin: 0; color: #656660; font-size: .6875em; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+.app-logo { display: inline-block; vertical-align: -3px; margin-right: 4px; border-radius: 3px; }
 .drive-controls { display: flex; align-items: center; gap: 3px; margin-left: auto; }
 .drive-connect-button { display: inline-flex; height: 1.75em; align-items: center; gap: .32em; border: 1px solid #d3d4ce; border-radius: 5px; background: transparent; color: #565851; padding: 0 .48em; font-size: .6875em; font-weight: 700; }
 .drive-connect-button:hover { border-color: #9b9e95; background: #ecece7; color: #171816; }
