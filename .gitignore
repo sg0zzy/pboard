@@ -5,3 +5,5 @@ coverage/
 *.log
 .env.local
 .env.*.local
+web-ext-artifacts/*-source.zip
+
