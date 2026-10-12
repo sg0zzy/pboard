@@ -19,7 +19,7 @@ Pboard has no advertising, analytics, or telemetry service. Read the [privacy po
 
 ## Get Pboard
 
-Visit the [Pboard repository](https://github.com/sg0zzy/pboard) for installation and build instructions, source code, and releases. Pboard is open source under the GNU General Public License v3.0.
+Visit the [Pboard repository](https://github.com/sg0zzy/pboard) for installation and build instructions, source code, and releases. Pboard is open source under the [GNU General Public License v3.0](https://github.com/sg0zzy/pboard/blob/main/LICENSE.md).
 
 ## Publisher and support
 

@@ -1,4 +1,4 @@
-Licensed under the GNU General Public License v3.0. See LICENSE
+Licensed under the [GNU General Public License v3.0](LICENSE.md).
 
 # Pboard
 
