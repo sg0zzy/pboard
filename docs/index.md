@@ -21,6 +21,8 @@ Pboard has no advertising, analytics, or telemetry service. Read the [privacy po
 
 Visit the [Pboard repository](https://github.com/sg0zzy/pboard) for installation and build instructions, source code, and releases. Pboard is open source under the [GNU General Public License v3.0](https://github.com/sg0zzy/pboard/blob/main/LICENSE.md).
 
+Read the [Terms of Service]({{ '/terms/' | relative_url }}) for information about your content, optional integrations, collaboration, and software limitations.
+
 ## Publisher and support
 
 Pboard is published by Stefano Gozzi. For support or privacy questions, email [stefanogozzi@gmail.com](mailto:stefanogozzi@gmail.com).

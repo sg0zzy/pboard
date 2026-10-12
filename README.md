@@ -201,5 +201,6 @@ After deployment, the expected URLs are:
 
 - Homepage: <https://sg0zzy.github.io/pboard/>
 - Privacy policy: <https://sg0zzy.github.io/pboard/privacy/>
+- Terms of Service: <https://sg0zzy.github.io/pboard/terms/>
 
-Use these URLs for the Google OAuth branding fields after checking they are live. Edit `docs/privacy.md` to update the policy. The technical documents already in `docs/` are excluded from the Pages build. If you configure a custom domain, update `url` and `baseurl` in `docs/_config.yml` to match.
+Use these URLs for the Google OAuth branding fields after checking they are live. Edit [docs/privacy.md](docs/privacy.md) or [docs/terms.md](docs/terms.md) to update the policies. The technical documents already in `docs/` are excluded from the Pages build. If you configure a custom domain, update `url` and `baseurl` in `docs/_config.yml` to match.
