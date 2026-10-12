@@ -4,9 +4,9 @@ Licensed under the [GNU General Public License v3.0](LICENSE.md).
 
 Pboard is a local-first Firefox and Chromium extension that keeps the current state of a project alongside AI conversations and ordinary web research. Conversations remain the place for exploration; Pboard stores the goals, ideas, decisions, constraints, questions, risks, references, and notes that still matter.
 
-Version 0.1 captures selected text and links from ordinary web pages, with a dedicated ChatGPT adapter where needed. It deliberately includes no account, backend, telemetry, AI API, or collaboration features. Captured content never leaves the browser.
+Pboard captures selected text, links, images, and page regions, with a dedicated ChatGPT selection adapter where needed. Boards save locally first in RxDB/IndexedDB. Optional Google Drive synchronization and sharing can transfer board content to Google and collaborators. There is no Pboard account, publisher-operated backend, telemetry, or AI API integration.
 
-The implemented product baseline and current limitations are recorded in [`SPECIFICATION.md`](SPECIFICATION.md).
+The implemented product behavior and limitations are recorded in [`SPECIFICATION.md`](SPECIFICATION.md). See the [documentation index](docs/README.md) for architecture, build instructions, refactor status, and historical research.
 
 ## What works
 
@@ -56,7 +56,7 @@ The implemented product baseline and current limitations are recorded in [`SPECI
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current board as a clean, structured prompt: ongoing cards in their board order, then Done cards, then Rejected cards. Trash is excluded; every exported card carries its category and status tags (e.g., `[issue] [confirmed]`).
-- Persist all state in `browser.storage.local` across Firefox restarts.
+- Persist boards in RxDB/IndexedDB and images in a separate local Blob store across browser restarts; extension preferences and Drive credentials remain in browser extension storage. The legacy repository is retained for migration, fallback, and rollback.
 - Reopen the Pboard sidebar from Firefox's toolbar button or `Alt+Shift+P`, even after it has been closed or replaced by another sidebar such as Bookmarks.
 
 ## Architecture
@@ -68,13 +68,17 @@ ChatGPT page
   └─ isolated content script and ChatGptAdapter
             ⇅ WebExtension messaging
 background/service worker (context menus, page action/action, and region capture)
-            ⇅ browser.storage.local
-React sidebar ─ project/card repository
+            ⇅ repository selector
+RxDB/IndexedDB + image Blob store (default)
+  └─ browser.storage.local AppState (legacy fallback)
+React sidebar ─ reactive project/card subscriptions
+  ├─ optional Google Drive snapshots + sharing
+  └─ optional WebRTC collaboration
 ```
 
 Provider-specific page access lives in `src/providers`. The rest of the board knows only the shared `ChatProviderAdapter` contract, so another provider can be added without changing storage or sidebar code.
 
-State is stored as one versioned object. Projects are application-owned; a conversation URL is optional source metadata on a card, never the owner of a project.
+The default repository stores projects, cards, and settings as separate RxDB documents. Versioned AppState and project snapshots remain compatibility formats for legacy storage and Drive. Projects are application-owned; a conversation URL is optional source metadata on a card, never the owner of a project.
 
 ## Browser permissions
 
@@ -112,7 +116,7 @@ The Firefox build uses the native `sidebar_action`, a toolbar `action` that open
 
 ## Develop and build
 
-Requirements: Node.js 20 or newer and npm. Firefox 126+ and Chromium-based browsers with Side Panel support (Chrome/Chromium 114+, including current releases) are supported.
+Requirements: Node.js 24 (as selected by `.nvmrc`) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions.
 
 ```bash
 npm install
@@ -178,7 +182,9 @@ src/images/       image decoding, cropping, and scaling
 src/messaging/    typed message contracts
 src/providers/    isolated provider adapters
 src/sidebar/      React board UI and prompt serialization
-src/storage/      browser storage adapter and domain repository
+src/storage/      RxDB repository, legacy adapter, migration, and Blob store
+src/collab/       WebRTC pools, signaling, and shared image sync
+src/sync/         Google auth, private/shared snapshots, and account preferences
 src/types/        extensible project and board item types
 tests/            domain, serialization, messaging, and adapter tests
 ```

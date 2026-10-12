@@ -1,14 +1,16 @@
 # Pboard — Product Specification
 
-**Version:** 0.1.0  
-**Baseline date:** 2026-09-16  
-**Status:** Implemented MVP
+**Package version at review:** 0.9.3
+
+**Reviewed:** 2026-10-12
+
+**Status:** Implemented local-first extension with optional Drive sync and collaboration
 
 This document records the behavior currently implemented in the repository. It is a baseline for development and debugging, not a description of unbuilt future features.
 
 ## 1. Product purpose
 
-Pboard is a local-first Firefox extension that keeps structured project state beside AI conversations and ordinary web research.
+Pboard is a local-first Firefox and Chromium extension that keeps structured project state beside AI conversations and ordinary web research.
 
 The product separates two concepts:
 
@@ -23,13 +25,14 @@ Discuss in ChatGPT → Pin selected text → Refine and reorder cards → Copy b
 
 ## 2. Supported environment
 
-- Firefox WebExtension using Manifest V3.
-- Minimum declared Firefox version: 126.
+- Firefox and Chromium WebExtensions using Manifest V3.
+- Minimum declared Firefox version: 142; minimum Chromium version: 114.
+- Firefox uses `sidebar_action` and background scripts; Chromium uses `side_panel` and an MV3 service worker.
 - Sidebar UI implemented with React and TypeScript.
 - Chat selection capture supported on:
   - `https://chatgpt.com/*`
   - `https://chat.openai.com/*`
-- Node.js 24.17.0 is recorded in `.nvmrc` for local builds.
+- `.nvmrc` selects Node.js major version 24 for local builds.
 
 ### 2.1 Board display size
 
@@ -48,21 +51,21 @@ Implemented behavior:
 
 - The initial state contains no projects.
 - A user can create a project with a non-empty name.
-- Project creation requires choosing one of the three board templates.
+- Project creation requires choosing one of the four board templates.
 - Pressing Escape anywhere in the New Project form closes it, discards its temporary name/template selection, and leaves stored project data unchanged.
 - After successful project creation, the Add Card editor opens automatically and receives focus so the next typed text can be submitted as the first card with Enter.
 - A newly created project becomes the current project.
 - A user can switch projects with a custom dropdown selector styled like the previous compact project control.
 - Projects can be dragged directly inside the open dropdown to change their persistent order; an insertion line previews the destination.
 - The dropdown supports Up/Down and Home/End navigation, Enter selection, Escape dismissal, and closing by clicking outside it.
-- Reordering does not change the current project or any project/card content. Existing storage remains compatible because project array order is already authoritative.
+- Reordering does not change the current project or board content. The RxDB repository stores an account-specific project-order preference, synchronized through private Drive app data and a dedicated WebRTC settings pool when connected. Selection stays local.
 - A folder-plus icon in the project-title row opens and closes the New Project form, replacing the previous separate text action.
 - A pencil icon replaces the project selector with a focused inline name field; Enter persists a non-empty trimmed name and Escape cancels without changes.
 - The selected project is global to the extension; it is not tied to the current ChatGPT conversation.
 - A user can delete the current project after confirming the destructive action in a panel directly beneath the project row.
 - The project confirmation panel participates in layout and never covers the project selector.
 - Confirming closes the panel immediately: the account removal marker and the current-project switch commit before Drive ownership is verified, so the board disappears without waiting for network work.
-- Deleting a project also deletes all cards belonging to it.
+- Owners delete project content and tombstone its cards. Editors and viewers can remove shared projects from their own account list without deleting the owner's content. If ownership of a known shared project cannot be verified, removal affects only the account list.
 - When the selected project is deleted, the first remaining project becomes current; otherwise no project is selected.
 - Ownership verification and the per-card tombstone pass continue in the background; a failure there is reported as a notice and does not undo the committed account removal.
 - A project's template can be changed after creation without deleting any cards.
@@ -75,6 +78,7 @@ type Project = {
   id: string;
   name: string;
   template: "brainstorming" | "idea" | "project" | "software_project";
+  revision: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -160,10 +164,10 @@ Implemented behavior:
 - After an existing card is saved, focus returns to that card and a second Enter opens a new inline draft directly beneath it.
 - No persistent Edit or Save button is shown on a card.
 - A card may have an optional title.
-- A card may carry an optional image, added by page region capture or by dropping an image file onto the board. The image is stored as a WebP data URL scaled so its longest side is at most 1400 px and renders above the card text.
+- A card may carry an optional image, added by page region capture or by dropping an image file onto the board. The processed WebP is scaled so its longest side is at most 1400 px, stored as a hash-addressed Blob in the default backend, and rendered above the card text. Legacy storage and Drive snapshots use data URLs at the compatibility boundary.
 - Dropped image files larger than 20 MB or files that are not images are rejected with a visible notice and do not change the board.
 - Card content must not be empty.
-- A user can change a card's type and status at any time.
+- A user with editing rights can change a card's type and status.
 - The card-type selector is a custom dropdown menu in the card's top line rather than a native select. The open menu shows every category with a color swatch in that category's semantic color, and the current category is marked bold with a check. Up/Down and Home/End navigate the open menu, Enter selects, and Escape or clicking outside closes it and returns focus to the selector.
 - Cards can be deleted.
 - Deleting any card always moves it to its project's Trash without confirmation; the card is recoverable by changing its status back, and each project has its own Trash.
@@ -188,7 +192,7 @@ Implemented behavior:
 - The active, Rejected, and Done sections each accept reorder previews only from their own section, preventing a misleading cross-section placement.
 - Card sorting and merging use a custom Pointer Events layer rather than native HTML card dragging. This keeps behavior consistent across browsers and permits dynamic feedback while dragging; native file drag-and-drop remains separate for adding images.
 - Pressing Shift before or during a card drag switches from reorder to merge mode; releasing it switches back to reorder. The floating preview and destination card become orange, gray reorder placeholders disappear, the destination grows slightly and displays **MERGE HERE**. Escape cancels an active drag.
-- On merge, the dragged card is the source. Its optional title and content are appended to the destination content after a blank line, then the source card is removed and order values are normalized.
+- On merge, the dragged card is the source. Its optional title and content are appended to the destination content after a blank line, then the source card is tombstoned in the default backend and hidden from the visible order.
 - The destination retains its ID, title, type, status, image, source metadata, position, and creation timestamp; only its content and update timestamp change.
 - Consuming a Confirmed source requires confirmation in an inline panel beneath that source card.
 - A source card containing an image cannot be merged in this version because the destination model supports only one image; the board shows a notice and leaves both cards unchanged.
@@ -223,16 +227,16 @@ Supported statuses:
 - `trash`
 - `rejected`
 
-Status semantics in version 0.1:
+Status semantics:
 
-- Status is local board metadata controlled by the user and remains independent from card type.
+- Status is board metadata controlled by users with editing rights, synchronized when connected, and independent from card type.
 - Candidate is proposed, Confirmed is accepted and ready, Started is active work, To validate is implementation-complete but awaiting review or acceptance, Done is validated, and Rejected is discarded.
 - The status selector presents the states compactly in the canonical order Candidate, Confirmed, Started, To validate, Done, Trashed, Rejected; the same order drives Left/Right cycling.
 - Semantic type is shown with a subtle colored top border and label chip.
 - Status is shown separately with `○`, `●`, `▶`, `◐`, `✓`, `–` (Trashed), or `×` and its own pill/border treatment; semantic card color does not encode status.
 - **Confirmed does not send the card to ChatGPT.**
 - Changing status does not start an AI operation or modify a conversation.
-- Rejected and trash cards remain stored and editable but are excluded from copied prompts. Trash cards can be restored by changing their status to any other status.
+- Rejected and trash cards remain stored and editable for users with editing rights. Rejected cards are included in the copied board's Rejected section; Trash is excluded. Trash cards can be restored by changing their status.
 
 Card data:
 
@@ -369,53 +373,26 @@ Copying is currently the only implemented board-to-chat workflow. The user must 
 
 ## 7. Persistence and synchronization
 
-- All state is stored in `browser.storage.local` under the key `projectBoardState`.
-- State is stored as one versioned object with schema version `3`.
-- Older projects receive their missing template/revision metadata in memory without rewriting or deleting cards.
-- Data persists across browser restarts.
-- The sidebar listens for storage changes and reloads when the background script pins a new card.
-- Projects belong to Pboard, not to provider conversation IDs.
-- Conversation URLs are optional source metadata only.
+The default repository stores projects, cards, and settings in RxDB using the free Dexie/IndexedDB backend. Images are hash-addressed Blobs in the separate `pboard-images-v1` IndexedDB database. The sidebar subscribes to project lists, current selection, and the active project's cards rather than reloading the entire application state.
 
-Application state:
+The legacy `browser.storage.local` repository remains available for fallback and rollback. Its `projectBoardState` key contains AppState version 3 (`projects`, `boardItems`, and `currentProjectId`). First opening RxDB imports and verifies that state without deleting the original. Migration failure falls back to legacy storage. See [local storage architecture](docs/rxdb-storage-refactor.md) for migration, ordering, rollback, and retained deletion records.
 
-```typescript
-type AppState = {
-  version: 3;
-  projects: Project[];
-  boardItems: BoardItem[];
-  currentProjectId: string | null;
-};
-```
+Projects belong to Pboard; conversation URLs are optional source metadata. Local writes complete before Drive requests, and synchronization failures preserve dirty local data. Private projects use versioned per-project snapshots in Drive's hidden `appDataFolder`, with whole-project timestamp conflict resolution. Dirty projects sync manually, when leaving a project, after debounced visibility loss, or after roughly 25 seconds of inactivity.
 
-Optional Google Drive synchronization is a separate asynchronous layer. Each local project has a revision and may be serialized as its own versioned snapshot in Drive's hidden `appDataFolder`. Local repository writes complete before any Drive request, and failures leave the dirty local project intact. Dirty projects sync manually, when leaving a project, after debounced visibility loss, or after roughly 25 seconds of inactivity.
+Shared boards use a visible owner-managed Drive folder with `project.json`, image assets, and signaling records. Drive folder permissions define owner/editor/viewer roles. Invited boards are discovered and imported while connected. Owners and editors back up pending shared changes without importing a whole remote snapshot over existing live documents; viewers can restore matching image bytes. A newer remote shared backup is reported as a conflict instead of overwritten.
+
+Live collaboration replicates project and card documents through separate WebRTC pools for the active shared board. Document conflicts use last write wins on `max(updatedAt, deletedAt)`, with master state winning ties. Account project order and permanent removal markers synchronize separately, both over WebRTC and private Drive preferences; current selection stays local. See [collaboration architecture](docs/collaboration.md) for scoping, role enforcement, signaling, and security limits.
 
 ## 8. Extension architecture
 
 ```text
-ChatGPT page
-  │
-  ├─ ChatGPT provider adapter
-  │    └─ reads selected text and conversation URL
-  │
-  └─ content script
-       │ WebExtension message: CAPTURE_SELECTION
-       ▼
-background script
-  ├─ owns selection, link, and page context-menu actions
-  ├─ owns the address-bar page action
-  └─ writes pinned cards through the repository
-       │
-       ▼
-browser.storage.local
-       │
-       └─ optional dirty-project snapshots → Google Drive appDataFolder
-       ▲
-       │
-React sidebar
-  ├─ project and card controls
-  ├─ drag-and-drop ordering
-  └─ prompt serialization and clipboard copy
+Page capture / ChatGPT selection adapter
+  └─ WebExtension messaging → background capture handlers
+                              ⇅ repository selector
+React sidebar subscriptions ⇄ RxDB + IndexedDB image Blobs (default)
+                              └─ browser.storage.local AppState (legacy fallback)
+                              ├─ private Drive snapshots + account preferences
+                              └─ shared Drive folders + WebRTC document replication
 ```
 
 Code boundaries:
@@ -426,7 +403,8 @@ Code boundaries:
 - `src/messaging/`: typed WebExtension message contracts.
 - `src/providers/`: provider-specific page access behind a shared adapter.
 - `src/sidebar/`: React UI, card component, styling, and prompt serialization.
-- `src/storage/`: storage adapter and project/card repository.
+- `src/storage/`: RxDB repository, legacy adapter, migration, ordering, and image Blob store.
+- `src/collab/`: WebRTC lifecycle, signaling, project scoping, and shared image sync.
 - `src/sync/`: Google OAuth/PKCE, Drive transport, snapshot serialization, and sync state.
 - `src/templates/`: declarative template, type-label, and semantic-color configuration.
 - `src/types/`: shared domain types.
@@ -448,12 +426,13 @@ Declared permissions:
 Privacy properties:
 
 - Google authentication and Drive synchronization are optional and user-initiated.
-- The only requested Google scope is `drive.appdata`; snapshots are stored in the app's private Drive data folder.
+- Google scopes are `drive.appdata` for private backups/preferences and full `drive` for incoming shared-board discovery, shared files, and permissions. Shared content lives in visible Drive folders.
+- WebRTC connection setup uses Drive signaling and Google/Twilio STUN services. See the [privacy policy](docs/privacy.md) for data handling and deletion controls.
 - No telemetry.
 - No AI API request.
 - No conversation scraping.
 - No entire-conversation upload.
-- Pinned content, including captured and dropped images, is always persisted in local extension storage first.
+- Pinned content, including captured and dropped images, is persisted locally before cloud synchronization.
 - If Drive is connected, captured image data contained in a project snapshot is included in that project's asynchronous backup.
 
 ## 10. Build and verification
@@ -470,9 +449,10 @@ npm run check
 
 1. strict TypeScript checking;
 2. the Vitest test suite;
-3. the production build.
+3. both Firefox and Chromium production builds;
+4. verification of generated manifests and browser-safe background bundles.
 
-Production artifacts are written to `dist/`. The sidebar is built as a normal web entry. Background and content scripts are separately bundled as classic IIFEs for Firefox compatibility.
+Firefox artifacts are written to `dist/`; Chromium artifacts are written to `dist/chromium/`. See [BUILD.md](BUILD.md) for packaging and release steps. The sidebar is built as a normal web entry. Background and content scripts are separately bundled as classic IIFEs for Firefox compatibility.
 
 Current automated coverage includes:
 
@@ -489,7 +469,9 @@ Current automated coverage includes:
 - board-template creation, configuration, and safe template changes;
 - note-only enforcement for Brainstorming;
 - version-1 storage migration without card-data loss;
-- board prompt serialization with category tags and rejected-card exclusion;
+- board prompt serialization with category/status tags, Done and Rejected sections, and Trash exclusion;
+- RxDB migration, rollback, subscriptions, image storage, and document conflict resolution;
+- shared-board discovery, Drive permissions/signaling, shared image transfer, account order/removal preferences, and viewer mutation restrictions;
 - runtime message validation;
 - capture-region cropping, scaling, and out-of-bounds clamping;
 - content selection capture and source metadata;
@@ -500,19 +482,19 @@ Current automated coverage includes:
 
 ## 11. Current limitations and non-features
 
-Version 0.1 does not implement:
+The current extension does not implement:
 
 - automatic board context injection into ChatGPT;
 - direct ChatGPT access to extension storage;
 - ChatGPT-created or ChatGPT-edited cards;
 - AI-proposed changes or approval previews;
-- opening source conversations from cards;
 - provider composer automation;
 - Claude, Gemini, Perplexity, or other provider adapters;
-- import or export;
+- a general-purpose user-facing file import/export workflow beyond clipboard copy and Drive snapshot restore;
 - automatic summarization;
 - custom user-defined templates or card types;
-- comments, custom user-defined templates, and server sync beyond the collaboration model in `docs/collaboration.md`;
+- comments or a publisher-operated synchronization server;
+- character-level collaborative text editing, automatic TURN relay configuration, or cryptographically authenticated per-peer writes (see [collaboration limits](docs/collaboration.md#authorization-and-security-limits));
 - AI APIs, billing, or telemetry.
 
 Any future ChatGPT-to-board writing flow should preserve the safety rule:

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Node.js (≥ 20 recommended; developed on Node 24). No local `engines` pin.
+- Node.js 24, selected by `.nvmrc`. `scripts/compile-manifests.sh` checks the major version; `package.json` has no `engines` pin.
 - Firefox and/or Chromium for smoke testing, if desired.
 
 ## Quick start
@@ -135,12 +135,12 @@ Equivalent granular commands:
 
 ```sh
 npm run build              # build only
-npm run verify:build firefox  # verify only
+npm run verify:build -- firefox  # verify only
 ```
 
 No environment variables are required. The optional Google OAuth client
 secret (`VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`, documented in
-`.env.example`) is only embedded when a `.env.local` file provides it; from
+`.env.example`) is embedded when supplied through the environment or `.env.local`; from
 a clean review checkout it is absent and the build still succeeds.
 
 ## 4. Compare against the submitted package
