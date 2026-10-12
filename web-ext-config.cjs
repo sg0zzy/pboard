@@ -1,8 +1,8 @@
 module.exports = {
   sourceDir: "dist",
   ignoreFiles: [
-    "assets/*.js",
-    "chromium/assets/*.js",
+    "**/*.map",
+    "chromium/**",
     "scripts/*.sh"
   ]
 };

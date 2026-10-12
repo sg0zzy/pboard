@@ -1,6 +1,6 @@
 {
   "name": "pboard",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,7 +16,9 @@
     "test:watch": "vitest",
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build"
+    "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",
+    "package:firefox": "node scripts/verify-build.mjs firefox && web-ext build --config web-ext-config.cjs --overwrite-dest && node scripts/verify-package.mjs",
+    "lint:firefox": "web-ext lint --config web-ext-config.cjs"
   },
   "dependencies": {
     "dexie": "^4.4.6",
@@ -31,10 +33,12 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "fake-indexeddb": "^6.2.5",
+    "fflate": "0.8.3",
     "jsdom": "^30.0.1",
     "node-datachannel": "^0.33.4",
     "typescript": "^7.0.2",
     "vite": "^8.3.0",
-    "vitest": "^5.0.0"
+    "vitest": "^5.0.0",
+    "web-ext": "10.7.0"
   }
 }

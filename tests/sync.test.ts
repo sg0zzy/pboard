@@ -3,6 +3,7 @@ import type { KeyValueStorage } from "../src/storage/repository";
 import { createGoogleAuthProvider, DRIVE_SCOPE } from "../src/sync/googleAuth";
 import { createChromiumGoogleAuthProvider } from "../src/sync/googleChromeAuth";
 import { createDriveTransport } from "../src/sync/driveTransport";
+import { driveRetryDelayMs, isDriveReplayableMethod } from "../src/sync/driveRetry";
 import { createGoogleDriveProvider } from "../src/sync/googleDriveProvider";
 import { createProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "../src/sync/snapshot";
 import { createDriveSyncStateStore, createDriveTombstoneStore, DRIVE_AUTH_STORAGE_KEY } from "../src/sync/state";
@@ -443,6 +444,79 @@ describe("Drive app-data transport", () => {
     expect(listUrl.searchParams.get("q")).toContain("project-");
     expect(new URL(requests[1].url).searchParams.get("q")).toContain("project-project-1.pboard");
     expect(String(requests[2].init?.body)).toContain('"parents":["appDataFolder"]');
+  });
+
+  it("replays a transient internalError instead of failing the sync", async () => {
+    let attempts = 0;
+    const fetchMock = vi.fn<typeof fetch>(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({ error: { code: 500, status: "INTERNAL", message: "Internal Error" } }), { status: 500 });
+      }
+      return new Response(JSON.stringify({ files: [{ id: "file-1", name: "project-project-1.pboard" }] }));
+    });
+    const transport = createDriveTransport(connectedAuth(), fetchMock);
+
+    expect(await transport.findProjectFile(project.id)).toEqual({ id: "file-1", name: "project-project-1.pboard" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("replays an idempotent content update but never a file-creating POST", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ error: { code: 500, message: "Internal Error" } }), { status: 500 }));
+    const transport = createDriveTransport(connectedAuth(), fetchMock);
+
+    await expect(transport.upload(project.id, "{}", "file-1")).rejects.toThrow("(500)");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    fetchMock.mockClear();
+    await expect(transport.upload(project.id, "{}")).rejects.toThrow("(500)");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the Drive error detail after exhausting the retries", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ error: { code: 503, status: "UNAVAILABLE", message: "Internal Error" } }), { status: 503 }));
+    const transport = createDriveTransport(connectedAuth(), fetchMock);
+
+    await expect(transport.download("file-1")).rejects.toThrow("Google Drive request failed (503): UNAVAILABLE: Internal Error");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("honours Retry-After and stops retrying client-side failures", async () => {
+    const started = Date.now();
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response("{}", { status: 429, headers: { "Retry-After": "1" } }));
+    const transport = createDriveTransport(connectedAuth(), fetchMock);
+
+    await expect(transport.download("file-1")).rejects.toThrow("(429)");
+    expect(Date.now() - started).toBeGreaterThanOrEqual(2000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+
+    const forbidden = vi.fn<typeof fetch>(async () => new Response("{}", { status: 403 }));
+    await expect(createDriveTransport(connectedAuth(), forbidden).download("file-1")).rejects.toThrow("(403)");
+    expect(forbidden).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 401 token refresh failure beyond the single replay", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response("{}", { status: 401 }));
+    const transport = createDriveTransport(connectedAuth(), fetchMock);
+
+    await expect(transport.download("file-1")).rejects.toThrow("(401)");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Drive transient retry policy", () => {
+  it("caps backoff growth and prefers the server hint", () => {
+    expect(driveRetryDelayMs(0, null)).toBeGreaterThanOrEqual(250);
+    expect(driveRetryDelayMs(0, null)).toBeLessThanOrEqual(500);
+    expect(driveRetryDelayMs(20, null)).toBeLessThanOrEqual(8000);
+    expect(driveRetryDelayMs(0, "3")).toBe(3000);
+    expect(driveRetryDelayMs(0, "600")).toBe(10000);
+    expect(driveRetryDelayMs(0, "invalid")).toBeGreaterThanOrEqual(250);
+    expect(isDriveReplayableMethod(undefined)).toBe(true);
+    expect(isDriveReplayableMethod("PATCH")).toBe(true);
+    expect(isDriveReplayableMethod("POST")).toBe(false);
   });
 });
 

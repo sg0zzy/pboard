@@ -57,6 +57,23 @@ describe("Drive account identity", () => {
     await expect(transport.listFilesByName("project.json", "application/json")).rejects.toThrow(/reconnect Google Drive and allow project sharing access/);
   });
 
+  it("replays transient Drive failures for sharing reads without repeating permission writes", async () => {
+    let reads = 0;
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).includes("/permissions")) {
+        return new Response(JSON.stringify({ error: { code: 500, message: "Internal Error" } }), { status: 500 });
+      }
+      reads += 1;
+      if (reads === 1) return new Response(JSON.stringify({ error: { code: 503, message: "Internal Error" } }), { status: 503 });
+      return new Response(JSON.stringify({ files: [] }));
+    });
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+
+    expect(await transport.listFilesByName("project.json", "application/json")).toEqual([]);
+    await expect(transport.createPermission("file", "editor", "peer@example.com")).rejects.toThrow("(500)");
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
   it("observes new peers and updated handshake records instead of cached Drive responses", async () => {
     const cache = new Map<string, string>();
     let files: { id: string; name: string; mimeType: string }[] = [];

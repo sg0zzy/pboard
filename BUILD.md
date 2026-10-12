@@ -31,7 +31,50 @@ npm run build
 npx web-ext lint --source-dir dist
 ```
 
-`web-ext-config.cjs` excludes source-map assets. `dist/chromium/` sits inside `dist/`, so `web-ext` warns about it — the Chromium variant is not a Firefox package, ignore that. Expected: 0 errors, 0 warnings (requires Firefox ≥ 142, enforced via `strict_min_version`).
+`web-ext-config.cjs` excludes source maps and the entire `dist/chromium/`
+subdirectory. All runtime JavaScript in `assets/` must be included. Firefox
+142 or newer is required by `strict_min_version`.
+
+## Package and publish Firefox updates
+
+```sh
+npm run release:firefox
+npm run lint:firefox
+npm run package:firefox
+```
+
+The last command creates `web-ext-artifacts/pboard-<version>.zip` and compares
+every runtime file in it against `dist/`. Upload that verified ZIP, rather
+than a previous artifact. Version 0.9.2 on AMO was missing all `assets/*.js`
+because the old packaging configuration excluded them; temporary installation
+from `dist/` bypassed that exclusion. Version 0.9.3 fixes the packaging.
+
+The workflow `.github/workflows/firefox-release.yml` runs tests, a Firefox
+build, Mozilla lint, and archive verification on pull requests and pushes to
+`main`. Publishing a stable GitHub Release automatically submits the matching
+version to the existing AMO listing, including reviewer sources. Prereleases
+build artifacts without submitting to AMO. Mozilla review can delay public
+availability; a successful workflow means the version was submitted.
+
+One-time setup:
+
+1. Generate API credentials for the Mozilla account that owns Pboard at
+   https://addons.mozilla.org/en-US/developers/addon/api/key/.
+2. In GitHub → Settings → Secrets and variables → Actions, add repository
+   secrets `AMO_JWT_ISSUER` (JWT issuer/API key) and `AMO_JWT_SECRET` (JWT secret).
+3. If the Firefox Drive OAuth build needs the optional credential, also add
+   `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`. This value is embedded in the
+   extension, as explained in `.env.example`; AMO credentials are used only
+   during submission.
+
+For each release, update `package.json`, the root package versions in
+`package-lock.json`, both manifests, and `tests/releaseMetadata.test.ts` to the
+same unused version. Commit and push the changes, tag that commit as
+`v<version>` (first fixed release: `v0.9.3`), and publish a GitHub Release for
+the tag. Keep the Gecko ID `project-board@local.invalid` unchanged so uploads
+update the existing listing. Alternatively, run the workflow manually with
+the version tag selected; manual runs also submit to AMO. Do not resubmit
+the same version after a successful upload.
 
 ## Loading the extension
 
@@ -69,7 +112,7 @@ npm ci
 ```
 
 `npm ci` (not `npm install`) — `package-lock.json` is the exact dependency
-tree used for the submitted build (207 packages, lockfile v3).
+tree used for the submitted build (lockfile v3).
 
 ## 3. Build the Firefox variant
 
@@ -108,9 +151,9 @@ The production extension was packaged with:
 npx web-ext build --source-dir dist --config web-ext-config.cjs
 ```
 
-(`web-ext-config.cjs` excludes source-map assets.) `dist/chromium/` sits
-inside `dist/`, so `web-ext` ignores it via the exclude list; it is a
-Chromium-only variant, not part of the Firefox package.
+`web-ext-config.cjs` excludes source maps and `chromium/**`, while keeping
+the sidebar JavaScript chunks. Run `npm run package:firefox` to package and
+verify all runtime files before submission.
 
 To compare byte-for-byte, unpack the submitted `.xpi`/`.zip` and diff it
 against a fresh `dist/` — the only acceptable differences are file order

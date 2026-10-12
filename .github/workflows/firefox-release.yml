@@ -1,0 +1,79 @@
+name: Firefox checks and Mozilla release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firefox-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  firefox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Validate release tag
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (process.env.REF_TYPE !== 'tag' || process.env.RELEASE_TAG !== `v${version}`) {
+            throw new Error(`Publish from the v${version} tag; for manual runs, select that tag.`);
+          }
+          JS
+      - run: npm ci
+      - name: Test and build Firefox
+        env:
+          VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET: ${{ secrets.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET }}
+        run: npm run release:firefox
+      - run: npm run lint:firefox
+      - name: Package and verify the upload contents
+        id: package
+        run: |
+          npm run package:firefox
+          node --input-type=module -e "import { readFileSync } from 'node:fs'; console.log('version=' + JSON.parse(readFileSync('package.json', 'utf8')).version)" >> "$GITHUB_OUTPUT"
+      - name: Archive reviewer sources
+        run: |
+          git archive --format=zip --output=web-ext-artifacts/pboard-source.zip HEAD \
+            .nvmrc .env.example package.json package-lock.json tsconfig.json \
+            manifest.json manifest.chromium.json sidebar.html \
+            vite.sidebar.config.ts vite.background.config.ts vite.content.config.ts \
+            web-ext-config.cjs src scripts tests icons BUILD.md README.md LICENSE.md
+      - name: Save extension and reviewer sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-release
+          path: |
+            web-ext-artifacts/pboard-${{ steps.package.outputs.version }}.zip
+            web-ext-artifacts/pboard-source.zip
+          if-no-files-found: error
+      - name: Submit update to Mozilla Add-ons
+        if: (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch'
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          if [ -z "$WEB_EXT_API_KEY" ] || [ -z "$WEB_EXT_API_SECRET" ]; then
+            echo "Add AMO_JWT_ISSUER and AMO_JWT_SECRET in repository Actions secrets."
+            exit 1
+          fi
+          npx --no-install web-ext sign --config web-ext-config.cjs \
+            --channel listed --upload-source-code web-ext-artifacts/pboard-source.zip \
+            --approval-timeout 0 --no-input

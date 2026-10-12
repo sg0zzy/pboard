@@ -1,4 +1,5 @@
 import type { GoogleAuthProvider } from "./googleAuth";
+import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -41,7 +42,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     return new Error(`Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
 
-  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true): Promise<Response> {
+  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0): Promise<Response> {
     const token = await auth.getAccessToken(!retry);
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
@@ -49,7 +50,14 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     // by another browser, including when the URL is unchanged between polls.
     const response = await fetcher(input, { ...init, headers,
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
-    if (response.status === 401 && retry) return authorizedFetch(input, init, false);
+    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt);
+    // A transient Google-side failure (internalError, rate limit) usually
+    // clears on a replay; only one-shot methods are replayed.
+    if (!response.ok && DRIVE_TRANSIENT_STATUSES[response.status] && attempt + 1 < DRIVE_TRANSIENT_ATTEMPTS &&
+        isDriveReplayableMethod(init.method)) {
+      await new Promise<void>((resolve) => { setTimeout(resolve, driveRetryDelayMs(attempt, response.headers.get("Retry-After"))); });
+      return authorizedFetch(input, init, retry, attempt + 1);
+    }
     if (!response.ok) throw await requestError(response);
     return response;
   }
