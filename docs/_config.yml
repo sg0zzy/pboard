@@ -1,0 +1,14 @@
+title: Pboard
+description: A browser extension for organizing project notes, links, and images.
+url: https://sg0zzy.github.io
+baseurl: /pboard
+markdown: kramdown
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+exclude:
+  - collaboration.md
+  - collaboration-storage-evaluation.md
+  - rxdb-storage-refactor.md

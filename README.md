@@ -185,4 +185,15 @@ tests/            domain, serialization, messaging, and adapter tests
 
 ## Privacy
 
-See the [Pboard Privacy Policy](PRIVACY.md) for details about local storage, optional Google Drive synchronization, board sharing, retention, and deletion. Pboard saves board content locally first and has no telemetry. Connecting Drive enables asynchronous cloud synchronization; sharing and live collaboration can also transfer board content to authorized collaborators.
+See the [Pboard Privacy Policy](docs/privacy.md) for details about local storage, optional Google Drive synchronization, board sharing, retention, and deletion. Pboard saves board content locally first and has no telemetry. Connecting Drive enables asynchronous cloud synchronization; sharing and live collaboration can also transfer board content to authorized collaborators.
+
+## GitHub Pages
+
+The public homepage and privacy policy are prepared in `docs/`. In the repository's **Settings → Pages**, choose **Deploy from a branch**, select **main** and **/docs**, then save. Commit and push these files before enabling Pages. GitHub builds the Markdown pages using the shared layout and configuration; no extension build is needed.
+
+After deployment, the expected URLs are:
+
+- Homepage: <https://sg0zzy.github.io/pboard/>
+- Privacy policy: <https://sg0zzy.github.io/pboard/privacy/>
+
+Use these URLs for the Google OAuth branding fields after checking they are live. Edit `docs/privacy.md` to update the policy. The technical documents already in `docs/` are excluded from the Pages build. If you configure a custom domain, update `url` and `baseurl` in `docs/_config.yml` to match.

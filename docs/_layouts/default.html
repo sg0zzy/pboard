@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ page.title | escape }} | {{ site.title | escape }}</title>
+    <meta name="description" content="{{ page.description | default: site.description | escape }}">
+    <link rel="stylesheet" href="{{ '/assets/site.css' | relative_url }}">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header>
+      <nav aria-label="Main navigation">
+        <a class="brand" href="{{ '/' | relative_url }}">Pboard</a>
+        <a href="{{ '/privacy/' | relative_url }}">Privacy policy</a>
+        <a href="https://github.com/sg0zzy/pboard">Source code</a>
+      </nav>
+    </header>
+    <main id="content">{{ content }}</main>
+    <footer>
+      <p>Pboard by Stefano Gozzi · <a href="mailto:stefanogozzi@gmail.com">Contact</a> · <a href="{{ '/privacy/' | relative_url }}">Privacy policy</a></p>
+    </footer>
+  </body>
+</html>
