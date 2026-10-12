@@ -185,4 +185,4 @@ tests/            domain, serialization, messaging, and adapter tests
 
 ## Privacy
 
-All project and card data is written to local extension storage first. If the user explicitly connects Google Drive, versioned per-project snapshots are also sent asynchronously to that account's private app-data folder. Pboard has no telemetry. Text and URLs are stored only after the user explicitly invokes a pin action from the toolbar, context menu, shortcut, or address bar.
+See the [Pboard Privacy Policy](PRIVACY.md) for details about local storage, optional Google Drive synchronization, board sharing, retention, and deletion. Pboard saves board content locally first and has no telemetry. Connecting Drive enables asynchronous cloud synchronization; sharing and live collaboration can also transfer board content to authorized collaborators.
