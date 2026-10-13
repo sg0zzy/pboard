@@ -27,7 +27,9 @@ export async function packageNotices(moduleId) {
         const fallbacks = JSON.parse(await readFile(join(fallbackDirectory, "sources.json"), "utf8"));
         const fallback = fallbacks[`${metadata.name}@${metadata.version}`];
         if (!fallback) throw new Error(`Missing license text for bundled dependency ${metadata.name}@${metadata.version}`);
-        documents.push({ name: "LICENSE (recorded fallback)", text: await readFile(join(fallbackDirectory, fallback.file), "utf8") });
+        const text = await readFile(join(fallbackDirectory, fallback.file), "utf8");
+        if (!text.trim()) throw new Error(`Empty license fallback for ${metadata.name}@${metadata.version}`);
+        documents.push({ name: "LICENSE (recorded fallback)", text });
         documents.push({ name: "License source", text: fallback.source });
       }
       return { name: metadata.name, version: metadata.version, license: metadata.license, documents };
@@ -72,6 +74,7 @@ export async function writeLicenseNotices(outputDirectory) {
   }
   let text = "Pboard — third-party licenses and notices\n\n";
   text += "These components retain their respective licenses. Pboard's GPLv3 license is in LICENSE.md.\n";
+  text += "Pboard source code and build instructions: https://github.com/sg0zzy/pboard\n";
   text += "Packages below were included in the production bundles, plus Rolldown's generated runtime helpers.\n\n";
   for (const [key, notices] of [...packages].sort(([a], [b]) => a.localeCompare(b, "en"))) {
     text += `${"=".repeat(72)}\n${key}\nLicense: ${notices.license ?? "See license text"}\n`;
