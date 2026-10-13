@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Node.js 24, selected by `.nvmrc`. `scripts/compile-manifests.sh` checks the major version; `package.json` has no `engines` pin.
+- Node.js 24.15.0 or newer within the 24 series. `.nvmrc` selects major version 24; the lockfile's `jsdom` dependency requires at least 24.15.0. `scripts/compile-manifests.sh` checks only the major version; `package.json` has no `engines` pin.
 - Firefox and/or Chromium for smoke testing, if desired.
 
 ## Quick start
@@ -75,6 +75,143 @@ the tag. Keep the Gecko ID `project-board@local.invalid` unchanged so uploads
 update the existing listing. Alternatively, run the workflow manually with
 the version tag selected; manual runs also submit to AMO. Do not resubmit
 the same version after a successful upload.
+
+## Chrome Web Store submission
+
+Readiness review: 13 October 2026, version 0.9.3. The repository has a GPLv3
+license, README, public homepage, privacy policy, and terms. All three public
+Pages URLs returned HTTP 200 during this review. This does not verify the
+publisher's Chrome Web Store account or Google Cloud production settings.
+
+`npm run release:chromium` passed on Node 24.21.0: strict typechecking, 55
+test files / 383 tests, production Chromium build, and background startup /
+manifest verification. Authenticated Drive tests and manual Chrome UI
+testing were not performed during this review.
+
+### Before submitting
+
+- Deploy the updated `docs/privacy.md` so the public policy includes the
+  Chrome Web Store Limited Use statement as well as the Google API statement.
+- Confirm the Chrome publisher account is registered, its contact email is
+  verified, and two-step verification is enabled.
+- Upload an initial draft to reserve the store extension ID. Confirm the
+  Chromium OAuth client is registered for that ID; its client ID must match
+  `manifest.chromium.json` and `src/sync/googleDriveConfig.ts`. An unpacked
+  build can have a different ID. Follow Chrome's
+  [OAuth setup instructions](https://developer.chrome.com/docs/extensions/how-to/integrate/oauth)
+  to test with the store ID.
+- Confirm the Drive API is enabled, OAuth branding uses the public URLs below,
+  and the consent screen is ready for external production users. Full `drive`
+  access is a restricted scope: complete Google's applicable verification and
+  confirm whether an assessment is required for this data flow. Repository
+  configuration and mocked tests cannot establish approval. See
+  [Drive scope classifications](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
+  and [restricted-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification).
+- Review collaboration authorization before distributing sharing publicly.
+  `src/collab/manager.ts` accepts peers with `isPeerValid: () => true` in both
+  pools. Viewer restrictions apply in the standard local client; receivers
+  do not independently authenticate remote peers or authorize every write.
+  Terms disclose this, but disclosure does not resolve the security gap. See
+  [the collaboration security limits](docs/collaboration.md#authorization-and-security-limits).
+- Prepare at least one real Chrome screenshot (1280×800 or 640×400) and a
+  440×280 small promotional image. The repository contains extension icons,
+  including a correctly sized 128×128 PNG, but no store screenshots or promo
+  image. See [Chrome's image requirements](https://developer.chrome.com/docs/webstore/images).
+- Run `npm ci` with a current Node 24 release, then `npm run release:chromium`.
+  The lockfile's `jsdom` dependency requires Node 24.15.0 or newer within
+  the Node 24 series; selecting major version 24 alone is insufficient.
+- Package **the contents of `dist/chromium/`**, with `manifest.json` at the
+  ZIP root. Do not upload the Firefox artifact or ZIP the enclosing `dist/`
+  directory. There is currently no `package:chromium` command. Include the
+  GPLv3 license and required bundled dependency license/copyright notices
+  in the distributed package; the current build-copy script copies only the
+  manifest and icons. Keep corresponding source and reproducible build
+  instructions available for recipients of each published version.
+- Load the production build in Chrome with the store ID and test local
+  capture, screenshots, copying, restart persistence, Drive connect/reconnect,
+  private sync, incoming shared boards, viewer/editor behavior, and revocation.
+  Repeat Drive tests with a separate account; mocks do not verify these flows.
+- Complete the dashboard's listing, privacy declarations, distribution, and
+  reviewer instructions, then submit the verified ZIP. Choose deferred
+  publishing if you want to review the approved item before making it public.
+
+### Listing text and links
+
+Suggested short description (also used by the manifest):
+
+> Keep a private, structured project state alongside AI conversations.
+
+Suggested listing description:
+
+> Keep project notes, decisions, tasks, links, and images in a Chrome side
+> panel alongside your conversations and web research. Organize cards into
+> project boards, capture selected text, links, images, or a page region, and
+> copy a board as structured text for use in another tool.
+>
+> Boards save on your device first. No Pboard account is required. Connecting
+> Google Drive optionally enables asynchronous backup, synchronization, and
+> board sharing. Connected boards and images are sent to Google; shared boards
+> can also transfer to collaborators through Drive and WebRTC. Full Drive
+> authorization is requested to discover and manage incoming shared boards.
+>
+> Pboard has no advertising, analytics, telemetry, or AI API integration.
+> Capturing or sharing content is under your control. Pboard is open source
+> under GPLv3. See the privacy policy and terms for data handling and current
+> collaboration limitations.
+
+- Homepage: <https://sg0zzy.github.io/pboard/>
+- Privacy policy: <https://sg0zzy.github.io/pboard/privacy/>
+- Terms: <https://sg0zzy.github.io/pboard/terms/>
+- Support: `stefanogozzi@gmail.com`
+- Source: <https://github.com/sg0zzy/pboard>
+
+### Privacy practices and permission justifications
+
+Suggested single purpose: **Organize and capture project reference material
+in persistent sidebar boards, with optional synchronization and sharing.**
+
+| Permission / host | Justification |
+| --- | --- |
+| `storage` | Persist extension settings, synchronization state, and local authorization state; board documents and images also use local IndexedDB. |
+| `contextMenus` | Capture selected text, links, images, and the current page through explicit menu actions. |
+| `clipboardWrite` | Copy cards or a structured board when the user clicks Copy. |
+| `activeTab` | Temporarily access the current page after an extension action, shortcut, or context-menu invocation. |
+| `scripting` | Read requested selections/links and inject the temporary region-capture overlay. |
+| `sidePanel` | Display the project's boards and capture controls alongside the current page. |
+| `identity` | Authorize optional Google Drive sync and sharing after Connect Drive. |
+| `alarms` | Schedule asynchronous uploads after connected boards become dirty. |
+| ChatGPT hosts | Load the bundled selection adapter on the two supported ChatGPT origins. |
+| Google API hosts | Read/write Pboard Drive files and sharing permissions; exchange, refresh, or revoke authorization as appropriate for the browser. |
+| Optional `<all_urls>` | Permit capture on user-chosen sites from the side panel, including region screenshots and inspecting selections/links when temporary access is unavailable. Access is requested through a capture action. |
+
+Select **No remote code**: runtime code is bundled locally; Google requests
+transfer data, and STUN establishes peer connections. Confirm this against
+the final package whenever dependencies or runtime loading change.
+
+Do not claim that no user data is handled simply because storage is local
+first. Match dashboard declarations to `docs/privacy.md`: captured website
+content, source URLs/page titles (the dashboard's web-history category),
+Google/collaborator names and email addresses, and authorization credentials
+are handled. Captured conversations can contain personal communications;
+notes/images can contain other sensitive categories. Review the actual
+dashboard definitions and disclose applicable categories, including optional
+Drive and collaboration transfers. Certify Limited Use only after checking
+the complete behavior. See [Chrome's privacy fields](https://developer.chrome.com/docs/webstore/cws-dashboard-privacy).
+
+### Reviewer instructions
+
+Local features require no account. Open the side panel, create a board and
+card, capture a selection from an ordinary HTTPS page, capture a region,
+copy the board, and restart Chrome to check persistence. Grant optional page
+access only when prompted by capture controls.
+
+For optional features, connect an authorized Google test account, edit a
+board, and check restoration in a second browser with the same account.
+Share a board with a second account and test editor/viewer roles, image
+transfer, member removal, and disconnect/reconnect. Provide any required
+test access through the dashboard's private Test instructions tab; never
+commit credentials to the repository or listing. Explain OAuth verification
+status and the documented collaboration limitations to reviewers.
 
 ## Loading the extension
 

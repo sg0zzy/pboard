@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",
     "package:firefox": "node scripts/verify-build.mjs firefox && web-ext build --config web-ext-config.cjs --overwrite-dest && node scripts/verify-package.mjs",
+    "package:chromium": "node scripts/verify-build.mjs chromium && node scripts/package-chromium.mjs",
     "lint:firefox": "web-ext lint --config web-ext-config.cjs"
   },
   "dependencies": {

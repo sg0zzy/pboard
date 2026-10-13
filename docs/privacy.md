@@ -6,7 +6,7 @@ permalink: /privacy/
 
 # Pboard Privacy Policy
 
-Last updated 12 October 2026
+Last updated 13 October 2026
 
 Publisher: Stefano Gozzi
 
@@ -48,6 +48,8 @@ Pboard creates, reads, updates, and deletes its project snapshots and related fi
 Private backups are stored in your account's application data folder. Enabling live collaboration or sharing a board creates Pboard files in a shared Drive layout. Images belonging to shared boards are transferred through their shared Drive folder.
 
 Pboard's use and transfer of information received from Google APIs adheres to the [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy), including the Limited Use requirements. Google data is used only to provide the features described here. The publisher does not routinely receive or read your Drive or board content.
+
+Pboard's use of user data complies with the [Chrome Web Store User Data Policy](https://developer.chrome.com/docs/webstore/program-policies/policies#protecting-user-privacy), including the Limited Use requirements.
 
 ## Sharing and live collaboration
 

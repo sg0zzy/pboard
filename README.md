@@ -89,7 +89,7 @@ The default repository stores projects, cards, and settings as separate RxDB doc
 - `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, inspect selected text and focused links for the capture toolbar, and inject the short-lived region-capture overlay when region capture is used. The toolbar asks for optional page access if it cannot inspect selected text or links through `activeTab`; Chromium also needs optional access for region screenshots from the side panel.
 - `identity`: run the optional Google OAuth authorization-code flow after an explicit **Connect Drive** action.
 - `alarms`: schedule an optional dirty-project Drive sync after roughly 25 seconds of inactivity.
-- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Firefox region capture uses temporary `activeTab` access; Chromium `<all_urls>` access remains optional and is requested only when the camera is used.
+- Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Firefox region capture uses temporary `activeTab` access. Optional `<all_urls>` access is requested for Chromium region capture and when the sidebar cannot inspect a page's selection or focused link through existing access.
 - Host access to Google OAuth and Drive API endpoints: exchange/refresh the optional OAuth token and persist snapshots in `appDataFolder`; Pboard requests `drive.appdata` for private sync and the full `drive` scope for boards shared by other users (discovery and collaboration on files this account does not own; `drive.file` cannot reliably find incoming invitations).
 
 No browsing-history permission or remote code is used. Unless the user explicitly connects Google Drive, pboard makes no cloud-sync requests. Generic pages receive no persistent content script; the selection shortcut runs only a one-off reader after the user's explicit keypress. The ChatGPT selection-capture content script still loads only on the two supported ChatGPT origins.
@@ -116,7 +116,7 @@ The Firefox build uses the native `sidebar_action`, a toolbar `action` that open
 
 ## Develop and build
 
-Requirements: Node.js 24 (as selected by `.nvmrc`) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions.
+Requirements: Node.js 24.15.0 or newer within the 24 series (`.nvmrc` selects major version 24) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions.
 
 ```bash
 npm install
@@ -192,6 +192,8 @@ tests/            domain, serialization, messaging, and adapter tests
 ## Privacy
 
 See the [Pboard Privacy Policy](docs/privacy.md) for details about local storage, optional Google Drive synchronization, board sharing, retention, and deletion. Pboard saves board content locally first and has no telemetry. Connecting Drive enables asynchronous cloud synchronization; sharing and live collaboration can also transfer board content to authorized collaborators.
+
+The [Terms of Service](docs/terms.md) describe content ownership, optional integrations, and software limitations. The [GPLv3 license](LICENSE.md) governs the software. See [BUILD.md](BUILD.md#chrome-web-store-submission) for the Chrome Web Store release checklist, listing text, and permission justifications.
 
 ## GitHub Pages
 

@@ -2,6 +2,7 @@ import { rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeLicenseNotices } from "./license-notices.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const variant = process.argv[2] === "chromium" ? "chromium" : "firefox";
@@ -17,6 +18,8 @@ for (const config of ["vite.sidebar.config.ts", "vite.background.config.ts", "vi
     stdio: "inherit"
   });
 }
+const count = await writeLicenseNotices(resolve(root, outputDir));
+console.log(`Included licenses and notices for ${count} bundled packages`);
 execFileSync(process.execPath, [resolve(root, "scripts/copy-manifest.mjs"), variant], {
   cwd: root,
   env,

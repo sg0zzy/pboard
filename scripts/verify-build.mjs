@@ -55,6 +55,14 @@ async function verifyVariant(directory, manifest, kind) {
   await assertFile(`${directory}/background.js`);
   await assertFile(`${directory}/content.js`);
   await assertFile(`${directory}/icons/pin.svg`);
+  const license = await readFile(resolve(root, directory, "LICENSE.md"), "utf8");
+  if (license !== await readFile(resolve(root, "LICENSE.md"), "utf8")) {
+    throw new Error(`${kind} build has an outdated GPL license`);
+  }
+  const notices = await readFile(resolve(root, directory, "THIRD-PARTY-NOTICES.txt"), "utf8");
+  if (!notices.includes("Pboard — third-party licenses and notices") || !notices.includes("react@")) {
+    throw new Error(`${kind} build is missing bundled dependency notices`);
+  }
 
   if (manifest.version !== packageMetadata.version) {
     throw new Error(`${kind} build version ${manifest.version} does not match package version ${packageMetadata.version}`);

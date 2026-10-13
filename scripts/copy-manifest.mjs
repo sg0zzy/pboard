@@ -10,6 +10,8 @@ const variant = process.argv[2] ?? "firefox";
 const outputDir = process.env.PBOARD_OUT_DIR ?? "dist";
 const sourceManifest = variant === "chromium" ? "manifest.chromium.json" : "manifest.json";
 
+await copyFile(join(root, "LICENSE.md"), join(root, outputDir, "LICENSE.md"));
+
 await copyFile(
   join(root, sourceManifest),
   join(root, outputDir, "manifest.json")
