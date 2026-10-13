@@ -20,6 +20,7 @@ npm run check        # typecheck + tests + both builds + verify
 | `npm run build:chromium` | Chromium build → `dist/chromium/` |
 | `npm run build:all` | Both variants |
 | `npm run verify:build` | Sanity-checks the built output (files present, manifest matches `package.json`, background bundle runs without Node-only globals) |
+| `npm run package:chromium` | Verify the Chromium build, create `web-ext-artifacts/pboard-chromium-<version>.zip`, and compare every packaged file with the build |
 | `npm run check` | Full gate: `typecheck` + `test` + `build:all` + `verify:build` |
 
 Each variant has a matching release script (`npm run release:firefox`, `release:chromium`, `release:all`) that runs typecheck, tests, build, and verification in one shot.
@@ -122,10 +123,9 @@ testing were not performed during this review.
   the Node 24 series; selecting major version 24 alone is insufficient.
 - Package **the contents of `dist/chromium/`**, with `manifest.json` at the
   ZIP root. Do not upload the Firefox artifact or ZIP the enclosing `dist/`
-  directory. There is currently no `package:chromium` command. Include the
-  GPLv3 license and required bundled dependency license/copyright notices
-  in the distributed package; the current build-copy script copies only the
-  manifest and icons. Keep corresponding source and reproducible build
+  directory. Run `npm run package:chromium` after the release check. Builds
+  include `LICENSE.md` and generated `THIRD-PARTY-NOTICES.txt`; packaging
+  requires both and compares the archive against the build. Keep corresponding source and reproducible build
   instructions available for recipients of each published version.
 - Load the production build in Chrome with the store ID and test local
   capture, screenshots, copying, restart persistence, Drive connect/reconnect,

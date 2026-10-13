@@ -27,7 +27,7 @@ export async function packageNotices(moduleId) {
         const fallbacks = JSON.parse(await readFile(join(fallbackDirectory, "sources.json"), "utf8"));
         const fallback = fallbacks[`${metadata.name}@${metadata.version}`];
         if (!fallback) throw new Error(`Missing license text for bundled dependency ${metadata.name}@${metadata.version}`);
-        documents.push({ name: "LICENSE (upstream)", text: await readFile(join(fallbackDirectory, fallback.file), "utf8") });
+        documents.push({ name: "LICENSE (recorded fallback)", text: await readFile(join(fallbackDirectory, fallback.file), "utf8") });
         documents.push({ name: "License source", text: fallback.source });
       }
       return { name: metadata.name, version: metadata.version, license: metadata.license, documents };

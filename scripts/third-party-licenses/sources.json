@@ -1,0 +1,14 @@
+{
+  "event-reduce-js@6.0.0": {
+    "file": "event-reduce-js-6.0.0.txt",
+    "source": "https://raw.githubusercontent.com/pubkey/event-reduce/52e54b9f5944c35435e8e9dbbbd58c2413294998/LICENSE"
+  },
+  "err-code@3.0.1": {
+    "file": "err-code-3.0.1.txt",
+    "source": "License declaration and author: https://registry.npmjs.org/err-code/3.0.1\nStandard license text: https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt"
+  },
+  "get-browser-rtc@1.1.0": {
+    "file": "get-browser-rtc-1.1.0.txt",
+    "source": "License declaration and author: https://registry.npmjs.org/get-browser-rtc/1.1.0\nStandard license text: https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt"
+  }
+}

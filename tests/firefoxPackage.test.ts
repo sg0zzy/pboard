@@ -44,3 +44,8 @@ it("rejects stale packaged bundles", async () => {
   const { build, archive } = await fixture(false, true);
   await expect(verifyPackage(archive, build)).rejects.toThrow("differs from build: assets/sidebar.js");
 });
+
+it("rejects a Chromium ZIP without license notices even if runtime files match", async () => {
+  const { build, archive } = await fixture();
+  await expect(verifyPackage(archive, build, "Chromium")).rejects.toThrow("missing LICENSE.md");
+});
