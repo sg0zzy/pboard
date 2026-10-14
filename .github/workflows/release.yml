@@ -103,6 +103,10 @@ jobs:
           name: firefox-release
           path: firefox-release
 
+      - name: Read release notes from the tag annotation
+        run: git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --no-tags
+          && git tag -l --format='%(contents)' "${{ github.ref_name }}" | sed '1{/^$/d}' > release-notes.md
+
       - name: List release assets
         run: ls -l firefox-release
 
@@ -113,11 +117,6 @@ jobs:
           name: Pboard ${{ github.ref_name }}
           draft: false
           fail_on_unmatched_files: true
-          body: |
-            Unsigned Firefox extension archive (AMO submission): `firefox-release/pboard-${{ needs.validate.outputs.version }}.zip`.
-            This archive is **unsigned** and not intended for direct installation.
-            Install the published version from <https://addons.mozilla.org/firefox/addon/pboard/> once Mozilla review completes.
-
-            Reviewer sources: `firefox-release/pboard-source.zip`.
-            Reproduction instructions: [BUILD.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/BUILD.md).
+          body_path: release-notes.md
+          append_body: true
           files: firefox-release/*
