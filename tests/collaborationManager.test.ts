@@ -239,6 +239,42 @@ describe("createCollaborationManager", () => {
     expect(await collabRepo.db.projects.findOne(shared.id).exec()).not.toBeNull();
   });
 
+  it("catches up both ways past a full batch of unrelated cards", { timeout: 30000 }, async () => {
+    const firstRepo = await makeRepo();
+    const secondRepo = await makeRepo();
+    const shared = await firstRepo.createProject("Shared");
+    await secondRepo.importProject(shared, []);
+    // Either peer can become master. Put unrelated documents before the shared
+    // cards on both so this fails regardless of the storage-token election.
+    for (const repo of [firstRepo, secondRepo]) {
+      const privateProject = await repo.createProject("Private");
+      const seed = await repo.addItem({ projectId: privateProject.id, content: "Private seed" });
+      const record = (await repo.db.cards.findOne(seed.id).exec())!.toJSON();
+      await repo.db.cards.bulkInsert(Array.from({ length: 100 }, (_, index) => ({
+        ...record, id: `private-${index}`
+      })));
+    }
+    const firstCard = await firstRepo.addItem({ projectId: shared.id, content: "PC catch-up" });
+    const secondCard = await secondRepo.addItem({ projectId: shared.id, content: "Phone catch-up" });
+    const scope = createMemorySignalingScope();
+    const access = { role: "owner" as const, fileId: "catch-up-file" };
+    const first = makeManager(firstRepo, access, firstRepo, scope);
+    const second = makeManager(secondRepo, access, firstRepo, scope);
+    await first.manager.start(shared.id);
+    await second.manager.start(shared.id);
+    await waitUntil(async () =>
+      (await secondRepo.getCard(firstCard.id))?.content === "PC catch-up" &&
+      (await firstRepo.getCard(secondCard.id))?.content === "Phone catch-up"
+    );
+    for (const repo of [firstRepo, secondRepo]) {
+      expect((await repo.db.cards.find().exec()).length).toBe(103);
+    }
+    await firstRepo.updateItem(firstCard.id, { content: "PC live edit" });
+    await waitUntil(async () => (await secondRepo.getCard(firstCard.id))?.content === "PC live edit");
+    await secondRepo.updateItem(secondCard.id, { content: "Phone live edit" });
+    await waitUntil(async () => (await firstRepo.getCard(secondCard.id))?.content === "Phone live edit");
+  });
+
   it("keeps a viewer pull-only: receives remote changes, cannot publish local writes", { timeout: 20000 }, async () => {
     const ownerRepo = await makeRepo();
     const viewerRepo = await makeRepo();

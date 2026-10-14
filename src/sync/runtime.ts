@@ -16,7 +16,7 @@ import type { RxRepository } from "../storage/rxdbRepository";
 import { hashBlob, imageToBlob } from "../storage/blobStore";
 import { createAccountSignalStore } from "./accountSignaling";
 import { createSharedBoardDiscovery } from "./sharedDiscovery";
-import { createSharedProjectSync } from "./sharedSync";
+import { createSharedProjectSync, createSharedProjectRefresh } from "./sharedSync";
 import { createAccountPreferenceSync } from "./accountPreferences";
 import type { GoogleAuthProvider } from "./googleAuth";
 
@@ -180,11 +180,19 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository }:
     getRepository: () => getRepository()
   });
 
+  const refreshFromDrive = createSharedProjectRefresh({
+    connected: driveConnected, permissions: drivePermissions,
+    getRepository: () => getRepository(),
+    isDeleted: async (projectId) => Boolean(await driveTombstones.get(projectId)) ||
+      Boolean(await (await getRepository())?.isDeletedProject(projectId))
+  });
+
   const collaborationManager: CollaborationManager = createCollaborationManager({
     getAccountId: connectedAccountId,
     myRole: async (projectId) => (await driveConnected() ? drivePermissions.myRole(projectId) : null),
     getSharedFileId: async (projectId) => (await driveConnected() ? drivePermissions.projectFileId(projectId) : null),
     bootstrapFromDrive,
+    refreshFromDrive,
     signalingFor: driveSignalingFor,
     imageTransport: {
       readImage: async (projectId, imageId) => {

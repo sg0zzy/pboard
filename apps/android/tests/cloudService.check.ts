@@ -53,6 +53,22 @@ describe('Android foreground sync lifecycle', () => {
     expect(mocks.reconcile).toHaveBeenCalledTimes(2);
     expect(service.state().error).toBe(''); expect(service.state().lastSynced).not.toBe('');
   });
+  it('clears a recovered live error without clearing a separate backup failure', async () => {
+    await service.initialize(); await service.setForeground(true);
+    mocks.live.error = 'Connection failed';
+    service.pollLive();
+    expect(service.state().error).toBe('Connection failed');
+    mocks.live.error = null;
+    service.pollLive();
+    expect(service.state().error).toBe('');
+    mocks.live.error = 'Connection failed';
+    service.pollLive();
+    mocks.reconcile.mockRejectedValueOnce(new Error('Backup unavailable'));
+    await service.sync();
+    mocks.live.error = null;
+    service.pollLive();
+    expect(service.state().error).toBe('Backup unavailable');
+  });
   it('does not start collaboration after a late reconciliation returns from the background', async () => {
     await service.initialize();
     let complete!: () => void;

@@ -15,6 +15,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
   let disposed = false;
   let generation = 0;
   const listeners = new Set<() => void>();
+  let lastLiveError = '';
   let state = { connected: false, busy: false, resolving: false, error: '', role: 'private', peers: 0, lastSynced: '', projectId: null as string | null };
   const emit = (patch: Partial<typeof state>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
   function schedule(delay = 25_000) {
@@ -129,7 +130,10 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
     },
     pollLive() {
       const live = runtime.collaborationManager.state();
-      emit({ peers: live.connectedPeers.length, ...(live.error ? { error: live.error } : {}) });
+      const error = live.error ?? '';
+      emit({ peers: live.connectedPeers.length,
+        ...(error || (lastLiveError && state.error === lastLiveError) ? { error } : {}) });
+      lastLiveError = error;
     },
     async invite(projectId: string, email: string, role: 'editor' | 'viewer') {
       await runtime.drivePermissions.invite(projectId, email, role);
