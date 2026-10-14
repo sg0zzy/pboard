@@ -294,6 +294,59 @@ export async function createRxRepository(options: {
     }
     if (!(await getCurrentProject())) await settings.upsert({ id: "currentProjectId", value: project.id });
   }
+  /** Read-only Drive recovery: merge documents without replacing the board. */
+  async function mergeSharedSnapshot(project: Project, items: BoardItem[], canApply: () => Promise<boolean>) {
+    if (items.some(item => item.projectId !== project.id)) throw new Error("Shared snapshot belongs to a different project");
+    return locked(async () => {
+      const active = async () => await canApply() && !await isDeletedProject(project.id) && Boolean(await getProject(project.id));
+      if (!await active()) return;
+      const existing = await projectCardRecords(project.id, true);
+      let tail = existing.at(-1)?.orderKey ?? null;
+      for (const item of [...items].sort((a, b) => a.order - b.order)) {
+        if (!await active()) return;
+        const { order: _, image, imageId: savedImageId, imageMimeType, imageWidth, imageHeight, ...fields } = item;
+        const imageId = image ? await putImage(image) : savedImageId;
+        if (!await active()) return;
+        let doc = await cards.findOne(item.id).exec();
+        // A v1 snapshot contains no deletion history. Absence cannot prove a
+        // remote deletion, and an old backup must never resurrect a tombstone.
+        if (doc && (doc.projectId !== project.id || doc.deletedAt)) continue;
+        const record: CardRecord = { ...fields,
+          displayMode: normalizeCardDisplayMode(item.displayMode),
+          orderKey: doc?.orderKey ?? orderKeyBetween(tail, null),
+          imageId, imageMimeType: image?.mimeType ?? imageMimeType,
+          imageWidth: image?.width ?? imageWidth, imageHeight: image?.height ?? imageHeight };
+        if (!doc) {
+          try {
+            await cards.insert(record);
+            tail = record.orderKey;
+            continue;
+          } catch (error) {
+            // WebRTC can insert the same card while image bytes are restored.
+            doc = await cards.findOne(item.id).exec();
+            if (!doc) throw error;
+          }
+        }
+        if (Date.parse(doc.updatedAt) >= Date.parse(record.updatedAt)) continue;
+        await doc.incrementalModify(current => {
+          if (current.projectId !== project.id || current.deletedAt || Date.parse(current.updatedAt) >= Date.parse(record.updatedAt)) return current;
+          // Retain live fractional ordering: the Drive v1 export only has ranks.
+          const merged = { ...current, ...record, orderKey: current.orderKey };
+          if (record.title === undefined) delete merged.title;
+          if (record.source === undefined) delete merged.source;
+          return merged;
+        });
+      }
+      if (!await active()) return;
+      const doc = await projects.findOne(project.id).exec();
+      if (!doc || Date.parse(doc.updatedAt) >= Date.parse(project.updatedAt)) return;
+      await doc.incrementalModify(current => {
+        if (Date.parse(current.updatedAt) >= Date.parse(project.updatedAt)) return current;
+        return { ...current, ...project, orderKey: current.orderKey, tailOrderKey: tail && (!current.tailOrderKey || tail > current.tailOrderKey) ? tail : current.tailOrderKey };
+      });
+    });
+  }
+
   async function importState(state: AppState) {
     const incomingProjectIds = new Set(state.projects.map((project) => project.id));
     for (const project of await allProjectRecords()) if (!incomingProjectIds.has(project.id)) await removeProject(project.id);
@@ -602,7 +655,7 @@ export async function createRxRepository(options: {
     subscribe(cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }), () => listCards(projectId), listener);
   const subscribeCard = (id: string, listener: (value: BoardItem | null) => void) => subscribe(cards.findOne(id), () => getCard(id), listener);
   async function load(): Promise<AppState> { return exportAll(); } // Compatibility for old command callers; not a reactive read path.
-  return { db, blobs, load, exportAll, exportProject, importProject, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
+  return { db, blobs, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
     createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, renameProject, deleteProject, changeProjectTemplate,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,

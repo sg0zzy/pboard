@@ -1,0 +1,41 @@
+{
+  "name": "pboard-android",
+  "version": "0.10.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "test": "vitest run",
+    "sync": "npm run build && cap sync android",
+    "android:run": "npm run sync && cap run android",
+    "android:debug": "npm run sync && cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.3",
+    "@capacitor/app": "8.1.2",
+    "@capacitor/camera": "8.2.5",
+    "@capacitor/clipboard": "8.0.1",
+    "@capacitor/core": "8.5.3",
+    "dexie": "4.4.6",
+    "fflate": "0.8.3",
+    "fractional-indexing": "3.4.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "rxdb": "17.5.0",
+    "rxjs": "7.8.2",
+    "simple-peer": "9.11.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^30.0.1",
+    "typescript": "^7.0.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  }
+}

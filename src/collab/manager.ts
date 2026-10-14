@@ -7,6 +7,7 @@ import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSc
 import type { PboardSignaling } from "./signaling";
 import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
+import { scopeMasterChanges } from "./scopedPull";
 import { createProjectImageSync, type SharedImageTransport } from "./imageSync";
 
 /**
@@ -42,6 +43,8 @@ export interface CollaborationManagerOptions {
    * happened. Called at most once per start().
    */
   bootstrapFromDrive: (projectId: string) => Promise<boolean>;
+  /** Read-only Drive catch-up shared by the project's reconnecting rooms. */
+  refreshFromDrive?: (projectId: string, isActive: () => boolean) => Promise<void>;
   /**
    * Build the signaling provider for one collection room. The manager calls this
    * once per collection with the topic, so the transport is swappable (Drive for
@@ -105,6 +108,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   let startedRepo: RxRepository | null = null;
   type SharedPool = RxWebRTCReplicationPool<CardRecord, PboardPeer> | RxWebRTCReplicationPool<ProjectRecord, PboardPeer> | RxWebRTCReplicationPool<SettingRecord, PboardPeer>;
   const pools: SharedPool[] = [];
+  let sessionGeneration = 0;
+  let recovery: Promise<void> | null = null;
   let imageSync: ReturnType<typeof createProjectImageSync> | null = null;
 
   function collectPeers(): string[] {
@@ -122,6 +127,15 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     ref: RxCollection<T>
   ): Promise<void> {
     const editable = isEditorRole(role);
+    const generation = sessionGeneration;
+    const beforeReconnect = async () => {
+      const isActive = () => generation === sessionGeneration && startedProjectId === projectId;
+      if (!isActive() || !options.refreshFromDrive) return;
+      recovery ??= options.refreshFromDrive(projectId, isActive).finally(() => {
+        if (generation === sessionGeneration) recovery = null;
+      });
+      await recovery;
+    };
     // Scope the room to this shared project. Cards carry `projectId`; the project
     // doc is keyed by id.
     const scopeProjectDoc = (doc: unknown): boolean => {
@@ -129,12 +143,13 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       if (collection === "cards") return "projectId" in doc && doc.projectId === projectId;
       return "id" in doc && doc.id === projectId;
     };
-    const pool = (await replicateWebRTC({
+    const pool = await replicateWebRTC<T, PboardPeer>({
       collection: ref,
       topic: topicFor(projectId, collection),
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
         signaling: options.signalingFor(topicFor(projectId, collection)),
         scopeDocument: scopeProjectDoc,
+        beforeReconnect,
         ...(options.wrtc ? { wrtc: options.wrtc } : {})
       }),
       isPeerValid: () => true,
@@ -142,8 +157,9 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       // drop documents via a modifier — a null would crash persistFromMaster).
       pull: { batchSize: 100 },
       ...(editable ? { push: { batchSize: 100, modifier: (doc: WithDeleted<T>) => (scopeProjectDoc(doc) ? doc : null) } } : {})
-    })) as SharedPool;
-    pools.push(pool);
+    });
+    scopeMasterChanges(pool.masterReplicationHandler, scopeProjectDoc);
+    pools.push(pool as SharedPool);
     pool.subs.push(pool.error$.subscribe((err) => {
       error = String(err.parameters?.errorText ?? err.message ?? err);
     }));
@@ -174,6 +190,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       pull: { batchSize: 100 },
       push: { batchSize: 100, modifier: (doc) => scoped(doc) ? doc : null }
     });
+    scopeMasterChanges(pool.masterReplicationHandler, scoped);
     pools.push(pool);
     pool.subs.push(pool.error$.subscribe((err) => { error = String(err.parameters?.errorText ?? err.message ?? err); }));
   }
@@ -217,6 +234,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   }
 
   async function doStop(): Promise<void> {
+    ++sessionGeneration;
+    recovery = null;
     await imageSync?.stop();
     imageSync = null;
     while (pools.length > 0) await (pools.pop() as SharedPool).cancel();

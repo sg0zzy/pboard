@@ -40,6 +40,8 @@ export type PboardWebRTCConnectionOptions = {
    * scoped separately by the replication push modifier.
    */
   scopeDocument?: (doc: unknown) => boolean;
+  /** Await a read-only recovery step after the cooldown, before replacing a failed peer. */
+  beforeReconnect?: () => Promise<void>;
 };
 
 type HandshakeState = {
@@ -96,7 +98,7 @@ function markApplied(state: HandshakeState, type: string | null): void {
 // `options`, so the argument is optional for direct use. The zero-arg form still
 // satisfies `WebRTCConnectionHandlerCreator<PboardPeer>`.
 export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnectionOptions): () => Promise<WebRTCConnectionHandler<PboardPeer>> {
-  const { signaling, wrtc, config, trickle = false, scopeDocument } = options;
+  const { signaling, wrtc, config, trickle = false, scopeDocument, beforeReconnect } = options;
   // The master streams its whole collection; a received response may carry docs
   // from projects outside this room. Drop them here so they never reach RxDB's
   // pull persist (a `null` pull modifier would instead crash it).
@@ -118,11 +120,12 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     const peers = new Map<string, PboardPeer>();
     const pendingSignals = new Map<string, unknown[]>();
     const handshake = new Map<string, HandshakeState>();
+    const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
     let closed = false;
     let ownPeerId: string | null = null;
 
     function createPeerConnection(remotePeerId: string) {
-      if (closed || !ownPeerId || remotePeerId === ownPeerId || peers.has(remotePeerId)) return;
+      if (closed || !ownPeerId || remotePeerId === ownPeerId || peers.has(remotePeerId) || reconnectTimers.has(remotePeerId)) return;
       let disconnected = false;
       const peer = new Peer({ initiator: remotePeerId > ownPeerId, wrtc, config, trickle }) as PboardPeer;
       peer.id = remotePeerId;
@@ -130,32 +133,60 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       const state: HandshakeState = { initiator: remotePeerId > ownPeerId, jsepState: "new" };
       handshake.set(remotePeerId, state);
       peer.on("signal", (signal) => {
+        if (closed || peers.get(remotePeerId) !== peer) return;
         const type = signalType(signal);
         if (type === "offer") state.jsepState = "have-local-offer";
         else if (type === "answer" || type === "pranswer") state.jsepState = "stable";
         void signaling.sendSignal(remotePeerId, signal).catch((error) => {
-          error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+          if (!closed && peers.get(remotePeerId) === peer) {
+            error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+          }
         });
       });
       peer.on("data", (payload) => {
+        if (closed || peers.get(remotePeerId) !== peer) return;
         const parsed = JSON.parse(payload.toString());
         if (parsed && typeof parsed === "object" && "result" in parsed) response$.next({ peer, response: { ...parsed, result: scopeResult(parsed.result) } });
         else message$.next({ peer, message: parsed });
       });
       peer.on("error", (error) => {
-        error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+        if (closed || peers.get(remotePeerId) !== peer) return;
+        // SCTP reports this when the other endpoint closes its data channel.
+        // Still recreate the connection, but do not present an orderly close
+        // as a collaboration failure. Other OperationErrors remain visible.
+        if (!/User-Initiated Abort.*reason=Close called/i.test(String(error))) {
+          error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+        }
         peer.destroy();
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
       });
       peer.on("connect", () => {
-        connect$.next(peer);
+        if (!closed && peers.get(remotePeerId) === peer) connect$.next(peer);
       });
       peer.on("close", () => {
+        if (closed || peers.get(remotePeerId) !== peer) return;
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
         if (peers.get(remotePeerId) === peer) peers.delete(remotePeerId);
         pendingSignals.delete(remotePeerId);
         handshake.delete(remotePeerId);
-        createPeerConnection(remotePeerId);
+        // Keep roster updates from bypassing the cooldown, and buffer valid
+        // incoming signals until the replacement peer is created.
+        reconnectTimers.set(remotePeerId, setTimeout(() => {
+          // Keep the timer entry until Drive finishes so roster updates cannot
+          // bypass recovery. Shutdown invalidates this attempt without waiting
+          // for an in-flight HTTP request.
+          void (async () => {
+            try { await beforeReconnect?.(); }
+            catch (error) {
+              if (!closed) error$.next(newRxError("RC_WEBRTC_PEER", {
+                errorText: `Drive refresh before reconnect failed: ${String(error)}`
+              }));
+            }
+            if (closed) return;
+            reconnectTimers.delete(remotePeerId);
+            createPeerConnection(remotePeerId);
+          })();
+        }, 2_000));
       });
       const buffered = pendingSignals.get(remotePeerId);
       if (buffered) {
@@ -207,6 +238,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         ownPeerId = peerId;
         for (const id of new Set([...initial, ...latestRoster])) createPeerConnection(id);
       } catch (error) {
+        if (closed) return;
         error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
       }
     })();
@@ -218,6 +250,8 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       },
       async close() {
         closed = true;
+        for (const timer of reconnectTimers.values()) clearTimeout(timer);
+        reconnectTimers.clear();
         for (const peer of peers.values()) peer.destroy();
         handshake.clear();
         peers.clear();

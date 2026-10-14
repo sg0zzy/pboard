@@ -41,3 +41,22 @@ export function createSharedProjectSync(options: {
     return "pushed";
   };
 }
+
+/** Pull only: retain pending uploads and merge newer saved documents before WebRTC recovery. */
+export function createSharedProjectRefresh(options: {
+  connected: () => Promise<boolean>;
+  permissions: Pick<DrivePermissionService, "myRole" | "readSharedSnapshot">;
+  getRepository: () => Promise<Pick<RxRepository, "mergeSharedSnapshot"> | null>;
+  isDeleted: (projectId: string) => Promise<boolean>;
+}) {
+  return async (projectId: string, isActive: () => boolean): Promise<void> => {
+    if (!isActive() || !await options.connected() || await options.isDeleted(projectId)) return;
+    if (!await options.permissions.myRole(projectId)) throw new Error("You no longer have access to this shared project");
+    const snapshot = deserializeProjectSnapshot(await options.permissions.readSharedSnapshot(projectId));
+    if (snapshot.project.id !== projectId) throw new Error("Shared snapshot belongs to a different project");
+    const rx = await options.getRepository();
+    if (!rx || !isActive()) return;
+    await rx.mergeSharedSnapshot(snapshot.project, snapshot.items, async () =>
+      isActive() && !await options.isDeleted(projectId));
+  };
+}
