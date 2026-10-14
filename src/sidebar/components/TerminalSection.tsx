@@ -1,7 +1,6 @@
 import type { MouseEvent, ReactNode } from "react";
 import type { BoardItemStatus } from "../../types";
-import { TrashIcon } from "./Card";
-import { CopyIcon } from "./CopyIcon";
+import { CopyIcon, TrashIcon } from "./icons";
 
 type TerminalStatus = Extract<BoardItemStatus, "done" | "rejected" | "trash">;
 

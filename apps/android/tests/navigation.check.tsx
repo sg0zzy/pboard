@@ -108,12 +108,12 @@ describe('mobile navigation and editing', () => {
     expect(storage.update).toHaveBeenCalledExactlyOnceWith('card', { content: card.content.replace('[ ] Ship', '[x] Ship') });
     expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
     await click('Actions for card 1');
-    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('dialog button')].find(button => button.textContent === 'Expanded')!.click());
+    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('dialog button')].find(button => button.textContent === 'Expanded view')!.click());
     expect(storage.update).toHaveBeenLastCalledWith('card', { displayMode: 'expanded' });
     expect(host.querySelector('[data-card-id]')?.classList.contains('display-mode-expanded')).toBe(true);
     expect(host.querySelector('.project-fingerprint')).not.toBeNull();
     storage.update.mockClear(); await click('Actions for card 1');
-    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('dialog button')].find(button => button.textContent === 'Expanded')!.click());
+    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('dialog button')].find(button => button.textContent === 'Expanded view')!.click());
     expect(storage.update).not.toHaveBeenCalled();
   });
   it('moves terminal statuses into containers, trashes whole sections and confirms board-scoped emptying', async () => {

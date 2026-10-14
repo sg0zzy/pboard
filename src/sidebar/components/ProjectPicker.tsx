@@ -1,6 +1,7 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { Project } from "../../types";
 import { reorderAtTarget, type DropPosition } from "../reorder";
+import { CheckIcon, ChevronDownIcon, DragHandleIcon } from "./icons";
 
 type Props = {
   projects: Project[];
@@ -99,7 +100,7 @@ export function ProjectPicker({ projects, currentProjectId, onSelect, onReorder 
           }
         }}
       >
-        <span>{currentProject?.name}</span><span className="project-picker-chevron" aria-hidden="true">⌄</span>
+        <span>{currentProject?.name}</span><span className="project-picker-chevron" aria-hidden="true"><ChevronDownIcon /></span>
       </button>
       {open && (
         <div className="project-picker-menu" role="listbox" aria-label="Projects">
@@ -135,9 +136,9 @@ export function ProjectPicker({ projects, currentProjectId, onSelect, onReorder 
                   setDropTarget(null);
                 }}
               >
-                <span className="project-picker-handle" aria-hidden="true">≡</span>
+                <span className="project-picker-handle" aria-hidden="true"><DragHandleIcon /></span>
                 <span>{project.name}</span>
-                {project.id === currentProjectId && <span className="project-picker-check" aria-hidden="true">✓</span>}
+                {project.id === currentProjectId && <span className="project-picker-check" aria-hidden="true"><CheckIcon /></span>}
               </button>
             );
           })}

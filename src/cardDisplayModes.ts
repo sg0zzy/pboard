@@ -4,12 +4,11 @@ export const DEFAULT_CARD_DISPLAY_MODE: CardDisplayMode = "standard";
 
 export const CARD_DISPLAY_MODE_DEFINITIONS: ReadonlyArray<{
   id: CardDisplayMode;
-  icon: string;
   label: string;
 }> = [
-  { id: "compact", icon: "─", label: "Compact" },
-  { id: "standard", icon: "▫", label: "Standard" },
-  { id: "expanded", icon: "□", label: "Expanded" }
+  { id: "compact", label: "Compact view" },
+  { id: "standard", label: "Standard view" },
+  { id: "expanded", label: "Expanded view" }
 ];
 
 export function normalizeCardDisplayMode(value: unknown): CardDisplayMode {

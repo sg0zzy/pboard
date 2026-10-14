@@ -1,0 +1,123 @@
+name: Firefox AMO release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate tagged Firefox build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check tag against manifest version and extension ID
+        run: node scripts/verify-release-tag.mjs "${{ github.ref_name }}"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build Firefox extension
+        env:
+          VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET: ${{ secrets.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET }}
+        run: npm run build
+
+      - name: Lint production Firefox output
+        run: npm run lint:firefox
+
+      - name: Package and verify the upload contents
+        id: package
+        run: npm run package:firefox
+
+      - name: Verify release assets
+        run: node scripts/verify-release-assets.mjs
+
+      - name: Read version for later jobs
+        id: release
+        run: |
+          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Archive reviewer sources
+        run: |
+          git archive --format=zip --output="web-ext-artifacts/pboard-source.zip" HEAD \
+            .nvmrc .env.example package.json package-lock.json tsconfig.json \
+            manifest.json manifest.chromium.json sidebar.html \
+            vite.sidebar.config.ts vite.background.config.ts vite.content.config.ts \
+            web-ext-config.cjs src scripts icons BUILD.md LICENSE.md README.md
+
+      - name: Save unsigned extension and reviewer sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-release
+          if-no-files-found: error
+          path: |
+            web-ext-artifacts/pboard-${{ steps.release.outputs.version }}.zip
+            web-ext-artifacts/pboard-source.zip
+
+      - name: Submit new version to Mozilla Add-ons
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+        run: |
+          if [ -z "$WEB_EXT_API_KEY" ] || [ -z "$WEB_EXT_API_SECRET" ]; then
+            echo "::error::AMO_API_KEY and AMO_API_SECRET repository secrets are required."
+            exit 1
+          fi
+          npx --no-install web-ext sign --config web-ext-config.cjs \
+            --channel listed --upload-source-code web-ext-artifacts/pboard-source.zip --no-input
+
+  github-release:
+    name: Publish GitHub release
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: firefox-release
+          path: firefox-release
+
+      - name: List release assets
+        run: ls -l firefox-release
+
+      - name: Create GitHub release for the tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag: ${{ github.ref_name }}
+          name: Pboard ${{ github.ref_name }}
+          draft: false
+          fail_on_unmatched_files: true
+          body: |
+            Unsigned Firefox extension archive (AMO submission): `firefox-release/pboard-${{ needs.validate.outputs.version }}.zip`.
+            This archive is **unsigned** and not intended for direct installation.
+            Install the published version from <https://addons.mozilla.org/firefox/addon/pboard/> once Mozilla review completes.
+
+            Reviewer sources: `firefox-release/pboard-source.zip`.
+            Reproduction instructions: [BUILD.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/BUILD.md).
+          files: firefox-release/*

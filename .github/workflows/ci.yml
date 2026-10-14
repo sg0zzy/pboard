@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  firefox:
+    name: Firefox extension checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build Firefox extension
+        env:
+          VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET: ${{ secrets.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET }}
+        run: npm run build
+
+      - name: Lint production Firefox output
+        run: npm run lint:firefox
+
+      - name: Verify build output
+        run: node scripts/verify-build.mjs firefox
+
+      - name: Package and verify the archive
+        run: npm run package:firefox
+
+      - name: Verify release assets exist
+        run: node scripts/verify-release-assets.mjs
+
+  android:
+    name: Android frontend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/android/package-lock.json
+
+      - name: Install Android dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build Android frontend
+        run: npm run build

@@ -1,6 +1,7 @@
 import { type CSSProperties, type KeyboardEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { STATUS_DEFINITIONS, statusClassName } from "../../statuses";
 import type { BoardItemStatus } from "../../types";
+import { ChevronDownIcon, ChevronUpIcon } from "./icons";
 
 const statusDefinitions = STATUS_DEFINITIONS;
 const MENU_GUTTER = 8;
@@ -150,7 +151,7 @@ export function StatusPicker({ value, onChange, disabled = false }: Props) {
       >
         <span aria-hidden={!open}>{current.symbol} {current.label}</span>
         <span aria-hidden="true" className="status-picker-chevron">
-          {open ? "∧" : "⌄"}
+          {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
         </span>
       </button>
       {open && (

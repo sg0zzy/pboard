@@ -15,8 +15,7 @@ import { Card } from "./components/Card";
 import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
-import { CopyIcon } from "./components/CopyIcon";
-import { DownloadIcon } from "./components/DownloadIcon";
+import { CloseIcon, CopyIcon, DownloadIcon, EditIcon, NewProjectIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
 import { CaptureToolbar } from "./components/CaptureToolbar";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
@@ -816,7 +815,7 @@ export function App() {
               title="Decrease board font size"
               disabled={uiScale === UI_SCALE_STEPS[0]}
               onClick={() => changeUiScale(-1)}
-            >−</button>
+            ><ZoomOutIcon /></button>
             <output className="scale-value" aria-label="Current board size" aria-live="polite">
               {Math.round(uiScale * 100)}%
             </output>
@@ -826,7 +825,7 @@ export function App() {
               title="Increase board font size"
               disabled={uiScale === UI_SCALE_STEPS[UI_SCALE_STEPS.length - 1]}
               onClick={() => changeUiScale(1)}
-            >+</button>
+            ><ZoomInIcon /></button>
           </div>
         </div>
         <div className="project-row">
@@ -881,7 +880,7 @@ export function App() {
               onClick={renamingProject ? cancelProjectRename : beginProjectRename}
             ><EditIcon /></button>
           )}
-          {currentProject && <button className="icon-button danger" aria-label="Delete project" title="Delete project" onClick={requestProjectDeletion}>×</button>}
+          {currentProject && <button className="icon-button danger" aria-label="Delete project" title="Delete project" onClick={requestProjectDeletion}><CloseIcon /></button>}
         </div>
         {currentProject && (
           <div className="board-summary-row">
@@ -1040,22 +1039,6 @@ function DropPlaceholder({
     >
       <span>Drop here</span>
     </div>
-  );
-}
-
-function NewProjectIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M3.75 6.25h6l1.5 2h9v10h-17zM12.5 13.25h5m-2.5-2.5v5" />
-    </svg>
-  );
-}
-
-function EditIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="m5 16.75-.5 3 3-.5L18.25 8.5l-2.5-2.5L5 16.75Zm8.75-8.75 2.5 2.5" />
-    </svg>
   );
 }
 

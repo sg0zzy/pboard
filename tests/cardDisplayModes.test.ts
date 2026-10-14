@@ -18,11 +18,11 @@ describe("card display modes", () => {
     expect(nextCardDisplayMode("expanded")).toBe("compact");
   });
 
-  it("uses height-oriented icons with accessible labels", () => {
+  it("uses height-oriented modes with accessible labels", () => {
     expect(CARD_DISPLAY_MODE_DEFINITIONS).toEqual([
-      { id: "compact", icon: "─", label: "Compact" },
-      { id: "standard", icon: "▫", label: "Standard" },
-      { id: "expanded", icon: "□", label: "Expanded" }
+      { id: "compact", label: "Compact view" },
+      { id: "standard", label: "Standard view" },
+      { id: "expanded", label: "Expanded view" }
     ]);
   });
 });

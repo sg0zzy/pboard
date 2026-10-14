@@ -10,7 +10,7 @@ import { toSafeWebHref } from "../linkify";
 import { MarkdownContent, MarkdownInline, setTaskCheckedAtLine } from "../markdown";
 import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag";
 import type { DropPosition } from "../reorder";
-import { CopyIcon } from "./CopyIcon";
+import { CheckIcon, CopyIcon, DragHandleIcon, TrashIcon } from "./icons";
 import { CategoryPicker } from "./CategoryPicker";
 import { CardDisplayModeControls } from "./CardDisplayModeControls";
 import { StatusPicker } from "./StatusPicker";
@@ -442,7 +442,7 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
        onDoubleClick={() => { if (!editing) startEditing(); }}
     >
       <div className="card-topline" onDoubleClick={(event) => event.stopPropagation()}>
-        <span className="drag-handle" title="Drag to reorder · Press Shift to merge" aria-label="Drag to reorder; press Shift to merge">≡</span>
+        <span className="drag-handle" title="Drag to reorder · Press Shift to merge" aria-label="Drag to reorder; press Shift to merge"><DragHandleIcon /></span>
         {templateDefinition.showTypeSelector && (
           <CategoryPicker
             cardTypes={templateDefinition.cardTypes}
@@ -540,20 +540,4 @@ function autoScrollForPointer(clientY: number) {
   const speed = 10;
   if (clientY < edge) window.scrollBy(0, -speed);
   else if (clientY > window.innerHeight - edge) window.scrollBy(0, speed);
-}
-
-export function TrashIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4.75 7.25h14.5M9 7.25V4.75h6v2.5m-8.5 0 .75 12h9.5l.75-12M10 10v6.5m4-6.5v6.5" />
-    </svg>
-  );
-}
-
-function CheckIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="m5.5 12.5 4 4 9-9" />
-    </svg>
-  );
 }

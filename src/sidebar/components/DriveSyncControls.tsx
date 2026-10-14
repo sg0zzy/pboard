@@ -7,6 +7,7 @@ import {
   projectSyncStorageKey,
   type DriveProjectSyncState
 } from "../../sync/state";
+import { ChevronDownIcon, ChevronUpIcon, CloudIcon, SyncIcon } from "../components/icons";
 
 type Props = { projectId: string | null; onConnectionChanged?: () => void };
 
@@ -113,12 +114,4 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
       <span className="visually-hidden" role="status">{statusText}</span>
     </div>
   );
-}
-
-function CloudIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18h10a4 4 0 0 0 .4-8A5.5 5.5 0 0 0 7 8.5 4.75 4.75 0 0 0 7 18Z" /></svg>;
-}
-
-function SyncIcon() {
-  return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 7v5h-5M5 17v-5h5M7.1 8.3A6 6 0 0 1 17.7 10M16.9 15.7A6 6 0 0 1 6.3 14" /></svg>;
 }
