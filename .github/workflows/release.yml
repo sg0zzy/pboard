@@ -104,8 +104,9 @@ jobs:
           path: firefox-release
 
       - name: Read release notes from the tag annotation
-        run: git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --no-tags
-          && git tag -l --format='%(contents)' "${{ github.ref_name }}" | sed '1{/^$/d}' > release-notes.md
+        run: |
+          git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --no-tags
+          git tag -l --format='%(contents)' "${{ github.ref_name }}" > release-notes.md
 
       - name: List release assets
         run: ls -l firefox-release
