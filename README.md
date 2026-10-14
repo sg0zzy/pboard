@@ -117,7 +117,7 @@ The Firefox build uses the native `sidebar_action`, a toolbar `action` that open
 
 ## Develop and build
 
-Requirements: Node.js 24.15.0 or newer within the 24 series (`.nvmrc` selects major version 24) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions.
+Requirements: Node.js 24.15.0 or newer within the 24 series (`.nvmrc` selects major version 24) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions and [RELEASE.md](RELEASE.md) for automated AMO releases and required GitHub secrets.
 
 ```bash
 npm install

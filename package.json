@@ -1,6 +1,6 @@
 {
   "name": "pboard",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "private": true,
   "type": "module",
   "scripts": {
@@ -19,7 +19,7 @@
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",
     "package:firefox": "node scripts/verify-build.mjs firefox && web-ext build --config web-ext-config.cjs --overwrite-dest && node scripts/verify-package.mjs",
     "package:chromium": "node scripts/verify-build.mjs chromium && node scripts/package-chromium.mjs",
-    "lint:firefox": "web-ext lint --config web-ext-config.cjs"
+    "lint:firefox": "web-ext lint --config web-ext-lint-config.cjs --warnings-as-errors"
   },
   "dependencies": {
     "dexie": "^4.4.6",

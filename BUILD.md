@@ -50,19 +50,22 @@ than a previous artifact. Version 0.9.2 on AMO was missing all `assets/*.js`
 because the old packaging configuration excluded them; temporary installation
 from `dist/` bypassed that exclusion. Version 0.9.3 fixes the packaging.
 
-The workflow `.github/workflows/firefox-release.yml` runs tests, a Firefox
-build, Mozilla lint, and archive verification on pull requests and pushes to
-`main`. Publishing a stable GitHub Release automatically submits the matching
-version to the existing AMO listing, including reviewer sources. Prereleases
-build artifacts without submitting to AMO. Mozilla review can delay public
-availability; a successful workflow means the version was submitted.
+The workflow `.github/workflows/release.yml` submits a new version to the existing
+AMO listing when a tag `v*.*.*` (e.g. `v0.9.5`) is pushed; it validates, builds,
+lints, packages, and archives reviewer sources first, then submits with
+`--channel=listed` and `--upload-source-code`, and attaches the unsigned archive
+plus reviewer sources to a GitHub Release. `.github/workflows/ci.yml` runs tests,
+a Firefox build, Mozilla lint, and archive verification on pull requests and
+pushes to `main` without contacting AMO. A successful workflow means the version
+was submitted, not approved by Mozilla. See [RELEASE.md](RELEASE.md) for
+credentials, tagging, and recovery from failed submissions.
 
-One-time setup:
+One-time setup (detailed in [RELEASE.md](RELEASE.md#1-configure-github-secrets-once)):
 
 1. Generate API credentials for the Mozilla account that owns Pboard at
    https://addons.mozilla.org/en-US/developers/addon/api/key/.
 2. In GitHub → Settings → Secrets and variables → Actions, add repository
-   secrets `AMO_JWT_ISSUER` (JWT issuer/API key) and `AMO_JWT_SECRET` (JWT secret).
+   secrets `AMO_API_KEY` (JWT issuer/API key) and `AMO_API_SECRET` (JWT secret).
 3. If the Firefox Drive OAuth build needs the optional credential, also add
    `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`. This value is embedded in the
    extension, as explained in `.env.example`; AMO credentials are used only
@@ -70,12 +73,12 @@ One-time setup:
 
 For each release, update `package.json`, the root package versions in
 `package-lock.json`, both manifests, and `tests/releaseMetadata.test.ts` to the
-same unused version. Commit and push the changes, tag that commit as
-`v<version>` (first fixed release: `v0.9.3`), and publish a GitHub Release for
-the tag. Keep the Gecko ID `project-board@local.invalid` unchanged so uploads
-update the existing listing. Alternatively, run the workflow manually with
-the version tag selected; manual runs also submit to AMO. Do not resubmit
-the same version after a successful upload.
+same unused version. Commit and push the changes, then tag that commit as
+`v<version>` (annotated tag, e.g. `v0.9.5`) and push the tag: the release
+workflow runs the validation above and submits the matching version to the
+existing AMO listing. Keep the Gecko ID `project-board@local.invalid` unchanged
+so uploads update the existing listing. Do not resubmit the same version after
+a successful upload; do not force-push or move tags.
 
 ## Chrome Web Store submission
 
@@ -301,12 +304,15 @@ identical JS bundles (Vite production build hashes are content-derived).
 ## 5. Known deviation when rebuilt without secrets
 
 If a `.env.local` with `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET` was
-present at the original build, the Google OAuth secret is embedded in the
-Firefox `sidebar` bundle (`dist/assets/sidebar-*.js`). Rebuilding from the
-AMO source archive — which deliberately omits `.env.local` — produces the
-same bundle except that one string is empty (`dt=```). Every other file
-(`manifest.json`, `content.js`, `background.js`, remaining `assets/*`,
-`sidebar.html` apart from the inline asset hash) hashes identically; the
-sidebar asset's content hash changes because that single string changed.
+present at the original build, the Google OAuth secret is embedded in two
+bundles: the Firefox `sidebar` bundle (`dist/assets/sidebar-*.js`) and the
+background bundle (`dist/background.js`, the Firefox-only `client_secret`
+used for token exchange). Rebuilding from the AMO source archive — which
+deliberately omits `.env.local` — produces the same files except that the
+secret string is empty in both bundles. The differences are therefore:
+`background.js` (secret string only), the sidebar asset's content hash
+(because that one string changed), and the inline asset hash in
+`sidebar.html` (pointing at the renamed sidebar asset). Every other file
+(`manifest.json`, `content.js`, remaining `assets/*`) hashes identically.
 This is expected and documented behavior: the secret is an optional
 build-time input (see `.env.example`), not part of the reviewed source.
