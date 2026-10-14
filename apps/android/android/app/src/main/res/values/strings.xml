@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">pboard</string>
+    <string name="title_activity_main">pboard</string>
+    <string name="package_name">it.stefanogozzi.pboard</string>
+    <string name="custom_url_scheme">it.stefanogozzi.pboard</string>
+</resources>
