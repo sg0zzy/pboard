@@ -6,7 +6,7 @@ import { OPEN_PBOARD_SHORTCUT } from "../src/background/shortcuts";
 
 describe("release metadata", () => {
   it("keeps package and browser manifest versions aligned", () => {
-    expect(packageMetadata.version).toBe("0.9.4");
+    expect(packageMetadata.version).toBe("0.9.5");
     expect(firefoxManifest.version).toBe(packageMetadata.version);
     expect(chromiumManifest.version).toBe(packageMetadata.version);
   });

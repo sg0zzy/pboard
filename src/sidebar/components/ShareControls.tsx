@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import type { Collaborator, DrivePermissionService, PboardRole } from "../../sync/drivePermissions";
+import { CloseIcon, PeopleIcon } from "./icons";
 
 type Props = {
   projectId: string | null;
@@ -114,7 +115,7 @@ export function ShareControls({ projectId, permissions, onAccessChanged, liveSta
           <div className="share-dialog-head">
             <strong>Share project</strong>
             <button type="button" className="text-button" aria-label="Close share dialog" onClick={() => setOpen(false)}>
-              ×
+              <CloseIcon />
             </button>
           </div>
 
@@ -203,13 +204,5 @@ export function ShareControls({ projectId, permissions, onAccessChanged, liveSta
         </div>
       )}
     </>
-  );
-}
-
-function PeopleIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M9 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 2c-3.3 0-6 1.8-6 4v1h12v-1c0-2.2-2.7-4-6-4Zm7.5-2.2A2.5 2.5 0 1 0 15 7a2.5 2.5 0 0 0 1.5 2.8ZM16 13c-.7 0-1.4.1-2 .3 1.2.8 2 1.9 2 3.2v1h5v-1c0-1.8-2-2.5-5-2.5Z" />
-    </svg>
   );
 }

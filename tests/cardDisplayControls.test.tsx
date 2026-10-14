@@ -102,8 +102,8 @@ describe("card display controls", () => {
     renderCard();
 
     const buttons = [...container.querySelectorAll<HTMLButtonElement>(".display-mode-button")];
-    expect(buttons.map((button) => button.textContent)).toEqual(["─", "▫", "□"]);
-    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(["Compact", "Standard", "Expanded"]);
+    expect(buttons.map((button) => button.querySelector("svg"))).not.toContain(null);
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(["Compact view", "Standard view", "Expanded view"]);
     expect(buttons.map((button) => button.getAttribute("aria-pressed"))).toEqual(["false", "true", "false"]);
   });
 
@@ -114,7 +114,7 @@ describe("card display controls", () => {
     act(() => card.dispatchEvent(new KeyboardEvent("keydown", { key: "v", bubbles: true })));
     expect(onUpdate).toHaveBeenCalledWith(item.id, { displayMode: "expanded" });
 
-    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Compact"]')!.click());
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="Compact view"]')!.click());
     expect(onUpdate).toHaveBeenLastCalledWith(item.id, { displayMode: "compact" });
   });
 

@@ -165,7 +165,7 @@ export function MinWidthMeasurer({
                   className="display-mode-button"
                   aria-label="Display mode"
                 >
-                  <span aria-hidden="true">▢</span>
+                  <span aria-hidden="true">M</span>
                 </button>
               ))}
             </div>

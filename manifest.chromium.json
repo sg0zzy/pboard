@@ -1,32 +1,80 @@
 {
   "manifest_version": 3,
   "name": "Pboard",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "Keep a private, structured project state alongside AI conversations.",
   "minimum_chrome_version": "114",
-  "permissions": ["storage", "contextMenus", "clipboardWrite", "activeTab", "scripting", "sidePanel", "identity", "alarms"],
-  "optional_host_permissions": ["<all_urls>"],
+  "permissions": [
+    "storage",
+    "contextMenus",
+    "clipboardWrite",
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "identity",
+    "alarms"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
   "oauth2": {
     "client_id": "337977813621-fng9g7fu9jelmjcunq2mth8p1kt78u1u.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/drive.appdata", "https://www.googleapis.com/auth/drive"]
+    "scopes": [
+      "https://www.googleapis.com/auth/drive.appdata",
+      "https://www.googleapis.com/auth/drive"
+    ]
   },
-  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*", "https://www.googleapis.com/*", "https://oauth2.googleapis.com/*"],
-  "background": { "service_worker": "background.js" },
-  "side_panel": { "default_path": "sidebar.html" },
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://www.googleapis.com/*",
+    "https://oauth2.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidebar.html"
+  },
   "icons": {
     "16": "icons/logo-16.png",
     "32": "icons/logo-32.png",
     "48": "icons/logo-48.png",
     "128": "icons/logo-128.png"
   },
-  "action": { "default_title": "Open Pboard", "default_icon": { "16": "icons/logo-16.png", "32": "icons/logo-32.png", "48": "icons/logo-48.png", "128": "icons/logo-128.png" } },
-  "content_scripts": [{
-    "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-    "js": ["content.js"],
-    "run_at": "document_idle"
-  }],
+  "action": {
+    "default_title": "Open Pboard",
+    "default_icon": {
+      "16": "icons/logo-16.png",
+      "32": "icons/logo-32.png",
+      "48": "icons/logo-48.png",
+      "128": "icons/logo-128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
   "commands": {
-    "pin-selection-to-pboard": { "suggested_key": { "default": "Alt+Shift+C" }, "description": "Pin the selected text to Pboard" },
-    "pin-page-to-pboard": { "suggested_key": { "default": "Alt+Shift+W" }, "description": "Pin the current web page to Pboard" }
+    "pin-selection-to-pboard": {
+      "suggested_key": {
+        "default": "Alt+Shift+C"
+      },
+      "description": "Pin the selected text to Pboard"
+    },
+    "pin-page-to-pboard": {
+      "suggested_key": {
+        "default": "Alt+Shift+W"
+      },
+      "description": "Pin the current web page to Pboard"
+    }
   }
 }

@@ -1,6 +1,7 @@
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { note, type CardTypeDefinition } from "../../templates/boardTemplates";
 import type { BoardItemType } from "../../types";
+import { ChevronDownIcon } from "./icons";
 
 type Props = {
   cardTypes: readonly CardTypeDefinition[];
@@ -88,7 +89,7 @@ export function CategoryPicker({ cardTypes, value, onChange }: Props) {
         onKeyDown={handleTriggerKeyDown}
       >
         <span>{triggerLabel}</span>
-        <span className="type-picker-chevron" aria-hidden="true">⌄</span>
+        <span className="type-picker-chevron" aria-hidden="true"><ChevronDownIcon /></span>
       </button>
       {open && (
         <div className="type-picker-menu" role="listbox" aria-label="Card type">
