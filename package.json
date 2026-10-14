@@ -1,6 +1,6 @@
 {
   "name": "pboard",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "dexie": "^4.4.6",
+    "fflate": "0.8.3",
     "fractional-indexing": "^3.4.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
@@ -34,7 +35,6 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "fake-indexeddb": "^6.2.5",
-    "fflate": "0.8.3",
     "jsdom": "^30.0.1",
     "node-datachannel": "^0.33.4",
     "typescript": "^7.0.2",

@@ -1,8 +1,8 @@
 # Pboard — Product Specification
 
-**Package version at review:** 0.9.3
+**Package version at review:** 0.9.4
 
-**Reviewed:** 2026-10-12
+**Reviewed:** 2026-10-14
 
 **Status:** Implemented local-first extension with optional Drive sync and collaboration
 
@@ -202,9 +202,9 @@ Implemented behavior:
 - Left and Right cycle the card status in the same order shown by the menu: Candidate, Confirmed, Started, To validate, Done, Trashed, and Rejected. Right moves forward, Left moves backward, and both wrap at the ends.
 - Ctrl+Left and Ctrl+Right step the card type through the categories supported by the board template in order, Command+Left/Right providing the macOS equivalent; single-category templates such as Brainstorming have no effect.
 - V cycles the focused, non-editing card through Compact, Standard, and Expanded display modes. The same modes are directly selectable from the `─`, `▫`, and `□` header controls.
-- Status changes are visually staged: the card's status chip and pill update immediately, but the card moves to its new section after a short pause (~800ms).
+- Status changes made through the status menu or the Left/Right arrow keys are visually staged: the card's status chip and pill update immediately, but the card moves to its new section after a short pause (~800ms).
 - Moving a card out of the visible section into the Rejected, Done, or Trash section moves focus to the next visible card in the list, or clears focus if there is no successor; moving back into the visible section keeps focus on the moved card. Sections are uncontrolled, so a status change never opens or closes one.
-- Clicking the trash icon (or pressing Delete on a focused, non-editing card) always moves the card to that project's Trash, undoable by changing its status back. Emptying the trash and removing a card from Trash require the confirmation panel.
+- Clicking the trash icon (or pressing Delete on a focused, non-editing card) always moves the card to that project's Trash immediately, without the staged pause, cancelling any still-pending staged status change for that card; the move is undoable by changing its status back. Emptying the trash and removing a card from Trash require the confirmation panel.
 - Deleting a card that is already in Trash removes it permanently.
 - Deleting a card normalizes the remaining order values.
 - Done cards are placed in a collapsed **Done** container.
@@ -347,11 +347,11 @@ Implemented behavior:
 
 ## 6. Copy board as prompt
 
-The sidebar provides a prominent **Copy board** button, with the same overlapping-sheets icon used by card copy actions, for the current project. Its clipboard output is a structured prompt in which every card is prefixed by a `[category]` tag.
+The sidebar provides a prominent **Copy board** button, with the same overlapping-sheets icon used by card copy actions, for the current project, paired with a **Download board** button directly to its right. Its clipboard output is a structured prompt in which every card is prefixed by a `[category]` tag.
 
 Implemented behavior:
 
-- The button is disabled when there are no non-trash cards.
+- Both buttons are disabled when there are no non-trash cards.
 - Ongoing cards (candidate, confirmed, started, and to-validate) are serialized in their current board order, followed by Done cards and then Rejected cards. Each section retains its own board order.
 - Trash cards are excluded.
 - Every card is prefixed with its category id and status tags in square brackets (for example, `[issue] [confirmed]`); legacy `idea` types are exported as `[core_idea]`.
@@ -369,7 +369,18 @@ PROJECT: AI brainstorming SaaS
 [decision] [confirmed] Use a browser sidebar.
 ```
 
+### Download board as zip
+
+The **Download board** button (arrow-into-tray icon) exports the current project as a zip archive:
+
+- `board.txt` contains exactly the same prompt text the **Copy board** button writes to the clipboard.
+- `images/` contains one file per card image the board displays (the same pictures the cards render), named after the card id with an extension derived from the stored mime type. Trash cards are excluded, and an image shared by several cards is stored once. A card whose image data is missing is skipped so the text export never fails.
+- The archive is named after the project (its name slugged for the filesystem, falling back to `board.zip`).
+- The browser download starts only once the whole zip is complete in memory, so the downloaded file always contains the txt and every image that was loaded in the cards.
+- The sidebar displays a temporary success notice; a failure is reported as a notice and starts no download.
+
 Copying is currently the only implemented board-to-chat workflow. The user must paste the generated prompt into ChatGPT or another AI application manually.
+
 
 ## 7. Persistence and synchronization
 

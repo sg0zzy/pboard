@@ -1,6 +1,6 @@
 # Pboard documentation
 
-Use this index to find the maintained description of each part of Pboard. Reviewed 12 October 2026 against package version 0.9.3.
+Use this index to find the maintained description of each part of Pboard. Reviewed 14 October 2026 against package version 0.9.4.
 
 | Document | Purpose |
 | --- | --- |

@@ -56,6 +56,7 @@ The implemented product behavior and limitations are recorded in [`SPECIFICATION
 - Drop an image file anywhere on the board to add it as an image card.
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current board as a clean, structured prompt: ongoing cards in their board order, then Done cards, then Rejected cards. Trash is excluded; every exported card carries its category and status tags (e.g., `[issue] [confirmed]`).
+- Download the current board as a zip: `board.txt` holds the exact copy-board prompt, and `images/` holds every card image the board displays (shared images once, trash excluded). The browser download starts only once the whole archive is built.
 - Persist boards in RxDB/IndexedDB and images in a separate local Blob store across browser restarts; extension preferences and Drive credentials remain in browser extension storage. The legacy repository is retained for migration, fallback, and rollback.
 - Reopen the Pboard sidebar from Firefox's toolbar button or `Alt+Shift+P`, even after it has been closed or replaced by another sidebar such as Bookmarks.
 

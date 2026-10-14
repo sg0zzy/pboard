@@ -16,6 +16,7 @@ import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
 import { CopyIcon } from "./components/CopyIcon";
+import { DownloadIcon } from "./components/DownloadIcon";
 import { CaptureToolbar } from "./components/CaptureToolbar";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
@@ -23,6 +24,7 @@ import { ProjectFingerprint, type FingerprintTransition } from "./components/Pro
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { hasCopyableBoardItems, serializeBoard, serializeProject } from "./serialize";
+import { buildBoardArchive, downloadBlob } from "./download";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
@@ -52,8 +54,9 @@ export function App() {
   const [dragMergeMode, setDragMergeMode] = useState(false);
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition } | null>(null);
   const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
-  const [notice, setNotice] = useState("");
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
+  const [notice, setNotice] = useState("");
+  const [downloading, setDownloading] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
   const [pendingMerge, setPendingMerge] = useState<{ sourceId: string; targetId: string } | null>(null);
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
@@ -391,8 +394,12 @@ export function App() {
     if (afterSave === "focus") setFocusRequest({ id: itemId, startEditing: false });
   }
 
+  // The card trash icon, Delete key, and section trash are deletion intents,
+  // not status browsing: they commit immediately, cancelling any staged
+  // status change, while menu/arrow status changes keep the ~800ms pause.
   async function moveCardToTrash(itemId: string) {
-    requestStatusChange(itemId, "trash");
+    clearPendingStatus(itemId);
+    await commitStatusNow(itemId, "trash");
   }
 
   async function removeCardPermanently(itemId: string) {
@@ -453,6 +460,10 @@ export function App() {
 
   async function commitStatusChange(itemId: string, status: BoardItemStatus) {
     if (pendingStatusesRef.current[itemId] !== status) return;
+    await commitStatusNow(itemId, status);
+  }
+
+  async function commitStatusNow(itemId: string, status: BoardItemStatus) {
     const beforeStatus = itemsRef.current.find((item) => item.id === itemId)?.status;
     if (beforeStatus === undefined || beforeStatus === status) {
       clearPendingStatus(itemId);
@@ -460,11 +471,9 @@ export function App() {
     }
     const itemsBeforeCommit = itemsRef.current;
     await repository.updateItem(itemId, { status });
-    const afterStatus = status;
+    // A status staged while the write was in flight must keep its own commit.
     if (pendingStatusesRef.current[itemId] === status) clearPendingStatus(itemId);
-    if (afterStatus !== undefined && beforeStatus !== afterStatus) {
-      applyCommittedStatusChange(itemId, beforeStatus, afterStatus, itemsBeforeCommit);
-    }
+    applyCommittedStatusChange(itemId, beforeStatus, status, itemsBeforeCommit);
   }
 
   function applyCommittedStatusChange(
@@ -631,6 +640,21 @@ export function App() {
     await navigator.clipboard.writeText(serializeBoard(currentProject, items));
     setNotice("Board copied as a prompt");
     window.setTimeout(() => setNotice(""), 2200);
+  }
+
+  async function downloadBoard() {
+    if (!currentProject || downloading) return;
+    setDownloading(true);
+    try {
+      const archive = await buildBoardArchive(currentProject, items, repository.getImage);
+      downloadBlob(archive.filename, archive.data);
+      setNotice("Board downloaded");
+      window.setTimeout(() => setNotice(""), 2200);
+    } catch {
+      setNotice("The board could not be downloaded");
+    } finally {
+      setDownloading(false);
+    }
   }
 
   async function copySection(sectionItems: BoardItem[], label: string) {
@@ -982,10 +1006,16 @@ export function App() {
             </section>
 
           <section className="board-controls">
-            <button className="copy-button" onClick={copyBoard} disabled={!hasCopyableBoardItems(items)}>
-              <CopyIcon />
-              <span>Copy board</span>
-            </button>
+            <div className="board-control-buttons">
+              <button className="copy-button" onClick={copyBoard} disabled={!hasCopyableBoardItems(items)}>
+                <CopyIcon />
+                <span>Copy board</span>
+              </button>
+              <button className="download-button" onClick={() => void downloadBoard()} disabled={!hasCopyableBoardItems(items) || downloading}>
+                <DownloadIcon />
+                <span>{downloading ? "Preparing…" : "Download board"}</span>
+              </button>
+            </div>
             {notice && <p className="notice" role="status">{notice}</p>}
           </section>
         </>

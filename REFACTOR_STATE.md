@@ -1,6 +1,6 @@
 # Pboard refactor status
 
-Reviewed against the repository on 12 October 2026; package version 0.9.3. This is a short status and handoff document. Architecture details live in the [documentation index](docs/README.md) rather than being repeated here.
+Reviewed against the repository on 14 October 2026; package version 0.9.4. This is a short status and handoff document. Architecture details live in the [documentation index](docs/README.md) rather than being repeated here.
 
 ## Implemented
 

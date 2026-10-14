@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Pboard",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Keep a private, structured project state alongside AI conversations.",
   "minimum_chrome_version": "114",
   "permissions": ["storage", "contextMenus", "clipboardWrite", "activeTab", "scripting", "sidePanel", "identity", "alarms"],

@@ -305,8 +305,9 @@ input:focus, textarea:focus, select:focus { border-color: #777b70; outline: 2px 
 .board-add-button svg { width: 1.2em; height: 1.2em; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .board-add-button .selection-highlight { fill: currentColor; fill-opacity: .12; }
 .board-controls { border-top: 1px solid #deded9; padding-top: 12px; }
-.copy-button { display: flex; width: 100%; align-items: center; justify-content: center; gap: .45em; padding: 10px; }
-.copy-button svg { width: 1.05em; height: 1.05em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.board-control-buttons { display: flex; gap: 8px; }
+.copy-button, .download-button { display: flex; flex: 1; min-width: 0; align-items: center; justify-content: center; gap: .45em; padding: 10px; }
+.copy-button svg, .download-button svg { width: 1.05em; height: 1.05em; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .notice { margin: 8px 0 0; color: #4f6f54; font-size: .75em; text-align: center; }
 .muted { color: #777970; }
 
