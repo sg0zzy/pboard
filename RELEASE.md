@@ -1,26 +1,35 @@
 # Releasing Pboard
 
-Automated release flow: `VERSION` file → `scripts/prepare-build.sh` (bump, sync, build all targets) → test locally → commit and push → `scripts/release.sh` (tag + notes) → GitHub Actions submits Firefox to AMO and publishes the GitHub Release.
+Automated release flow: `VERSION` file → `scripts/prepare-build.sh` (select version, sync, build all targets) → test locally → commit and push → `scripts/release.sh` (tag + notes) → GitHub Actions submits Firefox to AMO and publishes the GitHub Release. All scripts implement the repository contract [VERSIONING.md](VERSIONING.md).
 
 ## How VERSION works
 
-`VERSION` is the single source of truth (e.g. `0.10.1`, format `MAJOR.MINOR.PATCH`). `scripts/sync-version.mjs` applies it to:
+`VERSION` is the single source of truth for the core version and development status; the build system supplies the local `-dev.N` counter and build identity — never embedded by a commit per compilation (contract §3/§4.4). Two states:
 
-- `manifest.json` (Firefox) and `manifest.chromium.json` (Chromium)
+- `0.10.1` — stable core; Android dev builds require an explicitly selected development core.
+- `0.10.2-dev` — a development core has been selected (via `scripts/version.sh bump <kind>` or `--dev-core`). Every local Android build becomes `0.10.2-dev.N`, `N` from a gitignored, atomically locked counter that resets when the core changes (`.build-state/`). Each build also gets a unique build ID (UTC ms + suffix) and is archived under `dist/dev/<version>/<build-id>/` with `build-manifest.json` (SHA-256, commit SHA, dirty flag, source patch digest) and `source.patch` when dirty. Existing artifact paths are never overwritten.
+
+`scripts/sync-version.mjs [X.Y.Z-dev]` applies the selected state to:
+
+- `manifest.json` (Firefox) and `manifest.chromium.json` (Chromium) — display core, no `-dev`
 - `package.json` and `package-lock.json` (root npm, via `npm`-compatible plain edit)
 - `apps/android/package.json` (Android npm workspace)
-- `apps/android/android/app/build.gradle` → `versionName "VERSION"` and a **monotonically increasing** `versionCode` (bumped by 1 per sync; never reset)
+- `apps/android/android/app/build.gradle` — `versionName` is the display core; `versionCode` follows the documented adapter (contract §8): `core*1000 + slot`, dev slots `1..998` stamped per dev build (and restored afterwards in the tracked file), stable slot `999` assigned on stable preparation. A `versionCode` regression is refused; the code never decreases.
 - `tests/releaseMetadata.test.ts` (the version assertion)
 
 Check without writing: `node scripts/sync-version.mjs --check` (exit 1 + file list when out of sync). The AMO workflow independently re-verifies tag ↔ manifest version and the Gecko ID (`scripts/verify-release-tag.mjs`) before building.
 
+Documented exception: the `versionCode` stored in the tracked gradle file is the stable-slot value of the selected core; dev slots exist only inside local build outputs, so distributed codes stay monotonic without coordinating workstations' counters (contract §4.3/§8).
+
 ## Prepare a build
 
 ```sh
-./scripts/prepare-build.sh            # patch bump (default)
-./scripts/prepare-build.sh --minor    # 0.10.1 → 0.11.0
-./scripts/prepare-build.sh --major    # 0.10.1 → 1.0.0
-./scripts/prepare-build.sh --no-bump  # same version again (retry after a failed build)
+./scripts/prepare-build.sh --next=0.10.2    # explicit release core (recommended)
+./scripts/prepare-build.sh                  # patch bump as release-core candidate
+./scripts/prepare-build.sh --minor          # 0.10.1 → 0.11.0
+./scripts/prepare-build.sh --major          # 0.10.1 → 1.0.0
+./scripts/prepare-build.sh --dev-core       # development-only core (X.Y.Z-dev), test builds
+./scripts/prepare-build.sh --no-bump        # same version again (retry after a failed build)
 ```
 
 The script: refuses to bump when version files already have uncommitted changes (avoids double bumps), runs `npm ci` if needed, then typecheck + tests, builds Firefox, runs `web-ext lint --warnings-as-errors` against the real output, byte-verifies the Firefox package, builds Chromium, packages and byte-verifies it, then the Android workspace (typecheck, tests, `cap sync`, `gradlew assembleDebug`). Never commits, pushes, tags, or publishes.
@@ -33,7 +42,18 @@ The script: refuses to bump when version files already have uncommitted changes 
 | Chromium | `web-ext-artifacts/pboard-chromium-<version>.zip` (unsigned) |
 | Android | `apps/android/android/app/build/outputs/apk/debug/app-debug.apk` (debug-signed) and a copy `web-ext-artifacts/Pboard-<version>-debug.apk` |
 
-Local testing pointers: Firefox `about:debugging` → Load Temporary Add-on → `dist/manifest.json`; Chromium `chrome://extensions` → Load unpacked → `dist/chromium/`; Android install the debug APK on a device (`adb install web-ext-artifacts/Pboard-<version>-debug.apk`). Generated artifacts stay out of Git (`.gitignore` covers `web-ext-artifacts/*.zip`, `dist/`, Android `build/`).
+Local testing pointers: Firefox `about:debugging` → Load Temporary Add-on → `dist/manifest.json`; Chromium `chrome://extensions` → Load unpacked → `dist/chromium/`; Android install the debug APK on a device (`adb install web-ext-artifacts/Pboard-<version>-debug.apk`).
+
+## Local builds without a release
+
+```sh
+scripts/build_all.sh                      # Firefox + Chromium + Android dev build
+scripts/build_all.sh firefox chromium     # only these targets
+scripts/version.sh bump patch             # select the next development core for Android dev builds
+scripts/version.sh --check                # verify references are in sync
+```
+
+These never bump, commit or tag. `scripts/build_all.sh android` requires a selected development core (or use `--dev-core` with `prepare-build`); each Android build is archived under `dist/dev/<version>/<build-id>/` and reported as `ARTIFACT android: …`. Generated artifacts stay out of Git (`.gitignore` covers `web-ext-artifacts/*.zip`, `dist/`, `.build-state/`, Android `build/`, `*.apk`).
 
 ## Commit and push manually
 

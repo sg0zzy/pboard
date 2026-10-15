@@ -10,6 +10,7 @@ Use this index to find the maintained description of each part of Pboard. Review
 | [Refactor status](../REFACTOR_STATE.md) | Short implementation status and remaining verification |
 | [Local storage architecture](rxdb-storage-refactor.md) | RxDB schemas, ordering, images, migration, fallback, rollback, and historical measurements |
 | [Collaboration architecture](collaboration.md) | Drive layout, sharing, snapshots, signaling, WebRTC conflicts, account preferences, and security limits |
+| [Collaboration security implementation plan](collaboration-security-plan.md) | Proposed encrypted transport policy, device authentication, receiver authorization, migration, and release verification |
 | [Privacy policy](privacy.md) | Published disclosures and contact details |
 | [Terms of Service](terms.md) | Software license, content, optional integrations, and service limitations |
 | [GPLv3 license](../LICENSE.md) | Complete repository license text |

@@ -1,8 +1,17 @@
-import type { RxReplicationHandler } from "rxdb";
+import type { RxReplicationHandler, RxReplicationPullStreamItem } from "rxdb";
+import { Observable, type OperatorFunction } from "rxjs";
 
-/** Fill a project batch before reporting that the remote change log is exhausted. */
+/**
+ * Fill a project batch before reporting that the remote change log is exhausted,
+ * and filter the *live* master change stream the same way: private documents
+ * must never be serialized to a peer just because the stream bypasses catch-up
+ * reads. Both directions wrap the same `includes` predicate.
+ */
 export function scopeMasterChanges<T, Checkpoint>(
-  handler: Pick<RxReplicationHandler<T, Checkpoint>, "masterChangesSince">,
+  handler: Pick<RxReplicationHandler<T, Checkpoint>, "masterChangesSince"> & {
+    /** Present on the master handler; streams every master change event. */
+    masterChangeStream$?: Observable<RxReplicationPullStreamItem<T, Checkpoint>>;
+  },
   includes: (doc: unknown) => boolean
 ): void {
   const read = handler.masterChangesSince.bind(handler);
@@ -21,4 +30,25 @@ export function scopeMasterChanges<T, Checkpoint>(
       next = result.checkpoint;
     }
   };
+  // Live outgoing stream: private documents must never leave the device. The
+  // unfiltered stream would serialize every project's changes to the peer.
+  const stream = handler.masterChangeStream$;
+  if (stream) {
+    const tapScoped: OperatorFunction<RxReplicationPullStreamItem<T, Checkpoint>, RxReplicationPullStreamItem<T, Checkpoint>> = (source) =>
+      new Observable<RxReplicationPullStreamItem<T, Checkpoint>>((subscriber) => {
+        return source.subscribe({
+          next: (event) => {
+            if (event === "RESYNC") { subscriber.next(event); return; }
+            const documents = Array.isArray(event.documents) ? event.documents : [];
+            const scoped = (documents as unknown[]).filter(includes);
+            if (scoped.length === 0) return; // Never emit an all-private bulk.
+            subscriber.next({ ...event, documents: scoped as typeof event.documents });
+          },
+          error: (error: unknown) => subscriber.error(error),
+          complete: () => subscriber.complete()
+        });
+      });
+    // Replace the upstream subscription path: RxDB subscribes the field itself.
+    Object.defineProperty(handler, "masterChangeStream$", { value: stream.pipe(tapScoped), configurable: true });
+  }
 }

@@ -22,8 +22,9 @@ npm run check        # typecheck + tests + both builds + verify
 | `npm run verify:build` | Sanity-checks the built output (files present, manifest matches `package.json`, background bundle runs without Node-only globals) |
 | `npm run package:chromium` | Verify the Chromium build, create `web-ext-artifacts/pboard-chromium-<version>.zip`, and compare every packaged file with the build |
 | `npm run check` | Full gate: `typecheck` + `test` + `build:all` + `verify:build` |
+| `scripts/build_all.sh` | Local builds of all three targets (Firefox, Chromium, Android debug APK); prints one `ARTIFACT <path>` per target. Accepts target filters: `scripts/build_all.sh firefox chromium android [--skip-android-build]` |
 
-Each variant has a matching release script (`npm run release:firefox`, `release:chromium`, `release:all`) that runs typecheck, tests, build, and verification in one shot.
+Each variant has a matching release script (`npm run release:firefox`, `release:chromium`, `release:all`) that runs typecheck, tests, build, and verification in one shot. For versioned release preparation (bump + all variants + artifacts) use `scripts/prepare-build.sh`; `scripts/build_all.sh` is the build-only, no-version-change variant.
 
 ## Linting the Firefox package
 

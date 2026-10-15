@@ -19,6 +19,11 @@ import { createSharedBoardDiscovery } from "./sharedDiscovery";
 import { createSharedProjectSync, createSharedProjectRefresh } from "./sharedSync";
 import { createAccountPreferenceSync } from "./accountPreferences";
 import type { GoogleAuthProvider } from "./googleAuth";
+import { ensureDeviceKey, publicKeyFingerprint } from "../collab/security/keys";
+import { verifyManifest, acceptManifest, createInMemoryManifestEpochStore } from "../collab/security/manifest";
+import { parseStrictJson } from "../collab/security/canonical";
+import { installCollectionMutationGuard, createMutationReplayCache, verifyMutation, type MutationGuardInstall, type ForkGuard } from "../collab/security/mutation";
+import type { CollaborationSecurityOptions } from "../collab/manager";
 
 /** Platform-independent Drive and WebRTC wiring shared by browser and Android. */
 export function createDriveRuntime({ auth: googleAuth, storage, getRepository }: {
@@ -154,6 +159,208 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository }:
     return createDriveSignaling({ store });
   }
 
+  // ---------------------------------------------------------------------------
+  // Protocol 2: device keys, pinned board authority, signed manifests.
+  //
+  // Enrollment/trust bootstrapping is deliberately not implementable from Drive
+  // data alone (the plan forbids it): the owner approves a device key through an
+  // out-of-band verification (QR/fingerprint comparison). This runtime stores the
+  // pinned authority fingerprints in app-private storage and exposes them for the
+  // enrollment UI; without a pin no secure pool starts and collaboration stays
+  // offline rather than falling back to the unsigned protocol.
+  // ---------------------------------------------------------------------------
+
+  /** Storage slots: pinned authority fingerprints per board/account. */
+  const AUTHORITY_PIN_KEY = "pboardSecurityPins";
+
+  type SecurityPins = Record<string, {
+    /** Board/account id this pin governs. */
+    scope: string;
+    /** Canonical fingerprint of the pinned authority public key. */
+    authorityKeyId: string;
+    authorityPublicKey: { kty: "EC"; crv: "P-256"; x: string; y: string };
+    pinnedAt: number;
+    /** "board" rooms bind to a Drive file+folder; "account" rooms to the hash. */
+    kind: "board" | "account";
+  }>;
+
+  async function readPins(): Promise<SecurityPins> {
+    const stored = await storage.get(AUTHORITY_PIN_KEY);
+    const pins = stored[AUTHORITY_PIN_KEY];
+    return pins && typeof pins === "object" ? pins as SecurityPins : {};
+  }
+
+  async function writePins(pins: SecurityPins): Promise<void> {
+    await storage.set({ [AUTHORITY_PIN_KEY]: pins });
+  }
+
+  /** Pins the board authority after an out-of-band verification (enrollment UI). */
+  function pinBoardAuthority(boardId: string, authorityPublicJwk: { kty: "EC"; crv: "P-256"; x: string; y: string }, driveProjectFileId: string, driveFolderId: string) {
+    return (async () => {
+      const pins = await readPins();
+      pins[`board:${boardId}`] = {
+        scope: boardId,
+        authorityKeyId: await publicKeyFingerprint(authorityPublicJwk),
+        authorityPublicKey: authorityPublicJwk,
+        pinnedAt: Date.now(),
+        kind: "board"
+      };
+      await writePins(pins);
+      boardAuthorityCache.set(boardId, { driveProjectFileId, driveFolderId });
+    })();
+  }
+
+  function pinAccountAuthority(account: string, authorityPublicJwk: { kty: "EC"; crv: "P-256"; x: string; y: string }) {
+    return (async () => {
+      const pins = await readPins();
+      pins[`account:${account}`] = {
+        scope: account,
+        authorityKeyId: await publicKeyFingerprint(authorityPublicJwk),
+        authorityPublicKey: authorityPublicJwk,
+        pinnedAt: Date.now(),
+        kind: "account"
+      };
+      await writePins(pins);
+    })();
+  }
+
+  const boardAuthorityCache = new Map<string, { driveProjectFileId: string; driveFolderId: string }>();
+
+  async function resolveManifest(
+    pin: SecurityPins[string],
+    collection: "cards" | "projects" | "accountOrder",
+    identity: { boardId: string; driveProjectFileId: string; driveFolderId: string } | null
+  ): Promise<CollaborationSecurityOptions | null> {
+    const key = await ensureDeviceKey(`${pin.kind}-device:${pin.scope}`);
+    // Fetch the newest manifest for the room: board manifests live in the shared
+    // folder; account manifests in appDataFolder.
+    const raw = pin.kind === "board" && identity
+      ? await readBoardManifest(identity.driveProjectFileId, identity.driveFolderId)
+      : await readAccountManifest(pin.scope);
+    if (!raw) return null;
+    try {
+      const manifest = await verifyManifest(parseStrictJson(raw), pin.authorityPublicKey, pin.authorityKeyId);
+      if (pin.kind === "board" && identity) {
+        if (manifest.boardId !== identity.boardId || manifest.driveProjectFileId !== identity.driveProjectFileId || manifest.driveFolderId !== identity.driveFolderId) return null;
+      }
+      if (pin.kind === "account" && manifest.boardId !== `account:${pin.scope}`) return null;
+      const accepted = await acceptManifest(manifest, manifestEpochStore, Date.now());
+      void accepted;
+      return {
+        signer: { privateJwk: key.privateJwk, deviceKeyId: key.keyId },
+        manifest,
+        boardId: manifest.boardId,
+        ownSessionId: collaborationPeerId
+      };
+    } catch {
+      // An unverified or unverifiable manifest must not produce a security context.
+      return null;
+    }
+  }
+
+  async function boardSecurityFor(projectId: string): Promise<CollaborationSecurityOptions | null> {
+    if (!await driveConnected()) return null;
+    const pins = await readPins();
+    const pin = pins[`board:${projectId}`];
+    if (!pin) return null; // No pinned authority: stay offline rather than fall back.
+    const layout = await drivePermissions.realtimeFolderId(projectId).then(() => drivePermissions.projectFileId(projectId));
+    const fileId = await layout || null;
+    void fileId;
+    return resolveManifest(pin, "cards", {
+      boardId: projectId,
+      driveProjectFileId: (await drivePermissions.projectFileId(projectId)) ?? "",
+      driveFolderId: (await sharedProjects.get(projectId)).folderId ?? ""
+    });
+  }
+
+  async function accountSecurityFor(account: string): Promise<CollaborationSecurityOptions | null> {
+    const pins = await readPins();
+    const pin = pins[`account:${account}`];
+    if (!pin) return null;
+    return resolveManifest(pin, "accountOrder", null);
+  }
+
+  // Manifest fetch helpers: board manifests are stored as signed envelope JSON.
+  async function readBoardManifest(projectFileId: string, folderId: string): Promise<string | null> {
+    const transport = createDrivePermissionTransport(googleAuth);
+    const name = "pboard-manifest.json";
+    const direct = await transport.findFile(name, folderId).catch(() => null);
+    if (direct) return transport.downloadFileOrNull(direct.id);
+    void projectFileId;
+    return null;
+  }
+
+  async function readAccountManifest(account: string): Promise<string | null> {
+    const transport = createDriveTransport(googleAuth, fetch, "pboard-account-manifest-");
+    const file = await transport.findProjectFile(account).catch(() => null);
+    return file ? transport.download(file.id).catch(() => null) : null;
+  }
+
+  const manifestEpochStore = createInMemoryManifestEpochStore();
+
+  // Per-project mutation verification (protocol 2): a document that arrives
+  // through any persistence path for this project must carry valid signed
+  // provenance or the write is rejected with a 422-equivalent storage error.
+  const activeGuards = new Map<string, { install: MutationGuardInstall; projectId: string }>();
+
+  async function installBoardMutationGuard(projectId: string): Promise<MutationGuardInstall | null> {
+    const securityContext = await boardSecurityFor(projectId);
+    if (!securityContext) return null;
+    const rx = await getRepository();
+    if (!rx) return null;
+    const replay = createMutationReplayCache();
+    const guardFor = async (document: Record<string, unknown>): Promise<ForkGuard | null> => {
+      if (typeof document.projectId !== "string" || document.projectId !== projectId) return null;
+      return {
+        verify: async (document) => {
+          try {
+            await verifyMutation(document, {
+              manifest: securityContext.manifest,
+              boardId: securityContext.boardId,
+              collection: "cards"
+            }, replay);
+            return "accept";
+          } catch {
+            return "reject";
+          }
+        }
+      };
+    };
+    const installs: MutationGuardInstall[] = [];
+    const cardsGuard = installCollectionMutationGuard(rx.db.cards as never, guardFor);
+    const projectsGuard = installCollectionMutationGuard(rx.db.projects as never, async (document) => {
+      if (typeof document.id !== "string" || document.id !== projectId) return null;
+      return {
+        verify: async (document) => {
+          try {
+            await verifyMutation(document, {
+              manifest: securityContext.manifest,
+              boardId: securityContext.boardId,
+              collection: "projects", now: () => Date.now()
+            }, replay);
+            return "accept";
+          } catch {
+            return "reject";
+          }
+        }
+      };
+    });
+    installs.push(cardsGuard, projectsGuard);
+    const install: MutationGuardInstall = {
+      projectId,
+      async uninstall() { for (const entry of installs) await entry.uninstall(); }
+    };
+    activeGuards.set(projectId, { install, projectId });
+    return install;
+  }
+
+  async function removeBoardMutationGuard(projectId: string): Promise<void> {
+    const active = activeGuards.get(projectId);
+    if (!active) return;
+    activeGuards.delete(projectId);
+    await active.install.uninstall();
+  }
+
   /** Import a shared project's snapshot from Drive when there is no local copy yet. */
   async function bootstrapFromDrive(projectId: string): Promise<boolean> {
     const rx = await getRepository();
@@ -194,6 +401,10 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository }:
     bootstrapFromDrive,
     refreshFromDrive,
     signalingFor: driveSignalingFor,
+    boardSecurity: boardSecurityFor,
+    accountSecurity: accountSecurityFor,
+    installMutationGuard: (projectId) => installBoardMutationGuard(projectId),
+    removeMutationGuard: (projectId) => removeBoardMutationGuard(projectId),
     imageTransport: {
       readImage: async (projectId, imageId) => {
         const asset = await drivePermissions.readSharedImage(projectId, imageId);

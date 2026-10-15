@@ -6,4 +6,5 @@ coverage/
 .env.local
 .env.*.local
 web-ext-artifacts/*.zip
-
+*.apk
+.build-state/

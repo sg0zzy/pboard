@@ -61,6 +61,20 @@ Tests use `*.check.ts(x)` with an Android-local Vitest pattern so extension test
 
 Android Studio is optional for normal editing/building. The Gradle wrapper and first Maven dependency downloads require internet during setup; the installed application requires no network access. All scripts, styles, icons and fonts are bundled; no development server URL is configured in the APK.
 
+One command from the repository root builds the debug APK (and optionally installs/launches it):
+
+```bash
+scripts/build_android.sh   # same as npm run apk:debug; last line prints the APK path
+export ANDROID_HOME="$HOME/Android/Sdk"      # JDK 21 must also be installed; set JAVA_HOME if java is not on PATH
+npm run apk:debug          # frontend build + cap sync + gradlew assembleDebug
+npm run apk:debug:install  # ... then adb install -r
+npm run apk:debug:run      # ... then install and launch the activity
+```
+
+The script checks ANDROID_HOME, JDK 21+, the Capacitor CLI and gradle, and fails with the missing prerequisite. Flags: `--skip-frontend` reuses the previous bundle (Gradle-only rebuild), `--install`/`--run` need exactly one connected device unless only one of several is authorized. APK output: `apps/android/android/app/build/outputs/apk/debug/app-debug.apk`.
+
+Manual equivalent:
+
 ```bash
 export ANDROID_HOME="$HOME/Android/Sdk"
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 # adjust for your installation

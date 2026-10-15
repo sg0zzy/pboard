@@ -28,11 +28,11 @@ export async function readSnapshot(repository: RxRepository): Promise<Snapshot> 
   ]);
   const records = documents.map(doc => doc.toJSON()).filter(card => !card.deletedAt).sort(compareOrdered);
   const ranks = new Map<string, number>();
-  const cards = records.map((record: CardRecord): BoardItem => {
-    const { orderKey: _, deletedAt: __, ...card } = record;
+  const cards = records.map((record): BoardItem => {
+    const { orderKey: _, deletedAt: __, ...card } = record as CardRecord;
     const order = ranks.get(record.projectId) ?? 0;
     ranks.set(record.projectId, order + 1);
-    return { ...card, order };
+    return { ...(card as BoardItem), order };
   });
   return { projects, cards, showPreviews: setting?.value !== 'false', uiScale: normalizeUiScale(scale?.value ? Number(scale.value) : DEFAULT_UI_SCALE) };
 }

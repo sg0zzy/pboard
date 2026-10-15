@@ -1,4 +1,6 @@
 import { createRxDatabase, defaultConflictHandler, type RxCollection, type RxDatabase, type WithDeleted } from "rxdb";
+import { addRxPlugin } from "rxdb";
+import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
@@ -8,6 +10,7 @@ import { blobToDataUrl, createIndexedDbBlobStore, hashBlob, imageToBlob, type Bl
 import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
 import { mergeProjectOrder, parseProjectOrder, type ProjectOrderPreference } from "./projectOrder";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
+import type { MutationGuardInstall } from "../collab/security/mutation";
 import type { RepositoryEvents } from "./repository";
 
 export type RxCollections = {
@@ -18,14 +21,21 @@ export type RxCollections = {
 
 const now = () => new Date().toISOString();
 const newId = () => crypto.randomUUID();
-const isVisible = (card: CardRecord) => !card.deletedAt;
-const projectValue = (record: ProjectRecord): Project => {
+const isVisible = (card: { deletedAt?: string }) => !card.deletedAt;
+
+// Migration strategies fire when a stored collection's schema version is lower
+// than the declared schema (e.g. the protocol-2 `_sec` field bumped cards and
+// projects from version 0 to 1). Registering before any createRxDatabase call.
+addRxPlugin(RxDBMigrationSchemaPlugin);
+const projectValue = (record: { orderKey: string; tailOrderKey?: string; [key: string]: unknown }): Project => {
   const { orderKey: _, tailOrderKey: __, ...project } = record;
-  return project;
+  void _; void __;
+  return project as unknown as Project;
 };
-const cardValue = (record: CardRecord, order: number): BoardItem => {
+const cardValue = (record: { [key: string]: unknown; orderKey: string; deletedAt?: string }, order: number): BoardItem => {
   const { orderKey: _, deletedAt: __, ...card } = record;
-  return { ...card, order, displayMode: normalizeCardDisplayMode(card.displayMode) };
+  void _; void __;
+  return { ...(card as BoardItem), order, displayMode: normalizeCardDisplayMode(card.displayMode as BoardItem["displayMode"]) };
 };
 
 /** Conflict-handler view of a document: schema fields plus the tombstone flag. */
@@ -75,6 +85,13 @@ export async function createRxRepository(options: {
   mutatorRole?: CollaborationRole;
   /** Recheck Drive ownership before writing shared content deletion records. */
   resolveDeletionRole?: (projectId: string) => Promise<CollaborationRole>;
+  /**
+   * Protocol-2 mutation security. The collaboration manager installs a verifier
+   * for a shared project when it starts secured pools; every persistence path
+   * for that project's documents then requires valid signed provenance.
+   */
+  installMutationGuard?: (projectId: string) => Promise<MutationGuardInstall | null>;
+  removeMutationGuard?: (projectId: string) => Promise<void>;
 } = {}) {
   const db: RxDatabase<RxCollections> = await createRxDatabase<RxCollections>({
     name: options.name ?? "pboardlocalv1",
@@ -84,6 +101,9 @@ export async function createRxRepository(options: {
   await db.addCollections({
     projects: {
       schema: projectSchema,
+      // v0 → v1 adds the optional `_sec` mutation-provenance field; existing
+      // documents pass through unchanged (the field is simply absent).
+      migrationStrategies: { 1: (doc: Record<string, unknown>) => doc },
       conflictHandler: {
         isEqual: defaultConflictHandler.isEqual,
         async resolve(input) { return lastWriteWins(input); }
@@ -91,6 +111,7 @@ export async function createRxRepository(options: {
     },
     cards: {
       schema: cardSchema,
+      migrationStrategies: { 1: (doc: Record<string, unknown>) => doc },
       conflictHandler: {
         isEqual: defaultConflictHandler.isEqual,
         async resolve(input) { return lastWriteWins(input); }
@@ -543,7 +564,10 @@ export async function createRxRepository(options: {
     const ordered = await projectCardRecords(source.projectId);
     const index = ordered.findIndex((item) => item.id === itemId);
     const timestamp = now();
-    const record: CardRecord = { ...source.toJSON(), id: newId(), status: "candidate",
+    // The duplicate is a new local mutation; stale provenance from the source
+    // (wrong documentId, wrong payload hash) must not be inherited.
+    const { _sec: staleProvenance, ...sourceRecord } = source.toJSON();
+    const record: CardRecord = { ...sourceRecord, id: newId(), status: "candidate",
       orderKey: orderKeyBetween(source.orderKey, ordered[index + 1]?.orderKey ?? null), createdAt: timestamp, updatedAt: timestamp };
     await cards.insert(record);
     await touchProject(source.projectId, timestamp, record.orderKey);

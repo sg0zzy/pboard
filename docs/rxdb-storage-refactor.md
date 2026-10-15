@@ -23,12 +23,12 @@ The legacy implementation and its `projectBoardState` key remain intact. The RxD
 
 ## Versioned schemas and queries
 
-All three schemas start at version 0 in [`rxdbSchemas.ts`](../src/storage/rxdbSchemas.ts). Future changes require explicit RxDB schema migrations, not silent field removal.
+Cards and projects are at schema version 1 in [`rxdbSchemas.ts`](../src/storage/rxdbSchemas.ts) (version 0 → 1 added the optional `_sec` mutation-provenance field, with a passthrough migration strategy; see [collaboration security](collaboration-security-plan.md)). The `RxDBMigrationSchemaPlugin` is registered in [`rxdbRepository.ts`](../src/storage/rxdbRepository.ts). `settings` remains at version 0. Future changes require explicit RxDB schema migrations, not silent field removal.
 
 | Collection | Identity and fields | Indexes |
 |---|---|---|
-| `projects` | Existing project ID, name, template, revision, timestamps; added project `orderKey` and append high-water `tailOrderKey` | `orderKey` |
-| `cards` | Existing card ID, project ID, type, title, content, status, display mode, source, timestamps; added `orderKey`, optional image ID/dimensions/MIME, optional `deletedAt` | `projectId`, `(projectId, orderKey)`, `(projectId, status)` |
+| `projects` | Existing project ID, name, template, revision, timestamps; added project `orderKey` and append high-water `tailOrderKey`; optional `_sec` provenance on shared boards | `orderKey` |
+| `cards` | Existing card ID, project ID, type, title, content, status, display mode, source, timestamps; added `orderKey`, optional image ID/dimensions/MIME, optional `deletedAt`; optional `_sec` provenance on shared boards | `projectId`, `(projectId, orderKey)`, `(projectId, status)` |
 | `settings` | Key/value documents for `currentProjectId`, `migrationVersion`, local/account project order, and account selection metadata | primary key |
 
 Cards are queried only for the selected project in the board subscription. Card ID lookup uses the primary key. Card status query uses the project/status index. `BoardItem.order` is a compatibility projection derived from sorted rank keys in list/export queries; it is not persisted in RxDB. Existing fields, including optional source metadata, are retained. Ownership/ACL/actor fields were not added speculatively.

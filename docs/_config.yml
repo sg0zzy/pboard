@@ -10,6 +10,7 @@ defaults:
       layout: default
 exclude:
   - collaboration.md
+  - collaboration-security-plan.md
   - README.md
   - archive
   - rxdb-storage-refactor.md

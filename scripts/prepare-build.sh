@@ -11,27 +11,41 @@
 #
 # Never commits, pushes, tags, or publishes. Re-running after a failed
 # build: use --no-bump so the version is not incremented twice.
+#
+# VERSIONING.md §5: a stable release is an explicit operation. `--next` selects
+# the release core as a *candidate*: VERSION gets that exact core (no -dev), a
+# tag is never created here — the commit + `scripts/release.sh` do that. The
+# `--dev-core` variant instead selects `X.Y.Z-dev` for Android test builds and
+# always skips stable versionCode assignment.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 BUMP="patch"
+TARGET_SET=""
 for arg in "$@"; do
   case "$arg" in
     --patch)   BUMP="patch" ;;
     --minor)   BUMP="minor" ;;
     --major)   BUMP="major" ;;
     --no-bump) BUMP="none" ;;
+    --next=*)  TARGET_SET="${arg#--next=}" ;;
+    --dev-core*) BUMP="none" ; DEV_CORE="$(node scripts/version.mjs canonical | sed 's/$/-dev/')" ;;
     --help|-h)
       cat <<'EOF'
-Usage: scripts/prepare-build.sh [--patch|--minor|--major|--no-bump]
+Usage: scripts/prepare-build.sh [--patch|--minor|--major|--no-bump|--next=<X.Y.Z>|--dev-core]
 
-  --patch   increment patch (default)
-  --minor   increment minor, reset patch to 0
-  --major   increment major, reset minor and patch to 0
-  --no-bump synchronize and rebuild without changing the version
-            (use after a failed build to retry the same version)
+  --next=X.Y.Z  select the release core explicitly (recommended); VERSION becomes
+                exactly that core (stable), artifacts carry it; no tag is created
+  --patch       increment patch (default) as the release core candidate
+  --minor       increment minor, reset patch to 0
+  --major       increment major, reset minor and patch to 0
+  --dev-core    development-only: select VERSION X.Y.Z-dev at the next core and
+                build with development identity (versionCode stays untouched);
+                artifacts are test builds, not release candidates
+  --no-bump     synchronize and rebuild without changing the version
+                (use after a failed build to retry the same version)
 
 Never commits or pushes. After artifacts pass local testing, commit and
 push manually, then run scripts/release.sh.
@@ -49,8 +63,8 @@ if [ ! -f VERSION ]; then
   exit 1
 fi
 VERSION="$(tr -d '[:space:]' < VERSION)"
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "error: VERSION must be MAJOR.MINOR.PATCH (e.g. 0.10.1); found: '$VERSION'" >&2
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$ ]]; then
+  echo "error: VERSION must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-dev; found: '$VERSION'" >&2
   exit 1
 fi
 
@@ -88,8 +102,16 @@ fail() { echo "error: $*" >&2; exit 1; }
 
 # --- 1. Synchronize versions ------------------------------------------------
 step "Sync versions (VERSION -> manifests, npm, Android)"
-if [ "$BUMP" = "none" ]; then
+if [ "$BUMP" = "none" ] && [ -z "$TARGET_SET" ] && [ -z "${DEV_CORE:-}" ]; then
   node scripts/sync-version.mjs || fail "version synchronization failed"
+elif [ -n "$TARGET_SET" ]; then
+  if ! [[ "$TARGET_SET" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "--next must be an exact stable core X.Y.Z (e.g. --next=0.10.2)"
+  fi
+  printf '%s\n' "$TARGET_SET" > VERSION
+  node scripts/sync-version.mjs || fail "version synchronization failed"
+elif [ -n "${DEV_CORE:-}" ]; then
+  node scripts/version.mjs set "$DEV_CORE" || fail "development core selection failed"
 else
   node scripts/sync-version.mjs --next "$BUMP" || fail "version bump/sync failed"
 fi
@@ -133,12 +155,19 @@ step "Android typecheck and tests"
 (cd apps/android && npm test) || fail "Android tests failed"
 
 step "Android frontend build + Capacitor sync + debug APK"
-(cd apps/android && npm run android:debug) || fail "Android debug build failed"
+# Stable release candidate: build with the stable versionName/versionCode; a dev
+# core selection builds a dev-identity APK instead (stamped + restored).
+if [ -n "${DEV_CORE:-}" ]; then
+  scripts/build_android.sh >/dev/null 2>&1 || { scripts/build_android.sh 2>&1 | tail -n 20 >&2; fail "Android dev build failed"; }
+else
+  scripts/build_android.sh --stable-apk >/dev/null 2>&1 || { scripts/build_android.sh --stable-apk 2>&1 | tail -n 20 >&2; fail "Android build failed"; }
+fi
 
 # --- 4. Artifacts -----------------------------------------------------------
 ANDROID_APK="apps/android/android/app/build/outputs/apk/debug/app-debug.apk"
 ANDROID_APK_COPY="web-ext-artifacts/Pboard-${VERSION}-debug.apk"
 mkdir -p web-ext-artifacts
+if [ -e "$ANDROID_APK_COPY" ]; then fail "refusing to overwrite an existing staged artifact: $ANDROID_APK_COPY (delete it deliberately or bump the version)"; fi
 cp "$ANDROID_APK" "$ANDROID_APK_COPY" || fail "could not stage Android APK"
 
 step "Build summary (version $VERSION)"

@@ -73,7 +73,7 @@ Google and any recipients of shared content apply their own retention practices 
 
 ## Security and other services
 
-Pboard uses HTTPS for Google API requests and encrypted WebRTC data channels for live board transfers. Local storage is protected by your browser and device controls; Pboard does not add a separate password or encryption layer to its local databases. Protect access to your device and Google account.
+Pboard uses HTTPS for Google API requests and encrypted WebRTC data channels for live board transfers. Collaboration content is encrypted in transit (WebRTC DTLS); ordinary STUN/ICE connection setup traffic is not. When a board owner has pinned a security authority, live peers additionally authenticate with owner-approved device keys and receiving clients verify permissions, mutations and snapshots by signature; boards without a pinned authority (including ordinary account sync of project order) do not have peer authentication. Snapshots stored through Google Drive remain readable by Google — signatures provide integrity and origin verification, not additional confidentiality. Local storage is protected by your browser and device controls; Pboard does not add a separate password or encryption layer to its local databases. Protect access to your device and Google account.
 
 Google handles authentication, Drive storage, and related service requests under [Google's Privacy Policy](https://policies.google.com/privacy). Browser vendors, extension stores, websites you visit, and services you contact handle information under their own policies. This policy covers the Pboard extension; any future Pboard website with additional data processing will need disclosures for that processing.
 

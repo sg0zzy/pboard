@@ -7,6 +7,7 @@ import type { PboardRole } from "../src/sync/drivePermissions";
 import { createDriveSignaling, createMemorySignalingScope, type PboardDriveSignalRecord, type PboardSignaling } from "../src/collab/signaling";
 import { createRxRepository } from "../src/storage/rxdbRepository";
 import { createIndexedDbBlobStore } from "../src/storage/blobStore";
+import type { CardRecord } from "../src/storage/rxdbSchemas";
 import type { SharedImageTransport } from "../src/collab/imageSync";
 import type { BoardImage } from "../src/types";
 
@@ -249,7 +250,7 @@ describe("createCollaborationManager", () => {
     for (const repo of [firstRepo, secondRepo]) {
       const privateProject = await repo.createProject("Private");
       const seed = await repo.addItem({ projectId: privateProject.id, content: "Private seed" });
-      const record = (await repo.db.cards.findOne(seed.id).exec())!.toJSON();
+      const record = (await repo.db.cards.findOne(seed.id).exec())!.toJSON() as CardRecord;
       await repo.db.cards.bulkInsert(Array.from({ length: 100 }, (_, index) => ({
         ...record, id: `private-${index}`
       })));

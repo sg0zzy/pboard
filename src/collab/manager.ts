@@ -2,6 +2,10 @@ import { replicateWebRTC } from "rxdb/plugins/replication-webrtc";
 import type { RxWebRTCReplicationPool } from "rxdb/plugins/replication-webrtc";
 import type { RxCollection, WithDeleted } from "rxdb";
 import type { PboardRole } from "../sync/drivePermissions";
+import type { BoardPermissionManifest } from "./security/manifest";
+import { manifestHash } from "./security/manifest";
+import type { VerifiedSessionContext } from "./security/session";
+import type { MutationGuardInstall } from "./security/mutation";
 import type { RxRepository } from "../storage/rxdbRepository";
 import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
@@ -56,7 +60,26 @@ export interface CollaborationManagerOptions {
   imageTransport?: SharedImageTransport;
   /** Stable normalized account identity hash; null when Drive is disconnected. */
   getAccountId?: () => Promise<string | null>;
+  /**
+   * Protocol-2 board security. When provided, live pools only admit peers with a
+   * verified session under this authority (see collab/security/*). Null keeps the
+   * legacy unauthenticated flow (tests only). Account-order rooms use
+   * `accountSecurity` and reject any board-context enrollment.
+   */
+  boardSecurity?: (projectId: string) => Promise<CollaborationSecurityOptions | null>;
+  accountSecurity?: (account: string) => Promise<CollaborationSecurityOptions | null>;
+  /** Install per-project mutation verification on the repository (protocol 2). */
+  installMutationGuard?: (projectId: string) => Promise<MutationGuardInstall | null>;
+  removeMutationGuard?: (projectId: string) => Promise<void>;
 }
+
+/** Everything the connection handler needs to run protocol 2 for one room. */
+export type CollaborationSecurityOptions = {
+  signer: { privateJwk: JsonWebKey; deviceKeyId: string };
+  manifest: BoardPermissionManifest;
+  boardId: string;
+  ownSessionId: string;
+};
 
 export interface CollaborationManager {
   start(projectId: string): Promise<void>;
@@ -111,6 +134,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   let sessionGeneration = 0;
   let recovery: Promise<void> | null = null;
   let imageSync: ReturnType<typeof createProjectImageSync> | null = null;
+  let activeGuard: MutationGuardInstall | null = null;
 
   function collectPeers(): string[] {
     const ids = new Set<string>();
@@ -121,6 +145,43 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     return Array.from(ids).sort();
   }
 
+  /** Verified session contexts reported by this manager's pools, by signaling id. */
+  const verifiedContexts = new Map<string, VerifiedSessionContext>();
+
+  /** Handler callback wiring: track verified contexts, drop them on teardown. */
+  function securityHooksFor(securityContext: CollaborationSecurityOptions) {
+    return {
+      onSessionVerified: (remotePeerId: string, context: VerifiedSessionContext) => {
+        verifiedContexts.set(remotePeerId, context);
+      },
+      onSessionRejected: (remotePeerId: string, reason: string) => {
+        verifiedContexts.delete(remotePeerId);
+        error = `Peer session rejected: ${reason}`;
+      }
+    };
+  }
+
+  /**
+   * `isPeerValid` consults the verified session context only, never raw peer
+   * JSON: unverified peers are rejected before RxDB creates a replication. The
+   * connection handler stores contexts per remote session id; the pool resolves
+   * the peer's context through that handler's exposed checker below.
+   */
+  function roleAllowsReplication(securityContext: CollaborationSecurityOptions, context: VerifiedSessionContext): boolean {
+    // Any manifest role may receive content; replication direction is gated by
+    // the pool pull/push configuration and the repository mutator role gate.
+    return context.boardId === securityContext.boardId &&
+      context.manifestHash === manifestHash(securityContext.manifest) &&
+      context.manifestEpoch === securityContext.manifest.epoch;
+  }
+
+  /** Resolve protocol-2 security for one pool (board room or account room). */
+  async function resolvePoolSecurity(projectId: string, collection: SharedCollection): Promise<CollaborationSecurityOptions | null> {
+    if (!options.boardSecurity) return null;
+    const resolved = await options.boardSecurity(projectId);
+    return resolved;
+  }
+
   async function startPool<T extends CardRecord | ProjectRecord>(
     collection: SharedCollection,
     projectId: string,
@@ -128,6 +189,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   ): Promise<void> {
     const editable = isEditorRole(role);
     const generation = sessionGeneration;
+    const securityContext = await resolvePoolSecurity(projectId, collection);
     const beforeReconnect = async () => {
       const isActive = () => generation === sessionGeneration && startedProjectId === projectId;
       if (!isActive() || !options.refreshFromDrive) return;
@@ -150,9 +212,27 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
         signaling: options.signalingFor(topicFor(projectId, collection)),
         scopeDocument: scopeProjectDoc,
         beforeReconnect,
-        ...(options.wrtc ? { wrtc: options.wrtc } : {})
+        ...(options.wrtc ? { wrtc: options.wrtc } : {}),
+        ...(securityContext ? {
+          security: {
+            signer: securityContext.signer, manifest: securityContext.manifest,
+            boardId: securityContext.boardId, collection,
+            ownSessionId: securityContext.ownSessionId,
+            ...securityHooksFor(securityContext)
+          }
+        } : {})
       }),
-      isPeerValid: () => true,
+      // A peer replicates only with a verified session context. Secure pools
+      // reject every peer the handler has not proven (including legacy clients);
+      // legacy (insecure test) pools keep the open admission. The handler
+      // registers verified contexts by remote session id; a peer id equals the
+      // remote session id because the handler assigns it at admission time.
+      isPeerValid: securityContext
+        ? async (peer) => {
+            const context = verifiedContexts.get(String(peer.id));
+            return Boolean(context) && roleAllowsReplication(securityContext, context!);
+          }
+        : () => true,
       // Receive scoping happens in the connection handler (the pull path cannot
       // drop documents via a modifier — a null would crash persistFromMaster).
       pull: { batchSize: 100 },
@@ -180,13 +260,26 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const id = `projectOrder:${account}`;
     const topic = `pboard-account-${account}-order`;
     const scoped = (doc: unknown) => !!doc && typeof doc === "object" && "id" in doc && doc.id === id;
+    // The account room enforces its own scoped identity: shared-board credentials
+    // are rejected by collection binding inside the handler (protocol 2).
+    const securityContext = options.accountSecurity ? await options.accountSecurity(account) : null;
     const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
       collection: rx.db.settings, topic,
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
         signaling: options.signalingFor(topic), scopeDocument: scoped,
-        ...(options.wrtc ? { wrtc: options.wrtc } : {})
+        ...(options.wrtc ? { wrtc: options.wrtc } : {}),
+        ...(securityContext ? {
+          security: {
+            signer: securityContext.signer, manifest: securityContext.manifest,
+            boardId: securityContext.boardId, collection: "accountOrder" as const,
+            ownSessionId: securityContext.ownSessionId,
+            ...securityHooksFor(securityContext)
+          }
+        } : {})
       }),
-      isPeerValid: () => true,
+      isPeerValid: securityContext
+        ? async (peer) => Boolean(verifiedContexts.get(String(peer.id)))
+        : () => true,
       pull: { batchSize: 100 },
       push: { batchSize: 100, modifier: (doc) => scoped(doc) ? doc : null }
     });
@@ -224,6 +317,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     if (!(await rx.getProject(projectId))) {
       await options.bootstrapFromDrive(projectId);
     }
+    activeGuard = options.installMutationGuard ? await options.installMutationGuard(projectId) : null;
     await startPool("cards", projectId, rx.db.cards);
     await startPool("projects", projectId, rx.db.projects);
     if (options.imageTransport) {
@@ -241,6 +335,12 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     while (pools.length > 0) await (pools.pop() as SharedPool).cancel();
     await startedRepo?.setProjectOrderAccount(null);
     if (startedProjectId) startedRepo?.setMutatorRole(startedProjectId, null);
+    if (activeGuard) {
+      await options.removeMutationGuard?.(activeGuard.projectId).catch(() => {});
+      await activeGuard.uninstall().catch(() => {});
+      activeGuard = null;
+    }
+    verifiedContexts.clear();
     startedRepo = null;
     role = "private";
     sharedFileId = null;

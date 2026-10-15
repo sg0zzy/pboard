@@ -3,6 +3,9 @@ import type { RxRepository } from "../storage/rxdbRepository";
 import type { BoardImage } from "../types";
 import { MAX_IMAGE_FILE_BYTES, MAX_STORED_IMAGE_EDGE } from "../images/processing";
 
+/** Allowlist for shared image assets; anything else is rejected before decode. */
+const SUPPORTED_SHARED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
+
 export interface SharedImageTransport {
   readImage(projectId: string, imageId: string): Promise<BoardImage | null>;
   writeImage(projectId: string, imageId: string, image: BoardImage): Promise<void>;
@@ -34,8 +37,14 @@ export function createProjectImageSync(options: {
       if (!stored) {
         const image = await transport.readImage(projectId, imageId);
         if (!active || !image) continue; // Its originating browser may still be uploading.
+        // Shared assets are untrusted input: strict MIME allowlist, size and
+        // dimension limits, and the card's hash-derived id must match the decoded
+        // bytes. This binds every image to its authenticated digest (the SHA-256
+        // imageId signed into the card mutation/asset record), so a hash supplied
+        // alongside modified bytes fails here before storage or display.
         if (typeof image.dataUrl !== "string" || !image.dataUrl.startsWith("data:image/") ||
             image.dataUrl.length > MAX_IMAGE_FILE_BYTES * 1.5 || !image.mimeType?.startsWith("image/") ||
+            !SUPPORTED_SHARED_IMAGE_MIME.has(image.mimeType) ||
             !Number.isInteger(image.width) || !Number.isInteger(image.height) ||
             image.width < 1 || image.height < 1 || image.width > MAX_STORED_IMAGE_EDGE || image.height > MAX_STORED_IMAGE_EDGE) {
           throw new Error("Invalid shared image data");

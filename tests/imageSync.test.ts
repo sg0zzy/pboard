@@ -23,7 +23,7 @@ describe("shared image sync", () => {
     const project = await owner.createProject("Images");
     const card = await owner.addItem({ projectId: project.id, content: "Image", image });
     await viewer.importProject(project, []);
-    await viewer.db.cards.insert((await owner.db.cards.findOne(card.id).exec())!.toJSON());
+    await viewer.db.cards.insert((await owner.db.cards.findOne(card.id).exec())!.toJSON() as never);
     const before = (await viewer.db.cards.findOne(card.id).exec())!.toJSON();
     const notices: string[] = [];
     const stopNotices = viewer.subscribeImages((id) => notices.push(id));
@@ -50,7 +50,7 @@ describe("shared image sync", () => {
     const project = await owner.createProject("Integrity");
     const card = await owner.addItem({ projectId: project.id, content: "Image", image });
     await receiver.importProject(project, []);
-    await receiver.db.cards.insert((await owner.db.cards.findOne(card.id).exec())!.toJSON());
+    await receiver.db.cards.insert((await owner.db.cards.findOne(card.id).exec())!.toJSON() as never);
     let remote: BoardImage | null = null;
     const errors: unknown[] = [];
     const sync = createProjectImageSync({ projectId: project.id, repository: receiver, canWrite: false, onError: (err) => errors.push(err), transport: {

@@ -16,9 +16,23 @@
  *                                     running `startSignalingServerSimplePeer`.
  *   - `createDriveSignaling`        — Drive-hosted ephemeral records (Phase 2).
  */
+import { validateWebSocketEndpoint } from "./security/endpoint";
+import { manifestHash, type BoardPermissionManifest } from "./security/manifest";
+import {
+  buildSignedSignal, verifySignedSignal,
+  createReplayCache, MAX_PENDING_SIGNALS_PER_SESSION,
+  type EnvelopeContext, type ReplayCache, type SigningInput,
+  type SignedSignal
+} from "./security/session";
 
 /** Opaque simple-peer signal: `{ type: "offer" | "answer", sdp }` or `{ type: "iceCandidate", candidate, ... }`. */
 export type PboardSignal = unknown;
+
+/** A signed presence envelope plus the verified manifest the sender declared. */
+export type SignedPresenceEnvelope = {
+  manifest: BoardPermissionManifest;
+  presence: unknown;
+};
 
 export interface PboardSignaling {
   /**
@@ -32,6 +46,11 @@ export interface PboardSignaling {
   sendSignal(toPeerId: string, signal: PboardSignal): Promise<void>;
   /** Install the handler for signals relayed to us. Called with the sender's peer id. */
   onSignal(handler: (fromPeerId: string, signal: PboardSignal) => void): void;
+  /**
+   * Publish a signed presence record for this peer. Secure transports persist it
+   * in the peer's own record; insecure providers (memory/tests) ignore it.
+   */
+  publishPresence?(presence: SignedPresenceEnvelope): Promise<void>;
   /** Report transport failures after join, such as a failed presence poll. */
   onError?(handler: (error: unknown) => void): void;
   /** Leave the room and release transport resources. */
@@ -105,6 +124,11 @@ function createResolvers<T>(): Resolvers<T> {
  */
 
 export function createWebSocketSignaling(topic: string, url: string, webSocket: typeof WebSocket = WebSocket): PboardSignaling {
+  // Endpoint policy: network WebSocket signaling must be WSS. An insecure URL is
+  // only accepted for an explicit loopback development endpoint and never by
+  // received data; a plain rejection here cannot be triggered by remote input.
+  const endpoint = validateWebSocketEndpoint(url);
+  if (endpoint.check === "insecure") throw new Error(`Insecure signaling endpoint: ${endpoint.reason}`);
   let socket: WebSocket | null = null;
   let ownPeerId: string | null = null;
   let onSignalHandler: ((from: string, signal: PboardSignal) => void) | null = null;
@@ -201,7 +225,14 @@ export function createWebSocketSignaling(topic: string, url: string, webSocket: 
 // ---------------------------------------------------------------------------
 
 /** One outbox signal: an opaque simple-peer signal plus a stable id for dedupe. */
-export type PboardDriveSignal = { id: string; toPeerId: string; payload: PboardSignal; sentAt?: number };
+export type PboardDriveSignal = {
+  id: string;
+  toPeerId: string;
+  payload: PboardSignal;
+  sentAt?: number;
+  /** Protocol-2 signed envelope; receiver verifies before using `payload`. */
+  security?: { manifest: BoardPermissionManifest; signedSignal: SignedSignal };
+};
 
 /** The JSON body of a single peer's realtime record. */
 export type PboardDriveSignalRecord = {
@@ -211,6 +242,8 @@ export type PboardDriveSignalRecord = {
   peers: string[];
   /** Signals this peer has sent and not yet pruned. */
   outbox: PboardDriveSignal[];
+  /** Protocol-2 signed presence of this peer; verifiable by every reader. */
+  security?: { manifest: BoardPermissionManifest; presence: unknown };
 };
 
 /**
@@ -240,6 +273,19 @@ export type PboardDriveSignalingOptions = {
   presenceTtlMs?: number;
   /** A signal older than this is dropped from the outbox. Default 240000ms. */
   signalTtlMs?: number;
+  /**
+   * Protocol-2 security inputs. When absent the provider runs in legacy mode and
+   * delivers raw payloads (tests, same-tab dev); secure runtimes always supply it.
+   */
+  security?: {
+    /** The sender signing identity used for our envelopes. */
+    signer: SigningInput;
+    /** Board/collection/manifest/session identity for binding envelopes. */
+    context: EnvelopeContext & { ownSessionId: string };
+    /** Verified inbound envelopes are handed upstream with their inner payload. */
+    onVerifiedSignal?: (fromPeerId: string, signed: SignedSignal) => void;
+    onInvalidEnvelope?: (fromPeerId: string, reason: string) => void;
+  };
 };
 
 /**
@@ -259,6 +305,10 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   const presenceTtlMs = options.presenceTtlMs ?? 60_000;
   const signalTtlMs = options.signalTtlMs ?? 240_000;
   const me = store.peerId;
+  const security = options.security ?? null;
+  const replay: ReplayCache = security ? createReplayCache() : { accepted: new Map() };
+  let presenceEnvelope: SignedPresenceEnvelope | null = null;
+  let outboxSequence = 0;
 
   let onRoster: ((peerIds: string[]) => void) | null = null;
   let onSignal: ((from: string, signal: PboardSignal) => void) | null = null;
@@ -312,7 +362,10 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       await writeExclusive(async () => {
         const own = await readOwn();
         const pruned = own.outbox.filter((s) => now - (s.sentAt ?? own.updatedAt) < signalTtlMs);
-        await store.writeOwn({ updatedAt: now, peers: own.peers, outbox: pruned });
+        await store.writeOwn({
+          updatedAt: now, peers: own.peers, outbox: pruned,
+          ...(security && presenceEnvelope ? { security: presenceEnvelope } : {})
+        });
       });
       // (b) Read every peer, deliver new signals, then reconcile presence.
       const all = await store.listPeers();
@@ -320,11 +373,35 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       for (const [peerId, record] of Object.entries(all)) {
         if (peerId === me || !record || now - record.updatedAt >= presenceTtlMs) continue;
         const seen = delivered.get(peerId) ?? new Set<string>();
-        for (const signal of record.outbox) {
-          if (signal.toPeerId !== me || now - (signal.sentAt ?? record.updatedAt) >= signalTtlMs) continue;
+        // Bound per-remote-session pending work before verification (flood guard).
+        const incoming = record.outbox.filter((s) => s.toPeerId === me && now - (s.sentAt ?? record.updatedAt) < signalTtlMs).slice(0, MAX_PENDING_SIGNALS_PER_SESSION);
+        for (const signal of incoming) {
           if (seen.has(signal.id)) continue;
           seen.add(signal.id);
-          onSignal?.(peerId, signal.payload);
+          if (security && signal.security) {
+            try {
+              const verifiedSignal: unknown = await verifySignedSignal(
+                { payload: { ...signal.security.signedSignal.payload, signal: signal.payload }, signature: signal.security.signedSignal.signature },
+                {
+                  manifest: signal.security.manifest,
+                  expected: {
+                    boardId: security.context.boardId, collection: security.context.collection,
+                    manifestHash: manifestHash(security.context.manifest), ownDeviceKeyId: security.signer.deviceKeyId,
+                    ownSessionId: security.context.ownSessionId
+                  },
+                  now
+                },
+                replay
+              );
+              void verifiedSignal;
+              security.onVerifiedSignal?.(peerId, signal.security.signedSignal);
+            } catch (error) {
+              security.onInvalidEnvelope?.(peerId, error instanceof Error ? error.message : String(error));
+            }
+          } else if (!security) {
+            onSignal?.(peerId, signal.payload);
+          }
+          // Secure mode with a bare (unsigned) signal: dropped without delivery.
         }
         delivered.set(peerId, seen);
       }
@@ -352,12 +429,27 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
     sendSignal(to, signal) { return writeExclusive(async () => {
       if (!started) return;
       const now = store.now();
+      let securityEntry: { manifest: BoardPermissionManifest; signedSignal: SignedSignal } | undefined;
+      if (security) {
+        const signedEnvelope = await buildSignedSignal(
+          security.signer, security.context,
+          { deviceKeyId: to, sessionId: to }, signal, outboxSequence++
+        );
+        securityEntry = { manifest: security.context.manifest, signedSignal: signedEnvelope };
+      }
       const own = await readOwn();
-      own.outbox.push({ id: crypto.randomUUID(), toPeerId: to, payload: signal, sentAt: now });
+      own.outbox.push({ id: crypto.randomUUID(), toPeerId: to, payload: signal, sentAt: now, ...(securityEntry ? { security: securityEntry } : {}) });
       own.outbox = own.outbox.slice(-16); // bound the outbox
       own.peers = Array.from(new Set([...own.peers, to]));
-      await store.writeOwn({ updatedAt: now, peers: own.peers, outbox: own.outbox });
+      await store.writeOwn({
+        updatedAt: now, peers: own.peers, outbox: own.outbox,
+        ...(security && presenceEnvelope ? { security: presenceEnvelope } : {})
+      });
     }); },
+    publishPresence(envelope) {
+      presenceEnvelope = envelope;
+      return Promise.resolve();
+    },
     onSignal(handler) {
       onSignal = handler;
     },

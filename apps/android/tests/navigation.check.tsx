@@ -340,4 +340,27 @@ describe('mobile navigation and editing', () => {
     await act(async () => root.render(null));
     expect(native.remove).toHaveBeenCalledOnce(); expect(storage.stop).toHaveBeenCalledOnce();
   });
+  it('returns home automatically when the open board is deleted or disappears', async () => {
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+    expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
+    // The reactive watcher pushes a snapshot without the board (local deletion
+    // commits the account marker first; the owner or a sync can also remove it
+    // while this screen is open) before any navigation callback runs.
+    await act(async () => storage.listener!({ projects: [], cards: [], showPreviews: true }));
+    expect(host.querySelector('h1')?.textContent).toBe('pboard');
+    expect(host.textContent).not.toContain('no longer available');
+    expect(host.querySelectorAll('.board-tile')).toHaveLength(0);
+  });
+  it('returns to the board when an open card editor loses its card', async () => {
+    storage.snapshot.cards = [{ id: 'c1', projectId: 'phone', content: 'one', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+    // Enter on the focused card article opens the card editor.
+    const cardArticle = host.querySelector<HTMLElement>('article[aria-label^="Edit card 1"]')!;
+    cardArticle.focus();
+    await act(async () => cardArticle.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    expect(host.querySelector('h1')?.textContent).toBe('Edit card');
+    // Remote deletion of the card while the editor is open: bounce to the board.
+    await act(async () => storage.listener!({ ...storage.snapshot, cards: [] }));
+    expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
+  });
 });
