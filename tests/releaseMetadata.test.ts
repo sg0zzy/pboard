@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import packageMetadata from "../package.json";
 import firefoxManifest from "../manifest.json";
 import chromiumManifest from "../manifest.chromium.json";
@@ -6,7 +7,7 @@ import { OPEN_PBOARD_SHORTCUT } from "../src/background/shortcuts";
 
 describe("release metadata", () => {
   it("keeps package and browser manifest versions aligned", () => {
-    expect(packageMetadata.version).toBe("0.10.2");
+    expect(packageMetadata.version).toBe(readFileSync(new URL("../VERSION", import.meta.url), "utf8").trim().replace(/-dev$/, ""));
     expect(firefoxManifest.version).toBe(packageMetadata.version);
     expect(chromiumManifest.version).toBe(packageMetadata.version);
   });

@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 import { writeLicenseNotices } from "./license-notices.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+if (!process.env.PBOARD_STAGE) {
+  const { buildLocal } = await import('./local-build.mjs');
+  buildLocal([process.argv[2] === 'chromium' ? 'chromium' : 'firefox']);
+  process.exit(0);
+}
 const variant = process.argv[2] === "chromium" ? "chromium" : "firefox";
 const outputDir = variant === "chromium" ? "dist/chromium" : "dist";
 const env = { ...process.env, PBOARD_OUT_DIR: outputDir };

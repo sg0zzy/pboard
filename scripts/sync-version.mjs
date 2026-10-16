@@ -71,7 +71,7 @@ function stableVersionCode(core) {
 }
 
 /**
- * versionCode policy (contract §8):
+ * Preserved Android versionCode mapping:
  *  - stable selection/release set: versionCode = core*1000 + 999 (adopting the
  *    adapter value when it exceeds the file's current code, else refusing a
  *    regression);
@@ -83,7 +83,7 @@ function nextVersionCode(gradle, state) {
   if (!current) throw new Error("versionCode not found in apps/android/android/app/build.gradle");
   if (state.dev) return { code: Number(current[1]), bumped: false };
   const adapterCode = stableVersionCode(state.core);
-  const monotonic = Number(current[1]) < adapterCode ? adapterCode : Number(current[1]);
+  const monotonic = adapterCode;
   if (monotonic < Number(current[1])) {
     console.error(`Android versionCode regression refused: ${monotonic} < ${current[1]}`);
     process.exit(1);
@@ -123,7 +123,7 @@ if (nextIdx !== -1) {
 }
 
 let state = readVersionState();
-// The regression baseline is the *committed* VERSION (§3: Git is the source of
+// The regression baseline is the *committed* VERSION (Git is the source of
 // truth for code identity), not the already-selected working state — a dev-core
 // bump writes VERSION before the reference sync runs.
 let previousCore = state.core;
@@ -142,7 +142,7 @@ if (explicit?.kind) {
 } else if (explicit?.core) {
   state = { core: explicit.core, dev: true };
   if (!checkOnly) {
-    // Refuse a development core at or below the last selected core (§2.8, §9.6):
+    // Refuse a development core at or below the last selected core:
     // distributed test builds keep their upgrade ordering.
     if (compareCores(state.core, previousCore) <= 0) {
       console.error(`Refusing a development core that does not advance: ${previousCore.join(".")} → ${coreText(state)}`);
@@ -160,7 +160,8 @@ const targets = [
   resolve(root, "manifest.chromium.json"),
   resolve(root, "package.json"),
   resolve(root, "package-lock.json"),
-  resolve(root, "apps/android/package.json")
+  resolve(root, "apps/android/package.json"),
+  resolve(root, "apps/android/package-lock.json")
 ];
 
 let changed = [];
@@ -188,26 +189,6 @@ for (const target of targets) {
       console.log(`wrote ${rel}`);
     }
     note(rel);
-  }
-}
-
-// Release-metadata assertion pins the expected display version.
-{
-  const rel = "tests/releaseMetadata.test.ts";
-  const target = resolve(root, rel);
-  const text = readFileSync(target, "utf8");
-  if (!text.includes(`expect(packageMetadata.version).toBe("${version}");`)) {
-    if (checkOnly) {
-      changed.push(`${rel} (assertion pins a different version)`);
-    } else {
-      const updated = text.replace(
-        /expect\(packageMetadata\.version\)\.toBe\("[\d.]+"\)/,
-        `expect(packageMetadata.version).toBe("${version}")`
-      );
-      if (updated === text) throw new Error(`Could not update the version assertion in ${rel}`);
-      writeFileSync(target, updated);
-      console.log(`wrote ${rel}`);
-    }
   }
 }
 

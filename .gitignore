@@ -8,3 +8,16 @@ coverage/
 web-ext-artifacts/*.zip
 *.apk
 .build-state/
+/local_artifacts/
+
+# Private policy cache, release intermediates and signing material
+/.standards-cache/
+/official-output/
+/verified-output/
+/signing-input/
+/release-staging/
+/release-record/
+*.keystore
+*.jks
+*.p12
+/reviewed-release-plan/

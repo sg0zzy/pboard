@@ -1,9 +1,13 @@
 # Pboard documentation
 
-Use this index to find the maintained description of each part of Pboard. Reviewed 14 October 2026 against package version 0.9.5.
+Use this index to find the maintained description of each part of Pboard. Development standards adopted 16 October 2026; version authority is `VERSION`.
 
 | Document | Purpose |
 | --- | --- |
+| [Standards adoption](../DEVELOPMENT_STANDARDS.md) | Pinned central authority, mappings, exceptions and gaps |
+| [Migration evidence](../STANDARDS_MIGRATION_REPORT.md) | Local validation and remaining release prerequisites |
+| [Release operations](../RELEASE.md) | Preparation, signing, GitHub staging and manual distribution |
+| [Version mapping](../VERSIONING.md) | Product authority and native package fields |
 | [Repository README](../README.md) | Overview, installation, Drive configuration, and Pages setup |
 | [Product specification](../SPECIFICATION.md) | Implemented user behavior and product limits |
 | [Build and release guide](../BUILD.md) | Build commands, validation, packaging, Mozilla submission, and reviewer reproduction |

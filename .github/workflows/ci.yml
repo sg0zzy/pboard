@@ -1,81 +1,64 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 permissions:
   contents: read
-
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  firefox:
-    name: Firefox extension checks
+  checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [firefox, chromium, android]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
-
-      - name: Build Firefox extension
-        env:
-          VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET: ${{ secrets.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET }}
-        run: npm run build
-
-      - name: Lint production Firefox output
-        run: npm run lint:firefox
-
-      - name: Verify build output
-        run: node scripts/verify-build.mjs firefox
-
-      - name: Package and verify the archive
-        run: npm run package:firefox
-
-      - name: Verify release assets exist
-        run: node scripts/verify-release-assets.mjs
-
-  android:
-    name: Android frontend checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
+          cache-dependency-path: |
+            package-lock.json
+            apps/android/package-lock.json
+      - run: npm ci
+      - run: node scripts/sync-version.mjs --check
+      - if: matrix.target != 'android'
+        run: npm run typecheck && npm test
+      - if: matrix.target == 'android'
+        run: npm ci && npm run typecheck && npm test
         working-directory: apps/android
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - if: matrix.target == 'android'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: apps/android/package-lock.json
-
-      - name: Install Android dependencies
-        run: npm ci
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
-
-      - name: Build Android frontend
-        run: npm run build
+          distribution: temurin
+          java-version: '21'
+      - name: Build and verify test-only packages
+        env:
+          TARGET: ${{ matrix.target }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: scripts/build_all.sh "$TARGET"
+      - name: Preserve verified temporary output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pboard-${{ matrix.target }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: local_artifacts/*/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve incomplete diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: incomplete-pboard-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: local_artifacts/*/build-info.json
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,123 +1,132 @@
-name: Firefox AMO release
-
+name: Stable Release
 on:
   push:
-    tags:
-      - "v*.*.*"
-
+    tags: ['v*']
 permissions:
   contents: read
-
+# One repository-wide lock for allocation, build, staging and visibility.
 concurrency:
-  group: release-${{ github.ref }}
+  group: official-release-lifecycle
   cancel-in-progress: false
-
 jobs:
   validate:
-    name: Validate tagged Firefox build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      control: ${{ steps.control.outputs.sha }}
+      artifact_attempt: ${{ steps.control.outputs.attempt }}
+      already_published: ${{ steps.release.outputs.already_published }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: .nvmrc
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Check tag against manifest version and extension ID
-        run: node scripts/verify-release-tag.mjs "${{ github.ref_name }}"
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test
-        run: npm test
-
-      - name: Build Firefox extension
-        env:
-          VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET: ${{ secrets.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET }}
-        run: npm run build
-
-      - name: Lint production Firefox output
-        run: npm run lint:firefox
-
-      - name: Package and verify the upload contents
-        id: package
-        run: npm run package:firefox
-
-      - name: Verify release assets
-        run: node scripts/verify-release-assets.mjs
-
-      - name: Read version for later jobs
+      - id: control
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Validate source, history, configuration and reservation
         id: release
-        run: |
-          version=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Archive reviewer sources
-        run: |
-          git archive --format=zip --output="web-ext-artifacts/pboard-source.zip" HEAD \
-            .nvmrc .env.example package.json package-lock.json tsconfig.json \
-            manifest.json manifest.chromium.json sidebar.html \
-            vite.sidebar.config.ts vite.background.config.ts vite.content.config.ts \
-            web-ext-config.cjs src scripts icons BUILD.md LICENSE.md README.md
-
-      - name: Save unsigned extension and reviewer sources
-        uses: actions/upload-artifact@v4
-        with:
-          name: firefox-release
-          if-no-files-found: error
-          path: |
-            web-ext-artifacts/pboard-${{ steps.release.outputs.version }}.zip
-            web-ext-artifacts/pboard-source.zip
-
-      - name: Submit new version to Mozilla Add-ons
         env:
-          WEB_EXT_API_KEY: ${{ secrets.AMO_API_KEY }}
-          WEB_EXT_API_SECRET: ${{ secrets.AMO_API_SECRET }}
-        run: |
-          if [ -z "$WEB_EXT_API_KEY" ] || [ -z "$WEB_EXT_API_SECRET" ]; then
-            echo "::error::AMO_API_KEY and AMO_API_SECRET repository secrets are required."
-            exit 1
-          fi
-          npx --no-install web-ext sign --config web-ext-config.cjs \
-            --channel listed --upload-source-code web-ext-artifacts/pboard-source.zip --no-input
-
-  github-release:
-    name: Publish GitHub release
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: stable
+          SELECTOR: ${{ github.ref_name }}
+          CORE: ''
+        run: node scripts/release-control.mjs validate "$CHANNEL" "$SELECTOR" "$CORE"
+      - name: Preserve reservation or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-reservation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-record/
+          if-no-files-found: error
+          retention-days: 90
+  build:
     needs: validate
+    if: needs.validate.outputs.already_published != 'true'
+    uses: ./.github/workflows/build-targets.yml
+    with:
+      sha: ${{ needs.validate.outputs.sha }}
+      control: ${{ needs.validate.outputs.control }}
+      version: ${{ needs.validate.outputs.version }}
+      artifact_attempt: ${{ needs.validate.outputs.artifact_attempt }}
+  stage:
+    needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.control }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: verified-*-${{ github.run_id }}-${{ needs.validate.outputs.artifact_attempt }}
+          path: verified-output
+      - name: Prepare manifest and complete notes for human review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: stable
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+        run: node scripts/release-control.mjs stage "$CHANNEL" "$VERSION" "$SOURCE_SHA" verified-output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-plan-${{ github.run_id }}-${{ needs.validate.outputs.artifact_attempt }}
+          path: release-staging/
+          if-no-files-found: error
+          retention-days: 90
+  publish:
+    needs: [validate, build, stage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-publication
     permissions:
       contents: write
     steps:
-      - name: Download validated artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          name: firefox-release
-          path: firefox-release
-
-      - name: Read release notes from the tag annotation
-        run: |
-          git fetch origin "+refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}" --no-tags
-          git tag -l --format='%(contents)' "${{ github.ref_name }}" > release-notes.md
-
-      - name: List release assets
-        run: ls -l firefox-release
-
-      - name: Create GitHub release for the tag
-        uses: softprops/action-gh-release@v2
+          ref: ${{ needs.validate.outputs.control }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Pboard ${{ github.ref_name }}
-          draft: false
-          fail_on_unmatched_files: true
-          body_path: release-notes.md
-          append_body: true
-          files: firefox-release/*
+          node-version-file: .nvmrc
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: verified-*-${{ github.run_id }}-${{ needs.validate.outputs.artifact_attempt }}
+          path: verified-output
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-plan-${{ github.run_id }}-${{ needs.validate.outputs.artifact_attempt }}
+          path: reviewed-release-plan
+      - name: Verify aggregate outputs, stage draft and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: stable
+          VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+        run: node scripts/release-control.mjs publish "$CHANNEL" "$VERSION" "$SOURCE_SHA" verified-output
+      - name: Preserve publication or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            release-record/
+            release-staging/
+          if-no-files-found: error
+          retention-days: 90

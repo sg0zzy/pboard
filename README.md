@@ -97,6 +97,8 @@ No browsing-history permission or remote code is used. Unless the user explicitl
 
 ## Optional Google Drive sync
 
+Drive snapshots synchronize current data; they are not a historical backup or a complete database recovery procedure. See the recovery gap in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md).
+
 Google Drive support requires separate OAuth clients for Chromium and Firefox. Their public client IDs are set in `src/sync/googleDriveConfig.ts` (per browser, per stage); the Chromium production client ID and the `drive.appdata` and `drive` scopes are also declared in `manifest.chromium.json` for Chrome's native `identity.getAuthToken()` flow. Keep those two Chromium client-ID values identical. Firefox uses authorization-code PKCE with the loopback redirect derived from its fixed add-on ID (`http://127.0.0.1/mozoauth2/...`). If Google's Desktop OAuth client requires a client secret for Firefox token exchange, copy `.env.example` to the git-ignored `.env.local` and set `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`; Vite embeds it in the extension bundle, so it must not be treated as a confidential server-side secret. `<stage>` is `dev` under `npm run dev` and `production` under `npm run build` / `build:chromium`.
 
 The integration requests `https://www.googleapis.com/auth/drive.appdata` for private snapshots and the full `https://www.googleapis.com/auth/drive` scope for boards shared by other users, and explicitly shows Google's account selector. After upgrading from a build that requested only private sync access, reconnect Drive to grant sharing access. Access/refresh token state stays in extension-local storage. Project content continues to save locally first; Drive writes run asynchronously after manual sync, project switching, a debounced visibility loss, or about 25 seconds of dirty idle time. A Drive failure never rolls back local data.
@@ -117,7 +119,7 @@ The Firefox build uses the native `sidebar_action`, a toolbar `action` that open
 
 ## Develop and build
 
-Requirements: Node.js 24.15.0 or newer within the 24 series (`.nvmrc` selects major version 24) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions and [RELEASE.md](RELEASE.md) for automated AMO releases and required GitHub secrets.
+Requirements: Node.js 24.15.0 or newer within the 24 series (`.nvmrc` selects major version 24) and npm. The manifests require Firefox 142+ or Chromium 114+ with Side Panel support. Development policy is pinned in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md). See [BUILD.md](BUILD.md) for reproducible builds, packaging, and release instructions and [RELEASE.md](RELEASE.md) for staged releases, manual store delivery, and signing prerequisites.
 
 ```bash
 npm install
@@ -125,7 +127,7 @@ npm run check
 npm run build:all
 ```
 
-`npm run check` runs strict TypeScript checking, the shared test suite, both production builds, and a lightweight verification of both generated manifests and bundles. `npm run build` writes the Firefox package to `dist/`; `npm run build:chromium` writes the Chromium package to `dist/chromium/`; `npm run build:all` creates both. The tests and build verification are development-only and add no runtime code to the extension. The background and content entries are separately bundled as classic IIFEs so they work as Firefox background scripts or a Chromium MV3 service worker.
+`npm run check` runs strict TypeScript checking, the shared test suite, both production builds, and a lightweight verification of both generated manifests and bundles. Managed builds preserve unique packages and metadata under `local_artifacts/`; unpacked Firefox and Chromium intermediates remain at `dist/` and `dist/chromium/`. `npm run build:all` creates both. The tests and build verification are development-only and add no runtime code to the extension. The background and content entries are separately bundled as classic IIFEs so they work as Firefox background scripts or a Chromium MV3 service worker.
 
 Build verification also starts each production background bundle with mocked browser APIs and without Node globals, checking that its event handlers register successfully. This catches browser-incompatible dependency imports that can pass unit tests and still prevent the extension from starting.
 

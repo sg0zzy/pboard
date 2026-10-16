@@ -1,0 +1,28 @@
+{
+  "repository": "https://github.com/sg0zzy/dev-standards",
+  "edition": "1.0.0",
+  "commit": "e3111c4e9dc652f833a5f2ba5232c292646e7969",
+  "files": {
+    "VERSIONING.md": "2000005462517af3f5ad155eb07f6a824f0e835481a6fac4d5936bb34cad2818",
+    "SECURITY.md": "2b0ba0ae0fef4d45104b377553cf4e308e58b4136990fb199f9bf21a79e6ae5d",
+    "REVIEW.md": "34d9cc76df8fcd00c2e07d93ad4943e2f828774005acca318d2d2073ef5c7fd7",
+    "RELEASE.md": "9aa8cc0901861f3c2fc3584101e9222ae8ca6e2f2e951a64714af6f36e85b7fa",
+    "README.md": "3c60f69e6c1c0c02a8d97d71df6a5b7231c88a4fa1751f38945262685682717d",
+    "DISTRIBUTION.md": "c4169de6aadbfa8b03383151fb528b2ef6d26973f51b831196a1786992a3c6f7",
+    "CONFIGURATION.md": "c3a40f8c1eaaad0e863aca8c3986befe52f644027ef1d196ad9e4eeacb030113",
+    "COMPLIANCE.md": "183a0952cf828a1acccbe5ac836579deda6ac3ffd92010cffa8dabcb3c4279bf",
+    "BUILD.md": "5b424934f99d9464c29d330ec624b03fd53e88f89fb5eb5a9c844c32f20333f5",
+    "ARTIFACTS.md": "ffef3bd27ca10f2621b656bcaffe4dcf8e243b9249a3283b87ed1101e0b44ce6",
+    "ARCHITECTURE.md": "66168ac423d6638c761bab87ee8f21948b3520c2a127366a0e6240bf069242d3",
+    "ANDROID.md": "0979e5162db2d47ee75d128bcbba6d2c2b4c2d4092572dc95c54b20f42cf64a0",
+    "AGENTS.md": "8de35e3691b907cdfac5e381acf60bd91150ab284e59124cdf6df5e934bce79e",
+    "ADOPTION.md": "8787a674a4ae1bc7fe68249471271ef20347188f39ea3e3f50fed5501805fe60",
+    ".gitignore": "157772a364f37e9701ffd470b09b3e1fcc064670db0a2acbbca5a96f87fbabd2",
+    "templates/DEVELOPMENT_STANDARDS.md": "336f0f6d44b7930463cfb7a346f1286db7db06bccf2374388119c782b8bde432",
+    "templates/AGENTS.project.md": "cb42713fb72b2865c728553b207fd8a633179396d5a134533d535d84bb1d90a1",
+    "examples/release-scenarios.md": "d07e15b5cdcb1c76e6481ab579c882ce220b364f59eae6f6e7adbe47cdbbbb38",
+    "examples/project-config.example.yml": "e5818f62eee6daea018d1c688c9b790536001596cf8b105105534b6ccc9fa999",
+    "examples/github-actions-patterns.md": "bb202116b62d1db77838d5118782e15d5ff387a13a074981a38d633ee8837f10",
+    "examples/android-versioning.md": "380440aa0f563b60dde70631cd73ea61b43d4de733a5ff29fd9d32088e13d79f"
+  }
+}

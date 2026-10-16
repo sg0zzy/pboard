@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "project": "pboard",
+  "repository": "https://github.com/sg0zzy/pboard",
+  "versionAuthority": "VERSION",
+  "retention": 10,
+  "targets": {
+    "firefox": {
+      "platform": "firefox",
+      "architecture": "universal",
+      "package": "zip",
+      "signing": "unsigned-upload-archive"
+    },
+    "chromium": {
+      "platform": "chromium",
+      "architecture": "universal",
+      "package": "zip",
+      "signing": "unsigned-upload-archive"
+    },
+    "android": {
+      "platform": "android",
+      "architecture": "universal",
+      "package": "apk",
+      "signing": "debug-test-only"
+    },
+    "android-release": {
+      "platform": "android",
+      "architecture": "universal",
+      "package": "apk",
+      "signing": "android-release"
+    }
+  },
+  "matrix": {
+    "local": {
+      "required": [
+        "firefox",
+        "chromium",
+        "android"
+      ],
+      "optional": []
+    },
+    "ci": {
+      "required": [
+        "firefox",
+        "chromium",
+        "android"
+      ],
+      "optional": []
+    },
+    "beta": {
+      "required": [
+        "firefox",
+        "chromium",
+        "android-release"
+      ],
+      "optional": []
+    },
+    "stable": {
+      "required": [
+        "firefox",
+        "chromium",
+        "android-release"
+      ],
+      "optional": []
+    }
+  },
+  "signing": {
+    "android-release": {
+      "certificateSha256": null,
+      "credentialReferences": [
+        "ANDROID_KEYSTORE_BASE64",
+        "ANDROID_KEY_ALIAS",
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_PASSWORD"
+      ],
+      "environment": "release-signing",
+      "historyReviewed": false,
+      "highestHistoricalCode": null
+    }
+  },
+  "history": {
+    "reviewed": false,
+    "reservations": [],
+    "historicalAliases": {}
+  },
+  "distribution": [
+    {
+      "destination": "amo",
+      "target": "firefox",
+      "channel": "stable",
+      "mode": "manual"
+    },
+    {
+      "destination": "amo",
+      "target": "firefox",
+      "channel": "beta",
+      "mode": "disabled"
+    },
+    {
+      "destination": "chrome-web-store",
+      "target": "chromium",
+      "channel": "stable",
+      "mode": "manual"
+    },
+    {
+      "destination": "chrome-web-store",
+      "target": "chromium",
+      "channel": "beta",
+      "mode": "disabled"
+    },
+    {
+      "destination": "google-play",
+      "target": "android-release",
+      "channel": "stable",
+      "mode": "disabled"
+    },
+    {
+      "destination": "google-play",
+      "target": "android-release",
+      "channel": "beta",
+      "mode": "disabled"
+    }
+  ]
+}

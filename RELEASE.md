@@ -1,123 +1,60 @@
-# Releasing Pboard
+# Pboard release operations
 
-Automated release flow: `VERSION` file → `scripts/prepare-build.sh` (select version, sync, build all targets) → test locally → commit and push → `scripts/release.sh` (tag + notes) → GitHub Actions submits Firefox to AMO and publishes the GitHub Release. All scripts implement the repository contract [VERSIONING.md](VERSIONING.md).
+The central contracts pinned in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md) govern allocation, publication, security and distribution. Project implementation is in `project-standards.json` and `.github/workflows/`.
 
-## How VERSION works
+## Readiness
 
-`VERSION` is the single source of truth for the core version and development status; the build system supplies the local `-dev.N` counter and build identity — never embedded by a commit per compilation (contract §3/§4.4). Two states:
+Official publication is deliberately blocked until the release owner fills and reviews the existing-history and production-signer records. Run `node scripts/release-control.mjs preflight` to see the first blocker. This migration does not create credentials or declare unverified signing identities. All three official targets remain mandatory: Firefox ZIP, Chromium ZIP and release-signed Android APK, plus reviewer sources, release manifest and SHA-256 checksums.
 
-- `0.10.1` — stable core; Android dev builds require an explicitly selected development core.
-- `0.10.2-dev` — a development core has been selected (via `scripts/version.sh bump <kind>` or `--dev-core`). Every local Android build becomes `0.10.2-dev.N`, `N` from a gitignored, atomically locked counter that resets when the core changes (`.build-state/`). Each build also gets a unique build ID (UTC ms + suffix) and is archived under `dist/dev/<version>/<build-id>/` with `build-manifest.json` (SHA-256, commit SHA, dirty flag, source patch digest) and `source.patch` when dirty. Existing artifact paths are never overwritten.
+Before activation, inventory complete remote tags/releases, historical aliases, deleted/abandoned identities and all Android allocated/submitted/distributed codes. Record reconciled aliases/tombstones in `project-standards.json`; set `history.reviewed` only when complete. Keep durable tombstones there when reservations might disappear remotely. Owner review must establish branch/tag protection, trusted workflow/build/dependency review, and actual protected `release-signing` and `release-publication` environments with eligible refs/reviewers. Environment names in YAML do not establish these settings.
 
-`scripts/sync-version.mjs [X.Y.Z-dev]` applies the selected state to:
-
-- `manifest.json` (Firefox) and `manifest.chromium.json` (Chromium) — display core, no `-dev`
-- `package.json` and `package-lock.json` (root npm, via `npm`-compatible plain edit)
-- `apps/android/package.json` (Android npm workspace)
-- `apps/android/android/app/build.gradle` — `versionName` is the display core; `versionCode` follows the documented adapter (contract §8): `core*1000 + slot`, dev slots `1..998` stamped per dev build (and restored afterwards in the tracked file), stable slot `999` assigned on stable preparation. A `versionCode` regression is refused; the code never decreases.
-- `tests/releaseMetadata.test.ts` (the version assertion)
-
-Check without writing: `node scripts/sync-version.mjs --check` (exit 1 + file list when out of sync). The AMO workflow independently re-verifies tag ↔ manifest version and the Gecko ID (`scripts/verify-release-tag.mjs`) before building.
-
-Documented exception: the `versionCode` stored in the tracked gradle file is the stable-slot value of the selected core; dev slots exist only inside local build outputs, so distributed codes stay monotonic without coordinating workstations' counters (contract §4.3/§8).
-
-## Prepare a build
+## Stable preparation
 
 ```sh
-./scripts/prepare-build.sh --next=0.10.2    # explicit release core (recommended)
-./scripts/prepare-build.sh                  # patch bump as release-core candidate
-./scripts/prepare-build.sh --minor          # 0.10.1 → 0.11.0
-./scripts/prepare-build.sh --major          # 0.10.1 → 1.0.0
-./scripts/prepare-build.sh --dev-core       # development-only core (X.Y.Z-dev), test builds
-./scripts/prepare-build.sh --no-bump        # same version again (retry after a failed build)
+scripts/release.sh X.Y.Z --dry-run
+scripts/release.sh X.Y.Z --apply
 ```
 
-The script: refuses to bump when version files already have uncommitted changes (avoids double bumps), runs `npm ci` if needed, then typecheck + tests, builds Firefox, runs `web-ext lint --warnings-as-errors` against the real output, byte-verifies the Firefox package, builds Chromium, packages and byte-verifies it, then the Android workspace (typecheck, tests, `cap sync`, `gradlew assembleDebug`). Never commits, pushes, tags, or publishes.
+Dry-run displays intended metadata files, checks and the human commit/tag/push plan without changing source, refs, index or remotes. Apply requires a clean intended tree, reviewed history/signing, a greater explicitly selected version, root validation, Android tests and a managed debug APK build. It synchronizes metadata and restores original metadata on failure. It never commits, tags or pushes. Review the diff, test all local targets with `scripts/build_all.sh`, and prepare a dedicated reviewed release commit if metadata changed. An annotated `vX.Y.Z` must identify that commit; pushing it is a separate explicitly authorized human operation.
 
-## Artifacts (test these)
+The stable tag workflow validates exact syntax, annotation, peeled SHA, committed VERSION, trusted main ancestry, configuration and full high-water inventory. Both entry workflows use `official-release-lifecycle` for their complete lifecycle. Remote create-only beta refs and high-water revalidation also protect against independently pushed stable reservations. Tag rulesets should prohibit deletion/replacement and bypass.
 
-| Target | Path |
-|---|---|
-| Firefox | `web-ext-artifacts/pboard-<version>.zip` (unsigned, byte-compared to `dist/`) |
-| Chromium | `web-ext-artifacts/pboard-chromium-<version>.zip` (unsigned) |
-| Android | `apps/android/android/app/build/outputs/apk/debug/app-debug.apk` (debug-signed) and a copy `web-ext-artifacts/Pboard-<version>-debug.apk` |
+## Beta release
 
-Local testing pointers: Firefox `about:debugging` → Load Temporary Add-on → `dist/manifest.json`; Chromium `chrome://extensions` → Load unpacked → `dist/chromium/`; Android install the debug APK on a device (`adb install web-ext-artifacts/Pboard-<version>-debug.apk`).
+The **Beta Release** workflow is manually dispatched with `ref` (default `main`, reviewed branch/full committed SHA reachable from main, or an existing annotated beta tag for exact-source retry) and optional `core`. Without an explicit core, committed VERSION must select `X.Y.Z-dev`. It resolves source once, checks trust/configuration, inventories all remote official state and reviewed tombstones, allocates a globally forward `X.Y.Z-dev.N`, and creates an annotated immutable tag before packaging. Token-created tags continue packaging within the same workflow; no second tag-trigger run is assumed.
 
-## Local builds without a release
+The beta release is `prerelease: true` with `make_latest: false`. Stable publication is `prerelease: false` with latest enabled. Neither channel delivers to stores.
 
-```sh
-scripts/build_all.sh                      # Firefox + Chromium + Android dev build
-scripts/build_all.sh firefox chromium     # only these targets
-scripts/version.sh bump patch             # select the next development core for Android dev builds
-scripts/version.sh --check                # verify references are in sync
-```
+## Build and publication gates
 
-These never bump, commit or tag. `scripts/build_all.sh android` requires a selected development core (or use `--dev-core` with `prepare-build`); each Android build is archived under `dist/dev/<version>/<build-id>/` and reported as `ARTIFACT android: …`. Generated artifacts stay out of Git (`.gitignore` covers `web-ext-artifacts/*.zip`, `dist/`, `.build-state/`, Android `build/`, `*.apk`).
+`build-targets.yml` builds each official target with read-only permissions from the resolved SHA and uploads temporary manifests/packages. Browser packages use the numeric mapping in [VERSIONING.md](VERSIONING.md). Firefox reviewer sources contain the complete committed tree; private environment files are not included. Signing is a separate protected job using trusted control code, not selected-source executables.
 
-## Commit and push manually
+An unprivileged stage job prepares a downloadable release plan with complete notes, manifests and checksum identities before protected publication approval. Review that plan in the `release-publication` environment; the publisher requires identical regenerated plan bytes, failing if the stable baseline or other inputs changed. The protected publisher downloads verified artifacts, checks source/configuration, target outcomes, filenames, sizes, transport hashes and Android signer. It creates a draft, attaches packages plus `release-manifest.json` and `SHA256SUMS.txt`, downloads every uploaded asset to verify bytes, rechecks publication ordering, then makes the draft visible. A missing required target/asset or invalid signature blocks publication. Build and publication records are retained as Actions evidence for 90 days; immutable remote tags remain durable reservations. Completed Release manifests retain source/config/standards/run/package evidence.
 
-```sh
-git add -A
-git commit -m "Release 0.10.1"   # or your own message
-git push origin main             # CI must go green first
-```
+Stable notes use the previous **successfully published stable** from the API at publication time, not the newest tag or beta. First-stable notes include all reachable history, including the root commit. A divergent stable baseline fails for human reconciliation. Commit-range evidence and all commit subjects, including merges are retained without a 100-commit truncation. Generated notes require human review for meaningful grouping, cherry-pick duplication, omissions and sensitive/internal text in the release-plan artifact before environment approval. Hold approval and repair/review the plan process if notes are inadequate.
 
-## Run the release script
+## Signing and platform identities
 
-```sh
-./scripts/release.sh
-```
+- Firefox ID: `project-board@local.invalid`. Official ZIP is an unsigned **upload archive**, with license/notices and matching reviewer sources. It is not an installable signed XPI. AMO listed signing/publication remains manual; credentials `AMO_API_KEY` / `AMO_API_SECRET` are not passed into builds. A separate authorized AMO operation must verify returned signed output, keep its hash/receipt and distinguish submission/review from public availability. Unlisted signing is also external transfer and needs authorization.
+- Chromium: unsigned **store-upload ZIP**, not CRX. Existing OAuth client IDs remain unchanged. The owner must verify the actual Chrome Web Store extension ID against `manifest.chromium.json` and `src/sync/googleDriveConfig.ts`; see [submission details](BUILD.md#chrome-web-store-submission). No private CRX signing key is configured or generated.
+- Android ID: `it.stefanogozzi.pboard`, API 33+, compile/target 36. `release-signing` requires references `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`; the expected public certificate SHA-256 and highest historical/submitted code belong in `project-standards.json`. `scripts/sign-android.mjs` aligns/signs/verifies the final APK and certificate plus package version/code. There is no debug/unsigned fallback. These references do not create or rotate any key.
+- Existing Android encoded codes are retained within documented bounds. No GitHub↔Play or beta/stable update edge is promised until production certificates, existing installs, numeric history and device data-preservation checks have been verified. Local debug uses the production app ID for compatibility with existing development installs and the tracked code without allocating production codes. A different signer or code can block updates: use a dedicated emulator/test profile, back up valuable data, and never treat uninstalling as upgrade evidence. No AAB/Play signing profile is configured.
 
-It fails fast (actionable error, nonzero exit) unless: version refs match `VERSION`, tracked tree is clean, branch is `main`, local `main` == `origin/main` (it never pushes `main`), tag `v<VERSION>` exists neither locally nor on origin. It then:
+## Distribution
 
-1. finds the previous release tag by ancestry (`git tag --merged HEAD`, `sort -V`; handles the first release by ranging from the root commit),
-2. builds notes from commit subjects in `prevTag..HEAD` (non-merge commits plus merge subjects, deduplicated by subject),
-3. writes and displays `web-ext-artifacts/release-notes-v<version>.md`,
-4. asks for explicit confirmation,
-5. creates the annotated tag `v<VERSION>` with the notes as tag message,
-6. pushes **only that tag** (never `main`, never `--force`), triggering the AMO workflow.
+| Destination / platform | Beta | Stable | Package, required evidence and retry identity |
+| --- | --- | --- | --- |
+| GitHub / declared targets | manual workflow initiation | authorized annotated tag push | Completed staged manifest/checksum/signature gates; tag + SHA + asset hashes; GitHub visibility verified |
+| AMO / Firefox | disabled | manual | Verified Firefox upload ZIP + reviewer source; human signing/upload; record numeric version, input/output hashes, submission ID and actual review/publication state |
+| Chrome Web Store / Chromium | disabled | manual | Verified Chromium ZIP; human dashboard upload; extension ID + native version + SHA-256 + receipt; review is pending until confirmed live |
+| Google Play / Android | disabled | disabled | No configured AAB or credentials; no upload |
+| Pages / documentation | no release delivery | manual, separately authorized repository Pages setup | Existing `docs/` branch-hosting instructions in README; not an application-bundle build/deploy target |
+| Other destinations | disabled | disabled | No implicit delivery |
 
-If the tag push fails, the tag already exists locally — retry `git push origin refs/tags/v<version>` manually.
+Manual store delivery consumes completed verified artifacts; do not rebuild from main. Signing/store transformations require recorded input/output hashes and version/receipt. Reconcile destination state before retries, and preserve a successful GitHub release if store delivery fails. The detailed Chrome listing, permissions and reviewer instructions remain in BUILD.md. No standing external automation authority is introduced.
 
-## How GitHub Actions publishes to AMO
+## Failure and recovery
 
-The pushed tag triggers `.github/workflows/release.yml` (concurrency-controlled per tag; a normal `main` push never publishes):
+Failed packages leave the reservation consumed. For a transient stable failure, rerun the same trusted tagged workflow with the same source/config; source corrections need a greater version. For an exact beta retry, dispatch with the reserved tag as `ref` and its original `core`. A normal branch dispatch allocates a fresh greater reservation. A superseded reservation fails the forward gate. No tag may move.
 
-1. **validate** (`contents: read`): re-checks tag ↔ manifest version + Gecko ID, then typecheck, tests, Firefox build, strict lint, package byte-verification, reviewer-source archive, `web-ext sign --config web-ext-config.cjs --channel=listed --upload-source-code ... --no-input` using the `AMO_API_KEY`/`AMO_API_SECRET` secrets.
-2. **github-release** (`contents: write`): runs only if the submission succeeded; reads the release notes **from the tag annotation** (`git tag --format='%(contents)'`) and attaches the unsigned build + source archive.
-
-Android and Chromium are **not** published anywhere automatic. Submission success ≠ Mozilla approval; the listing updates only after review.
-
-## How release notes are generated
-
-Purely from Git history (`git log` subjects) — nothing invented, no AI, nothing omitted unless it's a duplicate subject. Merge commits: kept once; their merged commits appear as their own bullets; identical subjects deduplicated. The notes are reviewed locally before confirmation and stored in the tag annotation, not in any tracked file.
-
-## Recovering from failures
-
-| Failure | Action |
-|---|---|
-| Build fails in `prepare-build.sh` | Script stops with nonzero exit; rerun with `--no-bump` (same version, no double bump) |
-| Dirty tree guards trip | Commit the version files, or use `--no-bump` to rebuild without bumping |
-| `release.sh`: out-of-sync versions | Run `node scripts/sync-version.mjs`, commit, continue |
-| Tag exists / AMO already has version | Never re-tag or resubmit the same version; cut the next patch version; never delete or move a pushed tag |
-| Tag push failed | Tag exists locally; `git push origin refs/tags/v<version>` |
-| AMO submission failed in Actions | Fix, push to `main`, re-run `prepare-build.sh --no-bump`, commit, `release.sh` with bumped `VERSION`; never force-push tags |
-| GitHub-Release job failed after AMO submit | Re-run **only** the `Publish GitHub release` job (Re-run failed jobs); do not re-submit to AMO |
-| Local main behind/diverged from origin | Script says which; `git pull --ff-only` / reconcile manually |
-
-## Example release cycle
-
-```sh
-./scripts/prepare-build.sh              # 0.10.1 → 0.10.2, builds all three targets
-# test Firefox/Chromium/Android artifacts
-git add -A && git commit -m "Release 0.10.2" && git push origin main
-# wait for CI green
-./scripts/release.sh                    # review notes, confirm → tag v0.10.2 pushed
-# watch https://github.com/sg0zzy/pboard/actions → AMO gets 0.10.2, GitHub Release appears
-```
-
-## Prerequisites
-
-- Node 24 (`.nvmrc`), npm, JDK 21 + Android SDK for the APK, Git.
-- GitHub secrets: `AMO_API_KEY`, `AMO_API_SECRET` (existing AMO pipeline; unchanged).
+A matching published tag is verified against its existing manifest and every asset hash and returns success without rebuilding or writing. Draft retries verify existing bytes and upload only missing identical-plan assets; conflicting/incomplete assets fail for explicit reconciliation. No `--clobber` or automatic asset replacement is used. If an API times out, inspect actual draft/public state, tag/SHA and byte hashes first. Conflicting bytes require incident review rather than overwriting. Required live remote acceptance/retry tests remain pending in the migration report.
