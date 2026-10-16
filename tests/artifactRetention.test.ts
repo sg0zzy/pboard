@@ -18,6 +18,40 @@ const edit = (dir: string, fields: object) => {
   const file = join(dir, 'build-info.json'); writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), ...fields }));
 };
 describe('managed local artifacts', () => {
+  it.each(['directory', 'symlink', 'file', 'permission'])('handles a competing root creation (%s) before acquiring the lock', kind => {
+    const module = new URL('../scripts/artifact-retention.mjs', import.meta.url).href;
+    const outside = join(fixture, 'outside'); mkdirSync(outside);
+    // Inject a competing filesystem change after the absence check, before mkdir.
+    // Patching only this child keeps the race deterministic and other tests isolated.
+    const child = `
+      import fs from 'node:fs';
+      import {syncBuiltinESMExports} from 'node:module';
+      const [root, kind, outside] = process.argv.slice(1);
+      const mkdir = fs.mkdirSync;
+      fs.mkdirSync = (path, ...args) => {
+        if (path === root) {
+          if (kind === 'directory') mkdir(root);
+          else if (kind === 'symlink') fs.symlinkSync(outside, root);
+          else if (kind === 'file') fs.writeFileSync(root, 'preserve');
+          else throw Object.assign(new Error('permission failure'), {code: 'EACCES'});
+        }
+        return mkdir(path, ...args);
+      };
+      syncBuiltinESMExports();
+      const {createBuild} = await import(${JSON.stringify(module)});
+      try { createBuild({buildId: 'first', version: '0.10.3-local.1'}, root); console.log('created'); }
+      catch (e) { console.log(e.code ?? e.message); }
+    `;
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', child, storage, kind, outside], { encoding: 'utf8' }).trim();
+    if (kind === 'directory') {
+      expect(output).toBe('created'); expect(inspectBuilds(storage)).toHaveLength(1);
+    } else {
+      expect(output).toMatch(kind === 'permission' ? /^EACCES$/ : /canonical directory without symlinks/);
+      expect(existsSync(join(storage, '.retention.lock'))).toBe(false);
+      expect(existsSync(join(outside, 'first'))).toBe(false);
+      if (kind === 'file') expect(readFileSync(storage, 'utf8')).toBe('preserve');
+    }
+  });
   it('reserves exclusive direct children and refuses an identity collision', () => {
     const dir = start('first'); expect(basename(dir)).toBe('first');
     expect(() => start('first')).toThrow();

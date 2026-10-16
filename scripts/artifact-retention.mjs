@@ -13,7 +13,11 @@ export function safeRoot(root, create = false) {
   root = resolve(root);
   if (create && !stat(root)) {
     if (realpathSync(dirname(root)) !== dirname(root)) throw Error('Artifact root parent must not contain symlinks');
-    mkdirSync(root);
+    try { mkdirSync(root); } catch (e) {
+      // Another process may create the shared root before either acquires its lock.
+      // Revalidate the resulting path below; EEXIST can also mean a file or symlink.
+      if (e.code !== 'EEXIST') throw e;
+    }
   }
   if (!stat(root)) return root;
   if (!stat(root).isDirectory() || stat(root).isSymbolicLink() || realpathSync(root) !== root) throw Error('Artifact root must be a canonical directory without symlinks');

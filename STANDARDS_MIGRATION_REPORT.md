@@ -1,5 +1,54 @@
 # Standards migration report
 
+## GitHub Actions Node.js 24 runtime migration — 2026-10-17
+
+Updated all 38 action invocations across CI, official target builds, beta and
+stable workflows to full commit pins resolved from upstream stable release tags.
+Verified each pinned `action.yml` declares `runs.using: node24` and accepts the
+configured inputs. Reviewed upstream release notes and migration guidance:
+
+| Action | Reviewed upstream release |
+| --- | --- |
+| checkout | [v7.0.1](https://github.com/actions/checkout/releases/tag/v7.0.1) |
+| setup-node | [v7.1.0](https://github.com/actions/setup-node/releases/tag/v7.1.0) |
+| upload-artifact | [v7.0.2](https://github.com/actions/upload-artifact/releases/tag/v7.0.2) |
+| download-artifact | [v8.0.2](https://github.com/actions/download-artifact/releases/tag/v8.0.2) |
+| setup-java | [v6.1.0](https://github.com/actions/setup-java/releases/tag/v6.1.0) |
+
+The Node.js 24 action runtime requires runner 2.327.1 or later; these workflows
+use GitHub-hosted `ubuntu-latest`. Project Node selection still uses `.nvmrc`,
+and Android still selects Temurin 21. Explicit npm caches remain enabled only
+where already configured; other setup-node calls now disable automatic caching
+to preserve signing/publication boundaries. Existing credential persistence,
+permissions, approvals, artifact names/paths/retention and triggers are preserved.
+Artifact uploads retain the default archived format; downloads retain extraction
+and separate directories for pattern matches, with digest mismatches now fatal
+by upstream default.
+
+Validation: actionlint passed; parsed comparison against HEAD confirmed only
+action pins and automatic-cache opt-outs changed workflow behavior. All 38
+invocations passed upstream runtime/input checks, five isolated release-gate
+tests passed, and whitespace checks passed. The central policy pin and all 21
+digests were verified. No remote workflow was started; hosted execution and the
+absence of deprecation annotations await the next authorized run.
+
+## Artifact root creation race — 2026-10-17
+
+The reported CI concurrency failure exposed a race before artifact-lock acquisition:
+two processes could both observe a missing root, and the second `mkdir` failed
+with `EEXIST`. Root creation now tolerates that collision and validates the
+resulting canonical directory before locking. Files/symlinks remain rejected;
+other filesystem errors propagate. Exclusive build reservations and retention
+protection rules are unchanged.
+
+Local L07/L08 regression evidence: deterministic child-process fault injection
+reproduced the failure before the fix and now covers competing directory,
+symlink and file creation plus permission failures. The existing concurrent
+creation/completion test also passes. On Node 24.21.0, all 16 artifact tests,
+the full root suite (73 files / 520 tests), TypeScript and whitespace checks
+passed. The pinned standards checkout was verified against all 21 locked files.
+CI has not been rerun remotely; existing release-readiness gaps remain.
+
 ## Version and release shell automation — 2026-10-16
 
 The requested PhoneHaul-style shell interface is implemented locally without
