@@ -42,6 +42,8 @@ Pboard requests these permissions:
 
 - `https://www.googleapis.com/auth/drive.appdata`: store and retrieve private Pboard backups, account preferences, and synchronization records in Drive's application data folder.
 - `https://www.googleapis.com/auth/drive`: discover and work with Pboard boards shared with your account, manage Pboard shared folders and files, and manage collaborator permissions. This permission grants broad Drive access; Pboard uses it for its backup, synchronization, and collaboration features, including finding incoming shared boards.
+- `tabs` (installed with the extension): read the active browser tab's address and title so "Pin current page" and the capture toolbar can detect the page you are on. It does not read tab contents.
+- Optional host access for the web pages you pin from or capture: requested through an explicit prompt when you click "Pin selected text", "Pin link", or "Capture region" and the page was not opened through an action that already granted access. This access lets Pboard read the selection, link, or region on that page. You can grant it per request or revoke it at any time in your browser's extension permission settings.
 
 Pboard creates, reads, updates, and deletes its project snapshots and related files as needed for these features. Connected boards synchronize asynchronously, including after edits and other synchronization triggers; you do not need to press a sync button for every upload. Board content and captured images can therefore leave your device while Drive is connected.
 
