@@ -40,6 +40,8 @@ Every managed invocation accepts dirty input, captures a private copy before com
 
 `npm run release:firefox`, `release:chromium`, and `release:all` are historical aliases for checks/builds; they do not publish. `scripts/compile-manifests.sh` remains available. `scripts/prepare-build.sh` now forwards to the managed builder without selecting a version. `--skip-frontend`/`--skip-android-build` are rejected: reusing an unverified old bundle cannot establish source identity. `--stable-apk` is rejected on the test-only builder; use official release packaging for production APKs.
 
+Version bump and beta/stable tagging commands are documented in [RELEASE.md](RELEASE.md#shell-commands). They are separate from local compilation.
+
 ## Managed artifacts
 
 Output: `local_artifacts/<core>-local.<unique-integer>/Pboard-<identity>-<target>-universal.{zip,apk}`, with `build-info.json`. Each directory is an exclusive direct-child reservation. Manifest schema 1 / manager `pboard-local-builds` records state, source SHA/dirty/snapshot digest, effective configuration digest, standards pin, locks, host/toolchain, package versions, checksums/sizes and target outcomes. Local Android certificates are recorded as debug-only.
@@ -99,10 +101,10 @@ testing were not performed during this review.
   [Drive scope classifications](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)
   and [restricted-scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/restricted-scope-verification).
 - Review collaboration authorization before distributing sharing publicly.
-  `src/collab/manager.ts` accepts peers with `isPeerValid: () => true` in both
-  pools. Viewer restrictions apply in the standard local client; receivers
-  do not independently authenticate remote peers or authorize every write.
-  Terms disclose this, but disclosure does not resolve the security gap. See
+  Live rooms require trusted current security manifests and shared-board
+  mutation protection; unavailable trust blocks collaboration before signaling.
+  Complete the remaining real-browser secure-session and real-Drive revocation
+  validation before public distribution. See
   [the collaboration security limits](docs/collaboration.md#authorization-and-security-limits).
 - Prepare at least one real Chrome screenshot (1280×800 or 640×400) and a
   440×280 small promotional image. The repository contains extension icons,

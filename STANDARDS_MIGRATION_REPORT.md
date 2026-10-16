@@ -1,5 +1,224 @@
 # Standards migration report
 
+## Version and release shell automation — 2026-10-16
+
+The requested PhoneHaul-style shell interface is implemented locally without
+changing VERSION, platform identities, the standards pin, or destination modes.
+`scripts/version.sh show|bump patch/minor/major|set X.Y.Z-dev` now validates
+forward core selection, known local/durable reservations and platform limits,
+synchronizes every mirror transactionally, and supports nonmutating previews.
+Development selection retains the tracked Android code and reserves no beta/code.
+
+`scripts/release.sh prepare X.Y.Z` automates validation, metadata synchronization,
+a dedicated metadata commit when necessary and annotated local tagging;
+`tag X.Y.Z` validates/resumes an already committed selection. New commands default
+to plans; `--apply` executes their stated action. Existing metadata-only syntax is
+preserved. Failed validation restores metadata; later Git failures preserve an
+explicit resumable checkpoint. No destructive reset or tag replacement is used.
+`publish X.Y.Z --apply` requires matching current main/tag/version, revalidates
+complete history and destination identity (including push URL), and uses an
+atomic explicit main/tag push with no force, unrelated tags or partial fallback.
+An identical remote tag is a no-op; conflicting objects block.
+
+`scripts/beta-version.sh next` is a read-only history-based preview. Its
+`allocate` and exact-tag `retry` operations dispatch the existing trusted-main
+workflow only with `--apply`. Branch selectors are resolved once to full remote
+SHAs; retry retains the immutable tag selector. Official beta allocation stays
+inside the common beta/stable lifecycle, including clean trusted source, full
+high-water inventory, signing, staging and protected publication. Dispatch errors
+require remote reconciliation instead of blind allocation retries. No new
+standing remote authorization or store automation is adopted.
+
+Validation: 22 new shell-interface cases passed in disposable Git repositories
+with mocked GitHub/npm/push boundaries, including all three bump kinds,
+regression/overflow, partial-sync rollback, nonmutating plans with dirty work,
+annotated tags, dedicated/no-redundant commits, mandatory-check failure, tag
+failure/resume, superseded reservations, atomic push, identical/conflicting
+remote tags, branch/destination rejection, pinned beta source, exact-tag retry and
+indeterminate dispatch. The fixed historical fixtures are independent of the
+application's current VERSION. These provide local V01–V03/S01–S03/S07–S09 and
+B01/B03/Q02 evidence as applicable; they do not establish live remote acceptance.
+The focused policy/release suites passed 34 cases; the full root suite passed
+73 files / 510 tests. Root TypeScript, all shell syntax checks, changed JavaScript
+syntax checks, version mirrors and whitespace validation passed. RELEASE.md
+records usage, checkpoints, dependencies, dry-run limits and official CLI/Git
+references. Existing readiness placeholders and all other audit gaps remain.
+
+Only plans/help/show were exercised in this real checkout. No real release
+commits, tags, pushes, workflow dispatches, credential changes or publication were
+performed. Prior audit/security changes and the current branch/worktree were
+preserved.
+
+## Security remediation — 2026-10-16
+
+Independent audit finding 1 (unauthenticated collaboration fallback) is addressed
+in the current local changes. `src/collab/manager.ts` now requires trusted,
+current, structurally valid manifests bound to each requested board/account and
+including the local device. Missing providers, null results and verification
+errors block startup before signaling. Shared rooms also require a successfully
+installed mutation guard for that project. Board security is resolved once per
+start and supplied to both collection rooms; there is no production legacy
+admission option. Failed starts/role refreshes close partial rooms and report an
+error. Retry can resume after account trust is restored. Private local operations
+without an account remain available.
+
+`tests/collaborationAdmission.test.ts` adds 17 regressions for missing/null/failed
+providers, invalid/expired/misbound manifests, unknown devices, missing or wrong
+mutation guards, private local operation, restored trust and refresh cleanup.
+Root TypeScript and all 72 root test files / 488 tests passed; Android TypeScript
+and all 15 test files / 98 tests passed. Version mirrors and `git diff --check`
+passed. The native two-profile Chromium convergence/JSEP smoke test passed.
+
+The pre-existing manager convergence tests used unauthenticated transport
+fixtures. Simply supplying signed manifests did not establish secure sessions in
+those fixtures. They and the browser convergence harness now explicitly double
+authentication at the handler boundary, using ephemeral signed test manifests and
+test mutation-guard doubles. Their transport/storage checks still use real
+WebRTC/IndexedDB, but are not proof of end-to-end protocol-2 authentication.
+Production builds do not load the test double or the harness's build resolver.
+The 45 focused admission/recovery/protocol/adversarial checks passed separately;
+real-browser secure-session and real-Drive revocation validation remain open.
+
+This closes the reproduced missing-manifest fallback only. Audit findings 2/3,
+backup/restore, signing/history and remote-control verification gaps remain.
+The existing audit changes were preserved. No version/identity/credential change,
+commit, tag or remote operation was performed.
+
+## Independent compliance audit — 2026-10-16
+
+**Verdict: not fully compliant.** This audit checks committed source
+`13cd1e31264ba0fa82253d90efdf50dd1a7830bc` on `main`. The initial worktree
+was clean. Only this audit record was edited; application/tooling fixes are
+outside this check. Historical implementation claims below are not current
+acceptance evidence where this section identifies a contradiction.
+
+Authority: edition 1.0.0, commit `e3111c4e9dc652f833a5f2ba5232c292646e7969`.
+`python3 scripts/verify-standards.py /tmp/pboard-standards.R5jlaX` verified all
+21 locked files. The sibling `../dev-standards` is at
+`90bf955cbeb0fdf0a711e255b182f864807b3784` and failed the pin check; it was
+not substituted. No standards update is implied.
+
+Configuration SHA-256:
+`66132ecc9817170be13684ba02fde497db7739c47f6926dc9946a1a1a1ef6ade`.
+Lock SHA-256:
+`94de81784d476c7f37a61ea018134467a6ad70b90579b7d7a0fb0a3cd4ab88be`.
+The requested `../ononehaul/scripts` does not exist. The available
+`../phonehaul/scripts` version/build/release/cleanup implementations were
+consulted as reference only; they are not policy authority or proof of Pboard
+compliance.
+
+### Confirmed implementation findings
+
+1. **High — missing security context enables unauthenticated replication.**
+   `src/sync/runtime.ts:261` returns null for a missing board pin; manifest
+   resolution also returns null for missing/invalid/unverifiable manifests.
+   Account security has the same missing-pin path. These callbacks are wired
+   into the production manager at `src/sync/runtime.ts:404`.
+   `src/collab/manager.ts:230` and `:280` interpret a null context as open peer
+   admission and omit handler security. `doStart` also continues when the
+   mutation-guard installer returns null. Thus the comment promising offline
+   behavior without a pin is not enforced. Existing protocol-2 cryptographic
+   modules do not close this fallback.
+   **Evidence:** an isolated copy of the existing manager integration test
+   “connects two owner sessions through periodic Drive signaling when the second
+   browser opens later” was run with `boardSecurity`, `accountSecurity`, and
+   `installMutationGuard` explicitly resolving to null. It passed, including a
+   genuine local ICE/DTLS handshake and replicated content. No Google service
+   was used. This demonstrates the fallback, not exploitation of a live account.
+   **Policy:** ARCHITECTURE privacy/trust boundaries and synchronization
+   integrity; COMPLIANCE R06/R07/R10 as applicable. **Owner:** application/security
+   maintainers. Require verified security before creating production rooms;
+   keep any test-only legacy transport explicitly separate. Add manager/runtime
+   integration coverage for missing, invalid and expired manifests, including
+   account rooms and missing mutation guards.
+
+2. **Medium — publication success is recorded without checking the result.**
+   `scripts/release-control.mjs:198` discards the visibility-update response and
+   immediately records `published`. It does not verify final draft/channel
+   state or latest selection. This contradicts RELEASE's explicit requirement
+   to check the resulting beta release controls and RELEASE.md's visibility
+   verification claim.
+   **Evidence:** an isolated fixture using the existing release-gate harness
+   provided valid source/config/targets/checksums/reviewed plan and mocked
+   Git/GitHub only. The PATCH returned `draft: true, prerelease: true` for a
+   stable publication; the command exited zero and wrote `state: published`.
+   All five existing release-gate tests plus this reproduction passed (six
+   tests). The reproduction asserts the current defect, not compliant behavior.
+   **Policy:** RELEASE manual beta/result verification and observable state;
+   COMPLIANCE B01/S04. **Owner:** release maintainer. Verify the returned and
+   reconciled remote tag, visibility, channel and latest controls before
+   recording success; retain recoverable failure evidence otherwise.
+
+3. **Medium — official packaging failures lack a durable target result.**
+   `scripts/release-build.mjs:66` writes its manifest only after successful
+   compilation/validation. There is no failure handler that records failed
+   target state. In `build-targets.yml`, package uploads run only on success;
+   signer failure has no diagnostic upload either. The validation job's
+   preserved record can remain at `tag_reserved` when packaging fails, without
+   the required failed target/recovery result. GitHub job logs remain useful,
+   but do not supply the declared structured release record.
+   **Evidence:** an isolated copy with reviewed fixture metadata, fake Git and
+   an injected failing required npm check exited 1; neither
+   `official-output/build-info.json` nor `release-record/state.json` existed.
+   Workflow inspection confirms there is no failure upload for these jobs.
+   **Policy:** RELEASE common transaction/evidence, BUILD per-target outcomes,
+   ARTIFACTS CI/release metadata; COMPLIANCE B04/S06. **Owner:** release
+   maintainer. Initialize target records before work, preserve failed/skipped
+   outcomes and partial output on error, and upload explicitly incomplete
+   evidence with failure/always handling without enabling publication.
+
+### Existing blockers and evidence limits
+
+- Full database backup/restore instructions and representative restore evidence
+  remain missing, including attachments, relationships/settings, Android
+  photos and tombstones (ARCHITECTURE recovery; application maintainers).
+- Official history remains unreviewed and production Android certificate/code
+  inventory is unset. Existing readiness checks correctly reject these
+  placeholders; this is a release blocker, not permission to invent values
+  (RELEASE/ANDROID; release owner).
+- Actual remote branch/tag protections, environment approvals/ref restrictions,
+  production signer behavior, store acceptance and physical-device update/data
+  preservation remain unverified. No remote settings/API audit or release was
+  performed (SECURITY/ANDROID/COMPLIANCE; repository and release owners).
+- Collaboration documentation now describes implemented protocol-2 signatures,
+  mutual proof and storage guards. Historical blanket statements below about
+  absent authentication are incomplete; finding 1 identifies the current
+  concrete bypass. Real-browser secure-session and real-Drive revocation
+  acceptance gates remain open in `docs/collaboration.md`.
+- Local manifests read standards/config digests from the live tree after
+  capturing source (`scripts/local-build.mjs:78`), rather than from the private
+  snapshot. Concurrent edits could make provenance disagree with captured
+  inputs. This is an inspection concern, not a reproduced failure in this
+  audit; capture provenance/config from the same snapshot before claiming
+  concurrent-edit coverage for those fields (ARTIFACTS/L13).
+
+### Validation executed for this audit
+
+Node 24.21.0 was selected from the installed NVM toolchain; the initial shell
+had no Node/npm on PATH. No dependency installation was necessary.
+
+| Check | Current result |
+| --- | --- |
+| Exact pinned policy SHA and all locked digests | Pass, 21 files |
+| Generated version mirrors | Pass, VERSION 0.10.2 |
+| Root TypeScript | Pass |
+| Full root suite | Pass, 71 files / 471 tests |
+| Android TypeScript and full suite | Pass, 15 files / 98 tests |
+| Focused policy/retention/release/metadata suite | Pass, 4 files / 27 tests (also included in full suite) |
+| Existing release gates + isolated false-publication reproduction | 6 passed; reproduction confirms finding 2 |
+| Null-security-context WebRTC reproduction | 1 passed / 6 unselected; confirms finding 1 |
+| Injected official required-check failure | Exit 1, no persisted target/failure manifest; confirms finding 3 |
+| actionlint on all four workflows | Pass |
+| Whitespace validation | `git diff --check` passed |
+
+Temporary reproduction trees and their copies were removed after inspection.
+Only their redacted observations are recorded here. Existing local artifacts
+were not rebuilt, pruned or modified. Full package compilation, signing and
+live remote acceptance were not repeated; historical build evidence below
+must not be mistaken for a build of this audited commit. No commits, tags,
+pushes, workflow dispatches, publication or credential changes were performed.
+
+
 Adoption date: 2026-10-16. Central origin: https://github.com/sg0zzy/dev-standards. Edition **1.0.0**, commit **`e3111c4e9dc652f833a5f2ba5232c292646e7969`**. No central tags existed; Git resolved main to this SHA. Browser access returned 404, but authenticated Git retrieval succeeded. The pinned checkout and SHA-256 inventory of all 21 files were verified locally. No policy was reconstructed from memory.
 
 Status: **partial adoption, with tested local development and fail-closed release infrastructure**. Unverified production identity/history, repository controls and existing recovery/security gaps prevent claiming full compliance. No remote workflow or release was executed.

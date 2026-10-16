@@ -3,7 +3,7 @@ import type { RxWebRTCReplicationPool } from "rxdb/plugins/replication-webrtc";
 import type { RxCollection, WithDeleted } from "rxdb";
 import type { PboardRole } from "../sync/drivePermissions";
 import type { BoardPermissionManifest } from "./security/manifest";
-import { manifestHash } from "./security/manifest";
+import { manifestHash, manifestIsCurrent, roleForDevice, validateManifest } from "./security/manifest";
 import type { VerifiedSessionContext } from "./security/session";
 import type { MutationGuardInstall } from "./security/mutation";
 import type { RxRepository } from "../storage/rxdbRepository";
@@ -61,10 +61,9 @@ export interface CollaborationManagerOptions {
   /** Stable normalized account identity hash; null when Drive is disconnected. */
   getAccountId?: () => Promise<string | null>;
   /**
-   * Protocol-2 board security. When provided, live pools only admit peers with a
-   * verified session under this authority (see collab/security/*). Null keeps the
-   * legacy unauthenticated flow (tests only). Account-order rooms use
-   * `accountSecurity` and reject any board-context enrollment.
+   * Protocol-2 board security, verified against the pinned authority by the runtime.
+   * Missing providers or null contexts block collaboration. Account-order rooms
+   * require their own `accountSecurity` context.
    */
   boardSecurity?: (projectId: string) => Promise<CollaborationSecurityOptions | null>;
   accountSecurity?: (account: string) => Promise<CollaborationSecurityOptions | null>;
@@ -105,7 +104,8 @@ const isEditorRole = (role: CollaborationRole) => role === "owner" || role === "
  *   - viewer: pull-only (no push). A viewer never emits local writes, so nothing
  *     can be pushed; this is the replication-layer half of the read-only
  *     guarantee. The UI read-only + repository gate provide the primary
- *     enforcement; the malicious-modified-client case is out of scope for v1.
+ *     enforcement for local writes. Signed mutation guards enforce authorization
+ *     for remote writes before persistence.
  *
  * Scoping: the master's WebRTC handler streams its whole collection, so a room
  *   would otherwise leak a peer's private projects. Scoping is enforced in two
@@ -175,21 +175,25 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       context.manifestEpoch === securityContext.manifest.epoch;
   }
 
-  /** Resolve protocol-2 security for one pool (board room or account room). */
-  async function resolvePoolSecurity(projectId: string, collection: SharedCollection): Promise<CollaborationSecurityOptions | null> {
-    if (!options.boardSecurity) return null;
-    const resolved = await options.boardSecurity(projectId);
-    return resolved;
+  /** The runtime verifies authority signatures; admission also requires a current, scoped context. */
+  function requireSecurity(context: CollaborationSecurityOptions | null | undefined, boardId: string): CollaborationSecurityOptions {
+    if (!context) throw new Error("Collaboration requires a trusted security manifest. Local boards remain available.");
+    const manifest = validateManifest(context.manifest);
+    if (context.boardId !== boardId || manifest.boardId !== boardId ||
+        !manifestIsCurrent(manifest, Date.now()) || !roleForDevice(manifest, context.signer.deviceKeyId)) {
+      throw new Error("Collaboration security manifest is expired or does not authorize this room and device.");
+    }
+    return context;
   }
 
   async function startPool<T extends CardRecord | ProjectRecord>(
     collection: SharedCollection,
     projectId: string,
-    ref: RxCollection<T>
+    ref: RxCollection<T>,
+    securityContext: CollaborationSecurityOptions
   ): Promise<void> {
     const editable = isEditorRole(role);
     const generation = sessionGeneration;
-    const securityContext = await resolvePoolSecurity(projectId, collection);
     const beforeReconnect = async () => {
       const isActive = () => generation === sessionGeneration && startedProjectId === projectId;
       if (!isActive() || !options.refreshFromDrive) return;
@@ -213,26 +217,18 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
         scopeDocument: scopeProjectDoc,
         beforeReconnect,
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
-        ...(securityContext ? {
-          security: {
-            signer: securityContext.signer, manifest: securityContext.manifest,
-            boardId: securityContext.boardId, collection,
-            ownSessionId: securityContext.ownSessionId,
-            ...securityHooksFor(securityContext)
-          }
-        } : {})
+        security: {
+          signer: securityContext.signer, manifest: securityContext.manifest,
+          boardId: securityContext.boardId, collection,
+          ownSessionId: securityContext.ownSessionId,
+          ...securityHooksFor(securityContext)
+        }
       }),
-      // A peer replicates only with a verified session context. Secure pools
-      // reject every peer the handler has not proven (including legacy clients);
-      // legacy (insecure test) pools keep the open admission. The handler
-      // registers verified contexts by remote session id; a peer id equals the
-      // remote session id because the handler assigns it at admission time.
-      isPeerValid: securityContext
-        ? async (peer) => {
-            const context = verifiedContexts.get(String(peer.id));
-            return Boolean(context) && roleAllowsReplication(securityContext, context!);
-          }
-        : () => true,
+      // Only a mutually proven session under this room's manifest may replicate.
+      isPeerValid: async (peer) => {
+        const context = verifiedContexts.get(String(peer.id));
+        return Boolean(context) && roleAllowsReplication(securityContext, context!);
+      },
       // Receive scoping happens in the connection handler (the pull path cannot
       // drop documents via a modifier — a null would crash persistFromMaster).
       pull: { batchSize: 100 },
@@ -253,33 +249,30 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     ready = true;
   }
 
-  async function startAccountOrder(rx: RxRepository): Promise<void> {
-    const account = await options.getAccountId?.() ?? null;
+  async function startAccountOrder(rx: RxRepository, account: string | null, securityContext: CollaborationSecurityOptions | null): Promise<void> {
     await rx.setProjectOrderAccount(account);
-    if (!account) return;
+    if (!account || !securityContext) return;
     const id = `projectOrder:${account}`;
     const topic = `pboard-account-${account}-order`;
     const scoped = (doc: unknown) => !!doc && typeof doc === "object" && "id" in doc && doc.id === id;
     // The account room enforces its own scoped identity: shared-board credentials
     // are rejected by collection binding inside the handler (protocol 2).
-    const securityContext = options.accountSecurity ? await options.accountSecurity(account) : null;
     const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
       collection: rx.db.settings, topic,
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
         signaling: options.signalingFor(topic), scopeDocument: scoped,
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
-        ...(securityContext ? {
-          security: {
-            signer: securityContext.signer, manifest: securityContext.manifest,
-            boardId: securityContext.boardId, collection: "accountOrder" as const,
-            ownSessionId: securityContext.ownSessionId,
-            ...securityHooksFor(securityContext)
-          }
-        } : {})
+        security: {
+          signer: securityContext.signer, manifest: securityContext.manifest,
+          boardId: securityContext.boardId, collection: "accountOrder" as const,
+          ownSessionId: securityContext.ownSessionId,
+          ...securityHooksFor(securityContext)
+        }
       }),
-      isPeerValid: securityContext
-        ? async (peer) => Boolean(verifiedContexts.get(String(peer.id)))
-        : () => true,
+      isPeerValid: async (peer) => {
+        const context = verifiedContexts.get(String(peer.id));
+        return Boolean(context) && roleAllowsReplication(securityContext, context!);
+      },
       pull: { batchSize: 100 },
       push: { batchSize: 100, modifier: (doc) => scoped(doc) ? doc : null }
     });
@@ -306,8 +299,19 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const rx = await options.getRepository();
     if (!rx) return;
     startedRepo = rx;
-    await startAccountOrder(rx);
-    if (role === "private") return;
+    // Resolve every requested room before creating transports, including account rooms
+    // opened while viewing a private board. Null must never mean legacy admission.
+    const account = await options.getAccountId?.() ?? null;
+    const accountSecurity = account
+      ? requireSecurity(await options.accountSecurity?.(account), `account:${account}`)
+      : null;
+    const boardSecurity = role !== "private"
+      ? requireSecurity(await options.boardSecurity?.(projectId), projectId)
+      : null;
+    if (!boardSecurity) {
+      await startAccountOrder(rx, account, accountSecurity);
+      return;
+    }
     // Authoritative viewer write-restriction. WebRTC picks master/slave by token
     // hash, not role, and the master streams its change log unconditionally, so a
     // viewer that is the master would otherwise leak local writes to peers even
@@ -318,8 +322,12 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       await options.bootstrapFromDrive(projectId);
     }
     activeGuard = options.installMutationGuard ? await options.installMutationGuard(projectId) : null;
-    await startPool("cards", projectId, rx.db.cards);
-    await startPool("projects", projectId, rx.db.projects);
+    if (!activeGuard || activeGuard.projectId !== projectId) {
+      throw new Error("Collaboration requires verified mutation protection. Local boards remain available.");
+    }
+    await startAccountOrder(rx, account, accountSecurity);
+    await startPool("cards", projectId, rx.db.cards, boardSecurity);
+    await startPool("projects", projectId, rx.db.projects, boardSecurity);
     if (options.imageTransport) {
       imageSync = createProjectImageSync({ projectId, repository: rx, transport: options.imageTransport,
         canWrite: isEditorRole(role), onError: (err) => { error = err instanceof Error ? err.message : String(err); } });
@@ -351,14 +359,18 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
 
   const refreshRole = () => runExclusive(async () => {
     if (!startedProjectId) return;
+    const projectId = startedProjectId;
+    const wasReady = ready;
     const previousRole = role;
     const previousFileId = sharedFileId;
     try {
       await applyRole(startedProjectId);
-      if (role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
+      if (!wasReady || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
         await doStart(startedProjectId);
       }
     } catch (err) {
+      await doStop();
+      startedProjectId = projectId;
       error = err instanceof Error ? err.message : String(err);
       throw err;
     }

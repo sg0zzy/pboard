@@ -103,7 +103,23 @@ Protocol-2 security (`src/collab/security/`) implements the owner-approved devic
 
 Current verification: `tests/securityProtocol.test.ts` (canonical/keys/manifest), `tests/securityEndpoint.test.ts`, `tests/securityAdversarial.test.ts` (forged manifests, viewer writes, replay, proof copying, cross-board binding, wrapper persistence, checkpoint rollback, legacy rejection). The adversarial tests exercise the security modules directly and the storage wrapper through a live RxDB collection; real-browser DTLS evidence and real-Drive permission revocation remain open release gates from the plan. Drive latency, restrictive networks and the owner-offline availability tradeoff are unchanged.
 
+Live collaboration fails closed before signaling starts when a board or account
+security provider is missing, rejects verification, or returns no trusted manifest.
+The manager also checks manifest structure, freshness, room binding and local device
+membership. Shared-board rooms require installed mutation protection. There is no
+legacy admission option in the production manager. A blocked start reports an error
+and closes partial rooms; local board operations remain available. Retrying after
+trust is restored resolves the manifests again. If account-order replication is
+requested alongside a shared board, both contexts must be available before either
+room starts.
+
 ## Verification
+
+Admission regressions are in `tests/collaborationAdmission.test.ts`. The existing
+manager convergence tests and browser smoke harness explicitly double the
+authentication boundary while retaining real WebRTC transport and storage. They
+do not establish end-to-end protocol-2 authentication; protocol/adversarial tests
+exercise signature verification and persistence guards separately.
 
 Relevant test files include `tests/drivePermissions.test.ts`, `tests/driveSignaling.test.ts`, `tests/collaborationManager.test.ts`, `tests/sharedDiscovery.test.ts`, `tests/sharedSync.test.ts`, `tests/imageSync.test.ts`, `tests/accountSignaling.test.ts`, and `tests/conflictResolution.test.ts`. Tests mock Google transports; they are not evidence of authenticated real-Drive behavior.
 

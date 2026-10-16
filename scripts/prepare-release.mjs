@@ -1,16 +1,18 @@
 // Explicit stable metadata preparation with rollback; Git commit/tag/push remain human operations.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve, join } from 'node:path';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { official, assertForward, releaseReadiness } from './release-policy.mjs';
 import { remoteInventory } from './release-control.mjs';
-const root = resolve(new URL('..', import.meta.url).pathname);
+import { VERSION_FILES } from './version.mjs';
+const root = fileURLToPath(new URL('..', import.meta.url));
 const args = process.argv.slice(2), version = args[0], apply = args[1] === '--apply';
 try {
   if (args.length !== 2 || !['--dry-run', '--apply'].includes(args[1])) throw Error('usage: scripts/release.sh X.Y.Z --dry-run|--apply');
   official(version); if (version.includes('-')) throw Error('Select a stable core');
   const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
-  const planned = ['VERSION', 'manifest.json', 'manifest.chromium.json', 'package.json', 'package-lock.json', 'apps/android/package.json', 'apps/android/package-lock.json', 'apps/android/android/app/build.gradle'];
+  const planned = VERSION_FILES;
   console.log(JSON.stringify({ version, edits: planned, checks: ['full remote high-water inventory', 'clean intended source', 'signing/history readiness', 'npm run check', 'Android typecheck/tests and managed debug APK'], commit: 'human-reviewed dedicated release commit if metadata differs', tag: `annotated v${version} on reviewed commit (human operation)`, remoteActions: 'none; separately authorized tag push starts stable workflow' }, null, 2));
   if (!apply) process.exit(0);
   if (git('status', '--porcelain', '--untracked-files=all')) throw Error('Stable preparation requires a clean intended source tree');

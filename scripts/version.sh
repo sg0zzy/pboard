@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# Version and release-control helpers implementing VERSIONING.md.
-# Explicit development core selection: bump patch|minor|major, set X.Y.Z-dev, --check.
-# See VERSIONING.md for the VERSION authority and RELEASE.md for stable preparation.
+# Select a development core and synchronize VERSION mirrors. Never commits or tags.
 set -euo pipefail
-
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO"
+case "${1:---help}" in
+  -h|--help)
+    cat <<'HELP'
+usage: scripts/version.sh show
+       scripts/version.sh bump patch|minor|major [--dry-run]
+       scripts/version.sh set X.Y.Z-dev [--dry-run]
+       scripts/version.sh --check
 
-case "${1:-}" in
-  ""|-h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
+Bumps select a development core, reset subordinate fields, and sync all mirrors.
+Stable versions are selected explicitly with scripts/release.sh prepare X.Y.Z.
+HELP
+    exit 0 ;;
 esac
-
-exec node scripts/version.mjs "$@"
+exec node "$REPO/scripts/version.mjs" "$@"

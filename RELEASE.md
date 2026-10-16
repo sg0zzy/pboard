@@ -8,22 +8,107 @@ Official publication is deliberately blocked until the release owner fills and r
 
 Before activation, inventory complete remote tags/releases, historical aliases, deleted/abandoned identities and all Android allocated/submitted/distributed codes. Record reconciled aliases/tombstones in `project-standards.json`; set `history.reviewed` only when complete. Keep durable tombstones there when reservations might disappear remotely. Owner review must establish branch/tag protection, trusted workflow/build/dependency review, and actual protected `release-signing` and `release-publication` environments with eligible refs/reviewers. Environment names in YAML do not establish these settings.
 
-## Stable preparation
+## Shell commands
+
+Use Node 24, Git, Bash and an authenticated GitHub CLI (`gh`). Run commands from
+any directory; the scripts resolve this checkout. Existing source work must be
+reviewed/committed before stable preparation. No script changes branches or
+worktrees. `origin` must match the configured GitHub repository.
 
 ```sh
-scripts/release.sh X.Y.Z --dry-run
-scripts/release.sh X.Y.Z --apply
+scripts/version.sh show
+scripts/version.sh bump patch --dry-run  # preview the next development core
+scripts/version.sh bump patch            # or: minor / major
+scripts/version.sh set 0.11.0-dev         # explicit development core
+scripts/version.sh --check
 ```
 
-Dry-run displays intended metadata files, checks and the human commit/tag/push plan without changing source, refs, index or remotes. Apply requires a clean intended tree, reviewed history/signing, a greater explicitly selected version, root validation, Android tests and a managed debug APK build. It synchronizes metadata and restores original metadata on failure. It never commits, tags or pushes. Review the diff, test all local targets with `scripts/build_all.sh`, and prepare a dedicated reviewed release commit if metadata changed. An annotated `vX.Y.Z` must identify that commit; pushing it is a separate explicitly authorized human operation.
+Bumps synchronize VERSION and all generated mirrors without committing, tagging
+or building. Major/minor bumps reset subordinate fields. Invalid/regressing
+cores and platform overflow fail before editing; a sync failure restores the
+original metadata. Tracked Android versionCode stays unchanged for development
+selection. Known local tags and durable reservations establish a floor;
+these local commands do not claim to inventory unseen remote history.
 
-The stable tag workflow validates exact syntax, annotation, peeled SHA, committed VERSION, trusted main ancestry, configuration and full high-water inventory. Both entry workflows use `official-release-lifecycle` for their complete lifecycle. Remote create-only beta refs and high-water revalidation also protect against independently pushed stable reservations. Tag rulesets should prohibit deletion/replacement and bypass.
+## Stable preparation and tagging
 
-## Beta release
+Select the exact stable version explicitly. New release subcommands default to a
+nonmutating plan; add `--apply` to execute the stated operation.
 
-The **Beta Release** workflow is manually dispatched with `ref` (default `main`, reviewed branch/full committed SHA reachable from main, or an existing annotated beta tag for exact-source retry) and optional `core`. Without an explicit core, committed VERSION must select `X.Y.Z-dev`. It resolves source once, checks trust/configuration, inventories all remote official state and reviewed tombstones, allocates a globally forward `X.Y.Z-dev.N`, and creates an annotated immutable tag before packaging. Token-created tags continue packaging within the same workflow; no second tag-trigger run is assumed.
+```sh
+scripts/release.sh prepare 0.10.3 --dry-run
+scripts/release.sh prepare 0.10.3 --apply    # validate, sync, version commit if needed, annotated local tag
+scripts/release.sh publish 0.10.3 --dry-run
+scripts/release.sh publish 0.10.3 --apply    # atomic push of main + this exact tag; starts Stable Release
+```
 
-The beta release is `prerelease: true` with `make_latest: false`. Stable publication is `prerelease: false` with latest enabled. Neither channel delivers to stores.
+Plans list metadata/checks/commit/tag/remote actions. They perform no remote
+calls or source/index/ref changes and are not eligibility checks. Apply requires
+a clean intended tree, reviewed history/signing, full remote and local reservation
+checks, and valid platform mappings. Preparation runs the existing root and
+Android validation/build gates; there is no skip-checks override. It commits only
+version metadata when needed and creates an immutable annotated `vX.Y.Z` tag on
+the resulting commit. An already committed matching version needs no redundant
+commit. It does not push.
+
+`publish` requires the current `main` HEAD to match the annotated tag and VERSION
+mirrors. It revalidates remote history immediately before an atomic branch/tag
+push; it never forces refs, includes unrelated tags, or falls back to separate
+pushes. The GitHub workflow rechecks history/source under the shared beta/stable
+lifecycle before building or publishing. The existing server controls remain
+mandatory. A tag is a reservation, not evidence of successful publication.
+
+If metadata validation fails, the existing preparation transaction restores its
+original metadata. If the later commit/tag phase fails, the script preserves and
+reports a resumable metadata/commit checkpoint rather than resetting user work.
+Review and commit pending metadata if needed, then resume without another version
+commit using:
+
+```sh
+scripts/release.sh tag 0.10.3 --dry-run
+scripts/release.sh tag 0.10.3 --apply        # full validation of already committed metadata, local tag only
+```
+
+Existing tags are never replaced/deleted. An identical remote tag is a no-op;
+inspect/rerun its existing stable workflow. A conflicting tag blocks publication.
+If a push has an uncertain result, inspect remote refs/workflows before retrying.
+The old `scripts/release.sh X.Y.Z --dry-run|--apply` form remains available for
+metadata-only preparation and still never commits or tags.
+
+## Beta release and retry
+
+```sh
+scripts/beta-version.sh next 0.10.3             # read-only remote preview; not a reservation
+scripts/beta-version.sh allocate main 0.10.3 --dry-run
+scripts/beta-version.sh allocate main 0.10.3 --apply
+scripts/beta-version.sh retry v0.10.3-dev.1 --dry-run
+scripts/beta-version.sh retry v0.10.3-dev.1 --apply
+```
+
+The core can be omitted when VERSION selects `X.Y.Z-dev`; `allocate` defaults to
+`main`. `next` requires reviewed history/signing and checks all remote tags,
+releases and durable records plus known local reservations. Its result may be
+superseded before allocation. It edits no source/refs and consumes no number.
+
+`allocate --apply` uses the [GitHub CLI workflow dispatch](https://cli.github.com/manual/gh_workflow_run)
+entry point: it resolves a branch/commit once to a full remote SHA and dispatches
+`beta-release.yml` from trusted `main`. It does not allocate/push a beta tag
+locally. The existing workflow validates trusted-main ancestry and source/config,
+checks complete high-water history, and reserves an annotated `X.Y.Z-dev.N` tag
+under `official-release-lifecycle` before packaging. Both beta and stable use
+that shared lifecycle. Token-created beta tags continue packaging within the
+same workflow; no second tag-trigger run is assumed.
+
+`retry --apply` preserves the existing beta tag selector and derives its original
+core so the workflow retries that reservation/source. Changed source requires a
+greater version. A dispatch receipt is not publication success: monitor the run
+and its protected signing/publication approvals. If dispatch times out, inspect
+existing runs before retrying to avoid a second fresh allocation. Beta outputs
+use `prerelease: true` and `make_latest: false`; stores remain manual/disabled.
+
+Invoking `publish --apply` or `allocate/retry --apply` explicitly requests its
+stated remote operation. Merely adding these scripts grants an agent no standing
+permission to run those commands, activate signing, publish or deliver to stores.
 
 ## Build and publication gates
 

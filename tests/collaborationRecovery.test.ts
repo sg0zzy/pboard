@@ -1,3 +1,4 @@
+import { collaborationSecurityFixture } from "./helpers/collaborationSecurity";
 import { describe, expect, it, vi } from "vitest";
 import { BehaviorSubject, Subject } from "rxjs";
 import type { PboardWebRTCConnectionOptions } from "../src/collab/webrtcHandler";
@@ -36,6 +37,7 @@ it("shares one read-only refresh across rooms and invalidates it on project swit
     db: { cards: { name: "cards" }, projects: { name: "projects" } }
   } as unknown as RxRepository;
   const manager = createCollaborationManager({
+      ...collaborationSecurityFixture(),
     myRole: async () => "owner", getSharedFileId: async () => "file",
     bootstrapFromDrive: async () => false, getRepository: async () => repo,
     signalingFor: () => ({}) as never, refreshFromDrive

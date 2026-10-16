@@ -1,3 +1,4 @@
+import { collaborationSecurityFixture } from "../../tests/helpers/collaborationSecurity";
 import { createCollaborationManager } from "../../src/collab/manager";
 import { createRxRepository } from "../../src/storage/rxdbRepository";
 import { createDriveSignaling, createMemorySignalingScope, type PboardSignaling } from "../../src/collab/signaling";
@@ -30,6 +31,7 @@ const project = {
 };
 await rx.importProject({ ...project, id: "private-project", name: "Private board" }, []);
 const manager = createCollaborationManager({
+  ...collaborationSecurityFixture(),
   myRole: async (id) => id === project.id ? "owner" : null,
   getSharedFileId: async (id) => id === project.id ? "shared" : null,
   bootstrapFromDrive: async () => false, getRepository: async () => rx, getAccountId: async () => "account-A",

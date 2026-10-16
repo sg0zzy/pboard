@@ -31,7 +31,7 @@ Read [the pinned central README](https://github.com/sg0zzy/dev-standards/blob/e3
 | Source capture and local artifacts | `scripts/local-build.mjs`, `scripts/artifact-retention.mjs`, [BUILD.md](BUILD.md#managed-artifacts) |
 | CI revision, tests, temporary output | `.github/workflows/ci.yml`, [BUILD.md](BUILD.md#ci) |
 | Shared official reservation/publication coordination | `official-release-lifecycle` concurrency group in both release entry workflows; `scripts/release-control.mjs`; [RELEASE.md](RELEASE.md) |
-| Preparation, notes, recovery | `scripts/release.sh`, `scripts/prepare-release.mjs`, [RELEASE.md](RELEASE.md) |
+| Preparation, notes, recovery | `scripts/release.sh`, `scripts/beta-version.sh`, `scripts/release-cli.mjs`, `scripts/prepare-release.mjs`, [RELEASE.md](RELEASE.md) |
 | Signing, Android history and update edges | `project-standards.json`, `scripts/sign-android.mjs`, [RELEASE.md](RELEASE.md#signing-and-platform-identities) |
 | Destination modes and authorization | `project-standards.json`, [RELEASE.md](RELEASE.md#distribution) |
 
@@ -41,7 +41,7 @@ Read [the pinned central README](https://github.com/sg0zzy/dev-standards/blob/e3
 | --- | --- | --- | --- |
 | SHOULD departure | ARCHITECTURE: Android stack | Retain working Capacitor/React/TypeScript Android application and native Java plugins; a Kotlin/Compose rewrite would add migration risk without adoption benefit | Maintainers |
 | SHOULD departure | ADOPTION: vendored snapshot | Use verified retrieval plus full-file digests instead of copying central documents. Verified checkouts may be cached locally; initial offline access needs a previously verified checkout | Maintainers |
-| SHOULD departure | RELEASE: preparation automation | Metadata preparation rolls back on failure; human review/commit/annotated tag remain explicit separate operations | Maintainers |
+| Implementation | RELEASE: preparation automation | Bash preparation validates/synchronizes metadata, creates a dedicated commit when needed and an annotated local tag; push is a separate explicit command. Metadata failures roll back; later Git failures preserve a documented resumable checkpoint | Maintainers |
 | Scope exclusion | BUILD | No native desktop installer or standalone hosted application exists. Browser extensions run on desktop OSs. No AppImage/MSIX/EXE/macOS/AAB target is removed or newly implied | Maintainers |
 | Explicit defaults | ARTIFACTS / BUILD | Keep 10 successful unprotected local builds; temporary CI packages 14 days. No override | Maintainers |
 | MUST gap | RELEASE / ANDROID | Complete remote history, deleted reservations/store submissions, production certificate and installed-code inventory are unverified. `history.reviewed: false`, signing fingerprint/code null and `historyReviewed: false` deliberately block official allocation/publication | Release owner |

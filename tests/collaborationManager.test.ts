@@ -1,6 +1,15 @@
+// These existing convergence tests use real WebRTC with an explicit authentication
+// double. The real manager admission boundary is covered separately.
+vi.mock("../src/collab/webrtcHandler", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/collab/webrtcHandler")>();
+  const fixture = await import("./helpers/transportOnlyHandler");
+  return { ...actual, createPboardWebRTCConnectionHandler: (options: Parameters<typeof actual.createPboardWebRTCConnectionHandler>[0]) =>
+    fixture.createPboardWebRTCConnectionHandler(options, actual.createPboardWebRTCConnectionHandler) };
+});
+import { collaborationSecurityFixture } from "./helpers/collaborationSecurity";
 import "fake-indexeddb/auto";
 import NodeDataChannel from "node-datachannel/polyfill";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSimplePeerWrtc } from "rxdb/plugins/replication-webrtc";
 import { createCollaborationManager, type CollaborationManager } from "../src/collab/manager";
 import type { PboardRole } from "../src/sync/drivePermissions";
@@ -58,6 +67,7 @@ describe("createCollaborationManager", () => {
   ) {
     let bootstrapped = false;
     const manager = createCollaborationManager({
+      ...collaborationSecurityFixture(),
       myRole: async () => overrides.role,
       getSharedFileId: async () => overrides.fileId,
       bootstrapFromDrive: async (projectId) => {

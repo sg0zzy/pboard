@@ -111,7 +111,15 @@ async function until(predicate, message, timeout = 35_000) {
 }
 
 try {
-  await build({ configFile: false, root, build: {
+  await build({ configFile: false, root,
+    // This harness covers transport/convergence. Authentication is doubled only
+    // for the manager import; production builds never install this resolver.
+    plugins: [{ name: "transport-authentication-fixture", enforce: "pre", resolveId(source, importer) {
+      if (source === "./webrtcHandler" && importer === join(root, "src/collab/manager.ts")) {
+        return join(root, "experiments/collaboration/transport-only-handler.ts");
+      }
+    } }],
+    build: {
     outDir: join(work, "bundle"), emptyOutDir: true, target: "esnext",
     lib: { entry: join(root, "experiments/collaboration/webrtc-browser-probe.ts"), formats: ["es"], fileName: "probe" },
     rolldownOptions: { output: { codeSplitting: false } }

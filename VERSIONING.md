@@ -4,7 +4,7 @@ The [standards adoption](DEVELOPMENT_STANDARDS.md) pins the authoritative centra
 
 `VERSION` is the only editable product-version authority: `X.Y.Z` selects a stable candidate; `X.Y.Z-dev` selects a proposed development core. Stable selection is explicit. Local builds derive a separate `X.Y.Z-local.N` identity using a collision-resistant integer and do not edit these files or consume published beta numbers.
 
-`node scripts/sync-version.mjs` derives the core-version mirrors in both browser manifests, root and Android package/lock files, and Gradle `versionName`. `node scripts/sync-version.mjs --check` verifies them without edits. `scripts/version.sh bump patch|minor|major` or `set X.Y.Z-dev` explicitly selects a development core. Stable candidate preparation is in [RELEASE.md](RELEASE.md). Tests read VERSION rather than maintaining a literal version.
+`node scripts/sync-version.mjs` derives the core-version mirrors in both browser manifests, root and Android package/lock files, and Gradle `versionName`. `node scripts/sync-version.mjs --check` verifies them without edits. `scripts/version.sh bump patch|minor|major` or `set X.Y.Z-dev` explicitly selects a development core. Use `scripts/version.sh show` to inspect the selection; append `--dry-run` to a bump/set command to preview without edits. Bumps validate current/known reservation ordering and both platform adapters, and restore metadata on synchronization failure. Stable commit/tag preparation and beta workflow dispatch are in [RELEASE.md](RELEASE.md#shell-commands). Tests read VERSION rather than maintaining a literal version.
 
 ## Platform fields
 

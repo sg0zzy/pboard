@@ -3,8 +3,10 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { official } from './release-policy.mjs';
-const root = resolve(new URL('..', import.meta.url).pathname);
+import { official, compareVersion, extensionVersion } from './release-policy.mjs';
+const root = fileURLToPath(new URL('..', import.meta.url));
+export const VERSION_FILES = ['VERSION', 'manifest.json', 'manifest.chromium.json', 'package.json', 'package-lock.json', 'apps/android/package.json', 'apps/android/package-lock.json', 'apps/android/android/app/build.gradle'];
+
 export function readVersionState() {
   const selected = readFileSync(resolve(root, 'VERSION'), 'utf8').trim();
   const core = selected.replace(/-dev$/, ''); official(core);
@@ -25,9 +27,13 @@ export function androidVersionCode(version) {
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, argument] = process.argv.slice(2), state = readVersionState();
+    const [command, argument, flag, ...extra] = process.argv.slice(2), state = readVersionState();
+    if (extra.length || (flag !== undefined && flag !== '--dry-run') ||
+        (flag && !['bump', 'set'].includes(command)) ||
+        (argument !== undefined && !['bump', 'set', 'android-code'].includes(command))) throw Error('Unexpected arguments');
     let core = Object.values(state.core).join('.');
-    if (command === 'read') console.log(JSON.stringify(state));
+    if (command === 'show') console.log(`VERSION: ${core}${state.dev ? '-dev' : ''}\nLocal builds: ${core}-local.N\nBeta numbers: allocated by Beta Release workflow; no local reservation`);
+    else if (command === 'read') console.log(JSON.stringify(state));
     else if (command === 'canonical') console.log(`${core}${state.dev ? '-dev' : ''}`);
     else if (command === 'preview') console.log(`${core}-local.N (collision-resistant local identity at build time)`);
     else if (command === '--check') execFileSync(process.execPath, ['scripts/sync-version.mjs', '--check'], { cwd: root, stdio: 'inherit' });
@@ -44,7 +50,28 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         core = official(argument.slice(0, -4));
         if (core.includes('-')) throw Error('Invalid development core');
       }
-      execFileSync(process.execPath, ['scripts/sync-version.mjs', `${core}-dev`], { cwd: root, stdio: 'inherit' });
-    } else throw Error('usage: version.mjs read|canonical|preview|--check|bump patch|minor|major|set X.Y.Z-dev|android-code [VERSION]');
+      const current = Object.values(readVersionState().core).join('.');
+      if (compareVersion(core, current) <= 0) throw Error(`Development core must exceed current ${current}`);
+      // Validate both release adapters before editing anything; local bumps reserve no codes.
+      androidVersionCode(`${core}-dev.1`); androidVersionCode(core); extensionVersion(core);
+      const config = JSON.parse(readFileSync(resolve(root, 'project-standards.json')));
+      const tags = execFileSync('git', ['for-each-ref', '--format=%(refname:strip=2)', 'refs/tags/'], { cwd: root, encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+      const reservations = [...tags.map(tag => config.history.historicalAliases[tag] ?? tag.replace(/^v/, '')), ...config.history.reservations];
+      for (const previous of reservations) {
+        official(previous);
+        if (compareVersion(core, previous) <= 0) throw Error(`Development core must exceed known reservation ${previous}`);
+      }
+      console.log(`VERSION: ${current} -> ${core}-dev${flag ? ' (dry-run)' : ''}`);
+      if (!flag) {
+        const originals = new Map(VERSION_FILES.map(p => [p, readFileSync(resolve(root, p))]));
+        try {
+          execFileSync(process.execPath, [resolve(root, 'scripts/sync-version.mjs'), `${core}-dev`], { cwd: root, stdio: 'inherit' });
+          execFileSync(process.execPath, [resolve(root, 'scripts/sync-version.mjs'), '--check'], { cwd: root, stdio: 'inherit' });
+        } catch {
+          for (const [p, bytes] of originals) writeFileSync(resolve(root, p), bytes);
+          throw Error('Version update failed; original metadata restored');
+        }
+      }
+    } else throw Error('usage: version.mjs show|read|canonical|preview|--check|bump patch|minor|major [--dry-run]|set X.Y.Z-dev [--dry-run]|android-code [VERSION]');
   } catch (e) { console.error(e.message); process.exitCode = 1; }
 }
