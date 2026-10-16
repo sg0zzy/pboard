@@ -78,6 +78,13 @@ function counterPath() {
   return resolve(buildStateDir, "dev-counter.json");
 }
 
+function sleepSync(ms) {
+  // Real blocking sleep via the event loop being empty at module scope isn't
+  // available synchronously; ExecSync of a short child sleep is portable and
+  // cheap enough relative to the 5s lock timeout.
+  execFileSync("sleep", [String(ms / 1000)]);
+}
+
 function allocateCounter(state) {
   const core = coreText(state);
   mkdirSync(buildStateDir, { recursive: true });
@@ -90,7 +97,7 @@ function allocateCounter(state) {
       if (Date.now() - started > 5_000) {
         throw new Error("dev-counter lock timeout; remove .build-state/dev-counter.lock if no other build is running");
       }
-      sleepSync(50, started);
+      sleepSync(50);
     }
   }
   try {
@@ -105,11 +112,6 @@ function allocateCounter(state) {
   } finally {
     rmSync(lockDir, { force: true, recursive: true });
   }
-}
-
-function sleepSync(ms) {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) { /* bounded busy wait for lock fairness */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +221,8 @@ function runCli() {
     console.log(currentBuildVersion().version);
   } else if (command === "preview") {
     console.log(previewBuildVersion());
+  } else if (command === "build-id") {
+    console.log(buildId());
   } else if (command === "bump") {
     const kind = process.argv[3];
     if (kind !== "patch" && kind !== "minor" && kind !== "major") {
@@ -231,7 +235,7 @@ function runCli() {
     console.log(`development core selected: ${coreText(state)}-dev (local counter resets; next build is dev.1)`);
   } else if (command === "set") {
     const target = process.argv[3];
-    if (!/^(\\d+)\\.(\\d+)\\.(\\d+)-dev$/.test(target ?? "")) {
+    if (!/^(\d+)\.(\d+)\.(\d+)-dev$/.test(target ?? "")) {
       console.error("usage: version.mjs set X.Y.Z-dev");
       process.exit(2);
     }

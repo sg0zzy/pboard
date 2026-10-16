@@ -9,15 +9,14 @@
 #   scripts/build_all.sh --help
 #
 # Versioning behavior (contract §4):
-#   - targets are development builds of the currently selected VERSION core
-#     (`X.Y.Z-dev.N` for Android when a dev core is selected; Firefox/Chromium
-#     zips carry the core version in their name as before);
-#   - selecting a core is scripts/version.sh bump <kind> / set X.Y.Z-dev — never
-#     done implicitly here; with a stable VERSION selected, only the Firefox and
-#     Chromium targets build (Android dev builds require an explicit dev core);
-#   - each Android build gets a unique build ID and is archived under
-#     dist/dev/<version>/<build-id>/ with build-manifest.json; nothing is
-#     overwritten, committed or tagged.
+#   - every invocation gets a unique build ID; with a *development core* selected
+#     each artifact is additionally archived under dist/dev/<core>/<build-id>/
+#     together with build-manifest.json (SHA-256, commit SHA, dirty, patch
+#     digest); nothing is overwritten, committed or tagged;
+#   - Android dev builds carry `X.Y.Z-dev.N` + the adapted versionCode in the
+#     APK metadata (stamped + restored in the tracked gradle file by
+#     build-android); with only a stable core selected the Android target is
+#     skipped and the Firefox/Chromium targets still build and package;
 #
 # Output: the last lines list one ARTIFACT per target. Exit code 0 only when
 # every requested target built; failures name the target on stderr.
@@ -50,9 +49,35 @@ if [ ! -d node_modules ]; then
 fi
 
 version="$(node scripts/version.mjs preview)"
-core="$(node -p "const v = process.argv[1]; v.split('-')[0]" "$version" 2>/dev/null || echo "$version" | sed 's/ .*//;s/-dev$//')"
-core="${core%% *}"
-echo "==> Building from ${version%% (*}"
+# `preview` prints either "stable X.Y.Z (…)" or "X.Y.Z-dev.N (…)" — the
+# parenthetical contains the substring "dev", so match the first word only.
+read -r version_kind version_rest <<EOF
+$version
+EOF
+dev_selected=false
+[ "$version_kind" != "stable" ] && dev_selected=true
+# The core number X.Y.Z appears identically in both forms.
+core="$(printf '%s' "$version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+[ -n "$core" ] || { echo "build_all.sh: could not read the VERSION core from '$version'" >&2; exit 1; }
+build_id="$(node scripts/version.mjs build-id)"
+echo "==> Building from ${version%% (*}; build ID $build_id"
+
+# Archive helper: copy an artifact into its non-overwriting dev directory with a
+# build-manifest.json (VERSIONING.md §4.6–§4.8). Skipped for stable-selected cores.
+archive_target() {
+  local kind="$1" file="$2"
+  if [ "$dev_selected" != "true" ]; then return 0; fi
+  local dir="dist/dev/$core/$build_id"
+  if [ -e "$dir/$file" ]; then echo "build_all.sh: refusing to overwrite $dir/$file" >&2; return 1; fi
+  mkdir -p "$dir"
+  cp "$file" "$dir/" || return 1
+  node scripts/build-manifest.mjs "$kind" "$core" "$build_id" "$file" "$dir"
+}
+
+
+archive_note() {
+  if [ "$dev_selected" = "true" ]; then echo "; archived in dist/dev/$1/$build_id/"; fi
+}
 
 fail() { echo "build_all.sh: $*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -68,7 +93,8 @@ for target in "${targets[@]}"; do
       if npm run build >/tmp/pboard-firefox.$$ 2>&1 && npm run package:firefox >>/tmp/pboard-firefox.$$ 2>&1; then
         zip_path="$(ls -t web-ext-artifacts/pboard-*.zip 2>/dev/null | grep -v chromium | head -n1 || true)"
         [ -n "$zip_path" ] || fail "Firefox packaging produced no pboard-*.zip"
-        artifacts+=("ARTIFACT firefox: $zip_path (version $core, unsigned)")
+        archive_target firefox "$zip_path"
+        artifacts+=("ARTIFACT firefox: $zip_path (version $core, unsigned)$(archive_note "$core")")
         rm -f "/tmp/pboard-firefox.$$"
       else
         tail -n 20 /tmp/pboard-firefox.$$ >&2; rm -f /tmp/pboard-firefox.$$
@@ -80,7 +106,8 @@ for target in "${targets[@]}"; do
       if npm run build:chromium >/tmp/pboard-chromium.$$ 2>&1 && npm run package:chromium >>/tmp/pboard-chromium.$$ 2>&1; then
         zip_path="$(ls -t web-ext-artifacts/pboard-chromium-*.zip 2>/dev/null | head -n1 || true)"
         [ -n "$zip_path" ] || fail "Chromium packaging produced no pboard-chromium-*.zip"
-        artifacts+=("ARTIFACT chromium: $zip_path (version $core, unsigned)")
+        archive_target chromium "$zip_path"
+        artifacts+=("ARTIFACT chromium: $zip_path (version $core, unsigned)$(archive_note "$core")")
         rm -f "/tmp/pboard-chromium.$$"
       else
         tail -n 20 /tmp/pboard-chromium.$$ >&2; rm -f /tmp/pboard-chromium.$$

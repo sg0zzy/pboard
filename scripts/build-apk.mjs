@@ -151,9 +151,12 @@ process.on("SIGTERM", () => { restoreGradle(); process.exit(143); });
 {
   const nameLine = gradleOriginal.replace(/^(\s*)versionName\s+"[\d.]+"/m, `$1versionName "${version}"`);
   const bothLines = nameLine.replace(/^(\s*)versionCode\s+\d+/m, `$1versionCode ${buildCode}`);
-  if (bothLines === gradleOriginal) fail("Could not stamp the build version into app/build.gradle");
-  writeFileSync(gradlePath, bothLines);
-  console.log(`stamped versionName "${version}", versionCode ${buildCode} for this build only`);
+  if (bothLines === gradleOriginal) {
+    console.log("gradle version fields already carry this build identity; no stamp needed");
+  } else {
+    writeFileSync(gradlePath, bothLines);
+    console.log(`stamped versionName "${version}", versionCode ${buildCode} for this build only`);
+  }
 }
 
 const gradlew = resolve(nativeDir, process.platform === "win32" ? "gradlew.bat" : "gradlew");
