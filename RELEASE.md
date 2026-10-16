@@ -1,19 +1,69 @@
 # Pboard release operations
 
-The central contracts pinned in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md) govern allocation, publication, security and distribution. Project implementation is in `project-standards.json` and `.github/workflows/`.
+This guide covers preparing a stable release, requesting a beta, reviewing the
+workflow outputs and recovering a failed attempt. Both channels publish the same
+required packages to GitHub; delivery to browser stores is a separate operation.
+
+The central contracts pinned in [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md)
+govern allocation, publication, security and distribution. [VERSIONING.md](VERSIONING.md)
+defines version selection and platform mappings; [BUILD.md](BUILD.md) defines the
+toolchain and package checks. The executable configuration is
+[project-standards.json](project-standards.json).
+
+## Process overview
+
+| Stage | Stable | Beta |
+| --- | --- | --- |
+| Select source/version | Review the intended commit and explicitly choose `X.Y.Z` | Choose a reviewed remote branch/SHA and development core `X.Y.Z` |
+| Prepare/reserve | `prepare --apply` validates, commits metadata if needed and creates local annotated `vX.Y.Z` | `allocate --apply` dispatches the workflow, which reserves remote annotated `vX.Y.Z-dev.N` |
+| Start remote release | `publish --apply` atomically pushes current `main` and the exact stable tag | The dispatched workflow continues with the reserved source |
+| Build and sign | Required targets build from the tagged SHA; Android signing uses `release-signing` | Same required targets and protected signing gate |
+| Review and publish | Review the staged plan, then approve `release-publication`; publish as latest stable | Review the staged plan, then approve `release-publication`; publish as prerelease, never latest stable |
+| Deliver externally | Separate authorized manual AMO/Chrome Web Store operation | Store delivery disabled |
+
+Both workflows use `official-release-lifecycle` to coordinate reservation,
+building, staging and publication. Every new official version must exceed all
+previous official reservations and publications, including failed or abandoned
+attempts. Reserving a higher beta core can therefore prevent a later stable
+release on a lower core. A tag permanently consumes its version; completion
+requires the verified packages and a visible GitHub Release.
 
 ## Readiness
 
-Official publication is deliberately blocked until the release owner fills and reviews the existing-history and production-signer records. Run `node scripts/release-control.mjs preflight` to see the first blocker. This migration does not create credentials or declare unverified signing identities. All three official targets remain mandatory: Firefox ZIP, Chromium ZIP and release-signed Android APK, plus reviewer sources, release manifest and SHA-256 checksums.
+**Official releases are currently blocked.** The release owner must complete
+the existing-history and production-signer records before preparation/allocation
+can pass. Run the local configuration preflight from the repository root:
+
+```sh
+node scripts/release-control.mjs preflight
+```
+
+It reports the first configuration blocker; passing it does not establish remote
+protections, complete the history review or prove publication readiness. Record
+readiness evidence and remaining gaps in
+[STANDARDS_MIGRATION_REPORT.md](STANDARDS_MIGRATION_REPORT.md).
+
+All three official targets remain mandatory: Firefox ZIP, Chromium ZIP and
+release-signed Android APK, plus reviewer sources, release manifest and SHA-256
+checksums. Missing signing credentials or a failed target blocks completion.
 
 Before activation, inventory complete remote tags/releases, historical aliases, deleted/abandoned identities and all Android allocated/submitted/distributed codes. Record reconciled aliases/tombstones in `project-standards.json`; set `history.reviewed` only when complete. Keep durable tombstones there when reservations might disappear remotely. Owner review must establish branch/tag protection, trusted workflow/build/dependency review, and actual protected `release-signing` and `release-publication` environments with eligible refs/reviewers. Environment names in YAML do not establish these settings.
 
 ## Shell commands
 
-Use Node 24, Git, Bash and an authenticated GitHub CLI (`gh`). Run commands from
-any directory; the scripts resolve this checkout. Existing source work must be
-reviewed/committed before stable preparation. No script changes branches or
-worktrees. `origin` must match the configured GitHub repository.
+Use Node 24.15.0 or newer in the 24 series, npm, Git and Bash, plus an authenticated
+GitHub CLI (`gh`) for remote reads and release initiation. Stable preparation
+also needs the Android toolchain and installed root/Android dependencies listed
+in [BUILD.md](BUILD.md#prerequisites-and-targets).
+
+The `scripts/*.sh` wrappers resolve their checkout independently of the working
+directory; use an absolute path to the wrapper when outside the repository.
+Examples below assume the repository root. Existing source work must be
+reviewed/committed before stable preparation, including relevant untracked files.
+No script changes branches or worktrees. `publish` requires the current branch
+to be `main`; `origin` must match the configured GitHub repository.
+
+Use these commands to inspect or select the development core before releasing:
 
 ```sh
 scripts/version.sh show
@@ -32,10 +82,26 @@ these local commands do not claim to inventory unseen remote history.
 
 ## Stable preparation and tagging
 
-Select the exact stable version explicitly. New release subcommands default to a
-nonmutating plan; add `--apply` to execute the stated operation.
+Select the stable version with an explicit argument or use the core already
+selected in `VERSION`. When the argument is omitted, `release.sh` reads this
+checkout's `VERSION`: `X.Y.Z` and `X.Y.Z-dev` both select stable `X.Y.Z`, without
+bumping it. The plan shows the resolved version before any changes. An explicit
+argument takes precedence. The versions below are examples, not a declaration
+that `0.10.3` is available. New release subcommands default to a nonmutating plan;
+add `--apply` to execute the stated operation.
+
+1. Complete the readiness review and review/commit the intended source. Confirm
+   that the selected version is greater than every existing official reservation.
+2. Preview preparation, then apply it to run the required checks and create the
+   local release commit/tag. Inspect the resulting metadata, commit and tag.
+3. Preview publication. With explicit authorization for the remote operation,
+   apply it from current `main` at the tagged commit.
+4. Monitor **Stable Release** in [release.yml](.github/workflows/release.yml).
+   Complete signing approval and the [publication review](#publication-review-and-completion).
 
 ```sh
+scripts/release.sh prepare --dry-run       # use the core from VERSION
+scripts/release.sh publish --dry-run       # use the core from VERSION
 scripts/release.sh prepare 0.10.3 --dry-run
 scripts/release.sh prepare 0.10.3 --apply    # validate, sync, version commit if needed, annotated local tag
 scripts/release.sh publish 0.10.3 --dry-run
@@ -72,10 +138,21 @@ scripts/release.sh tag 0.10.3 --apply        # full validation of already commit
 Existing tags are never replaced/deleted. An identical remote tag is a no-op;
 inspect/rerun its existing stable workflow. A conflicting tag blocks publication.
 If a push has an uncertain result, inspect remote refs/workflows before retrying.
-The old `scripts/release.sh X.Y.Z --dry-run|--apply` form remains available for
-metadata-only preparation and still never commits or tags.
+The old `scripts/release.sh [X.Y.Z] --dry-run|--apply` form remains available for
+metadata-only preparation and still never commits or tags. Omitting its version
+also uses the core from `VERSION`. Invoking `release.sh` without arguments shows
+help.
 
 ## Beta release and retry
+
+1. Complete the readiness review. Select reviewed committed source already
+   available remotely and a development core that passes the global version floor.
+2. Optionally run `next` to preview the next beta identity. It reads remote state
+   and does not reserve that identity.
+3. Preview `allocate`. With explicit authorization to dispatch **Beta Release**,
+   apply it and monitor [beta-release.yml](.github/workflows/beta-release.yml).
+4. Complete signing approval and the [publication review](#publication-review-and-completion).
+   Use `retry` only to resume the exact existing beta reservation/source.
 
 ```sh
 scripts/beta-version.sh next 0.10.3             # read-only remote preview; not a reservation
@@ -94,7 +171,7 @@ superseded before allocation. It edits no source/refs and consumes no number.
 entry point: it resolves a branch/commit once to a full remote SHA and dispatches
 `beta-release.yml` from trusted `main`. It does not allocate/push a beta tag
 locally. The existing workflow validates trusted-main ancestry and source/config,
-checks complete high-water history, and reserves an annotated `X.Y.Z-dev.N` tag
+checks complete high-water history, and reserves an annotated `vX.Y.Z-dev.N` tag
 under `official-release-lifecycle` before packaging. Both beta and stable use
 that shared lifecycle. Token-created beta tags continue packaging within the
 same workflow; no second tag-trigger run is assumed.
@@ -109,6 +186,29 @@ use `prerelease: true` and `make_latest: false`; stores remain manual/disabled.
 Invoking `publish --apply` or `allocate/retry --apply` explicitly requests its
 stated remote operation. Merely adding these scripts grants an agent no standing
 permission to run those commands, activate signing, publish or deliver to stores.
+
+## Publication review and completion
+
+After either channel starts, follow the run through these checkpoints:
+
+1. Confirm the recorded channel, version, tag and full source SHA match the
+   intended release. A dispatch receipt or pushed tag alone does not mean success.
+2. Review the `release-signing` job and its approval, where configured. All
+   required builds and final Android signature verification must succeed.
+3. Download `release-plan-<run_id>-<attempt>` from the workflow run after staging.
+   Review `release-notes.md`, `release-manifest.json` and `SHA256SUMS.txt` for the
+   source/version, required target results, package identities and complete notes.
+4. Approve `release-publication` only after that review. If the notes or identities
+   are inadequate, hold approval and repair the plan process; the publisher
+   requires the reviewed plan to match its regenerated bytes.
+5. Confirm the workflow succeeded and the GitHub Release is visible with all three
+   required packages, Firefox reviewer sources, `release-manifest.json` and
+   `SHA256SUMS.txt`. Check the channel: beta is a prerelease with `make_latest: false`;
+   stable is published with `prerelease: false` and `make_latest: true`.
+
+Keep the tag/SHA, run/attempt, manifest and asset hashes as release evidence.
+Report any manual store submission separately as pending, failed or confirmed
+available. Temporary Actions artifacts alone do not establish a completed release.
 
 ## Build and publication gates
 

@@ -99,6 +99,38 @@ describe('version Bash interface', () => {
 });
 
 describe('stable Bash interface', () => {
+  it.each(['prepare', 'tag', 'publish'])('defaults %s to VERSION from outside the checkout without mutation', command => {
+    const head = git('rev-parse', 'HEAD'), before = snapshot();
+    for (const flags of [[], ['--dry-run']]) {
+      const result = run('release.sh', command, ...flags);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ command, version: '0.10.2', tag: 'v0.10.2', dryRun: true });
+    }
+    expect(snapshot()).toEqual(before); expect(git('rev-parse', 'HEAD')).toBe(head);
+    expect(git('status', '--porcelain')).toBe(''); expect(git('tag')).toBe(''); expect(audit()).toEqual([]);
+  });
+  it('uses the selected development core without bumping it, including legacy preparation', () => {
+    writeFileSync(join(root, 'VERSION'), ' 0.11.0-dev\r\n');
+    for (const args of [['prepare', '--dry-run'], ['--dry-run']]) {
+      const result = run('release.sh', ...args);
+      expect(result.status, result.stderr).toBe(0); expect(JSON.parse(result.stdout).version).toBe('0.11.0');
+    }
+    expect(readFileSync(join(root, 'VERSION'), 'utf8')).toBe(' 0.11.0-dev\r\n');
+    expect(git('tag')).toBe(''); expect(audit()).toEqual([]);
+  });
+  it('rejects missing or malformed VERSION defaults while allowing explicit overrides', () => {
+    for (const version of ['', '01.11.0', '0.11.0-dev.1']) {
+      writeFileSync(join(root, 'VERSION'), version);
+      expect(run('release.sh', 'prepare', '--dry-run').status).toBe(1);
+    }
+    rmSync(join(root, 'VERSION'));
+    expect(run('release.sh', 'prepare', '--dry-run').status).toBe(1);
+    for (const args of [['prepare', '0.11.0', '--dry-run'], ['prepare', '--dry-run', '0.11.0'], ['0.11.0', '--dry-run']]) {
+      const result = run('release.sh', ...args);
+      expect(result.status, result.stderr).toBe(0); expect(JSON.parse(result.stdout).version).toBe('0.11.0');
+    }
+    expect(git('tag')).toBe(''); expect(audit()).toEqual([]);
+  });
   it('defaults to a source/ref/index/remote nonmutating plan, even with dirty work', () => {
     writeFileSync(join(root, 'notes.txt'), 'preserve');
     const head = git('rev-parse', 'HEAD'), index = git('write-tree'), before = snapshot();
@@ -119,9 +151,9 @@ describe('stable Bash interface', () => {
     expect(run('release.sh','prepare','0.11.0','--apply').status).toBe(1);
     expect(snapshot()).toEqual(before); expect(git('rev-parse','HEAD')).toBe(head); expect(git('tag')).toBe('');
   });
-  it('does not commit again when the selected version is already committed', () => {
+  it.each(['prepare', 'tag'])('applies %s using VERSION without a redundant version commit', command => {
     const head=git('rev-parse','HEAD');
-    const r=run('release.sh','tag','0.10.2','--apply'); expect(r.status,r.stderr).toBe(0);
+    const r=run('release.sh',command,'--apply'); expect(r.status,r.stderr).toBe(0);
     expect(git('rev-parse','HEAD')).toBe(head); expect(git('cat-file','-t','refs/tags/v0.10.2')).toBe('tag');
   });
   it('blocks malformed, reserved, superseded and unready release selections before edits', () => {
@@ -134,7 +166,7 @@ describe('stable Bash interface', () => {
   it('publishes only the explicit branch/tag atomically after revalidation', () => {
     expect(run('release.sh','prepare','0.11.0','--apply').status).toBe(0);
     expect(run('release.sh','publish','0.11.0','--dry-run').status).toBe(0);expect(existsSync(join(root,'commands.jsonl'))).toBe(false);
-    const r=run('release.sh','publish','0.11.0','--apply');expect(r.status,r.stderr).toBe(0);
+    const r=run('release.sh','publish','--apply');expect(r.status,r.stderr).toBe(0);
     const args=JSON.parse(readFileSync(join(root,'commands.jsonl'),'utf8'));expect(args).toContain('--atomic');expect(args).toContain('refs/heads/main:refs/heads/main');expect(args).toContain('refs/tags/v0.11.0:refs/tags/v0.11.0');expect(args).not.toContain('--force');
   });
   it('leaves a resumable version commit after tag failure and resumes without another commit', () => {
