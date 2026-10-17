@@ -79,7 +79,9 @@
     }
   },
   "history": {
-    "reviewed": false,
+    "unresolved": [
+      "Reconcile deleted or abandoned official versions and historical aliases against durable records; current GitHub inventory cannot prove their absence"
+    ],
     "reservations": [],
     "historicalAliases": {}
   },

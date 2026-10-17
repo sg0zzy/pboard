@@ -35,9 +35,9 @@ describe('pinned standards version/operation gates', () => {
       const c=structuredClone(config);mutate(c);expect(()=>validateConfig(c)).toThrow();
     }
   });
-  it('fails closed on unreviewed history or absent production signer', () => {
-    expect(()=>releaseReadiness(config)).toThrow(/history/);
-    const c=structuredClone(config); c.history.reviewed=true;
+  it('fails closed on unresolved history or absent production signer', () => {
+    expect(()=>releaseReadiness(config)).toThrow(/historical inventory/);
+    const c=structuredClone(config); c.history.unresolved=[];
     expect(()=>releaseReadiness(c)).toThrow(/Android/);
   });
 });

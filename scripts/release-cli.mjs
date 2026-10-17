@@ -3,9 +3,9 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { official, assertForward, nextBeta, extensionVersion, releaseReadiness } from './release-policy.mjs';
+import { official, assertForward, nextBeta, extensionVersion } from './release-policy.mjs';
 import { readVersionState, androidVersionCode, VERSION_FILES } from './version.mjs';
-import { remoteInventory } from './release-control.mjs';
+import { remoteInventory, releaseInventory } from './release-control.mjs';
 const root = fileURLToPath(new URL('..', import.meta.url));
 const config = () => JSON.parse(readFileSync(join(root, 'project-standards.json')));
 const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -48,13 +48,13 @@ async function stable(args) {
     remoteActions: command === 'publish' ? 'atomic push of main and this tag to origin; starts Stable Release workflow' : 'none',
     dryRun: !apply }, null, 2));
   if (!apply) return;
-  clean(); releaseReadiness(config()); repository();
+  clean(); repository();
+  const inventory = await releaseInventory();
   if (command === 'publish') {
     if (git('branch', '--show-current') !== 'main') throw Error('Publish requires the current main branch');
     if (git('cat-file', '-t', `refs/tags/${tag}`) !== 'tag' || git('rev-parse', `${tag}^{commit}`) !== git('rev-parse', 'HEAD')) throw Error('Publish requires the annotated release tag on current HEAD');
     node('scripts/verify-release-tag.mjs', tag);
     node('scripts/sync-version.mjs', '--check');
-    const inventory = await remoteInventory();
     const remoteTag = inventory.tags.find(t => t.ref === `refs/tags/${tag}`);
     if (remoteTag) {
       if (remoteTag.object.sha !== git('rev-parse', `refs/tags/${tag}`)) throw Error('Remote tag differs; immutable reservation must not move');
@@ -119,9 +119,10 @@ async function beta(args) {
       remoteActions: 'dispatch Beta Release; workflow creates tag, builds, signs and publishes after approvals', dryRun: !apply }, null, 2));
     if (!apply) return;
   }
-  releaseReadiness(config()); const repo = repository();
+  const repo = repository();
+  const inventory = await releaseInventory();
   if (command === 'next') {
-    const candidate = nextBeta(core, [...(await remoteInventory()).versions, ...localReservations()]);
+    const candidate = nextBeta(core, [...inventory.versions, ...localReservations()]);
     platformVersion(candidate);
     console.log(candidate); console.error('Preview only; no reservation. Allocation revalidates in the shared workflow.');
     return;

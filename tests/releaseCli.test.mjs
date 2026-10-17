@@ -29,7 +29,7 @@ beforeEach(() => {
   const gradle = join(root, mirrorFiles.at(-1));
   writeFileSync(gradle, readFileSync(gradle, 'utf8').replace(/versionCode\s+\d+/, 'versionCode 10002999').replace(/versionName\s+"[^"]*"/, 'versionName "0.10.2"'));
   const c = JSON.parse(readFileSync(new URL('../project-standards.json', import.meta.url)));
-  c.history.reviewed = true;
+  c.history.unresolved = [];
   Object.assign(c.signing['android-release'], { historyReviewed: true, highestHistoricalCode: 0, certificateSha256: 'a'.repeat(64) });
   save('project-standards.json', c); save('remote-fixture.json', { tags: [], releases: [] });
   writeFileSync(join(root, '.gitignore'), 'fake-bin/\nremote-fixture.json\napi-audit.jsonl\ncommands.jsonl\n');
@@ -42,7 +42,7 @@ appendFileSync(join(root,'api-audit.jsonl'),JSON.stringify(a)+'\\n');
 if(a[0]==='workflow'){ if(process.env.FAIL_DISPATCH)process.exit(1); process.exit(0); }
 const endpoint=a.find(x=>x.startsWith('repos/'));
 if(endpoint.endsWith('/git/matching-refs/tags/'))for(const t of state.tags)console.log(JSON.stringify(t));
-else if(endpoint.includes('/releases?'))for(const r of state.releases)console.log(JSON.stringify(r));
+else if(endpoint.includes('/releases?')){if(process.env.FAIL_INVENTORY)process.exit(1);for(const r of state.releases)console.log(JSON.stringify(r));}
 else if(endpoint.includes('/commits/'))console.log(JSON.stringify({sha:'a'.repeat(40)}));
 else throw Error('Unexpected or mutating API');
 `, { mode: 0o700 });
@@ -160,7 +160,7 @@ describe('stable Bash interface', () => {
     const before=snapshot(); inventory(['0.12.0-dev.1']);
     expect(run('release.sh','prepare','0.11.0','--apply').stderr).toContain('does not exceed');
     expect(run('release.sh','prepare','01.11.0','--apply').status).toBe(1);
-    const c=JSON.parse(readFileSync(join(root,'project-standards.json')));c.history.reviewed=false;save('project-standards.json',c);git('add','project-standards.json');git('commit','-m','unready');
+    const c=JSON.parse(readFileSync(join(root,'project-standards.json')));c.history.unresolved=['Unreconciled deleted reservations'];save('project-standards.json',c);git('add','project-standards.json');git('commit','-m','unready');
     expect(run('release.sh','prepare','0.11.0','--apply').stderr).toContain('Release blocked'); expect(snapshot()).toEqual(before);
   });
   it('publishes only the explicit branch/tag atomically after revalidation', () => {
@@ -219,7 +219,51 @@ describe('beta Bash interface', () => {
   it('blocks dispatch with unreconciled history and does not retry an indeterminate dispatch', () => {
     env.FAIL_DISPATCH='1';expect(run('beta-version.sh','allocate','main','0.11.0','--apply').stderr).toContain('Inspect Beta Release runs');
     expect(audit().filter(a=>a[0]==='workflow')).toHaveLength(1);
-    const c=JSON.parse(readFileSync(join(root,'project-standards.json')));c.history.reviewed=false;save('project-standards.json',c);
+    const c=JSON.parse(readFileSync(join(root,'project-standards.json')));c.history.unresolved=['Unreconciled deleted reservations'];save('project-standards.json',c);
     expect(run('beta-version.sh','allocate','main','0.11.0','--apply').stderr).toContain('Release blocked');expect(audit().filter(a=>a[0]==='workflow')).toHaveLength(1);
+  });
+});
+
+// Inventory runs in an isolated fixture; every API request is read-only.
+describe('automated release inventory', () => {
+  const inspect = () => spawnSync(process.execPath, ['--input-type=module', '-e',
+    "import {releaseInventory} from './scripts/release-control.mjs'; console.log(JSON.stringify(await releaseInventory()));"], { cwd: root, env, encoding: 'utf8' });
+  it('accepts complete interpretable history without a review checkbox, with pagination on both APIs', () => {
+    inventory(['0.9.3', '0.10.1']);
+    const result = inspect(); expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).versions).toEqual(['0.9.3', '0.10.1']);
+    expect(audit()).toHaveLength(2); expect(audit().every(a => a.includes('--paginate'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(root, 'project-standards.json'))).history).not.toHaveProperty('reviewed');
+  });
+  it('blocks unavailable or partial inventory before metadata or refs change', () => {
+    env.FAIL_INVENTORY = '1'; const head = git('rev-parse', 'HEAD'), before = snapshot();
+    expect(run('release.sh', 'prepare', '0.11.0', '--apply').status).toBe(1);
+    expect(snapshot()).toEqual(before); expect(git('rev-parse', 'HEAD')).toBe(head); expect(git('tag')).toBe('');
+  });
+  it('keeps draft releases, tombstones and disappeared aliases consumed', () => {
+    const c = JSON.parse(readFileSync(join(root, 'project-standards.json')));
+    c.history.reservations = ['0.11.0-dev.5']; c.history.historicalAliases = { 'old-beta': '0.11.0-dev.7' }; save('project-standards.json', c);
+    save('remote-fixture.json', { tags: [], releases: [{ tag_name: '0.11.0-dev.9', draft: true }] });
+    const result = inspect(); expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).versions).toEqual(['0.11.0-dev.5', '0.11.0-dev.7', '0.11.0-dev.9']);
+    expect(run('beta-version.sh', 'next', '0.11.0').stdout.trim()).toBe('0.11.0-dev.10');
+  });
+  it('rejects unknown tags, invalid ledgers and mappings that erase canonical reservations', () => {
+    save('remote-fixture.json', { tags: [{ref:'refs/tags/legacy-beta'}], releases: [] });
+    expect(inspect().stderr).toContain('Invalid official version');
+    const c = JSON.parse(readFileSync(join(root, 'project-standards.json')));
+    c.history.historicalAliases = {'legacy-beta':'0.11.0-dev.4'}; save('project-standards.json', c);
+    expect(inspect().status).toBe(0);
+    c.history.historicalAliases['v0.12.0'] = '0.9.0'; save('project-standards.json', c);
+    expect(inspect().stderr).toContain('redefines canonical version');
+    c.history.historicalAliases = {}; c.history.reservations = ['garbage']; save('project-standards.json', c);
+    expect(inspect().status).toBe(1);
+  });
+  it('fetches current history but fails on unresolved migration evidence even with reviewed=true', () => {
+    const c = JSON.parse(readFileSync(join(root, 'project-standards.json')));
+    c.history.reviewed = true; c.history.unresolved = ['Missing deleted-version evidence']; save('project-standards.json', c);
+    expect(inspect().stderr).toContain('Missing deleted-version evidence'); expect(audit()).toHaveLength(2);
+    delete c.history.unresolved; save('project-standards.json', c);
+    expect(inspect().stderr).toContain('history.reviewed is obsolete');
   });
 });

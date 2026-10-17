@@ -14,11 +14,11 @@ beforeEach(() => {
   mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin')); input = join(root, 'verified'); mkdirSync(input);
   for (const file of ['release-control.mjs', 'release-policy.mjs', 'version.mjs']) cpSync(new URL(`../scripts/${file}`, import.meta.url), join(root, 'scripts', file));
   config = JSON.parse(readFileSync(new URL('../project-standards.json', import.meta.url)));
-  config.history.reviewed = true;
+  config.history.unresolved = [];
   Object.assign(config.signing['android-release'], { historyReviewed: true, highestHistoricalCode: 0, certificateSha256: 'a'.repeat(64) });
   save(join(root, 'project-standards.json'), config); save(join(root, 'dev-standards.lock.json'), { commit: pin });
-  writeFileSync(join(root, 'bin/git'), `#!${process.execPath}\nimport {readFileSync} from 'node:fs';const a=process.argv.slice(2);if(a[0]==='show' && a[1].endsWith(':manifest.json'))console.log(JSON.stringify({browser_specific_settings:{gecko:{id:'project-board@local.invalid'}}}));else if(a[0]==='show')process.stdout.write(readFileSync('project-standards.json'));else if(a[0]==='log')console.log('- fixture change');\n`, { mode: 0o700 });
-  writeFileSync(join(root, 'bin/gh'), `#!${process.execPath}\nimport {appendFileSync,existsSync,readFileSync} from 'node:fs';const a=process.argv.slice(2);appendFileSync('api-audit.jsonl',JSON.stringify(a)+'\\n');if(a[0]!=='api'||a.includes('POST')||a.includes('PATCH')||a.includes('-f')||a.includes('-F'))throw Error('Remote mutation forbidden in fixture');const endpoint=a.find(x=>x.startsWith('repos/'));if(endpoint.endsWith('/git/matching-refs/tags/'))console.log(JSON.stringify({ref:'refs/tags/v0.10.3'}));else if(endpoint.includes('/releases?')){if(existsSync('published.json'))console.log(readFileSync('published.json','utf8'));}else if(endpoint.includes('/releases/assets/'))process.stdout.write(readFileSync('asset-'+endpoint.split('/').pop()+'.bin'));else if(endpoint.includes('/git/ref/tags/'))console.log(JSON.stringify({object:{type:'tag',sha:'b'.repeat(40)}}));else if(endpoint.includes('/git/tags/'))console.log(JSON.stringify({object:{sha:'${sha}'}}));else throw Error('Unexpected API request');\n`, { mode: 0o700 });
+  writeFileSync(join(root, 'bin/git'), `#!${process.execPath}\nimport {readFileSync} from 'node:fs';const a=process.argv.slice(2);if(a[0]==='cat-file')console.log('tag');else if(a[0]==='rev-parse')console.log('${sha}');else if(a[0]==='show' && a[1].endsWith(':VERSION'))console.log('0.10.3');else if(a[0]==='show' && a[1].endsWith(':manifest.json'))console.log(JSON.stringify({browser_specific_settings:{gecko:{id:'project-board@local.invalid'}}}));else if(a[0]==='show')process.stdout.write(readFileSync('project-standards.json'));else if(a[0]==='log')console.log('- fixture change');\n`, { mode: 0o700 });
+  writeFileSync(join(root, 'bin/gh'), `#!${process.execPath}\nimport {appendFileSync,existsSync,readFileSync} from 'node:fs';const a=process.argv.slice(2);appendFileSync('api-audit.jsonl',JSON.stringify(a)+'\\n');if(a[0]!=='api'||a.includes('POST')||a.includes('PATCH')||a.includes('-f')||a.includes('-F'))throw Error('Remote mutation forbidden in fixture');const endpoint=a.find(x=>x.startsWith('repos/'));if(endpoint.endsWith('/git/matching-refs/tags/'))console.log(JSON.stringify({ref:'refs/tags/v0.10.3'}));else if(endpoint.includes('/releases?')){if(existsSync('published.json'))console.log(JSON.stringify(JSON.parse(readFileSync('published.json','utf8'))));}else if(endpoint.includes('/releases/assets/'))process.stdout.write(readFileSync('asset-'+endpoint.split('/').pop()+'.bin'));else if(endpoint.includes('/git/ref/tags/'))console.log(JSON.stringify({object:{type:'tag',sha:'b'.repeat(40)}}));else if(endpoint.includes('/git/tags/'))console.log(JSON.stringify({object:{sha:'${sha}'}}));else throw Error('Unexpected API request');\n`, { mode: 0o700 });
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 function build(target, changes = {}) {
@@ -30,6 +30,17 @@ function run(command) {
   return spawnSync(process.execPath, ['scripts/release-control.mjs', command, 'stable', '0.10.3', sha, input], { cwd: root, env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` }, encoding: 'utf8' });
 }
 describe('release aggregate gates (simulated remote)', () => {
+  it('checks the historical Android code floor for direct stable workflow entry', () => {
+    config.signing['android-release'].highestHistoricalCode = 10003999;
+    save(join(root, 'project-standards.json'), config);
+    const result = spawnSync(process.execPath, ['scripts/release-control.mjs', 'validate', 'stable', 'v0.10.3'], { cwd: root, env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` }, encoding: 'utf8' });
+    expect(result.status).toBe(1); expect(result.stderr).toContain('Android code does not exceed');
+  });
+  it('blocks an unpublished release superseded by a newer draft reservation before staging', () => {
+    save(join(root, 'published.json'), { tag_name: 'v0.11.0-dev.1', draft: true });
+    expect(run('stage').stderr).toContain('does not exceed reservation');
+    expect(existsSync(join(root, 'release-staging'))).toBe(false);
+  });
   it('blocks a missing mandatory target before creating any draft', () => {
     build('firefox'); const result = run('stage'); expect(result.status).toBe(1); expect(result.stderr).toContain('Missing mandatory target');
     expect(readFileSync(join(root, 'api-audit.jsonl'), 'utf8')).not.toContain('PATCH');

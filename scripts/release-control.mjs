@@ -5,7 +5,7 @@ import { resolve, dirname, basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { androidVersionCode } from './version.mjs';
-import { assertForward, compareVersion, official, nextBeta, releaseReadiness, extensionVersion } from './release-policy.mjs';
+import { assertForward, compareVersion, official, nextBeta, releaseReadiness, historyReservations, historicalVersion, extensionVersion } from './release-policy.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const config = () => JSON.parse(readFileSync(join(root, 'project-standards.json'), 'utf8'));
 const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
@@ -20,19 +20,21 @@ const output = values => {
 };
 export async function remoteInventory() {
   const c = config();
-  // API pagination includes drafts, deleted-release tags, nonstandard aliases and ledger tombstones.
+  // Paginate both endpoints, including drafts. Deleted identities require durable ledger records.
   const pages = endpoint => gh('api', '--paginate', endpoint, '--jq', '.[] | @json').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
   const tags = pages(`repos/${repo()}/git/matching-refs/tags/`);
   const releases = pages(`repos/${repo()}/releases?per_page=100`);
-  const versions = new Set(c.history.reservations);
+  const unresolved = c.history?.unresolved;
+  const versions = new Set(historyReservations(c));
   for (const name of [...tags.map(t => t.ref.replace('refs/tags/', '')), ...releases.map(r => r.tag_name)]) {
-    const alias = c.history.historicalAliases[name];
-    // All historical tags require reconciliation; no silently ignored version-looking aliases.
-    const v = alias ?? name.replace(/^v/, '');
-    versions.add(official(v));
+    versions.add(historicalVersion(c, name));
   }
-  for (const v of versions) official(v);
-  return { versions: [...versions], releases, tags };
+  return { versions: [...versions], releases, tags, unresolved };
+}
+export async function releaseInventory() {
+  const inventory = await remoteInventory();
+  releaseReadiness(config());
+  return inventory;
 }
 function trustSource(sha) {
   if (!/^[a-f0-9]{40}$/.test(sha)) throw Error('Expected full committed SHA');
@@ -69,9 +71,8 @@ function record(state, values) {
   writeFileSync(join(root, 'release-record/state.json'), JSON.stringify({ state, ...values, standardsCommit: JSON.parse(readFileSync(join(root, 'dev-standards.lock.json'))).commit, configurationSha256: hash(join(root, 'project-standards.json')), run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, utc: new Date().toISOString() }, null, 2));
 }
 async function validate(channel, selector, requestedCore) {
-  releaseReadiness(config());
   let sha, version, tag;
-  const inventory = await remoteInventory();
+  const inventory = await releaseInventory();
   if (channel === 'beta') {
     // Resolve the remote branch or full SHA exactly once, using validated arguments.
     if (!/^(?:[a-f0-9]{40}|[A-Za-z0-9][A-Za-z0-9._/-]*)$/.test(selector) || selector.includes('..')) throw Error('Invalid source selector');
@@ -111,7 +112,8 @@ async function validate(channel, selector, requestedCore) {
     if (git('show', `${sha}:VERSION`) !== version) throw Error('Stable source VERSION does not match tag');
     if (!inventory.releases.some(r => r.tag_name === tag && !r.draft)) assertForward(version, inventory.versions, true);
     extensionVersion(version);
-    androidVersionCode(version);
+    const code = androidVersionCode(version);
+    if (!inventory.releases.some(r => r.tag_name === tag && !r.draft) && code <= config().signing['android-release'].highestHistoricalCode) throw Error('Android code does not exceed reviewed historical/submission inventory');
   }
   const refreshed = await remoteInventory();
   const published = refreshed.releases.find(r => r.tag_name === tag && !r.draft);
@@ -126,9 +128,10 @@ async function validate(channel, selector, requestedCore) {
   output({ channel, version, sha, tag });
 }
 async function publish(channel, version, sha, directory, stageOnly = false) {
-  releaseReadiness(config());
+  const inventory = await releaseInventory();
   official(version); trustSource(sha);
-  const tag = `v${version}`, inventory = await remoteInventory();
+  const tag = `v${version}`;
+  if (!inventory.releases.some(r => r.tag_name === tag && !r.draft)) assertForward(version, inventory.versions, true);
   const remoteTag = JSON.parse(gh('api', `repos/${repo()}/git/ref/tags/${tag}`));
   if (remoteTag.object.type !== 'tag') throw Error('Expected annotated tag');
   const tagObject = JSON.parse(gh('api', `repos/${repo()}/git/tags/${remoteTag.object.sha}`));
@@ -148,7 +151,7 @@ async function publish(channel, version, sha, directory, stageOnly = false) {
     targets.push(...info.targets);
   }
   for (const target of config().matrix[channel].required) if (!targets.some(t => t.id === target && t.outcome === 'succeeded') || !files.some(f => f.target === target)) throw Error(`Missing mandatory target: ${target}`);
-  const priorStable = inventory.releases.filter(r => !r.draft && !r.prerelease && r.tag_name !== tag).sort((a, b) => compareVersion(b.tag_name.slice(1), a.tag_name.slice(1)))[0];
+  const priorStable = inventory.releases.filter(r => !r.draft && !r.prerelease && r.tag_name !== tag).sort((a, b) => compareVersion(historicalVersion(config(), b.tag_name), historicalVersion(config(), a.tag_name)))[0];
   const range = priorStable ? `${priorStable.tag_name}..${sha}` : sha;
   if (priorStable) git('merge-base', '--is-ancestor', `${priorStable.tag_name}^{commit}`, sha); // Divergence requires reviewed reconciliation.
   const notes = `Pboard ${version}\n\nSource: ${sha}\nBaseline: ${priorStable?.tag_name ?? 'initial reachable history (including root)'}\nRange: ${range}\n\n${git('log', '--format=- %h %s', range)}\n\nPackages: Firefox/Chromium ZIPs are unsigned store-upload archives, not signed installable extensions. Android APK is release-signed. External delivery is manual/disabled.\n`;
@@ -170,7 +173,7 @@ async function publish(channel, version, sha, directory, stageOnly = false) {
     return;
   }
   // Publication ordering is checked again under the shared beta/stable lifecycle lock.
-  assertForward(version, inventory.releases.filter(r => !r.draft).map(r => official(r.tag_name.replace(/^v/, ''))));
+  assertForward(version, inventory.releases.filter(r => !r.draft).map(r => historicalVersion(config(), r.tag_name)));
   if (!existing) gh('release', 'create', tag, '--verify-tag', '--draft', '--title', `Pboard ${version}`, '--notes-file', join(staging, 'release-notes.md'));
   record('staged', { channel, version, sha, tag, previousStable: priorStable?.tag_name });
   // Reconcile identical draft assets and upload only missing files; conflicts never clobber.
@@ -194,7 +197,7 @@ async function publish(channel, version, sha, directory, stageOnly = false) {
     if (createHash('sha256').update(data).digest('hex') !== f.hash) throw Error('Uploaded bytes differ');
   }
   const fresh = await remoteInventory();
-  assertForward(version, fresh.releases.filter(r => !r.draft).map(r => official(r.tag_name.replace(/^v/, ''))));
+  assertForward(version, fresh.versions, true);
   gh('api', '--method', 'PATCH', `repos/${repo()}/releases/${uploaded.id}`, '-F', 'draft=false', '-F', `prerelease=${channel === 'beta'}`, '-f', `make_latest=${channel === 'beta' ? 'false' : 'true'}`);
   record('published', { channel, version, sha, tag });
 }
@@ -204,7 +207,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     if (command === 'validate') await validate(...args);
     else if (command === 'stage') await publish(...args, true);
     else if (command === 'publish') await publish(...args);
-    else if (command === 'preflight') releaseReadiness(config());
+    else if (command === 'preflight') await releaseInventory();
     else if (command === 'inventory') console.log(JSON.stringify(await remoteInventory(), null, 2));
     else throw Error('usage: release-control.mjs preflight|inventory|validate CHANNEL SELECTOR [CORE]|publish CHANNEL VERSION SHA DIRECTORY');
   } catch (e) { record('failed', { command, reason: e.message }); console.error(e.message); process.exitCode = 1; }

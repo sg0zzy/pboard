@@ -71,9 +71,31 @@ export function validateConfig(c) {
   }
   return c;
 }
+export function historyReservations(c) {
+  const h = c.history;
+  if (!h || !Array.isArray(h.unresolved) || h.unresolved.some(reason => typeof reason !== 'string' || !reason.trim()) ||
+      !Array.isArray(h.reservations) || !h.historicalAliases || typeof h.historicalAliases !== 'object' || Array.isArray(h.historicalAliases)) {
+    throw Error('Release blocked: missing/invalid history inventory configuration; reconcile migration evidence (history.reviewed is obsolete)');
+  }
+  for (const name of Object.keys(h.historicalAliases)) historicalVersion(c, name);
+  return [...new Set([...h.reservations, ...Object.values(h.historicalAliases)].map(official))];
+}
+export function historicalVersion(c, name) {
+  const canonical = name.replace(/^v/, '');
+  const alias = Object.hasOwn(c.history.historicalAliases, name) ? c.history.historicalAliases[name] : undefined;
+  let standard = false;
+  try { official(canonical); standard = true; } catch { /* Nonstandard names need an explicit mapping. */ }
+  if (standard && alias !== undefined && alias !== canonical) throw Error(`Historical alias redefines canonical version: ${name}`);
+  return official(alias ?? canonical);
+}
+export function historyReadiness(c) {
+  historyReservations(c);
+  const h = c.history;
+  if (h.unresolved.length) throw Error(`Release blocked: unresolved historical inventory: ${h.unresolved.join('; ')}`);
+}
 export function releaseReadiness(c) {
   validateConfig(c);
-  if (!c.history.reviewed) throw Error('Release blocked: review full remote tags/releases, historical aliases and durable reservations; set history.reviewed only after inventory');
+  historyReadiness(c);
   const signer = c.signing['android-release'];
   if (!Number.isSafeInteger(signer.highestHistoricalCode) || signer.highestHistoricalCode < 0 || !signer.historyReviewed || !/^[a-fA-F0-9]{64}$/.test(signer.certificateSha256 ?? '')) throw Error('Release blocked: Android production signer and code/submission history require owner review');
 }

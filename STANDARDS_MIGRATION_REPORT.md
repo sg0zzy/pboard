@@ -1,5 +1,79 @@
 # Standards migration report
 
+## Release history guard review — 2026-10-17
+
+**Finding:** complete history validation is required by the adopted policy;
+`history.reviewed` is a project implementation choice, not a central requirement.
+The original unconditional check was in `scripts/release-policy.mjs:76`, added by
+commit `13cd1e31264ba0fa82253d90efdf50dd1a7830bc` (`shared versioning polcies`).
+`project-standards.json` initialized it to false. `releaseReadiness()` was called
+by the stable/beta CLI and workflow control before `remoteInventory()`, so it
+prevented automated inspection. It was persistent migration state, never an
+implemented requirement to repeat manual approval for every release.
+
+Verified the adopted edition 1.0.0 at
+`e3111c4e9dc652f833a5f2ba5232c292646e7969` using
+`python3 scripts/verify-standards.py /tmp/pboard-standards-review`: all 21 file
+digests passed. The sibling standards checkout was newer; it was not used as
+policy authority. A separate clone was detached at the exact pin.
+
+Applicable central requirements at that pin:
+
+- [VERSIONING, Precedence and forward progress](https://github.com/sg0zzy/dev-standards/blob/e3111c4e9dc652f833a5f2ba5232c292646e7969/VERSIONING.md#precedence-and-forward-progress):
+  use SemVer precedence, exceed published versions and durable reservations,
+  inventory complete remote tags/releases/tombstones, reconcile historical
+  aliases, block unknown records, and never free an identity by deletion.
+- [RELEASE, Common transaction and evidence](https://github.com/sg0zzy/dev-standards/blob/e3111c4e9dc652f833a5f2ba5232c292646e7969/RELEASE.md#common-transaction-and-evidence)
+  and failure/retry rules: share reservation state, create tags only, preserve
+  failed reservations, revalidate publication ordering, and verify identical
+  completed-publication retries without replacing bytes or moving tags.
+- [ADOPTION, Initial adoption](https://github.com/sg0zzy/dev-standards/blob/e3111c4e9dc652f833a5f2ba5232c292646e7969/ADOPTION.md#initial-adoption):
+  inventory historical identities, stores and outstanding submissions; preserve
+  authoritative version/signing history and record unresolved gaps.
+- [ANDROID, Monotonic versionCode](https://github.com/sg0zzy/dev-standards/blob/e3111c4e9dc652f833a5f2ba5232c292646e7969/ANDROID.md#monotonic-versioncode):
+  account for allocated/submitted/distributed codes, retain retry reservations,
+  enforce bounds and supported update ordering; encoded schemes may be retained
+  when their ordering, limits, concurrency and migration behavior are proven.
+- [CONFIGURATION, Validation and override rules](https://github.com/sg0zzy/dev-standards/blob/e3111c4e9dc652f833a5f2ba5232c292646e7969/CONFIGURATION.md#validation-and-override-rules):
+  unresolved production placeholders fail the affected operation. Neither the
+  required mapping nor its example specifies a `history.reviewed` gate.
+
+Replaced the checkbox with `history.unresolved`, a list of specific historical
+ambiguities. The existing uncertainty about deleted/abandoned reservations and
+aliases remains explicitly listed; no evidence was invented or gap cleared.
+Ordinary release operations automatically paginate tags and Releases before
+readiness checks. Once historical gaps are reconciled and documented, an empty
+list allows automated validation with no manual history approval per release.
+Missing migration configuration fails closed; setting the obsolete checkbox
+cannot override unresolved evidence. The diagnostic `inventory` command reports
+current history and remaining gaps without treating that result as readiness.
+
+Durable alias values now remain reservations even after their remote names
+disappear. Aliases cannot remap canonical identifiers downward. The publication
+baseline and ordering checks use the same historical mapping. Added the Android
+historical code floor to direct stable workflow validation (the local CLI
+already enforced it), and check reservations before staging and again before
+visibility changes. Tag creation, immutable object matching, shared lifecycle
+serialization and exact published-byte retry verification remain enforced.
+
+Repeated read-only paginated GitHub inspection returned tags and published stable
+Releases for `0.9.3`, `0.9.6`, and `0.10.1`, with no other current records. This
+agrees with the earlier inventory below. APIs cannot establish deleted history
+or external submissions. Production certificate, Android code/submission review
+and repository/environment protection evidence remain outstanding; releases are
+still blocked for those concrete reasons. No distribution mode or standards pin
+was changed. No project commits, tags, pushes, releases or workflow dispatches
+were created; tests use isolated disposable fixtures.
+
+Validation: `npx vitest run tests/standardsPolicy.test.mjs tests/releaseCli.test.mjs
+ tests/releaseGates.test.mjs tests/releaseMetadata.test.ts` passed all **50 tests**
+in four files. Coverage includes partial API failure before edits/refs, pagination
+on both endpoints, automatic operation without the checkbox, unknown records,
+drafts/tombstones/disappeared aliases, unresolved evidence despite a true legacy
+flag, canonical-alias conflicts, direct stable Android history floors, superseded
+staging, immutable tags and verified published-byte retries. `git diff --check`
+passed. These are local/fake-remote checks, not live publication/device evidence.
+
 ## Release-readiness inventory — 2026-10-17
 
 Investigated `release.sh prepare --apply` stopping at `history.reviewed: false`.

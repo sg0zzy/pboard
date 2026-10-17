@@ -16,8 +16,8 @@ try {
   console.log(JSON.stringify({ version, edits: planned, checks: ['full remote high-water inventory', 'clean intended source', 'signing/history readiness', 'npm run check', 'Android typecheck/tests and managed debug APK'], commit: 'human-reviewed dedicated release commit if metadata differs', tag: `annotated v${version} on reviewed commit (human operation)`, remoteActions: 'none; separately authorized tag push starts stable workflow' }, null, 2));
   if (!apply) process.exit(0);
   if (git('status', '--porcelain', '--untracked-files=all')) throw Error('Stable preparation requires a clean intended source tree');
-  releaseReadiness(JSON.parse(readFileSync(join(root, 'project-standards.json'))));
   assertForward(version, (await remoteInventory()).versions);
+  releaseReadiness(JSON.parse(readFileSync(join(root, 'project-standards.json'))));
   const originals = new Map(planned.map(p => [p, readFileSync(join(root, p))]));
   try {
     writeFileSync(join(root, 'VERSION'), `${version}\n`);

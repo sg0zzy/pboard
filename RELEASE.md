@@ -47,7 +47,11 @@ All three official targets remain mandatory: Firefox ZIP, Chromium ZIP and
 release-signed Android APK, plus reviewer sources, release manifest and SHA-256
 checksums. Missing signing credentials or a failed target blocks completion.
 
-Before activation, inventory complete remote tags/releases, historical aliases, deleted/abandoned identities and all Android allocated/submitted/distributed codes. Record reconciled aliases/tombstones in `project-standards.json`; set `history.reviewed` only when complete. Keep durable tombstones there when reservations might disappear remotely. Owner review must establish branch/tag protection, trusted workflow/build/dependency review, and actual protected `release-signing` and `release-publication` environments with eligible refs/reviewers. Environment names in YAML do not establish these settings.
+Every release automatically inventories paginated remote Git tags and GitHub Releases (including drafts), plus durable reservations and all recorded alias versions in `project-standards.json`. API failures, unknown records, collisions and ordering violations fail closed. Inspect current evidence without release mutations with `node scripts/release-control.mjs inventory`; `preflight` also enforces readiness.
+
+`history.unresolved` lists concrete migration gaps that current APIs cannot resolve, such as deleted reservations without durable evidence. Reconcile each gap once using reliable historical records, persist aliases/tombstones, and remove only resolved entries with evidence recorded in `STANDARDS_MIGRATION_REPORT.md`. An empty list permits routine automated validation; no per-release manual history approval is required. Missing migration configuration fails closed. The obsolete `history.reviewed` flag has no authority. A complete current API response does not prove the absence of deleted identities. Recorded alias versions remain reserved even when their remote names disappear, and aliases cannot redefine canonical versions.
+
+Android allocated/submitted/distributed codes and production signing identity remain separately required. Keep durable tombstones when reservations might disappear remotely. Owner review must establish branch/tag protection, trusted workflow/build/dependency review, and actual protected `release-signing` and `release-publication` environments with eligible refs/reviewers. Environment names in YAML do not establish these settings.
 
 ## Shell commands
 
@@ -110,7 +114,7 @@ scripts/release.sh publish 0.10.3 --apply    # atomic push of main + this exact 
 
 Plans list metadata/checks/commit/tag/remote actions. They perform no remote
 calls or source/index/ref changes and are not eligibility checks. Apply requires
-a clean intended tree, reviewed history/signing, full remote and local reservation
+a clean intended tree, resolved migration gaps and signing readiness, full remote and local reservation
 checks, and valid platform mappings. Preparation runs the existing root and
 Android validation/build gates; there is no skip-checks override. It commits only
 version metadata when needed and creates an immutable annotated `vX.Y.Z` tag on
@@ -163,7 +167,7 @@ scripts/beta-version.sh retry v0.10.3-dev.1 --apply
 ```
 
 The core can be omitted when VERSION selects `X.Y.Z-dev`; `allocate` defaults to
-`main`. `next` requires reviewed history/signing and checks all remote tags,
+`main`. `next` requires resolved migration gaps and signing readiness, and checks all remote tags,
 releases and durable records plus known local reservations. Its result may be
 superseded before allocation. It edits no source/refs and consumes no number.
 
