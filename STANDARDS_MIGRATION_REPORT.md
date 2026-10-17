@@ -1,5 +1,36 @@
 # Standards migration report
 
+## Release-readiness inventory — 2026-10-17
+
+Investigated `release.sh prepare --apply` stopping at `history.reviewed: false`.
+The wrapper correctly resolved `VERSION` to `0.10.2`; the readiness check stops
+before metadata edits, builds or Git mutations.
+
+Read-only paginated GitHub inventory found these tags and matching published,
+non-prerelease Releases; no drafts or other current remote tags were returned:
+
+| Tag | Git object type | Git object SHA |
+| --- | --- | --- |
+| `v0.9.3` | commit (historical lightweight tag) | `950b4ed8f57b8fc3dab47ce4b7ccbd17cc2b2188` |
+| `v0.9.6` | annotated tag | `a7cf79de8c6f1d2170c60bbeb0481f307d43ae03` |
+| `v0.10.1` | annotated tag | `21edbf61e66393ca1f3223031ce121bb10206616` |
+
+Local tags match these version names. Existing Release asset lists contain
+browser ZIPs and reviewer sources, with no Android packages. This does not
+establish that Android has never been distributed elsewhere or submitted.
+The repository comparator accepts `0.10.2` above the visible reservation set;
+its adapters produce browser `0.10.2.65535` and Android code `10002999`.
+This is candidate evidence, not confirmation that the version/code is available
+against deleted history or external submissions.
+
+Owner evidence still needed: deleted/abandoned versions and historical aliases,
+Android allocated/submitted/distributed code inventory, and intended production
+signer public SHA-256 fingerprint. `history.reviewed`, Android `historyReviewed`,
+`highestHistoricalCode` and `certificateSha256` remain unchanged pending that
+evidence. Repository/environment protection verification also remains open.
+The pinned standards checkout and all 21 file digests were verified. No release
+preparation, remote mutation or credential change was performed.
+
 ## GitHub Actions Node.js 24 runtime migration — 2026-10-17
 
 Updated all 38 action invocations across CI, official target builds, beta and
