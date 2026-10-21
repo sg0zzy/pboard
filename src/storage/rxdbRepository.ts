@@ -1,5 +1,5 @@
 import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
-import { draftCommand, pendingHeads, pendingValue } from "./pendingWork";
+import { draftCommand, pendingHeads, pendingValue, validatePending } from "./pendingWork";
 import { liveBoardRole, liveBoardEntitlement, registerAuthorizationJournal, recordLiveBoardAdmission, installLiveBoardMutations } from "../collab/security/liveMutations";
 import { canonicalize } from "../collab/security/canonical";
 import { documentValue, makeChange, scope, type PendingEdit } from "./changeJournal";
@@ -1064,7 +1064,7 @@ export async function createRxRepository(options: {
         const value = pendingValue(selected.value);
         if (request.edits) Object.assign(value, request.edits);
         const edit: PendingEdit = { id: newId(), boardId: request.boardId, base: selected, value, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, parents: result.heads, supersedes: pendingHeads(await journal.pendingEdits.toArray()).filter(e => e.base.documentId === request.documentId).map(e => e.id) };
-        await import('./pendingWork').then(module => module.validatePending(edit, request.boardId));
+        await validatePending(edit, request.boardId);
         await journal.pendingEdits.put(edit); await changed(request.boardId);
       });
     };

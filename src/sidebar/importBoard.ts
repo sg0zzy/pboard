@@ -1,4 +1,3 @@
-import { strFromU8, unzipSync } from 'fflate';
 import { BOARD_ITEM_STATUSES, BOARD_ITEM_TYPES, BOARD_TEMPLATES, type BoardImage, type BoardItem, type BoardTemplate } from '../types';
 import { normalizeCardDisplayMode } from '../cardDisplayModes';
 import { isTypeSupported } from '../templates/boardTemplates';
@@ -19,6 +18,9 @@ const text = (value: unknown, max = 1024 * 1024): string => {
  * signatures and remote bindings are deliberately never imported. */
 export async function readBoardArchive(data: Uint8Array): Promise<ImportedBoard> {
   if (data.length > MAX_BOARD_IMPORT_BYTES) throw new Error('Board ZIP exceeds the 25 MB import limit.');
+  // The ZIP codec is only needed for an import; loading it on demand keeps it
+  // out of the sidebar's startup chunk.
+  const { strFromU8, unzipSync } = await import('fflate');
   let total = 0, count = 0;
   const names = new Set<string>();
   const files = unzipSync(data, { filter(file) {

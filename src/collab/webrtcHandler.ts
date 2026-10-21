@@ -8,7 +8,9 @@ import { validateReplicationRequest } from "./security/replicationRequests";
 import { collaborationDiagnostic } from "./diagnostics";
 // The package root requires Node globals and stream APIs. Use the bundled
 // browser entry, as RxDB's own WebRTC handler does, in extension contexts.
-import Peer from "simple-peer/simplepeer.min.js";
+// The transport is loaded on demand: it is only needed once a peer actually
+// connects, and it is the heaviest dependency of the extension.
+import type SimplePeer from "simple-peer";
 import { Subject } from "rxjs";
 import { newRxError } from "rxdb";
 import type { RxError, RxTypeError } from "rxdb";
@@ -38,7 +40,7 @@ import { manifestHash, manifestIsCurrent, AUTH_TIMEOUT_MS } from "./security/man
 export type PboardWrtc = SimplePeerWrtc;
 
 /** A live simple-peer connection; `id` is the remote peer's signaling id. */
-export type PboardPeer = InstanceType<typeof Peer> & { id: string };
+export type PboardPeer = InstanceType<typeof SimplePeer> & { id: string };
 
 export type PboardWebRTCConnectionOptions = {
   signaling: PboardSignaling;
@@ -218,12 +220,27 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       if (timer) { clearTimeout(timer); authTimers.delete(remotePeerId); }
     }
 
-    function createPeerConnection(remotePeerId: string) {
+    /**
+     * Starts a connection attempt. The transport bundle is loaded on demand,
+     * so a failure to load it is reported like any other peer failure instead
+     * of becoming an unhandled rejection.
+     */
+    function startPeerConnection(remotePeerId: string): void {
+      void createPeerConnection(remotePeerId).catch((error) => {
+        if (closed) return;
+        error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+      });
+    }
+
+    async function createPeerConnection(remotePeerId: string) {
       if (closed || !ownPeerId || remotePeerId === ownPeerId || peers.has(remotePeerId) || reconnectTimers.has(remotePeerId)) return;
       if (security && (!remoteSessions.has(remotePeerId) || !remoteDeviceKeys.has(remotePeerId) || (presenceExpiry.get(remotePeerId) ?? 0) < now())) return;
       let disconnected = false;
       let resolveTransportReady!: () => void;
       const transportReady = new Promise<void>(resolve => { resolveTransportReady = resolve; });
+      // The transport bundle is fetched on first use and then reused.
+      const { default: Peer } = await import("simple-peer/simplepeer.min.js");
+      if (closed || peers.has(remotePeerId)) return;
       const peer = new Peer({ initiator: remotePeerId > ownPeerId, wrtc, config, trickle }) as PboardPeer;
       peer.id = remotePeerId;
       peers.set(remotePeerId, peer);
@@ -318,7 +335,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
             }
             if (closed) return;
             reconnectTimers.delete(remotePeerId);
-            if (!security || activeRoster.has(remotePeerId)) createPeerConnection(remotePeerId);
+            if (!security || activeRoster.has(remotePeerId)) startPeerConnection(remotePeerId);
           })();
         }, 2_000));
       });
@@ -530,7 +547,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         challengesIssued.delete(id); peer.destroy();
       }
       if (!ownPeerId) return;
-      for (const id of roster) createPeerConnection(id);
+      for (const id of roster) startPeerConnection(id);
     }
 
     signaling.onPresence?.((from, envelope) => {
@@ -546,7 +563,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         }
         remoteSessions.set(from, identity.sessionId); remoteDeviceKeys.set(from, identity.deviceKeyId);
         presenceExpiry.set(from, (envelope.presence as { payload: { expiresAt: number } }).payload.expiresAt);
-        if (activeRoster.has(from)) createPeerConnection(from);
+        if (activeRoster.has(from)) startPeerConnection(from);
       })().catch(error => security.onSessionRejected?.(from, `Presence rejected: ${String(error)}`));
       presenceTasks.set(from, task);
     });
@@ -638,7 +655,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
               });
           }, 30_000);
         }
-        for (const id of new Set([...initial, ...latestRoster])) createPeerConnection(id);
+        for (const id of new Set([...initial, ...latestRoster])) startPeerConnection(id);
       } catch (error) {
         if (closed) return;
         error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));

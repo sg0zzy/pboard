@@ -1,4 +1,3 @@
-import { strToU8, zipSync } from "fflate";
 import type { StoredBlob } from "../storage/blobStore";
 import type { BoardItem, Project } from "../types";
 import { serializeBoard } from "./serialize";
@@ -29,6 +28,9 @@ export async function buildBoardArchive(
   items: BoardItem[],
   getImage: (imageId: string) => Promise<StoredBlob | null>
 ): Promise<BoardArchive> {
+  // The ZIP codec is only needed for an export; loading it on demand keeps it
+  // out of the sidebar's startup chunk.
+  const { strToU8, zipSync } = await import("fflate");
   const files: Record<string, Uint8Array> = { "board.txt": strToU8(serializeBoard(project, items)) };
   const seen = new Map<string, string>();
   for (const item of items) {

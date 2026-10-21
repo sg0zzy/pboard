@@ -272,6 +272,12 @@ npx web-ext build --source-dir dist --config web-ext-config.cjs
 the sidebar JavaScript chunks. Run `npm run package:firefox` to package and
 verify all runtime files before submission.
 
+The sidebar is split into several chunks. `react` and `storage` are separated
+by the build config; the WebRTC transport (`simplepeer.min-*.js`) and the ZIP
+codec are loaded on demand, because each is needed only for live collaboration
+or for a board import/export. The background service worker is a single IIFE
+and therefore carries its dependencies inline; it cannot be code-split.
+
 To compare byte-for-byte, unpack the submitted `.xpi`/`.zip` and diff it
 against a fresh `dist/`. For official archives, first account for the documented four-field version stamp in `manifest.json`; a Mozilla-signed XPI also has service-generated signature files. For the unsigned staging ZIP, remaining differences are file order
 (`web-ext` sorts entries) and the `zip` timestamp headers. File contents

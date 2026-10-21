@@ -33,6 +33,9 @@ async function session(beforeReconnect?: () => Promise<void>) {
   const handler = await createPboardWebRTCConnectionHandler({ signaling, beforeReconnect })();
   const errors: string[] = [];
   handler.error$.subscribe(error => errors.push(String(error.parameters.errorText)));
+  // The transport bundle is loaded on demand, so the first peer appears one
+  // microtask after the handler starts.
+  await vi.waitFor(() => expect(mock.Peer.instances).toHaveLength(1));
   return { handler, errors, signaling, roster, signal, peer: mock.Peer.instances[0] };
 }
 
