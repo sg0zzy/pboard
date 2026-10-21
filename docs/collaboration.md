@@ -1,5 +1,35 @@
 # Pboard collaboration architecture
 
+Approved implementation target: [two operating modes, synchronization semantics and recovery
+acceptance scenarios](architecture/synchronization-contract.md). That contract is
+the approved baseline; its implementation is staged and the behavior described
+here remains the current compatibility baseline.
+
+Update, 19 October 2026: ordinary production builds also expose an opt-in,
+independent board-grant WebSocket/WebRTC path. Google/Drive ACLs do not authorize
+that path, and optional private Drive persistence can run alongside it. See the
+[current architecture review, authorization model and limits](architecture/websocket-signaling-experiment.md#current-architecture-review-and-correction--19-october-2026).
+Google-connected WebSocket devices now enroll automatically under owner-signed
+email policies. Same-account devices need no invitation; other accounts must be
+explicitly invited via Share project. See the [current account-sharing flow](../services/pboard-signaling/README.md#automatic-google-account-sharing--current-flow).
+
+WebSocket invitations now appear as **Shared boards available** in the main
+sidebar, outside collapsed collaboration settings, including on an empty device.
+Both browsers must have WebSocket collaboration enabled at the same rendezvous
+and be connected to their respective Google accounts. Discovery runs every five
+seconds and on focus. The original authority browser must be online to approve
+the recipient device; until then the invitation shows a waiting status. After
+approval, **Open board** waits for the authenticated peer transfer before
+selecting the received board. The owner must have that board open for the initial
+transfer. No unsigned placeholder or cross-account private Drive read is used.
+An unsuccessful open reports the error and restores the previous live session
+when the user has not navigated elsewhere. Account login alone never opens a
+room or grants board membership. Previously received boards remain in the normal
+project list rather than being repeated in the invitation inbox.
+
+The sections below describe the preserved legacy Drive collaboration path; its
+shared folders are actual existing functionality, not private appData storage.
+
 Reviewed against the implementation on 12 October 2026. Google Drive provides persistent snapshots, sharing permissions, and signaling. RxDB stores local documents and replicates live changes over WebRTC. Pboard does not operate a central synchronization server. See [local storage](rxdb-storage-refactor.md) for migration and rollback, and [refactor status](../REFACTOR_STATE.md) for remaining validation.
 
 ## Runtime wiring
@@ -126,3 +156,124 @@ Relevant test files include `tests/drivePermissions.test.ts`, `tests/driveSignal
 `npm run test:webrtc:browser` runs two isolated headless Chromium profiles with real IndexedDB and WebRTC against simulated Drive records. It covers bidirectional project template/card mutations, account order, project deletion without resurrection, newer fork conflict resolution, and replayed JSEP answers. It needs Chromium on PATH or `PBOARD_CHROMIUM_BIN`; it makes no authenticated Google requests.
 
 Use [BUILD.md](../BUILD.md) for the ordinary validation commands. Real Google account invitation/role/removal flows, Drive latency/quotas, restrictive networks, and Firefox/Chromium extension lifecycle behavior still need dedicated integration or manual verification. No undated test count in this guide represents the current suite result.
+
+Current causal peer-history integration (20 October 2026): [Job 7 data flow, authorization, compatibility and validation](architecture/peer-causal-history.md). Proven journal descendants outrank timestamps; unresolved variants remain retained. The legacy document policy described above remains a compatibility projection when causality is unavailable.
+
+
+Job 8 adds [durable offline permissions and pending work](architecture/offline-authorization.md)
+and a separate Google service-admission gate for the public independent-board
+rendezvous path. Google identity still cannot authorize arbitrary boards.
+Structural pending commands, portable historical admission and owner-authorized
+recovery remain incomplete; no authority replacement or deployment is implied.
+
+Removal/bootstrap follow-up (20 October 2026): signed board deletion records
+signed tombstones before list/selection teardown, and resolves authorization from
+board grants. Initial guard installation and teardown share the repository's
+local mutation queue with snapshot recovery. Existing empty cards must verify as
+signed before bootstrap completes. See the
+[removal and bootstrap race fixes](architecture/offline-authorization.md#removal-and-initial-bootstrap-races--20-october-2026-follow-up).
+
+
+Invitation renewal follow-up (21 October 2026): the original authority browser
+maintains device grants for every locally owned, permitted board, including
+unselected boards, and republishes its saved email invitations after directory
+loss. Valid advertised policies are checked before renewal, preserving replay and
+authority-replacement rejection. Unchanged policies are republished only near
+expiry; pending device requests retry at most every 30 seconds unless explicitly
+refreshed. The sidebar polls every five seconds with a four-second identity cache,
+and shows a compact owner/short-ID row and “Waiting for owner…” status. Polling
+intervals are not a latency guarantee: background throttling, offline authority,
+revoked devices or network failures can still delay enrollment. Initial content
+transfer still needs an authorized online peer with the board open. No server
+quota, credential, Drive permission or security validation was relaxed.
+
+Directory-capacity isolation (21 October 2026): a verified `directory_capacity`
+rejection is now scoped to the unpublished board. It no longer aborts enrollment
+of devices under other valid advertised policies. Publication retries for that
+board are bounded to once per 30 seconds unless explicitly forced. A full pending
+request queue is similarly reported per board. The UI retains valid invitations
+and displays a collaboration quota warning; malformed proofs, policy conflicts
+and authorization failures still reject access normally. No server limits or
+permissions are relaxed, and over-quota boards receive no directory admission.
+
+Private Drive reconciliation already uses a separate path and remains available
+for account-bound, backed-up changes regardless of this signaling quota. Changes
+that have not reached Drive cannot be recovered from Drive after their source
+browser is closed; WebRTC also needs an authorized online peer. The native
+Chromium regression fills the real Rust sixteen-board owner directory, verifies
+rejection of a seventeenth publication, then recovers a signed same-account edit through
+private Drive while B's peer session is stopped, without transferring board
+ownership. Google HTTP is simulated; no public service is changed by this test.
+
+### Active-board connection lifecycle and repeated grant checks
+
+Independent WebSocket collaboration opens two collection pools for the selected
+board, not two pools per saved board. `manager.doStart()` awaits `doStop()` before
+starting the new board; stop cancels the previous pools and history sessions while
+retaining durable offline permissions and journal entries. Switching therefore
+does not promise delivery of the final peer message. Pending history is retained
+for later authorized exchange, and independent private Drive work can finish in
+the background. The pool lifecycle regression checks cancellation on switch and
+on stop. No new draining pool or per-board connection cache was introduced.
+
+Identity discovery still polls for current signed membership. It now avoids
+repeating `grants.trust()` and invalidating the security context when a previously
+verified complete bundle is unchanged. This optimization requires a matching
+SHA-256 digest of the entire received and locally saved bundles, the same device,
+the same persisted accepted epoch/hash, and a still-valid current manifest.
+Removal of local grants, changed history,
+tampered prefixes and expiry force full validation; disconnect/provider disable
+clears the memo. No server authorization or membership checks are skipped.
+Account-wide private Drive reconciliation and the identity polling frequency are
+unchanged; this is a specific reduction in redundant client work, not a claim
+that all background synchronization costs have been eliminated.
+
+### Startup recovery of missing private boards
+
+The sidebar reconciles private Drive boards on mount, every 30 seconds, on focus,
+when it becomes visible, and when the browser returns online. These requests use
+the same coalesced account reconciliation path. WebRTC and the original device
+are not required to restore data already uploaded into the user's appDataFolder.
+
+Recovery now isolates unreadable history archives and board-specific failures:
+valid archives still discover remote-only boards, including boards without a
+compatibility snapshot. Each affected board retains an error/pending state;
+other boards continue restoring. A failed snapshot read never counts as remote
+absence and blocks overwriting that board's unreadable snapshot. Invalid archives
+are never admitted, and count toward the existing aggregate recovery byte limit.
+Ordering or legacy invitation discovery failures are reported after independent
+private recovery rather than blocking it. Inventory/list failures still reject;
+local deletion markers, account bindings, authorization and conflict checks remain
+in force. An incomplete scan rejects with an aggregate error, so callers cannot
+mistake partial recovery for complete success. Successful later discovery clears
+only its own stale sidebar error notice.
+
+Regression scenarios cover an unavailable source device, multiple missing boards,
+history-only recovery, images, an unrelated corrupt archive, unreadable snapshots,
+retry after repair, idempotence, retained local work, and failing ordering/legacy
+discovery services. Private recovery does not create a board-authority permission.
+
+### Same-account menu order with independent WebSocket collaboration
+
+Menu ordering remains an account-private preference (`projectOrder:<account>` in
+RxDB settings, persisted through the existing `account-preferences-` appDataFolder
+transport). Reorders trigger preference persistence; another open sidebar pulls
+preferences through startup/focus/visibility/online and periodic reconciliation.
+The periodic interval is 30 seconds, not an immediate delivery guarantee.
+
+The independent WebSocket provider currently opens board content rooms, not a
+production account-order room. Starting/stopping those pools must therefore not
+reset the preference account to null. The manager now preserves the account scope
+already verified by private persistence while connected, and detaches it on
+disconnect. This requires no additional Google identity HTTP per board switch and
+grants no account-room admission. Existing legacy authenticated account-order
+WebRTC replication remains available and unchanged.
+
+The regression uses two isolated repositories viewing different boards, exercises
+switch/stop, persists and retrieves both reorder directions through private Drive,
+and checks that logout edits do not modify the saved account preference. It also
+asserts that no unapproved signaling room is opened. Board participants from other
+accounts do not receive the user's full menu or private board IDs. Immediate
+account-order delivery over the independent WebSocket/WebRTC path remains a
+separate integration requiring account-scoped authentication; board grants alone
+must never authorize it.

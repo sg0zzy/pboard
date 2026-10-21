@@ -1,0 +1,56 @@
+# Deployment template. Installation and activation require operator authorization.
+[Unit]
+Description=Pboard experimental authenticated signaling
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=pboard-signaling
+Group=pboard-signaling
+ExecStart=/opt/pboard-signaling/pboard-signaling
+Environment=PBOARD_SIGNALING_BIND=127.0.0.1:8787
+Environment=PBOARD_SIGNALING_GRANTS=/etc/pboard-signaling/grants.json
+Environment=PBOARD_SIGNALING_AUTOMATIC_ADMISSION=1
+Environment=PBOARD_SIGNALING_REQUIRE_TLS_PROXY=1
+# Application limits are independently configurable; proxy caps may be lower.
+Environment=PBOARD_SIGNALING_MAX_CONNECTIONS=256
+Environment=PBOARD_SIGNALING_MAX_PEERS_PER_ROOM=16
+Environment=PBOARD_SIGNALING_AUTH_PER_SECOND=32
+Environment=PBOARD_SIGNALING_HTTP_CONCURRENCY=4
+Environment=PBOARD_SIGNALING_HTTP_PER_SECOND=64
+# Public startup requires a configured Google verifier. Independent board grants
+# additionally require GOOGLE_IDENTITIES=1; Google never grants board access.
+# Environment=PBOARD_SIGNALING_BOARD_GRANTS=1
+# Identity-only account discovery/enrollment under board-root-signed policies:
+# Environment=PBOARD_SIGNALING_GOOGLE_IDENTITIES=1
+Environment=RUST_LOG=pboard_signaling=info
+# Required verifier configuration for this public TLS service; supply operator values.
+# Environment=PBOARD_SIGNALING_GOOGLE_EMAILS=owner@example.test,editor@example.test
+# Environment=PBOARD_SIGNALING_AUTHORITY_KEY=/etc/pboard-signaling/authority.key
+# Environment=PBOARD_SIGNALING_ENROLLMENT_STATE=/var/lib/pboard-signaling/enrollment.json
+StateDirectory=pboard-signaling
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=768M
+CPUQuota=100%
+TasksMax=128
+LimitNOFILE=8192
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { browser } from "../../platform/browser";
-import { driveSyncState, googleAuth, googleDrive } from "../../sync/browser";
+import { driveSyncState, googleAuth, googleDrive, authorizePrivatePersistence } from "../../sync/browser";
 import { requestDriveReconciliation, requestProjectSync } from "../../sync/client";
 import {
   DRIVE_AUTH_STORAGE_KEY,
@@ -16,10 +16,21 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
   const [syncState, setSyncState] = useState<DriveProjectSyncState | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [syncingProjects, setSyncingProjects] = useState<ReadonlySet<string>>(() => new Set());
+  const [syncFeedback, setSyncFeedback] = useState('');
+  const syncing = useRef(new Set<string>()), selectedProject = useRef(projectId);
+  const refreshGeneration = useRef(0);
+  const syncBusy = projectId !== null && syncingProjects.has(projectId);
+  selectedProject.current = projectId;
+  useEffect(() => { setLocalError(''); setSyncFeedback(''); }, [projectId]);
 
   const refresh = useCallback(async () => {
-    setConnected(await googleDrive.getConnectionState() === "connected");
-    setSyncState(projectId ? await driveSyncState.get(projectId) : null);
+    const generation = ++refreshGeneration.current;
+    const isConnected = await googleDrive.getConnectionState() === "connected";
+    const state = projectId ? await driveSyncState.get(projectId) : null;
+    if (generation !== refreshGeneration.current || selectedProject.current !== projectId) return;
+    setConnected(isConnected);
+    setSyncState(state);
   }, [projectId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
@@ -39,6 +50,7 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
     setLocalError("");
     try {
       await googleAuth.connect();
+      await authorizePrivatePersistence();
       onConnectionChanged?.();
       await refresh();
       void requestDriveReconciliation();
@@ -60,16 +72,24 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
   }
 
   async function syncNow() {
-    if (!projectId || !syncState?.dirty) return;
-    setLocalError("");
-    const result = await requestProjectSync(projectId);
-    if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
+    if (!projectId || syncing.current.has(projectId)) return;
+    syncing.current.add(projectId); setSyncingProjects(new Set(syncing.current));
+    setLocalError(""); setSyncFeedback('');
+    try {
+      await authorizePrivatePersistence(projectId);
+      const result = await requestProjectSync(projectId);
+      if (selectedProject.current !== projectId) return;
+      if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
+      else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Drive sync complete.');
+      await refresh();
+    } catch (error) { if (selectedProject.current === projectId) setLocalError(error instanceof Error ? error.message : "Google Drive sync failed"); }
+    finally { syncing.current.delete(projectId); setSyncingProjects(new Set(syncing.current)); }
   }
 
   if (!connected) {
     const configured = googleAuth.isConfigured();
     return (
-      <div className="drive-controls">
+      <div className="drive-controls drive-controls--disconnected">
         <button
           type="button"
           className={`drive-connect-button${localError ? " error" : ""}`}
@@ -80,13 +100,15 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
           <CloudIcon />
           <span>{authBusy ? "Connecting…" : "Connect Drive"}</span>
         </button>
+        <span className="drive-connect-disclosure">Connect to back up existing local boards privately to the selected Google account.</span>
         <span className="visually-hidden" role="status">{localError}</span>
       </div>
     );
   }
 
-  const status = syncState?.status ?? "synced";
-  const statusText = localError || syncState?.error || (
+  const currentState = syncState?.projectId === projectId ? syncState : null;
+  const status = currentState?.status ?? "synced";
+  const statusText = syncBusy ? 'Syncing project to Google Drive' : localError || currentState?.error || (
     status === "syncing" ? "Syncing project to Google Drive" :
     status === "pending" ? "Local changes pending Google Drive sync" :
     status === "error" ? "Google Drive sync failed" :
@@ -105,12 +127,13 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
       ><CloudIcon /></button>
       <button
         type="button"
-        className={`drive-icon-button drive-sync-button${status === "syncing" ? " syncing" : ""}`}
+        className={`drive-icon-button drive-sync-button${syncBusy || status === "syncing" ? " syncing" : ""}`}
         aria-label="Sync current project to Google Drive now"
-        title={syncState?.dirty ? "Sync current project to Google Drive now" : "Current project is already synced"}
-        disabled={!projectId || !syncState?.dirty || status === "syncing"}
+        title={syncBusy ? 'Syncing project to Google Drive…' : "Sync current project to Google Drive now"}
+        disabled={!projectId || syncBusy || authBusy}
         onClick={() => void syncNow()}
       ><SyncIcon /></button>
+      {(syncBusy || localError || syncFeedback) && <span className="drive-sync-feedback" role="status">{syncBusy ? 'Syncing…' : localError || syncFeedback}</span>}
       <span className="visually-hidden" role="status">{statusText}</span>
     </div>
   );

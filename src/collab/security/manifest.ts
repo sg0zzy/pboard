@@ -62,16 +62,18 @@ function manifestPayload(value: unknown): BoardPermissionManifest {
       throw new Error(`Manifest ${field} is missing or oversized`);
     }
   }
-  // Account-order rooms have no Drive project; board rooms must bind both ids.
+  // Empty pairs identify a standalone cryptographic board. Legacy Drive boards
+  // retain their exact file/folder binding; a partial binding is never valid.
   const isAccountManifest = typeof manifest.boardId === "string" && manifest.boardId.startsWith("account:");
   for (const field of ["driveProjectFileId", "driveFolderId"] as const) {
     const value = manifest[field];
     if (isAccountManifest) {
       if (value !== "") throw new Error(`Account manifest must not bind Drive ${field}`);
-    } else if (typeof value !== "string" || value.length === 0 || value.length > 200) {
+    } else if (typeof value !== "string" || value.length > 200) {
       throw new Error(`Manifest ${field} is missing or oversized`);
     }
   }
+  if (!isAccountManifest && Boolean(manifest.driveProjectFileId) !== Boolean(manifest.driveFolderId)) throw new Error("Manifest Drive binding must be complete or absent");
   if (!Number.isSafeInteger(manifest.epoch) || (manifest.epoch as number) < 0) throw new Error("Manifest epoch is invalid");
   for (const field of ["issuedAt", "expiresAt"] as const) {
     if (!Number.isSafeInteger(manifest[field]) || (manifest[field] as number) < 0) throw new Error(`Manifest ${field} is invalid`);

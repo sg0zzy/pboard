@@ -37,4 +37,5 @@ export function registerRxRepositoryResolver(resolver: () => Promise<RxRepositor
 }
 
 export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
-export const { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, sharedProjects, drivePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver() });
+export const { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, boardCollaboration } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
+  hasSignalingHostPermission: (origin) => browser.permissions.contains({ origins: [origin] }) });

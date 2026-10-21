@@ -1,4 +1,12 @@
-import { createRxDatabase, defaultConflictHandler, type RxCollection, type RxDatabase, type WithDeleted } from "rxdb";
+import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
+import { draftCommand, pendingHeads, pendingValue } from "./pendingWork";
+import { liveBoardRole, liveBoardEntitlement, registerAuthorizationJournal, recordLiveBoardAdmission, installLiveBoardMutations } from "../collab/security/liveMutations";
+import { canonicalize } from "../collab/security/canonical";
+import { documentValue, makeChange, scope, type PendingEdit } from "./changeJournal";
+import { admitPendingEdit, portableJournalChanges, certifyLocalHistory, verifyPendingAdmission } from "../collab/security/journalProof";
+import { reconcile, validateRecord } from "./causalReconciliation";
+import { withUntrustedImport } from "../collab/security/liveMutations";
+import { createRxDatabase, defaultConflictHandler, type DeepReadonly, type RxStorage, type RxCollection, type RxDatabase, type WithDeleted } from "rxdb";
 import { addRxPlugin } from "rxdb";
 import { RxDBMigrationSchemaPlugin } from "rxdb/plugins/migration-schema";
 import { getRxStorageDexie } from "rxdb/plugins/storage-dexie";
@@ -12,6 +20,13 @@ import { mergeProjectOrder, parseProjectOrder, type ProjectOrderPreference } fro
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
 import type { MutationGuardInstall } from "../collab/security/mutation";
 import type { RepositoryEvents } from "./repository";
+import { ChangeJournal } from "./changeJournal";
+import { createRevision } from 'rxdb/plugins/utils';
+import { installJournalStorage, recoverJournal } from "./journalStorage";
+import { withJournalMaterialization } from "./journalMaterialization";
+import { createCausalReconciliation } from "./causalReconciliation";
+import { createConflictResolution } from "./conflictResolution";
+import { createPrivateRecovery } from "./privateRecovery";
 
 export type RxCollections = {
   projects: RxCollection<ProjectRecord>;
@@ -71,9 +86,11 @@ function lastWriteWins<T extends { updatedAt: string; deletedAt?: string }>(
 
 export async function createRxRepository(options: {
   name?: string;
+  /** Internal pure-command scratchpad; never exposed to a remote provider. */
+  pendingScratch?: boolean;
   blobs?: BlobStore;
   events?: RepositoryEvents;
-  storage?: ReturnType<typeof getRxStorageDexie>;
+  storage?: RxStorage<any, any>;
   /**
    * Collaboration write-gate. When the caller is a Viewer of the active shared
    * project, board/project mutations are rejected at the storage layer so no
@@ -93,6 +110,22 @@ export async function createRxRepository(options: {
   installMutationGuard?: (projectId: string) => Promise<MutationGuardInstall | null>;
   removeMutationGuard?: (projectId: string) => Promise<void>;
 } = {}) {
+  let activeJournal: ChangeJournal | undefined;
+  async function causalWinner<T extends CardRecord | ProjectRecord>(collection: "cards" | "projects", input: ConflictInput<T>): Promise<WithDeleted<T>> {
+    const boardId = collection === "cards" ? (input.newDocumentState as CardRecord).projectId : input.newDocumentState.id;
+    if (activeJournal && liveBoardRole(db[collection], boardId)) {
+      const changes = (await activeJournal.entries.where("[collection+documentId]").equals([collection, input.newDocumentState.id]).toArray())
+        .filter(e => e.state === "committed" && e.boardId === boardId);
+      const matches = (value: unknown) => changes.find(e => canonicalize(e.value) === canonicalize(documentValue(value as Record<string, unknown>)));
+      // No inferred ancestry for an unknown legacy payload: its normal guarded
+      // observation must be retained first. Proven causal heads outrank clocks.
+      if (matches(input.newDocumentState) && matches(input.realMasterState) && changes.some(change => change.proof)) {
+        const result = reconcile(changes);
+        if ((result.kind === "current" || result.kind === "deleted") && result.variants.length) return result.variants[0].value as unknown as WithDeleted<T>;
+      }
+    }
+    return lastWriteWins(input);
+  }
   const db: RxDatabase<RxCollections> = await createRxDatabase<RxCollections>({
     name: options.name ?? "pboardlocalv1",
     storage: options.storage ?? getRxStorageDexie(),
@@ -106,7 +139,7 @@ export async function createRxRepository(options: {
       migrationStrategies: { 1: (doc: Record<string, unknown>) => doc },
       conflictHandler: {
         isEqual: defaultConflictHandler.isEqual,
-        async resolve(input) { return lastWriteWins(input); }
+        async resolve(input) { return causalWinner("projects", input); }
       }
     },
     cards: {
@@ -114,7 +147,7 @@ export async function createRxRepository(options: {
       migrationStrategies: { 1: (doc: Record<string, unknown>) => doc },
       conflictHandler: {
         isEqual: defaultConflictHandler.isEqual,
-        async resolve(input) { return lastWriteWins(input); }
+        async resolve(input) { return causalWinner("cards", input); }
       }
     },
     settings: {
@@ -133,6 +166,22 @@ export async function createRxRepository(options: {
     }
   });
   const { projects, cards, settings } = db;
+  const journal = new ChangeJournal(db.name);
+  activeJournal = journal;
+  try {
+    await journal.open();
+    await recoverJournal(journal, { projects, cards });
+    registerAuthorizationJournal(cards, journal); registerAuthorizationJournal(projects, journal);
+    installJournalStorage(projects, "projects", journal);
+    installJournalStorage(cards, "cards", journal);
+  } catch (error) {
+    journal.close();
+    await db.close();
+    throw error;
+  }
+  const permissionWrites = new Map<string, Promise<void>>();
+  db.onClose.push(async () => { await Promise.all(permissionWrites.values()); journal.close(); });
+  const reconciliation = createCausalReconciliation(journal);
   const blobs = options.blobs ?? createIndexedDbBlobStore();
   const events = options.events ?? {};
   let queue: Promise<unknown> = Promise.resolve();
@@ -141,26 +190,105 @@ export async function createRxRepository(options: {
     queue = run.catch(() => undefined);
     return run;
   }
-  async function changed(projectId: string) { await events.projectChanged?.(projectId); }
-  /**
-   * Per-project collaboration write-gate. Set by the collaboration manager when
-   * it starts a shared project: "viewer" means the caller has read-only Drive
-   * access. The gate rejects per-project content mutations for viewers so no
-   * local write can exist to be replicated. WebRTC picks master/slave by token
-   * hash, not role, and the master streams its change log unconditionally — so
-   * a viewer that is the master would otherwise leak its local writes to peers.
-   * The replication push modifier only covers the slave→master path; this gate
-   * is the authoritative enforcement the spec requires.
-   */
-  const mutatorRoles = new Map<string, CollaborationRole>();
-  function setMutatorRole(projectId: string, role: CollaborationRole | null) {
-    if (role === null) mutatorRoles.delete(projectId);
-    else mutatorRoles.set(projectId, role);
+  async function installBoardSecurity(options: { security: import('../collab/manager').CollaborationSecurityOptions; attestExisting?: boolean; preserveSignedData?: boolean }) {
+    const install = await locked(() => installLiveBoardMutations({ ...options,
+      projectId: options.security.boardId, cards, projects }));
+    return { projectId: install.projectId, uninstall: () => locked(() => install.uninstall()) };
   }
-  function assertCanMutate(projectId: string) {
-    if ((mutatorRoles.get(projectId) ?? options.mutatorRole) === "viewer") {
-      throw new Error("You have view-only access to this shared project");
+  async function changed(projectId: string) { await events.projectChanged?.(projectId); }
+  // Local-only permissions survive logout/restart; they never confer remote admission.
+  function setMutatorRole(projectId: string, role: CollaborationRole | null) {
+    if (role === null || role === "private") return Promise.resolve();
+    const write = (permissionWrites.get(projectId) ?? Promise.resolve()).then(async () => {
+      const previous = await journal.permissions.get(projectId);
+      await journal.permissions.put({ ...previous, id: projectId, role });
+    });
+    permissionWrites.set(projectId, write);
+    return write;
+  }
+  async function assertCanMutate(projectId: string, allowPending = false) {
+    if (await journal.boardErasure(projectId)) throw new Error('This board was permanently deleted.');
+    await permissionWrites.get(projectId);
+    const permission = await journal.permissions.get(projectId);
+    const observed = liveBoardEntitlement(cards, projectId);
+    if (observed === 'revoked' && permission) await journal.permissions.update(projectId, { role: 'revoked' });
+    if (observed === 'viewer' && permission?.role !== 'viewer') await journal.permissions.update(projectId, { role: 'viewer' });
+    if (observed === 'revoked' || permission?.role === "revoked") throw new Error("Board editing permission was removed; pending work remains available for export");
+    if (observed === "viewer" || liveBoardRole(cards, projectId) === "viewer" || (permission?.role ?? options.mutatorRole) === "viewer") throw new Error("You have view-only access to this shared project");
+    const signed = permission?.authorityKeyId || (await projects.findOne(projectId).exec())?._sec
+      || (await journal.entries.where("boardId").equals(projectId).toArray()).some(e => !!e.value._sec)
+      || (await journal.pendingEdits.toArray()).some(e => e.boardId === projectId);
+    if (signed && !liveBoardRole(cards, projectId) && !(allowPending && permission?.deviceKeyId && permission.role !== "viewer")) {
+      throw new Error("Current board authorization is required; cached content remains readable and exportable");
     }
+  }
+  async function pendingFor(documentId: string): Promise<PendingEdit[]> {
+    const edits = (await journal.pendingEdits.toArray()).filter(e => e.base.documentId === documentId);
+    const superseded = new Set(edits.flatMap(e => e.supersedes ?? []));
+    return edits.filter(e => !e.admittedChangeId && !superseded.has(e.id));
+  }
+  async function localCard(record: DeepReadonly<CardRecord>): Promise<CardRecord> {
+    const pending = await pendingFor(record.id);
+    // Parallel drafts are retained for explicit review, never selected by clocks.
+    return pending.length === 1 ? pending[0].value as unknown as CardRecord : record as CardRecord;
+  }
+  async function admitPendingWork(boardId: string) {
+    const admitted = await locked(async () => {
+      await assertCanMutate(boardId);
+      const edits = (await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId);
+      // An immutable private archive may predate a later signed admission.
+      // Recover its receipt from verified history, never from backup flags or
+      // device identity alone. This also works after loss of the original key.
+      const history = edits.some(edit => !edit.admittedChangeId) ? await journal.entries.where('boardId').equals(boardId).toArray() : [];
+      for (const edit of edits) if (!edit.admittedChangeId) {
+        const candidates = history.filter(entry => (entry.value._sec as any)?.provenance?.operationId === `pending:${edit.id}`);
+        for (const entry of candidates) {
+          try { await verifyPendingAdmission(db[edit.base.collection], edit, entry); }
+          catch { continue; } // Keep unverified/changed drafts for explicit review.
+          edit.admittedChangeId = entry.id;
+          await journal.pendingEdits.update(edit.id, { admittedChangeId: entry.id });
+          break;
+        }
+      }
+      const superseded = new Set(edits.flatMap(e => e.supersedes ?? []));
+      const permission = await journal.permissions.get(boardId);
+      const heads = edits.filter(e => !e.admittedChangeId && !superseded.has(e.id) && e.deviceKeyId === permission?.deviceKeyId && e.authorityKeyId === permission.authorityKeyId);
+      const batch: import('./changeJournal').JournalEntry[] = [];
+      const admittedEdits: { edit: PendingEdit; changeId: string }[] = [];
+      for (const edit of heads) {
+        const collection = db[edit.base.collection];
+        const old = history.find(e => (e.value._sec as any)?.provenance?.operationId === `pending:${edit.id}`);
+        if (old && ((old.value._sec as any)?.provenance?.authorKeyId !== edit.deviceKeyId || old.documentId !== edit.base.documentId
+          || canonicalize(pendingValue(old.value)) !== canonicalize(pendingValue(edit.value)))) throw new Error('Pending operation identity conflicts with retained history');
+        if (old) await verifyPendingAdmission(collection, edit, old);
+        const entry = old ?? await admitPendingEdit(collection, edit);
+        if (!edit.creation && !await journal.entries.get(edit.base.id)) batch.push({ ...edit.base, state: 'committed', origin: 'baseline' });
+        validateRecord(entry); await recordLiveBoardAdmission(collection, boardId, entry.value);
+        if (!entry.admission) entry.admission = await certifyLocalHistory(collection, entry);
+        batch.push(entry); admittedEdits.push({ edit, changeId: entry.id });
+      }
+      if (batch.length) {
+        await assertCanMutate(boardId);
+        if (!liveBoardRole(cards, boardId)) throw new Error('Current board authorization expired before pending admission');
+        await changed(boardId);
+        await journal.accept(batch); // Entire structural command becomes durable together.
+        for (const { edit, changeId } of admittedEdits) {
+          await journal.pendingEdits.update(edit.id, { admittedChangeId: changeId });
+          for (const id of edit.supersedes ?? []) await journal.pendingEdits.update(id, { admittedChangeId: changeId });
+        }
+      }
+      return heads.length > 0 || edits.some(edit => edit.admittedChangeId && !edit.projected);
+    });
+    if (!admitted) return;
+    await privateRecovery.apply(boardId, async () => !!liveBoardRole(cards, boardId));
+    await locked(async () => {
+      await assertCanMutate(boardId);
+      await touchProject(boardId);
+      for (const edit of await journal.pendingEdits.toArray()) if (edit.boardId === boardId && edit.admittedChangeId && !edit.projected) {
+        await journal.pendingEdits.update(edit.id, { projected: true });
+      }
+    });
+    await changed(boardId);
   }
   async function touchProject(projectId: string, timestamp = now(), appendedKey?: string) {
     const project = await projects.findOne(projectId).exec();
@@ -174,9 +302,17 @@ export async function createRxRepository(options: {
         ...(appendedKey && (!current.tailOrderKey || appendedKey > current.tailOrderKey) ? { tailOrderKey: appendedKey } : {}) };
     });
   }
+  async function overlay(name: 'cards' | 'projects', records: Record<string, any>[], boardId?: string) {
+    const byId = new Map(records.map(row => [String(row.id), row]));
+    const edits = pendingHeads((await journal.pendingEdits.toArray()).filter(e => e.base.collection === name && (!boardId || e.boardId === boardId)));
+    const counts = new Map<string, number>(); for (const edit of edits) counts.set(edit.base.documentId, (counts.get(edit.base.documentId) ?? 0) + 1);
+    for (const edit of edits) if (counts.get(edit.base.documentId) === 1) byId.set(edit.base.documentId, edit.value);
+    return [...byId.values()].filter(row => !row._deleted).sort((a, b) => compareOrdered(a as { id: string; orderKey: string }, b as { id: string; orderKey: string }));
+  }
   async function allProjectRecords() {
     const deleted = await deletedProjectIds();
-    return (await projects.find().exec()).map((doc) => doc.toJSON()).filter((doc) => !deleted.includes(doc.id)).sort(compareOrdered);
+    const erased = new Set((await journal.boardErasures()).map(entry => entry.boardId));
+    return (await overlay("projects", (await projects.find().exec()).map(doc => doc.toJSON()))).filter(doc => !deleted.includes(doc.id) && !erased.has(doc.id)) as ProjectRecord[];
   }
   let projectOrderAccount: string | null = null;
   const localOrderId = "localProjectOrder";
@@ -191,7 +327,7 @@ export async function createRxRepository(options: {
     return preference ? parseProjectOrder(preference.value).deletedProjectIds ?? [] : [];
   }
   async function isDeletedProject(projectId: string): Promise<boolean> {
-    return (await deletedProjectIds()).includes(projectId);
+    return !!await journal.boardErasure(projectId) || (await deletedProjectIds()).includes(projectId);
   }
   async function orderedProjects() {
     const records = await allProjectRecords();
@@ -230,34 +366,39 @@ export async function createRxRepository(options: {
         value: JSON.stringify(mergeProjectOrder(parseProjectOrder(current.value), preference)) }));
     });
   }
-  async function projectCardRecords(projectId: string, includeDeleted = false) {
-    const records = (await cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }).exec()).map((doc) => doc.toJSON()).sort(compareOrdered);
+  async function projectCardRecords(projectId: string, includeDeleted = false, includePending = true) {
+    if (await journal.boardErasure(projectId)) return [];
+    const raw = (await cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }).exec()).map(doc => doc.toJSON());
+    const records = (includePending ? await overlay("cards", raw, projectId) : raw.sort(compareOrdered)) as CardRecord[];
     return includeDeleted ? records : records.filter(isVisible);
   }
   async function listProjects(): Promise<Project[]> { return (await orderedProjects()).map(projectValue); }
-  async function getProject(id: string): Promise<Project | null> {
+  async function getProject(id: string, includePending = true): Promise<Project | null> {
     if (await isDeletedProject(id)) return null;
     const doc = await projects.findOne(id).exec();
-    return doc ? projectValue(doc.toJSON()) : null;
+    const value = includePending ? (await overlay("projects", doc ? [doc.toJSON()] : [], id))[0] : doc?.toJSON();
+    return value ? projectValue(value as ProjectRecord) : null;
   }
   async function getCurrentProject(): Promise<Project | null> {
     const setting = await settings.findOne("currentProjectId").exec();
     if (!setting?.value) return null;
     return await getProject(setting.value) ?? (await listProjects())[0] ?? null;
   }
-  async function listCards(projectId: string): Promise<BoardItem[]> {
+  async function listCards(projectId: string, includePending = true): Promise<BoardItem[]> {
     if (await isDeletedProject(projectId)) return [];
-    return (await projectCardRecords(projectId)).map(cardValue);
+    return (await projectCardRecords(projectId, false, includePending)).map(cardValue);
   }
   async function listCardsByStatus(projectId: string, status: BoardItemStatus): Promise<BoardItem[]> {
-    const records = (await cards.find({ selector: { projectId, status } }).exec()).map((doc) => doc.toJSON()).filter(isVisible).sort(compareOrdered);
-    return records.map(cardValue);
+    return (await listCards(projectId)).filter(card => card.status === status);
   }
   async function getCard(id: string): Promise<BoardItem | null> {
     const doc = await cards.findOne(id).exec();
-    if (!doc || !isVisible(doc.toJSON())) return null;
-    const ordered = await projectCardRecords(doc.projectId);
-    return cardValue(doc.toJSON(), ordered.findIndex((card) => card.id === id));
+    const pending = await pendingFor(id);
+    const boardId = doc?.projectId ?? pending[0]?.boardId;
+    if (!boardId) return null;
+    const records = await projectCardRecords(boardId);
+    const index = records.findIndex(card => card.id === id);
+    return index >= 0 ? cardValue(records[index], index) : null;
   }
   async function hydrateCard(card: BoardItem): Promise<BoardItem> {
     if (!card.imageId) return card;
@@ -265,10 +406,10 @@ export async function createRxRepository(options: {
     if (!image) throw new Error(`Image data is missing for card ${card.id}; wait for image sync before exporting`);
     return { ...card, image: { dataUrl: await blobToDataUrl(image.blob), mimeType: image.mimeType, width: image.width, height: image.height } };
   }
-  async function exportProject(projectId: string): Promise<{ project: Project; items: BoardItem[] }> {
-    const project = await getProject(projectId);
+  async function exportProject(projectId: string, includePending = true): Promise<{ project: Project; items: BoardItem[] }> {
+    const project = await getProject(projectId, includePending);
     if (!project) throw new Error("Project not found");
-    const items = await Promise.all((await listCards(projectId)).map(hydrateCard));
+    const items = await Promise.all((includePending ? await listCards(projectId) : (await projectCardRecords(projectId, false, false)).map(cardValue)).map(hydrateCard));
     return { project, items: items.map(({ imageId: _, imageMimeType: __, imageWidth: ___, imageHeight: ____, ...item }) => item) };
   }
   async function exportAll(): Promise<AppState> {
@@ -289,11 +430,18 @@ export async function createRxRepository(options: {
     }
   }
   async function deleteImage(imageId: string): Promise<void> {
+    if ((await journal.pendingEdits.toArray()).some(e => e.value.imageId === imageId || e.base.value.imageId === imageId)) return;
     // Tombstoned cards retain references for rollback and future replication.
     if ((await cards.find().exec()).some((doc) => doc.imageId === imageId)) throw new Error("Image is still referenced by a card");
+    if ((await journal.entries.toArray()).some(entry => entry.value.imageId === imageId)) {
+      throw new Error("Image is still referenced by local change history");
+    }
     await blobs.deleteBlob(imageId);
   }
   async function importProject(project: Project, items: BoardItem[], preserveOrderKey?: string) {
+    return locked(() => withUntrustedImport([cards, projects], () => importProjectData(project, items, preserveOrderKey)));
+  }
+  async function importProjectData(project: Project, items: BoardItem[], preserveOrderKey?: string) {
     if (await isDeletedProject(project.id)) return;
     const existing = await projects.findOne(project.id).exec();
     const orderKey = preserveOrderKey ?? existing?.orderKey ?? orderKeyBetween((await allProjectRecords()).at(-1)?.orderKey ?? null, null);
@@ -318,7 +466,7 @@ export async function createRxRepository(options: {
   /** Read-only Drive recovery: merge documents without replacing the board. */
   async function mergeSharedSnapshot(project: Project, items: BoardItem[], canApply: () => Promise<boolean>) {
     if (items.some(item => item.projectId !== project.id)) throw new Error("Shared snapshot belongs to a different project");
-    return locked(async () => {
+    return locked(() => withUntrustedImport([cards, projects], async () => {
       const active = async () => await canApply() && !await isDeletedProject(project.id) && Boolean(await getProject(project.id));
       if (!await active()) return;
       const existing = await projectCardRecords(project.id, true);
@@ -365,7 +513,7 @@ export async function createRxRepository(options: {
         if (Date.parse(current.updatedAt) >= Date.parse(project.updatedAt)) return current;
         return { ...current, ...project, orderKey: current.orderKey, tailOrderKey: tail && (!current.tailOrderKey || tail > current.tailOrderKey) ? tail : current.tailOrderKey };
       });
-    });
+    }));
   }
 
   async function importState(state: AppState) {
@@ -419,61 +567,70 @@ export async function createRxRepository(options: {
     const previous = existing ? Date.parse(parseProjectOrder(existing.value).updatedAt) : 0;
     const updatedAt = new Date(Math.max(Date.parse(now()), previous + 1)).toISOString();
     const deletedProjectIds = existing ? parseProjectOrder(existing.value).deletedProjectIds : undefined;
-    await settings.upsert({ id, value: JSON.stringify({ ids: orderedIds, updatedAt,
+    await settings.upsert({ id, value: JSON.stringify({ ...(existing ? parseProjectOrder(existing.value) : {}), ids: orderedIds, updatedAt,
       ...(deletedProjectIds ? { deletedProjectIds } : {}) }) });
   }); }
-  async function renameProject(projectId: string, name: string) {
+  async function renameProject(projectId: string, name: string) { return locked(async () => {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("Project name is required");
     const doc = await projects.findOne(projectId).exec();
     if (!doc) throw new Error("Project not found");
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     if (doc.name === trimmed) return;
     await doc.incrementalPatch({ name: trimmed });
     await touchProject(projectId);
     await changed(projectId);
-  }
+  }); }
   async function deleteProject(projectId: string) {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) return;
-    // Commit the account-visible removal first so the board disappears without
-    // waiting for Drive ownership verification or the per-card tombstone pass.
-    await locked(async () => {
+    await permissionWrites.get(projectId);
+    const permission = await journal.permissions.get(projectId);
+    const signed = !!doc._sec || !!permission?.authorityKeyId;
+    const hide = () => locked(async () => {
       const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
       const preference = await settings.findOne(id).exec();
       const previous = preference ? parseProjectOrder(preference.value)
         : { ids: (await listProjects()).map((project) => project.id), updatedAt: "1970-01-01T00:00:00.000Z" };
       await settings.upsert({ id, value: JSON.stringify({
+        ...previous,
         ids: previous.ids.filter((id) => id !== projectId),
-        updatedAt: new Date(Math.max(Date.parse(now()), Date.parse(previous.updatedAt) + 1)).toISOString(),
+        updatedAt: new Date(Math.max(Date.parse(now()), Date.parse(previous.updatedAt) + 1,
+          Date.parse(previous.restoreEvents?.[projectId] ?? '1970-01-01T00:00:00.000Z') + 1)).toISOString(),
         deletedProjectIds: [...new Set([...(previous.deletedProjectIds ?? []), projectId])].sort()
       }) });
-      if ((await getCurrentProject())?.id === projectId || (await settings.findOne("currentProjectId").exec())?.value === projectId) {
+      if ((await settings.findOne("currentProjectId").exec())?.value === projectId) {
         await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
       }
     });
-    const role = options.resolveDeletionRole ? await options.resolveDeletionRole(projectId)
-      : mutatorRoles.get(projectId) ?? options.mutatorRole ?? "owner";
-    // Shared collections replicate to every collaborator. Non-owners may only
-    // hide the board through their own account preference, never delete content.
-    if (role === "owner") {
+    // Signed-board authority comes from its verified grant, never a Drive ACL.
+    // Keep its handle visible until signed tombstones are durable: selection
+    // changes stop the collaboration manager and uninstall the signing guard.
+    if (!signed) await hide();
+    const role = signed ? liveBoardRole(projects, projectId) ?? permission?.role
+      : options.resolveDeletionRole ? await options.resolveDeletionRole(projectId) : permission?.role ?? options.mutatorRole ?? "owner";
+    const canDeleteContent = role === "owner" && (!signed || liveBoardRole(projects, projectId) === "owner");
+    // Non-owners remove only their account's list handle. Cached rows, images,
+    // pending work and conflicts are retained independently of transport state.
+    if (canDeleteContent) {
       await events.projectDeleting?.(projectValue(doc.toJSON()));
       await locked(async () => {
-        for (const card of await projectCardRecords(projectId)) {
+        for (const card of await projectCardRecords(projectId, false, false)) {
           await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
         }
         await doc.remove();
       });
     }
+    if (signed) await hide();
     // Preference sync can itself queue repository writes. Release the mutation
     // lock before notifying listeners so removing a board cannot deadlock sync.
-    if (role === "owner") await events.projectDeleted?.(projectId);
-    else if (role) await events.projectHidden?.(projectId);
+    if (canDeleteContent) await events.projectDeleted?.(projectId);
+    else await events.projectHidden?.(projectId);
   }
   async function changeProjectTemplate(projectId: string, template: BoardTemplate): Promise<number> { return locked(async () => {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) throw new Error("Project not found");
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     if (doc.template === template) return 0;
     let remapped = 0;
     const timestamp = now();
@@ -490,7 +647,7 @@ export async function createRxRepository(options: {
     const projectDoc = await projects.findOne(input.projectId).exec();
     if (!projectDoc) throw new Error("Project not found");
     const project = projectValue(projectDoc.toJSON());
-    assertCanMutate(input.projectId);
+    await assertCanMutate(input.projectId);
     let beforeKey: string | null = null;
     let afterKey: string | null = null;
     if (input.afterItemId) {
@@ -532,9 +689,26 @@ export async function createRxRepository(options: {
   async function updateItem(itemId: string, patch: Partial<Pick<BoardItem, "content" | "title" | "type" | "status" | "displayMode">>) { return locked(async () => {
     const doc = await cards.findOne(itemId).exec();
     if (!doc || doc.deletedAt) throw new Error("Card not found");
-    assertCanMutate(doc.projectId);
+    await assertCanMutate(doc.projectId, true);
     const project = await getProject(doc.projectId);
     if (patch.type && project && !isTypeSupported(project.template, patch.type)) throw new Error("Card type is not supported by this board template");
+    const permission = await journal.permissions.get(doc.projectId);
+    if (permission?.authorityKeyId && (!liveBoardRole(cards, doc.projectId) || (await pendingFor(itemId)).length)) {
+      const earlier = await pendingFor(itemId);
+      if (earlier.length > 1) throw new Error("Parallel offline drafts need explicit review; all versions are retained");
+      const base = earlier[0]?.base ?? await makeChange({ boardId: doc.projectId, collection: "cards", documentId: itemId,
+        ancestry: "unknown", parents: [], value: documentValue(doc.toJSON(true)) });
+      const candidates = await journal.entries.where("[collection+documentId]").equals(["cards", itemId]).toArray();
+      const portable = portableJournalChanges(candidates);
+      const matches = candidates.filter(e => portable.has(e.id))
+        .filter(e => e.state === "committed" && canonicalize(e.value) === canonicalize(base.value));
+      const value: import("./changeJournal").DocumentValue = { ...earlier[0]?.value ?? documentValue(doc.toJSON(true)), ...patch, updatedAt: now() };
+      delete value._sec; // This is private pending work, never a remotely valid mutation.
+      validateRecord({ ...base, value });
+      await journal.pendingEdits.put({ id: newId(), boardId: doc.projectId, base: earlier[0]?.base ?? (matches.length === 1 ? matches[0] : base),
+        value, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId, supersedes: earlier.map(e => e.id) });
+      return;
+    }
     const changedFields = Object.entries(patch).filter(([key, value]) => doc.get(key as keyof CardRecord) !== value);
     if (!changedFields.length) return;
     const timestamp = now();
@@ -545,13 +719,13 @@ export async function createRxRepository(options: {
   async function deleteItem(itemId: string) { return locked(async () => {
     const doc = await cards.findOne(itemId).exec();
     if (!doc || doc.deletedAt) return;
-    assertCanMutate(doc.projectId);
+    await assertCanMutate(doc.projectId);
     await doc.incrementalPatch({ deletedAt: now() });
     await touchProject(doc.projectId);
     await changed(doc.projectId);
   }); }
   async function emptyTrash(projectId: string): Promise<number> { return locked(async () => {
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     const trash = (await projectCardRecords(projectId)).filter((item) => item.status === "trash");
     for (const item of trash) await (await cards.findOne(item.id).exec())?.incrementalPatch({ deletedAt: now() });
     if (trash.length) { await touchProject(projectId); await changed(projectId); }
@@ -560,7 +734,7 @@ export async function createRxRepository(options: {
   async function duplicateItem(itemId: string): Promise<BoardItem> { return locked(async () => {
     const source = await cards.findOne(itemId).exec();
     if (!source || source.deletedAt) throw new Error("Card not found");
-    assertCanMutate(source.projectId);
+    await assertCanMutate(source.projectId);
     const ordered = await projectCardRecords(source.projectId);
     const index = ordered.findIndex((item) => item.id === itemId);
     const timestamp = now();
@@ -580,7 +754,7 @@ export async function createRxRepository(options: {
     const target = await cards.findOne(targetId).exec();
     if (!source || !target || source.deletedAt || target.deletedAt) throw new Error("Card not found");
     if (source.projectId !== target.projectId) throw new Error("Cards must belong to the same project");
-    assertCanMutate(source.projectId);
+    await assertCanMutate(source.projectId);
     if (source.imageId) throw new Error("Image cards cannot be merged without losing the image");
     const appended = [source.title?.trim(), source.content.trim()].filter(Boolean).join("\n");
     const timestamp = now();
@@ -590,7 +764,7 @@ export async function createRxRepository(options: {
     await changed(source.projectId);
   }); }
   async function reorderItems(projectId: string, orderedIds: string[]) { return locked(async () => {
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     const current = await projectCardRecords(projectId);
     const requested = new Set(orderedIds);
     if (orderedIds.length !== current.length || requested.size !== current.length || current.some((item) => !requested.has(item.id))) throw new Error("Reorder list must contain every project card exactly once");
@@ -626,7 +800,7 @@ export async function createRxRepository(options: {
     await touchProject(projectId, now(), keys.at(-1)); await changed(projectId);
   }); }
   async function moveItem(projectId: string, itemId: string, orderedIds: string[]) { return locked(async () => {
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     const position = orderedIds.indexOf(itemId);
     if (position < 0 || orderedIds.lastIndexOf(itemId) !== position) throw new Error("Moved card must occur exactly once");
     const item = await cards.findOne(itemId).exec();
@@ -643,7 +817,7 @@ export async function createRxRepository(options: {
     await changed(projectId);
   }); }
   async function rebalanceProject(projectId: string) { return locked(async () => {
-    assertCanMutate(projectId);
+    await assertCanMutate(projectId);
     const ranked = rebalanceOrderKeys(await projectCardRecords(projectId));
     for (const [id, orderKey] of ranked) await (await cards.findOne(id).exec())?.incrementalPatch({ orderKey });
     const project = await projects.findOne(projectId).exec();
@@ -656,36 +830,279 @@ export async function createRxRepository(options: {
     await doc.remove();
     if ((await settings.findOne("currentProjectId").exec())?.value === projectId) await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
   }
+  /** Reverses only this account's list preference (D04). Cached content and retained conflict/pending evidence stay untouched. */
+  async function unhideProject(projectId: string) {
+    if (await journal.boardErasure(projectId)) throw new Error('This board was permanently deleted.');
+    if (await getProject(projectId)) return; // Board already visible; nothing to restore.
+    const doc = await projects.findOne(projectId).exec();
+    const wasHidden = await isDeletedProject(projectId);
+    if (!doc && !wasHidden) throw new Error("This board's cached copy is unavailable locally; its evidence remains exportable");
+    await locked(async () => {
+      const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+      const preference = await settings.findOne(id).exec();
+      if (wasHidden && preference) {
+        const parse = parseProjectOrder(preference.value);
+        const next = { ...parse,
+          ids: [...new Set([...parse.ids, projectId])],
+          deletedProjectIds: (parse.deletedProjectIds ?? []).filter(id => id !== projectId),
+          // Timestamped restore: preference merges keep it visible against older
+          // deletion markers on any device, while newer deletions still win.
+          restoreEvents: { ...(parse.restoreEvents ?? {}), [projectId]: new Date(Math.max(Date.now(), Date.parse(parse.updatedAt) + 1)).toISOString() },
+          updatedAt: new Date(Math.max(Date.now(), Date.parse(parse.updatedAt) + 1)).toISOString() };
+        await settings.upsert({ id, value: JSON.stringify(next) });
+      }
+    });
+    // An owner-authorized removal removed the project document itself. Rebuild
+    // the board row and cards from the latest non-deleted variant in the
+    // retained history — the deletion tombstones stay in the journal as
+    // evidence, but the explicit restore brings the pre-deletion state back.
+    if (!doc) await locked(async () => {
+      const entries = (await journal.entries.where("boardId").equals(projectId).toArray()).filter(e => e.state === "committed");
+      const groups = new Map<string, typeof entries>();
+      for (const entry of entries) { const id = scope(entry), group = groups.get(id); if (group) group.push(entry); else groups.set(id, [entry]); }
+      const ordered = [...groups.values()].sort((a, b) => a[0].collection === b[0].collection ? a[0].documentId.localeCompare(b[0].documentId) : a[0].collection === "projects" ? -1 : 1);
+      for (const changes of ordered) {
+        const target = changes[0];
+        const result = reconcile(changes);
+        if (!["current", "deleted", "mergeable", "conflict"].includes(result.kind) || !result.variants.length) continue;
+        // Latest variant that was not a deletion — including an ancestor the
+        // tombstone replaced, since an explicit restore reverts the deletion.
+        // Tombstone-only groups (nothing pre-deletion) stay pure evidence.
+        const chosen = result.variants.find(c => c.value._deleted !== true && !c.value.deletedAt)
+          ?? [...changes].filter(c => c.value._deleted !== true && !c.value.deletedAt)
+            .sort((a, b) => String(b.value.updatedAt).localeCompare(String(a.value.updatedAt)))[0];
+        if (!chosen) continue; // Tombstone-only groups stay pure evidence.
+        const collection = target.collection === "projects" ? projects : cards;
+        const storageRow = (await (collection as typeof projects).storageInstance.findDocumentsById([target.documentId], true))[0] as unknown as { _deleted?: boolean; deletedAt?: string } | undefined;
+        const liveDoc = await (collection as typeof projects).findOne(target.documentId).exec();
+        if (liveDoc) continue; // A live current document outranks retained variants.
+        // A tombstone row blocks the same-document upsert; hard-delete it first.
+        if (storageRow) {
+          await withUntrustedImport([collection], () => withJournalMaterialization(collection as typeof projects, chosen.value as never,
+            () => (collection as typeof projects).bulkRemove([target.documentId])));
+        }
+        await withUntrustedImport([collection], () => withJournalMaterialization(collection as typeof projects, chosen.value as never,
+          () => (collection as typeof projects).upsert(chosen.value as never)));
+      }
+    });
+    await changed(projectId);
+  }
   function subscribe<T>(query: { $: { subscribe: (next: () => void) => { unsubscribe(): void } } }, read: () => Promise<T>, listener: (value: T) => void) {
-    let active = true;
-    const refresh = () => { void read().then((value) => { if (active) listener(value); }); };
+    const { refresh, stop } = subscribeRead(read, listener);
     const sub = query.$.subscribe(refresh);
+    const stopJournal = journal.subscribe(refresh);
     refresh();
-    return () => { active = false; sub.unsubscribe(); };
+    return () => { stop(); sub.unsubscribe(); stopJournal(); };
+  }
+  // A signed write emits several WAL notifications. Bound reads to one in
+  // flight plus a trailing refresh, including bursts from another browser.
+  function subscribeRead<T>(read: () => Promise<T>, listener: (value: T) => void) {
+    let active = true, running = false, dirty = false;
+    const refresh = () => {
+      dirty = true;
+      if (!active || running) return;
+      running = true;
+      void Promise.resolve().then(async () => {
+        while (active && dirty) {
+          dirty = false;
+          try { const value = await read(); if (active && !dirty) listener(value); }
+          catch { console.error('Local recovery view could not refresh; local data is retained.'); }
+        }
+      }).finally(() => { running = false; if (active && dirty) refresh(); });
+    };
+    return { refresh, stop: () => { active = false; } };
   }
   const subscribeProjects = (listener: (value: Project[]) => void) => {
-    const stopProjects = subscribe(projects.find(), listProjects, listener);
-    const stopSettings = subscribe(settings.find(), listProjects, listener);
-    return () => { stopProjects(); stopSettings(); };
+    const { refresh, stop } = subscribeRead(listProjects, listener);
+    const first = projects.find().$.subscribe(refresh);
+    const second = settings.find().$.subscribe(refresh);
+    const stopJournal = journal.subscribe(refresh); refresh();
+    return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
-    const emit = () => { void getCurrentProject().then(listener); };
-    const first = settings.find().$.subscribe(emit);
-    const second = projects.find().$.subscribe(emit);
-    emit();
-    return () => { first.unsubscribe(); second.unsubscribe(); };
+    const { refresh, stop } = subscribeRead(getCurrentProject, listener);
+    const first = settings.find().$.subscribe(refresh);
+    const second = projects.find().$.subscribe(refresh);
+    const stopJournal = journal.subscribe(refresh); refresh();
+    return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCards = (projectId: string, listener: (value: BoardItem[]) => void) =>
     subscribe(cards.find({ selector: { projectId }, sort: [{ projectId: "asc" }, { orderKey: "asc" }] }), () => listCards(projectId), listener);
   const subscribeCard = (id: string, listener: (value: BoardItem | null) => void) => subscribe(cards.findOne(id), () => getCard(id), listener);
   async function load(): Promise<AppState> { return exportAll(); } // Compatibility for old command callers; not a reactive read path.
-  return { db, blobs, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
-    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, renameProject, deleteProject, changeProjectTemplate,
+  const conflicts = createConflictResolution({ journal, collections: { cards, projects }, assertCanMutate, isDeletedProject,
+    listVisibleBoards: async () => (await listProjects()).map(project => project.id),
+    changed, touchProject, hasImage: blobs.hasBlob, locked,
+    canDraft: async boardId => { try { await assertCanMutate(boardId, true); return !!(await journal.permissions.get(boardId))?.authorityKeyId && !liveBoardRole(cards, boardId); } catch { return false; } } });
+  const privateRecovery = createPrivateRecovery({ db, journal, blobs, locked });
+  async function listPendingWork() {
+    const heads = pendingHeads(await journal.pendingEdits.toArray());
+    if (!heads.length) return [];
+    // "No handle" check: a board the current account list does not show — removed
+    // (hidden), hard-removed, or filtered by the active account scope — leaves its
+    // work as retained evidence with a restore handle rather than as blocked work.
+    const visible = new Set((await listProjects()).map(project => project.id));
+    const boards = new Map<string, Promise<{ role: ReturnType<typeof liveBoardRole>; permission: Awaited<ReturnType<typeof journal.permissions.get>>; boardMissing: boolean; boardName: unknown }>>();
+    for (const { boardId } of heads) if (!boards.has(boardId)) boards.set(boardId, (async () => {
+      const permission = await journal.permissions.get(boardId);
+      const role = liveBoardRole(cards, boardId);
+      const boardMissing = !visible.has(boardId);
+      const boardDoc = await projects.findOne(boardId).exec();
+      const boardName = boardDoc?.name ?? (await journal.entries.where('boardId').equals(boardId).toArray()).find(e => e.collection === 'projects')?.value.name;
+      return { permission, role, boardMissing, boardName };
+    })());
+    return Promise.all(heads.map(async edit => {
+      const { permission, role, boardMissing, boardName } = await boards.get(edit.boardId)!;
+      return { ...edit, boardMissing, boardName, canReview: !boardMissing && (role === 'owner' || role === 'editor'),
+        reason: boardMissing ? 'This board was removed from this account’s list. Its work stays here; restore the board to review it.'
+          : permission?.role === 'revoked' ? 'Access was removed. Export or make a private copy.' : permission?.role === 'viewer' ? 'View-only access. Work remains available for export.'
+          : edit.deviceKeyId !== permission?.deviceKeyId ? 'Review this recovered draft as a new edit on this device.' : !role ? 'Waiting for current board authorization.' : 'Ready for authorized reconciliation.' };
+    }));
+  }
+  async function reviewPendingWork(id: string, reviewedIds: string[]) {
+    await locked(async () => {
+      const selected = await journal.pendingEdits.get(id); if (!selected) throw new Error('Pending version is missing');
+      await assertCanMutate(selected.boardId);
+      const current = pendingHeads(await journal.pendingEdits.toArray()).filter(e => e.boardId === selected.boardId && e.base.collection === selected.base.collection && e.base.documentId === selected.base.documentId);
+      if (canonicalize(current.map(e => e.id).sort()) !== canonicalize([...reviewedIds].sort()) || !current.some(e => e.id === id)) throw new Error('Pending versions changed; review them again');
+      const permission = (await journal.permissions.get(selected.boardId))!;
+      if (selected.base.collection === 'projects' && selected.value._deleted && permission.role !== 'owner') throw new Error('Only an owner may approve board deletion');
+      await journal.pendingEdits.put({ ...selected, id: newId(), deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, supersedes: current.map(e => e.id), admittedChangeId: undefined, projected: undefined });
+      await changed(selected.boardId);
+    });
+    const edit = (await journal.pendingEdits.get(id))!; await admitPendingWork(edit.boardId);
+  }
+  async function discardRemovedBoardWork(boardId: string, reviewedIds: string[], privateAccount?: string) {
+    const reviewed = [...reviewedIds];
+    await locked(async () => {
+      if ((await listProjects()).some(project => project.id === boardId)) throw new Error('Remove this board from the list before permanently deleting its retained work.');
+      const retained = (await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId);
+      await eraseLocalBoardData(boardId, privateAccount, retained, reviewed);
+    });
+  }
+  /** Account-private erasure, never an unsigned shared-board deletion. */
+  async function eraseLocalBoardData(boardId: string, privateAccount?: string, retained: PendingEdit[] = [], reviewed?: string[]) {
+    if ((await journal.boardErasure(boardId))?.localPurged) { await events.projectErased?.(boardId); return; }
+    const history = await journal.entries.where('boardId').equals(boardId).toArray();
+    const pending = [...retained, ...(await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId)];
+    const live = await cards.find({ selector: { projectId: boardId } }).exec();
+    const values = [...history.map(entry => entry.value), ...pending.flatMap(edit => [edit.value, edit.base.value]), ...live.map(doc => doc.toJSON())];
+    const bound = (await settings.findOne(`privateDrive:${await hashBlob(new Blob([boardId]))}`).exec())?.value;
+    const details = { accountId: bound ?? privateAccount ?? null,
+      imageIds: [...new Set(values.map(value => value.imageId).filter((id): id is string => typeof id === 'string'))],
+      cardIds: [...new Set([...history.filter(entry => entry.collection === 'cards').map(entry => entry.documentId), ...live.map(doc => doc.id), ...pending.filter(edit => edit.base.collection === 'cards').map(edit => edit.base.documentId)])] };
+    if (reviewed) await journal.discardPendingWork(boardId, reviewed, details);
+    else await journal.beginBoardErasure(boardId, details.accountId, details.imageIds, details.cardIds);
+    const marker = (await journal.boardErasure(boardId))!;
+    for (const [collection, ids] of [[cards, marker.cardIds], [projects, [boardId]]] as const) {
+      for (const previous of await collection.storageInstance.findDocumentsById([...ids], true)) {
+        const timestamp = now();
+        const value: any = { id: previous.id, orderKey: 'a0', createdAt: timestamp, updatedAt: timestamp,
+          ...(collection === cards ? { projectId: boardId, type: 'note', content: '', status: 'candidate', displayMode: 'standard' }
+            : { name: '', template: 'project', revision: 0 }),
+          _deleted: true, _attachments: {}, _meta: { lwt: Date.now() }, _rev: createRevision(db.token, previous as any) };
+        await withJournalMaterialization(collection, documentValue(value), async () => {
+          const result = await (collection.storageInstance as any).bulkWrite([{ previous, document: value }], 'pboard-local-erasure');
+          if (result.error.length) throw new Error('Local board erasure remains pending. Retry deletion.');
+        });
+      }
+    }
+    await journal.purgeBoardHistory(boardId);
+    for (const imageId of marker.imageIds) {
+      const referenced = (await journal.entries.toArray()).some(entry => entry.value.imageId === imageId)
+        || (await journal.pendingEdits.toArray()).some(edit => edit.value.imageId === imageId || edit.base.value.imageId === imageId)
+        || (await cards.find().exec()).some(doc => doc.imageId === imageId);
+      if (!referenced) await blobs.deleteBlob(imageId);
+    }
+    await journal.receipts.update(marker.id, { localPurged: true } as any);
+    await events.projectErased?.(boardId);
+    if ((await settings.findOne('currentProjectId').exec())?.value === boardId) await settings.upsert({ id: 'currentProjectId', value: (await listProjects())[0]?.id ?? '' });
+  }
+  async function permanentlyDeleteBoard(boardId: string, privateAccount?: string) {
+    await locked(async () => {
+      const retained = (await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId);
+      await eraseLocalBoardData(boardId, privateAccount, retained, pendingHeads(retained).map(edit => edit.id));
+    });
+  }
+  async function applyPrivateBoardErasure(boardId: string, accountId: string) {
+    await locked(async () => {
+      const bound = (await settings.findOne(`privateDrive:${await hashBlob(new Blob([boardId]))}`).exec())?.value;
+      if (bound && bound !== accountId) throw new Error('Board erasure belongs to another private account');
+      await eraseLocalBoardData(boardId, accountId);
+    });
+  }
+  const api = { db, blobs, journal, reconciliation, privateRecovery, installBoardSecurity, admitPendingWork, listPendingWork, reviewPendingWork, discardRemovedBoardWork, permanentlyDeleteBoard, applyPrivateBoardErasure,
+    subscribePendingWork(listener: (value: Awaited<ReturnType<typeof listPendingWork>>) => void) {
+      const { refresh, stop } = subscribeRead(listPendingWork, listener);
+      const unsubscribe = journal.subscribe(refresh); refresh();
+      return () => { stop(); unsubscribe(); };
+    },
+    async exportPendingWork(boardId: string) { return { format: "pboard-pending-work-v1" as const, boardId,
+      edits: (await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId),
+      images: await Promise.all([...new Set((await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId).flatMap(e => [e.value.imageId, e.base.value.imageId]).filter((id): id is string => typeof id === 'string'))].map(async imageId => {
+        const image = await blobs.getBlob(imageId); if (!image) throw new Error('A pending image is missing; the draft remains locally recoverable');
+        return { ...image, imageId, blob: undefined, dataUrl: await blobToDataUrl(image.blob) };
+      })) }; }, ...conflicts, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
+    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, renameProject, deleteProject, changeProjectTemplate, unhideProject,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,
     subscribeProjects, subscribeCurrentProject, subscribeCards, subscribeCard,
     putImage, getImage: blobs.getBlob, hasImage: blobs.hasBlob, imageAvailability: blobs.imageAvailability, deleteImage,
     subscribeImages: blobs.subscribe, importImages };
+  if (!options.pendingScratch) {
+    const resolve = api.resolveConflict;
+    api.resolveConflict = async request => {
+      const permission = await journal.permissions.get(request.boardId);
+      if (!permission?.authorityKeyId || liveBoardRole(cards, request.boardId)) return resolve(request);
+      await assertCanMutate(request.boardId, true);
+      await locked(async () => {
+        const result = await reconciliation.inspect(request);
+        if (!["conflict", "mergeable"].includes(result.kind) || canonicalize([...request.heads].sort()) !== canonicalize([...result.heads].sort()) || result.heads.length > 8) throw new Error('Conflict changed; review its current versions');
+        if (pendingHeads(await journal.pendingEdits.toArray()).some(e => e.boardId === request.boardId && e.base.documentId === request.documentId)) throw new Error('Review existing pending versions before drafting another resolution');
+        const selected = result.variants.find(e => e.id === request.variantId); if (!selected) throw new Error('Select a reviewed version');
+        if (request.collection === 'projects' && result.variants.some(e => e.value._deleted) && permission.role !== 'owner') throw new Error('Only an owner may resolve board deletion');
+        const value = pendingValue(selected.value);
+        if (request.edits) Object.assign(value, request.edits);
+        const edit: PendingEdit = { id: newId(), boardId: request.boardId, base: selected, value, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, parents: result.heads, supersedes: pendingHeads(await journal.pendingEdits.toArray()).filter(e => e.base.documentId === request.documentId).map(e => e.id) };
+        await import('./pendingWork').then(module => module.validatePending(edit, request.boardId));
+        await journal.pendingEdits.put(edit); await changed(request.boardId);
+      });
+    };
+    const projectCommands = ['renameProject', 'deleteProject', 'changeProjectTemplate', 'emptyTrash', 'reorderItems', 'moveItem', 'rebalanceProject'] as const;
+    const cardCommands = ['updateItem', 'deleteItem', 'duplicateItem', 'mergeItems'] as const;
+    for (const command of [...projectCommands, ...cardCommands, 'addItem'] as const) {
+      const original = api[command] as (...args: any[]) => Promise<any>;
+      (api as any)[command] = async (...args: any[]) => {
+        let boardId: string | undefined;
+        if (command === 'addItem') boardId = args[0].projectId;
+        else if ((projectCommands as readonly string[]).includes(command)) boardId = args[0];
+        else boardId = (await getCard(args[0]))?.projectId ?? (await cards.findOne(args[0]).exec())?.projectId;
+        if (!boardId) return original(...args);
+        const permission = await journal.permissions.get(boardId);
+        if (!permission?.authorityKeyId) {
+          if (command !== 'deleteProject' && (await journal.pendingEdits.toArray()).some(e => e.boardId === boardId)) await assertCanMutate(boardId);
+          return original(...args);
+        }
+        if (liveBoardRole(cards, boardId) && !pendingHeads((await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId)).length) return original(...args);
+        // Viewer removal still hides only that account's copy.
+        if (command === 'deleteProject' && permission.role !== 'owner') return original(...args);
+        await assertCanMutate(boardId, true);
+        const result = await locked(async () => {
+          const source = [
+            ...(await projects.storageInstance.findDocumentsById([boardId!], true)).map(value => ({ collection: 'projects' as const, value })),
+            ...(await cards.find({ selector: { projectId: boardId } }).exec()).map(doc => ({ collection: 'cards' as const, value: doc.toJSON(true) }))
+          ];
+          const result = await draftCommand({ boardId: boardId!, journal, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, source,
+            command, args, createScratch: async (): Promise<any> => createRxRepository({ name: `pboardscratch${newId().replaceAll('-', '')}`, storage: getRxStorageMemory(), blobs, pendingScratch: true }) });
+          await changed(boardId!); return result;
+        });
+        if (liveBoardRole(cards, boardId)) await admitPendingWork(boardId);
+        return result;
+      };
+    }
+  }
+  for (const marker of await journal.boardErasures()) await locked(() => eraseLocalBoardData(marker.boardId));
+  return api;
 }
 
 export type RxRepository = Awaited<ReturnType<typeof createRxRepository>>;

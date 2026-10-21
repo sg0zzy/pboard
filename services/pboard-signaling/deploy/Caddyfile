@@ -1,0 +1,30 @@
+# Example only; do not activate before reviewing grants and rollout blockers.
+pboard.cecosl.ovh {
+    @websocket path /ws
+    handle @websocket {
+        reverse_proxy 127.0.0.1:8787 {
+            header_up X-Forwarded-Proto https
+        }
+    }
+    handle /healthz {
+        reverse_proxy 127.0.0.1:8787
+    }
+    @enrollment path /experiment/challenge /experiment/enroll /identity/challenge /identity/exchange
+    handle @enrollment {
+        reverse_proxy 127.0.0.1:8787 {
+            header_up X-Forwarded-Proto https
+        }
+    }
+    @grants path /grants/publish /grants/*
+    handle @grants {
+        request_body {
+            max_size 4MB
+        }
+        reverse_proxy 127.0.0.1:8787 {
+            header_up X-Forwarded-Proto https
+        }
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

@@ -61,6 +61,7 @@ vi.mock("../src/sync/client", () => ({
 }));
 
 vi.mock("../src/sync/browser", () => ({
+  boardCollaboration: { settings: async () => ({ provider: "drive", url: "wss://pboard.cecosl.ovh/ws" }) },
   collaborationManager: {
     state: () => ({ ready: false, role: "private", connectedPeers: [], error: null }),
     start: vi.fn(async () => undefined),
@@ -68,8 +69,10 @@ vi.mock("../src/sync/browser", () => ({
     stop: vi.fn(async () => undefined)
   },
   drivePermissions: {},
+  sharePermissions: {},
   discoverSharedBoards: vi.fn(async () => []),
   SHARED_PROJECTS_KEY: "sharedProjects",
+  renewBoardAuthorization: vi.fn(async () => ({ role: "owner" })),
   googleAuth: { connect: vi.fn(async () => undefined), disconnect: vi.fn(async () => undefined), isConfigured: () => false },
   googleDrive: { getConnectionState: vi.fn(async () => "disconnected") },
   driveSyncState: { get: vi.fn(async () => null), markDirty: vi.fn(async () => undefined) },

@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; color: #202124; background: #f7f7f5; }
+body { margin: 0; padding: 20px; }
+main { max-width: 720px; margin: auto; }
+h1 { font-size: 1.4rem; }
+p { line-height: 1.5; }
+fieldset { min-width: 0; border: 1px solid #777b70; border-radius: 8px; padding: 12px; }
+label, textarea { display: block; width: 100%; box-sizing: border-box; }
+textarea { font: inherit; margin: 6px 0; padding: 8px; color: inherit; background: #fff; border: 1px solid #777b70; border-radius: 6px; }
+button { font: inherit; padding: 6px 10px; margin: 4px 4px 4px 0; cursor: pointer; }
+.demo-card { margin: 12px 0; padding: 10px; border: 1px solid #777b70; border-radius: 6px; }
+#error { color: #944740; }
+#connection { font-weight: bold; }
+@media (prefers-color-scheme: dark) {
+  :root { color: #e7e7e3; background: #20211f; }
+  textarea { background: #292a27; }
+  #error { color: #ffb4ab; }
+}

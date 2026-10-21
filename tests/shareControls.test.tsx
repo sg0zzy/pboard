@@ -108,6 +108,19 @@ describe("ShareControls", () => {
     expect(rows[2].querySelector(".share-remove-button")).toBeTruthy();
   });
 
+  it("preserves email text and focus while live status updates", async () => {
+    const service = makeService().service;
+    await openDialog(service);
+    await until(() => container.querySelector(".share-invite input") !== null);
+    const input = container.querySelector<HTMLInputElement>(".share-invite input")!;
+    input.focus();
+    act(() => setFieldValue(input, "partial.email@", "input"));
+    act(() => root.render(<ShareControls projectId="p1" permissions={service} liveStatus="Waiting for another browser" />));
+    expect(container.querySelector(".share-invite input")).toBe(input);
+    expect(input.value).toBe("partial.email@");
+    expect(document.activeElement).toBe(input);
+  });
+
   it("invites a collaborator with the selected role and clears the email", async () => {
     const { service, invite } = makeService();
     await openDialog(service);

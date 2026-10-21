@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => {
 vi.mock('../../../src/sync/runtime', () => ({
   createDriveRuntime: () => ({
     googleDrive: { reconcileAll: mocks.reconcile },
+    authorizePrivatePersistence: vi.fn(async () => {}),
     collaborationManager: { start: mocks.start, stop: mocks.stop, refreshRole: mocks.refresh, state: () => mocks.live },
     driveSyncState: { markDirty: mocks.dirty, get: async () => ({ remoteFileId: 'backup' }) },
     driveTombstones: { add: mocks.tombstone },

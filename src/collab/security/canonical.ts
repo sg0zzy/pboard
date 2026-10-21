@@ -149,8 +149,17 @@ export function signedBytesHash(domain: string, value: Json): string {
  */
 export function parseStrictJson(text: string, maxBytes = MAX_PROTOCOL_PAYLOAD_BYTES): Json {
   if (new TextEncoder().encode(text).length > maxBytes) throw new Error("Payload exceeds protocol limits");
-  let depth = 0;
+  let depth = 0, inString = false, escaped = false;
   for (const char of text) {
+    // Braces inside JSON strings (including chunk data) are content, not
+    // nesting. Counting them rejects valid frames or bypasses depth limits.
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') { inString = true; continue; }
     if (char === "{" || char === "[") depth++;
     else if (char === "}" || char === "]") depth--;
     if (depth > 16) throw new Error("Payload nesting exceeds protocol limits");

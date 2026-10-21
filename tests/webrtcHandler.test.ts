@@ -183,6 +183,25 @@ describe("createPboardWebRTCConnectionHandler", () => {
     expect(b.messages[0]).toEqual(probe("m1"));
     expect(a.errors).toEqual([]);
     expect(b.errors).toEqual([]);
+    await a.handler.close();
+    await expect(a.handler.send(a.peers[0], probe("after-close"))).resolves.toBeUndefined();
+  });
+
+  it.each(["bytes", "frames"])("bounds queued input before asynchronous verification: %s", { timeout: 30000 }, async limit => {
+    const scope = createMemorySignalingScope(), log: Recorded[] = [];
+    const a = await openSession(scope, `handler-input-${limit}`, log);
+    const b = await openSession(scope, `handler-input-${limit}`, log);
+    await waitUntil(() => a.peers.length > 0 && b.peers.length > 0);
+    const receiver = b.peers[0];
+    // Exercise the actual handler input event after a native connection. Avoid
+    // asking SCTP to allocate an oversized network packet just to test our gate.
+    if (limit === "bytes") receiver.emit("data", new Uint8Array(16 * 1024 * 1024 + 1));
+    else {
+      const frame = new TextEncoder().encode(JSON.stringify(probe("queued-flood")));
+      for (let index = 0; index < 129; index++) receiver.emit("data", frame);
+    }
+    await waitUntil(() => receiver.destroyed);
+    await expect(b.handler.send(receiver, probe("after-quota"))).resolves.toBeUndefined();
   });
 
   it("drops an answer that arrives before this instance has sent an offer", { timeout: 30000 }, async () => {

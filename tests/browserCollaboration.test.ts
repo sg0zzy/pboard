@@ -36,6 +36,24 @@ vi.mock("../src/platform/browser", () => {
 vi.mock("../src/sync/accountPreferences", () => ({
   createAccountPreferenceSync: () => (async () => {})
 }));
+// Discovery now also runs private-account reconciliation. Keep these legacy
+// invitation tests offline; real private recovery is covered by recovery tests.
+vi.mock("../src/sync/privateDriveHistory", async (original) => ({
+  ...await original<typeof import('../src/sync/privateDriveHistory')>(),
+  createPrivateDriveHistory: () => ({ available: async () => false })
+}));
+vi.mock("../src/sync/driveTransport", () => {
+  const files = new Map<string, string>();
+  return { createDriveTransport: () => ({
+    listProjectFiles: async () => [],
+    findProjectFile: async () => null,
+    download: async (id: string) => files.get(id)!,
+    upload: async (id: string, contents: string) => {
+      files.set(`private-${id}`, contents);
+      return { id: `private-${id}`, name: `project-${id}.pboard` };
+    }
+  }) };
+});
 import {
   collaborationManager,
   drivePermissions,

@@ -15,7 +15,7 @@ import {
   DOMAIN_SIGNAL, parseStrictJson, PROTOCOL_VERSION, signedBytes
 } from "./canonical";
 import { signBytes, verifyBytes, importSigningKey, type DevicePublicKey } from "./keys";
-import { manifestHash, roleForDevice, type BoardPermissionManifest, type ManifestRole } from "./manifest";
+import { manifestHash, manifestIsCurrent, roleForDevice, type BoardPermissionManifest, type ManifestRole } from "./manifest";
 
 export type ProtocolCollection = "cards" | "projects" | "accountOrder";
 
@@ -155,11 +155,13 @@ export async function verifyPresence(
   manifest: BoardPermissionManifest,
   expected: { boardId: string; collection: ProtocolCollection; manifestHash: string; now: number }
 ): Promise<{ role: ManifestRole; deviceKeyId: string; sessionId: string }> {
+  if (!manifestIsCurrent(manifest, expected.now)) throw new Error("Presence authorization manifest expired");
   const envelope = presence as Partial<SignedPresence> | null;
   const payload = envelope?.payload;
   if (!payload || typeof payload !== "object") throw new Error("Presence payload is missing");
   if (payload.protocol !== PROTOCOL_VERSION) throw new Error("Presence protocol version is unsupported");
   if (payload.boardId !== expected.boardId || payload.collection !== expected.collection) throw new Error("Presence is bound to another room");
+  if (payload.epoch !== manifest.epoch || typeof payload.sessionId !== "string" || !payload.sessionId || payload.sessionId.length > 200 || payload.issuedAt > expected.now + 30_000) throw new Error("Presence epoch/session/time is invalid");
   if (payload.manifestHash !== expected.manifestHash) throw new Error("Presence references an unverified manifest");
   if (!Number.isSafeInteger(payload.expiresAt) || payload.expiresAt < expected.now || !Number.isSafeInteger(payload.issuedAt)) {
     throw new Error("Presence has expired or has invalid timestamps");
@@ -252,6 +254,7 @@ export async function verifySignedSignal(
   if (!payload || typeof payload !== "object") throw new Error("Signal payload is missing");
   if (payload.protocol !== PROTOCOL_VERSION) throw new Error("Signal protocol version is unsupported");
   if (payload.boardId !== check.expected.boardId || payload.collection !== check.expected.collection) throw new Error("Signal is bound to another room");
+  if (payload.epoch !== check.manifest.epoch) throw new Error("Signal epoch does not match manifest");
   if (payload.manifestHash !== check.expected.manifestHash) throw new Error("Signal references an unverified manifest");
   if (payload.toDeviceKeyId !== check.expected.ownDeviceKeyId || payload.toSessionId !== check.expected.ownSessionId) throw new Error("Signal is addressed to another session");
   if (!Number.isSafeInteger(payload.expiresAt) || payload.expiresAt < check.now) throw new Error("Signal has expired");

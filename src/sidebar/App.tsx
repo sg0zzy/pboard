@@ -1,3 +1,4 @@
+import { ExperimentalEnrollment } from "./components/ExperimentalEnrollment";
 import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
@@ -12,6 +13,8 @@ import {
   type BoardTemplate
 } from "../types";
 import { Card } from "./components/Card";
+import { PendingWorkControls } from "./components/PendingWorkControls";
+import { ConflictResolutionControls } from "./components/ConflictResolutionControls";
 import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
@@ -24,12 +27,14 @@ import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
 import { hasCopyableBoardItems, serializeBoard, serializeProject } from "./serialize";
 import { buildBoardArchive, downloadBlob } from "./download";
+import { ImportBoardControls } from "./components/ImportBoardControls";
 import { adjustUiScale, DEFAULT_UI_SCALE, normalizeUiScale, UI_SCALE_STEPS, UI_SCALE_STORAGE_KEY } from "./uiScale";
 import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
-import { collaborationManager, drivePermissions, discoverSharedBoards, SHARED_PROJECTS_KEY } from "../sync/browser";
+import { collaborationManager, drivePermissions, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
+import { BoardCollaborationControls } from "./components/BoardCollaborationControls";
 import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
@@ -140,13 +145,29 @@ export function App() {
 
   useEffect(() => {
     let active = true;
-    const discover = () => { void discoverSharedBoards().catch((error) => {
-      if (active) setNotice(error instanceof Error ? error.message : "Could not discover shared boards");
+    let discoveryNotice: string | null = null;
+    const discover = () => { void discoverSharedBoards().then(() => {
+      if (!active || !discoveryNotice) return;
+      const previous = discoveryNotice; discoveryNotice = null;
+      setNotice(current => current === previous ? "" : current);
+    }).catch((error) => {
+      if (active) {
+        discoveryNotice = error instanceof Error ? error.message : "Could not refresh boards from Google Drive";
+        setNotice(discoveryNotice);
+      }
     }); };
     discover();
     const timer = window.setInterval(discover, 30_000);
+    const onVisible = () => { if (document.visibilityState === "visible") discover(); };
     window.addEventListener("focus", discover);
-    return () => { active = false; window.clearInterval(timer); window.removeEventListener("focus", discover); };
+    window.addEventListener("online", discover);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      active = false; window.clearInterval(timer);
+      window.removeEventListener("focus", discover);
+      window.removeEventListener("online", discover);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [collaborationRevision]);
 
   useEffect(() => {
@@ -795,6 +816,8 @@ export function App() {
 
   return (
     <main className="app" style={{ fontSize: `${uiScale}rem` }}>
+      <PendingWorkControls api={repository} onRenewBoard={renewBoardAuthorization} />
+      <ConflictResolutionControls api={repository} onRenewBoard={renewBoardAuthorization} />
       {currentProject && (
         <MinWidthMeasurer
           template={currentProject.template}
@@ -806,7 +829,8 @@ export function App() {
       <header>
         <div className="app-title-row">
           <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
-          <ShareControls projectId={currentProject?.id ?? null} permissions={drivePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
+          <ShareControls projectId={currentProject?.id ?? null} permissions={sharePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
+          {import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
           <div className="font-scale-controls" aria-label="Board font size">
             <button
@@ -936,6 +960,7 @@ export function App() {
           </form>
         )}
       </header>
+      <BoardCollaborationControls projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />
 
       {!currentProject ? (
         <section className="empty-state">
@@ -1019,6 +1044,7 @@ export function App() {
           </section>
         </>
       )}
+      <ImportBoardControls />
     </main>
   );
 }

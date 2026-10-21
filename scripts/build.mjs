@@ -17,7 +17,9 @@ if (variant === "chromium") env.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET = "";
 
 await rm(resolve(root, outputDir), { recursive: true, force: true });
 for (const config of ["vite.sidebar.config.ts", "vite.background.config.ts", "vite.content.config.ts"]) {
-  execFileSync(process.execPath, [resolve(root, "node_modules/vite/bin/vite.js"), "build", "--config", config], {
+  execFileSync(process.execPath, (env.PBOARD_SIGNALING_DEV_BUILD === '1'
+    ? [resolve(root, "scripts/compile-signaling-extension.mjs"), config]
+    : [resolve(root, "node_modules/vite/bin/vite.js"), "build", "--config", config]), {
     cwd: root,
     env,
     stdio: "inherit"

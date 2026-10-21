@@ -1,0 +1,33 @@
+# Integrate into the existing HAProxy config; this is not a complete config.
+# Install a valid pboard.cecosl.ovh certificate bundle before enabling.
+# Existing mate certificate and routing remain present.
+
+# In frontend https, add the new bundle to the existing bind directive:
+# bind :443 ssl crt /etc/haproxy/certs/mate.pem crt /etc/haproxy/certs/pboard-signaling.pem ssl-min-ver TLSv1.2
+# Add before the current default-host rejection:
+# acl host_pboard hdr(host) -i pboard.cecosl.ovh
+# Replace that rejection with:
+# http-request return status 404 unless host_mate or host_pboard
+# Then add:
+# use_backend pboard_signaling if host_pboard
+
+backend pboard_signaling
+    mode http
+    acl allowed_signaling_path path /ws /healthz /experiment/challenge /experiment/enroll
+    acl allowed_signaling_path path /grants/challenge /grants/publish
+    acl allowed_signaling_path path /identity/challenge /identity/exchange
+    acl allowed_signaling_path path_reg ^/grants/[A-Za-z0-9_-]{43}$
+    http-request return status 404 unless allowed_signaling_path
+    # This backend is reached only from the HTTPS frontend. Never trust an
+    # incoming forwarded-proto value supplied by a remote client.
+    http-request del-header X-Forwarded-Proto
+    http-request set-header X-Forwarded-Proto https
+    stick-table type ip size 10k expire 1m store http_req_rate(10s)
+    http-request track-sc0 src
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 60 }
+    timeout connect 5s
+    timeout queue 5s
+    timeout http-request 10s
+    timeout server 30s
+    timeout tunnel 60s
+    server pboard 127.0.0.1:8787 check maxconn 128 maxqueue 32

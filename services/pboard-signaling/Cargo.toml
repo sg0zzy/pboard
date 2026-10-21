@@ -1,0 +1,32 @@
+[package]
+name = "pboard-signaling"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+[features]
+# Local synthetic-Google browser harness only. Never enabled in deployed builds.
+test-google-fixture = []
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+p256 = { version = "0.13", features = ["ecdsa"] }
+base64 = "0.22"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

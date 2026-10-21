@@ -1,6 +1,6 @@
 {
   "name": "pboard",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,6 +15,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
+    "test:recovery": "node scripts/recovery/run.mjs",
+    "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
+    "demo:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs --interactive",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",
     "package:firefox": "node scripts/verify-build.mjs firefox && web-ext build --config web-ext-config.cjs --overwrite-dest && node scripts/verify-package.mjs",

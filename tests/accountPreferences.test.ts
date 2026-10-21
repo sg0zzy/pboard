@@ -10,6 +10,7 @@ import { createBackendProjectSnapshotStore, serializeProjectSnapshot } from "../
 import { createDriveSyncStateStore, createDriveTombstoneStore } from "../src/sync/state";
 import type { DriveTransport } from "../src/sync/driveTransport";
 import type { KeyValueStorage } from "../src/storage/repository";
+import { createCollaborationManager } from "../src/collab/manager";
 
 function memoryStorage(): KeyValueStorage {
   const data: Record<string, unknown> = {};
@@ -40,6 +41,42 @@ async function open(storage = memoryStorage()) {
 }
 
 describe("durable account project order", () => {
+  it('keeps private order scoped to the signed-in account through board switches without opening an unauthorized account room', async () => {
+    const first = await open(), second = await open(), transport = memoryDrive();
+    let connected = true;
+    const signaling = vi.fn(() => { throw new Error('No account signaling authority was granted'); });
+    const makeManager = (session: typeof first) => createCollaborationManager({
+      myRole: async () => null, getSharedFileId: async () => null, bootstrapFromDrive: async () => false,
+      getRepository: async () => session.rx, signalingFor: signaling,
+      getAccountId: async () => null, // independent WebSocket path has no live account room
+      getProjectOrderAccountId: async () => connected ? undefined : null
+    });
+    const a = makeManager(first), b = makeManager(second);
+    const sync = (session: typeof first) => createAccountPreferenceSync({ transport,
+      getAccountId: async () => connected ? 'same-account' : null, getRepository: async () => session.rx });
+    const syncA = sync(first), syncB = sync(second);
+    try {
+      const one = await first.rx.createProject('One'), two = await first.rx.createProject('Two');
+      for (const project of [one, two]) await second.rx.importProject(project, []);
+      await syncA(); await syncB();
+      await a.start(one.id); await b.start(two.id);
+      await first.rx.reorderProjects([two.id, one.id]);
+      expect((await first.rx.getProjectOrder('same-account'))?.ids).toEqual([two.id, one.id]);
+      await a.start(two.id); // a board switch must not detach the preference scope
+      await syncA(); await syncB();
+      expect((await second.rx.listProjects()).map(p => p.id)).toEqual([two.id, one.id]);
+      await a.stop(); // closing live replication keeps account-private ordering active
+      await first.rx.reorderProjects([one.id, two.id]);
+      expect((await first.rx.getProjectOrder('same-account'))?.ids).toEqual([one.id, two.id]);
+      await syncA(); await syncB();
+      expect((await second.rx.listProjects()).map(p => p.id)).toEqual([one.id, two.id]);
+      expect(signaling).not.toHaveBeenCalled();
+      connected = false; await b.stop();
+      const saved = await second.rx.getProjectOrder('same-account');
+      await second.rx.reorderProjects([two.id, one.id]);
+      expect(await second.rx.getProjectOrder('same-account')).toEqual(saved);
+    } finally { await a.stop(); await b.stop(); await first.rx.db.close(); await second.rx.db.close(); }
+  });
   it.each(["editor", "viewer"] as const)("persists a %s's removal for their other sessions while preserving the owner's project", async (role) => {
     const drive = memoryDrive();
     const owner = await open();

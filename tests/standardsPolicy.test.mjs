@@ -36,8 +36,8 @@ describe('pinned standards version/operation gates', () => {
     }
   });
   it('fails closed on unresolved history or absent production signer', () => {
-    expect(()=>releaseReadiness(config)).toThrow(/historical inventory/);
-    const c=structuredClone(config); c.history.unresolved=[];
-    expect(()=>releaseReadiness(c)).toThrow(/Android/);
+    const c=structuredClone(config); c.history.unresolved=['Unreconciled deleted official versions'];
+    expect(()=>releaseReadiness(c)).toThrow(/historical inventory/);
+    expect(()=>releaseReadiness(config)).toThrow(/Android/);
   });
 });

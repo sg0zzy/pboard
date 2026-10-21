@@ -22,7 +22,7 @@ describe("buildBoardArchive", () => {
     const archive = await buildBoardArchive(project, items, async () => null);
     expect(archive.filename).toBe("New SaaS.zip");
     const files = unzipSync(archive.data);
-    expect(Object.keys(files)).toEqual(["board.txt"]);
+    expect(Object.keys(files)).toEqual(["board.txt", "board.json"]);
     expect(new TextDecoder().decode(files["board.txt"])).toBe(serializeBoard(project, items));
   });
 
@@ -32,7 +32,7 @@ describe("buildBoardArchive", () => {
     ];
     const archive = await buildBoardArchive(project, items, async () => storedBlob("abc", "image/webp", [1, 2, 3]));
     const files = unzipSync(archive.data);
-    expect(Object.keys(files).sort()).toEqual(["board.txt", "images/shot-1.webp"]);
+    expect(Object.keys(files).sort()).toEqual(["board.json", "board.txt", "images/shot-1.webp"]);
     expect(Array.from(files["images/shot-1.webp"]!)).toEqual([1, 2, 3]);
   });
 
@@ -44,7 +44,7 @@ describe("buildBoardArchive", () => {
     ];
     const getImage = vi.fn(async (imageId: string) => imageId === "shared" ? storedBlob("shared", "image/png", [9]) : null);
     const files = unzipSync((await buildBoardArchive(project, items, getImage)).data);
-    expect(Object.keys(files).sort()).toEqual(["board.txt", "images/a-1.png"]);
+    expect(Object.keys(files).sort()).toEqual(["board.json", "board.txt", "images/a-1.png"]);
     expect(getImage).toHaveBeenCalledTimes(2);
   });
 
@@ -56,7 +56,7 @@ describe("buildBoardArchive", () => {
       { ...base, id: "gone", type: "reference", status: "trash", order: 1, content: "Trash", imageId: "x" }
     ];
     const files = unzipSync((await buildBoardArchive(project, items, async () => storedBlob("x", "image/png", [1]))).data);
-    expect(Object.keys(files).sort()).toEqual(["board.txt", "images/kept-1.png"]);
+    expect(Object.keys(files).sort()).toEqual(["board.json", "board.txt", "images/kept-1.png"]);
     expect(new TextDecoder().decode(files["board.txt"])).not.toContain("Trash");
     expect(new TextDecoder().decode(files["images/kept-1.png"])).toBe("inline-png");
   });

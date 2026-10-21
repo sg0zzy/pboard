@@ -66,6 +66,7 @@ vi.mock("../src/sync/client", () => ({
 }));
 
 vi.mock("../src/sync/browser", () => ({
+  boardCollaboration: { settings: async () => ({ provider: "drive", url: "wss://pboard.cecosl.ovh/ws" }) },
   collaborationManager: {
     state: () => ({ ready: false, role: "private", connectedPeers: [], error: null }),
     start: vi.fn(async () => undefined),
@@ -73,8 +74,10 @@ vi.mock("../src/sync/browser", () => ({
     stop: vi.fn(async () => undefined)
   },
   drivePermissions: {},
+  sharePermissions: {},
   discoverSharedBoards: vi.fn(async () => []),
   SHARED_PROJECTS_KEY: "sharedProjects",
+  renewBoardAuthorization: vi.fn(async () => ({ role: "owner" })),
   googleAuth: { connect: vi.fn(async () => undefined), disconnect: vi.fn(async () => undefined), isConfigured: () => false },
   googleDrive: { getConnectionState: vi.fn(async () => "disconnected") },
   driveSyncState: { get: vi.fn(async () => null), markDirty: vi.fn(async () => undefined) },
@@ -127,7 +130,7 @@ describe("board download button", () => {
     const anchor = clickAnchor.mock.instances[0] as unknown as HTMLAnchorElement;
     expect(anchor.download).toBe("My Board.zip");
     const files = unzipSync(new Uint8Array(await capturedBlob!.arrayBuffer()));
-    expect(Object.keys(files).sort()).toEqual(["board.txt", "images/shot-1.png"]);
+    expect(Object.keys(files).sort()).toEqual(["board.json", "board.txt", "images/shot-1.png"]);
     expect(new TextDecoder().decode(files["board.txt"])).toContain("[reference] [candidate] Screenshot");
     expect(Array.from(files["images/shot-1.png"]!)).toEqual([1, 2, 3]);
     await until(() => container.querySelector(".notice")?.textContent === "Board downloaded", "the download notice");

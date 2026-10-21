@@ -158,6 +158,10 @@ Implemented behavior:
 - Manually created cards default to type `note` and status `candidate`.
 - Cards enter inline editing when the user double-clicks their title or content area.
 - While editing, Enter saves, Shift+Enter inserts a newline, Escape cancels, and another double-click saves.
+- While editing, keeping the left mouse button pressed on a word selects that word in the title or content field. The selection stays after the button is released.
+- The word under the pointer is the one the browser caret rests on, so a press just after a word still selects that word.
+- Moving the pointer while the button is held cancels the word selection and leaves the ordinary drag-selection behavior untouched.
+- The second click of a double-click never starts a word selection, so the double-click that saves the card keeps working.
 - While editing, Tab and Shift+Tab cycle through the card's controls and text fields, wrapping within the card.
 - Ctrl+Enter saves without arming creation of a new card below; Command+Enter is the macOS equivalent. The next Enter therefore edits the same selected card again.
 - Cancelling an edit with Escape restores focus to the same selected card, allowing immediate arrow navigation or Enter-to-edit without selecting it again.
@@ -374,10 +378,13 @@ PROJECT: AI brainstorming SaaS
 The **Download board** button (arrow-into-tray icon) exports the current project as a zip archive:
 
 - `board.txt` contains exactly the same prompt text the **Copy board** button writes to the clipboard.
+- `board.json` contains versioned card metadata for importing the board, including template, titles, display modes, order, source references and image associations. It excludes collaboration credentials and signatures.
 - `images/` contains one file per card image the board displays (the same pictures the cards render), named after the card id with an extension derived from the stored mime type. Trash cards are excluded, and an image shared by several cards is stored once. A card whose image data is missing is skipped so the text export never fails.
 - The archive is named after the project (its name slugged for the filesystem, falling back to `board.zip`).
 - The browser download starts only once the whole zip is complete in memory, so the downloaded file always contains the txt and every image that was loaded in the cards.
 - The sidebar displays a temporary success notice; a failure is reported as a notice and starts no download.
+
+**Import pboard** opens a ZIP file picker, including when no board exists. It validates the archive before writing and creates a new local board with fresh board/card identities. Existing boards and collaboration authority are preserved. Current archives restore structured cards and images; older `board.txt`/`images/` archives restore combined title/text and attach images as separate cards because those files did not record associations or the board template. Legacy category tags are used to infer a template; card-looking text inside old prompts can be ambiguous. Trash and unavailable image bytes cannot be recovered from an export that omitted them. Imports are limited to 25 MB compressed, 64 MB expanded and 1,000 cards. RxDB is required; the legacy fallback backend reports an error without importing. A storage failure may leave a partial new board, which is retained and reported rather than automatically deleted. Imports restore content, not synchronization history, conflict variants or authority keys.
 
 Copying is currently the only implemented board-to-chat workflow. The user must paste the generated prompt into ChatGPT or another AI application manually.
 
@@ -470,6 +477,7 @@ Current automated coverage includes:
 - project creation, selection, reordering, persistence, and deletion;
 - cascading card deletion with a project;
 - card creation, editing, deletion, and reordering;
+- press-and-hold word selection in the card editor, including its interaction with the double-click that saves the card;
 - status and category stepping from a focused card;
 - text-card merging, source removal, destination preservation, and image-source rejection;
 - before/after insertion calculations used by the drag placeholder;

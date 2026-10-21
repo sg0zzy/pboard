@@ -96,7 +96,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
     async initialize() { emit({ connected: await auth.getConnectionState() === 'connected' }); },
     async connect() {
       emit({ busy: true, error: '' });
-      try { await auth.connect(); emit({ connected: true }); await sync(); }
+      try { await auth.connect(); await runtime.authorizePrivatePersistence(); emit({ connected: true }); await sync(); }
       catch (error) { emit({ error: error instanceof Error ? error.message : String(error) }); }
       finally { emit({ busy: false }); }
     },

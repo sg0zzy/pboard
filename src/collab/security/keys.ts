@@ -191,16 +191,53 @@ export async function saveDeviceKey(key: StoredDeviceKey): Promise<void> {
  * or `account-authority:<accountHash>`.
  */
 export async function ensureDeviceKey(purpose: string): Promise<StoredDeviceKey> {
-  const existing = await idbGet(`purpose:${purpose}`) ?? lsGet(`purpose:${purpose}`);
-  if (existing) return existing;
-  const key = await generateDeviceKey();
-  await saveDeviceKey({ ...key, keyId: `purpose:${purpose}` });
-  // The fingerprint stays in `publicJwk`; `keyId` is the storage slot here.
-  return key;
+  const obtain = async () => {
+    const slot = `purpose:${purpose}`;
+    const existing = await idbGet(slot) ?? lsGet(slot);
+    if (existing) {
+      // Older code accidentally persisted the storage slot as the cryptographic
+      // key id. Preserve the private key and repair only its public fingerprint.
+      const keyId = await publicKeyFingerprint(existing.publicJwk);
+      const repaired = { ...existing, keyId };
+      if (existing.keyId !== keyId) {
+        if (indexedDbLike) await idbPut(slot, repaired); else lsPut(slot, repaired);
+      }
+      return repaired;
+    }
+    const key = await generateDeviceKey();
+    await saveDeviceKey(key);
+    if (indexedDbLike) await idbPut(slot, key); else lsPut(slot, key);
+    return key;
+  };
+  return globalThis.navigator?.locks
+    ? navigator.locks.request(`pboard-key:${purpose}`, obtain)
+    : obtain();
 }
 
 /** Signs canonical protocol bytes with a stored device key. */
 export async function signWithStored(stored: StoredDeviceKey, bytes: Uint8Array): Promise<string> {
   const signingKey = await importSigningKey(stored.privateJwk as JsonWebKey);
   return signBytes(signingKey, bytes);
+}
+/** Read without generating or replacing a compatibility identity. */
+export async function loadPurposeKey(purpose: string): Promise<StoredDeviceKey | null> {
+  return await idbGet(`purpose:${purpose}`) ?? lsGet(`purpose:${purpose}`);
+}
+/** Recovery adds a separate purpose slot; existing device/authority keys remain intact. */
+export async function saveRecoveredPurposeKey(purpose: string, key: StoredDeviceKey): Promise<void> {
+  if (!purpose.startsWith('recovered-board-authority:') || await publicKeyFingerprint(key.publicJwk) !== key.keyId
+    || !await verifyBytes(key.publicJwk, await signBytes(await importSigningKey(key.privateJwk), textBytes('pboard-recovery-key-check')), textBytes('pboard-recovery-key-check'))) throw new Error('Invalid recovered authority key');
+  if (!indexedDbLike) throw new Error('Durable security key storage is unavailable');
+  const database = await openKeyDatabase(indexedDbLike);
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, 'readwrite', { durability: 'strict' });
+    const store = transaction.objectStore(STORE_NAME), slot = `purpose:${purpose}`;
+    const request = store.get(slot);
+    request.onsuccess = () => {
+      if (request.result && request.result.keyId !== key.keyId) { transaction.abort(); return; }
+      store.put(key, key.keyId); store.put(key, slot);
+    };
+    transaction.oncomplete = () => { database.close(); resolve(); };
+    transaction.onerror = transaction.onabort = () => { database.close(); reject(new Error('Recovered authority could not be stored without replacing existing keys')); };
+  });
 }

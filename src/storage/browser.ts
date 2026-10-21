@@ -1,9 +1,12 @@
+import { importLocalBoard, type ImportedCard } from './importBoard';
 import { createRepository, STORAGE_KEY } from "./repository";
 import { browser } from "../platform/browser";
-import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences } from "../sync/browser";
+import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount } from "../sync/browser";
 import { createProjectDeletionRoleResolver } from "../sync/projectDeletion";
 import { createRxRepository, type RxRepository } from "./rxdbRepository";
 import type { AppState, BoardItem, BoardItemStatus, Project } from "../types";
+import type { ConflictRecord } from "./conflictResolution";
+import { eraseLegacyBoardCopies } from './boardErasure';
 
 export const STORAGE_BACKEND_KEY = "pboardStorageBackend";
 export const RXDB_MIGRATION_ERROR_KEY = "pboardRxMigrationError";
@@ -31,6 +34,7 @@ const resolveDeletionRole = createProjectDeletionRoleResolver({ sharedProjects, 
   connected: async () => await googleAuth.getConnectionState() === "connected" });
 async function openRxRepository(): Promise<RxRepository> {
   if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ resolveDeletionRole, events: {
+    projectErased: projectId => eraseLegacyBoardCopies(browser.storage.local, projectId),
     projectHidden: async () => { await syncAccountPreferences(); },
     projectChanged: (projectId) => driveSyncState.markDirty(projectId),
     projectDeleting: async (project) => {
@@ -117,6 +121,13 @@ function legacySubscribe<T>(read: () => Promise<T>, listener: (value: T) => void
 }
 
 export const repository = {
+  async importLocalBoard(name: string, template: Project['template'], cards: ImportedCard[]) {
+    const rx = await selectedRxRepository();
+    if (!rx) throw new Error('Board import requires the RxDB storage backend. Existing boards are unchanged.');
+    const project = await importLocalBoard(rx, name, template, cards);
+    await driveSyncState.markDirty(project.id);
+    return project;
+  },
   load: async (): Promise<AppState> => (await chosen()).load(),
   createProject: async (...args: Parameters<typeof legacyRepository.createProject>) => (await chosen()).createProject(...args),
   selectProject: async (...args: Parameters<typeof legacyRepository.selectProject>) => (await chosen()).selectProject(...args),
@@ -126,6 +137,7 @@ export const repository = {
   },
   renameProject: async (...args: Parameters<typeof legacyRepository.renameProject>) => (await chosen()).renameProject(...args),
   deleteProject: async (...args: Parameters<typeof legacyRepository.deleteProject>) => (await chosen()).deleteProject(...args),
+  unhideProject: async (...args: Parameters<RxRepository["unhideProject"]>) => { const rx = await selectedRxRepository(); if (!rx) throw new Error("This storage backend does not retain hidden boards; nothing to restore"); return rx.unhideProject(...args); },
   changeProjectTemplate: async (...args: Parameters<typeof legacyRepository.changeProjectTemplate>) => (await chosen()).changeProjectTemplate(...args),
   addItem: async (...args: Parameters<typeof legacyRepository.addItem>) => (await chosen()).addItem(...args),
   updateItem: async (...args: Parameters<typeof legacyRepository.updateItem>) => (await chosen()).updateItem(...args),
@@ -147,6 +159,31 @@ export const repository = {
   getProject: async (id: string): Promise<Project | null> => {
     const rx = await selectedRxRepository();
     return rx ? rx.getProject(id) : (await legacyRepository.load()).projects.find((project) => project.id === id) ?? null;
+  },
+  listConflicts: async () => (await selectedRxRepository())?.listConflicts() ?? [],
+  saveConflictDraft: async (...args: Parameters<RxRepository["saveConflictDraft"]>) => {
+    const rx = await selectedRxRepository(); if (!rx) throw new Error("Conflict recovery requires local RxDB storage");
+    return rx.saveConflictDraft(...args);
+  },
+  resolveConflict: async (...args: Parameters<RxRepository["resolveConflict"]>) => {
+    const rx = await selectedRxRepository(); if (!rx) throw new Error("Conflict recovery requires local RxDB storage");
+    return rx.resolveConflict(...args);
+  },
+  subscribeConflicts: async (listener: (records: ConflictRecord[]) => void, onError: (error: unknown) => void) => {
+    const rx = await selectedRxRepository(); if (!rx) { listener([]); return () => {}; }
+    let active = true, generation = 0;
+    const refresh = () => {
+      const current = ++generation;
+      void rx.listConflicts().then(records => { if (active && current === generation) listener(records); })
+        .catch(error => { if (active && current === generation) onError(error); });
+    };
+    let scheduled: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = rx.journal.subscribe(() => {
+      clearTimeout(scheduled); scheduled = setTimeout(refresh, 125);
+    });
+    const timer = setInterval(refresh, 10_000); // Access/grant expiry can change without a document write.
+    refresh();
+    return () => { active = false; clearTimeout(scheduled); clearInterval(timer); unsubscribe(); };
   },
   listProjects: async (): Promise<Project[]> => {
     const rx = await selectedRxRepository();
@@ -189,6 +226,26 @@ export const repository = {
     return { project, items: state.boardItems.filter((card) => card.projectId === projectId) };
   },
   exportAll: async () => { const rx = await selectedRxRepository(); return rx ? rx.exportAll() : legacyRepository.load(); },
+  listPendingWork: async () => (await selectedRxRepository())?.listPendingWork() ?? [],
+  subscribePendingWork: async (listener: Parameters<RxRepository['subscribePendingWork']>[0]) => (await getRxRepository()).subscribePendingWork(listener),
+  reviewPendingWork: async (...args: Parameters<RxRepository['reviewPendingWork']>) => (await getRxRepository()).reviewPendingWork(...args),
+  discardRemovedBoardWork: async (...args: Parameters<RxRepository['discardRemovedBoardWork']>) => {
+    const account = await privateErasureAccount(args[0]).catch(() => null);
+    await (await getRxRepository()).discardRemovedBoardWork(args[0], args[1], account ?? undefined);
+    if ((await (await getRxRepository()).journal.boardErasure(args[0]))?.cloudPending) await driveSyncState.markDirty(args[0], true);
+    else await driveSyncState.forget(args[0]);
+    void googleDrive.reconcileAll().catch(() => {}); // Durable erasure queue retries while offline.
+  },
+  permanentlyDeleteBoard: async (boardId: string) => {
+    const rx = await getRxRepository();
+    if ((await rx.getCurrentProject())?.id === boardId) await collaborationManager.stop();
+    const account = await privateErasureAccount(boardId).catch(() => null);
+    await rx.permanentlyDeleteBoard(boardId, account ?? undefined);
+    if ((await rx.journal.boardErasure(boardId))?.cloudPending) await driveSyncState.markDirty(boardId, true);
+    else await driveSyncState.forget(boardId);
+    void googleDrive.reconcileAll().catch(() => {});
+  },
+  exportPendingWork: async (boardId: string) => (await getRxRepository()).exportPendingWork(boardId),
   putImage: async (image: BoardItem["image"]) => { if (!image) throw new Error("Image required"); return (await getRxRepository()).putImage(image); },
   getImage: async (imageId: string) => (await getRxRepository()).getImage(imageId),
   subscribeImage: async (imageId: string, listener: () => void) =>

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pboard collaboration test — preparing</title>
+  <link rel="stylesheet" href="standalone-demo.css">
+</head>
+<body>
+  <main>
+    <h1>Pboard collaboration test</h1>
+    <p id="identity">Preparing this temporary device…</p>
+    <p>This is a disposable test board using Pboard’s real synchronization runtime. Your installed extension and existing boards are untouched.</p>
+    <p id="setup" role="status">The test driver will create and approve both devices automatically.</p>
+    <p id="connection" role="status">Waiting for setup…</p>
+    <p id="error" role="alert"></p>
+    <fieldset id="controls" disabled>
+      <legend>Try editing in either window</legend>
+      <form id="add-card">
+        <label>New text card<textarea name="content" required rows="3"></textarea></label>
+        <button type="submit">Add card</button>
+      </form>
+      <div id="cards"></div>
+      <button id="disconnect" type="button">Disconnect this device</button>
+      <button id="reconnect" type="button">Reconnect this device</button>
+    </fieldset>
+    <p id="boundary"></p>
+    <p>Keep both windows open. Press Ctrl+C in the launching terminal to finish and remove these temporary profiles. Test cards are not backed up.</p>
+  </main>
+  <script type="module" src="secure-probe.js"></script>
+  <script type="module" src="standalone-demo.mjs"></script>
+</body>
+</html>

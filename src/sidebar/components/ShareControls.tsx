@@ -5,7 +5,7 @@ import { CloseIcon, PeopleIcon } from "./icons";
 type Props = {
   projectId: string | null;
   /** The Drive permission service (injected so the component is independently testable). */
-  permissions: DrivePermissionService;
+  permissions: Pick<DrivePermissionService, "myRole" | "listCollaborators" | "projectFileId" | "ensureSharedProject" | "invite" | "updateRole" | "removeCollaborator"> & { canManageMembership?: (board: string) => Promise<boolean | null> };
   onAccessChanged?: () => void;
   liveStatus?: string;
 };
@@ -25,16 +25,17 @@ export function ShareControls({ projectId, permissions, onAccessChanged, liveSta
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  const [membershipAllowed, setMembershipAllowed] = useState<boolean | null>(null);
   const [privateProject, setPrivateProject] = useState(false);
 
   const load = useCallback(async () => {
     if (!projectId) return;
-    const [mine, list, fileId] = await Promise.all([
+    const [mine, list, fileId, allowed] = await Promise.all([
       permissions.myRole(projectId),
       permissions.listCollaborators(projectId),
-      permissions.projectFileId(projectId)
+      permissions.projectFileId(projectId), permissions.canManageMembership?.(projectId) ?? Promise.resolve(null)
     ]);
-    setMyRole(mine);
+    setMyRole(mine); setMembershipAllowed(allowed);
     setCollaborators(list);
     setPrivateProject(fileId === null);
     setLoadedProjectId(projectId);
@@ -44,14 +45,14 @@ export function ShareControls({ projectId, permissions, onAccessChanged, liveSta
     if (!open || !projectId) return;
     let active = true;
     setLoadedProjectId(null);
-    setMyRole(null);
+    setMyRole(null); setMembershipAllowed(null);
     setCollaborators([]);
     setError("");
     void Promise.all([
-      permissions.myRole(projectId), permissions.listCollaborators(projectId), permissions.projectFileId(projectId)
-    ]).then(([mine, list, fileId]) => {
+      permissions.myRole(projectId), permissions.listCollaborators(projectId), permissions.projectFileId(projectId), permissions.canManageMembership?.(projectId) ?? Promise.resolve(null)
+    ]).then(([mine, list, fileId, allowed]) => {
       if (!active) return;
-      setMyRole(mine);
+      setMyRole(mine); setMembershipAllowed(allowed);
       setCollaborators(list);
       setPrivateProject(fileId === null);
       setLoadedProjectId(projectId);
@@ -62,7 +63,7 @@ export function ShareControls({ projectId, permissions, onAccessChanged, liveSta
   }, [open, projectId, load]);
 
   const loaded = projectId !== null && loadedProjectId === projectId;
-  const canManage = loaded && (myRole === "owner" || myRole === "editor" || (privateProject && myRole === null));
+  const canManage = loaded && (membershipAllowed ?? (myRole === "owner" || myRole === "editor" || (privateProject && myRole === null)));
 
   async function run(action: () => Promise<void>) {
     setBusy(true);

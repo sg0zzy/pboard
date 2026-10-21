@@ -1,10 +1,10 @@
-import { blobToDataUrl, hashBlob, imageToBlob } from "../storage/blobStore";
+import { blobToDataUrl } from "../storage/blobStore";
 import type { RxRepository } from "../storage/rxdbRepository";
 import type { BoardImage } from "../types";
-import { MAX_IMAGE_FILE_BYTES, MAX_STORED_IMAGE_EDGE } from "../images/processing";
+import { verifyImageAsset, SUPPORTED_IMAGE_MIME } from "./security/imageAsset";
 
 /** Allowlist for shared image assets; anything else is rejected before decode. */
-const SUPPORTED_SHARED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
+const SUPPORTED_SHARED_IMAGE_MIME = SUPPORTED_IMAGE_MIME;
 
 export interface SharedImageTransport {
   readImage(projectId: string, imageId: string): Promise<BoardImage | null>;
@@ -17,6 +17,8 @@ export function createProjectImageSync(options: {
   repository: RxRepository;
   transport: SharedImageTransport;
   canWrite: boolean;
+  /** Asks authorized peers for missing attachment bytes over the authenticated DataChannel; failures keep them pending. */
+  requestFromPeers?: (imageIds: string[]) => Promise<void>;
   onError: (error: unknown) => void;
   pollMs?: number;
 }) {
@@ -29,30 +31,22 @@ export function createProjectImageSync(options: {
   let stopImages: (() => void) | undefined;
 
   async function transfer() {
-    const cards = await repository.listCards(projectId);
-    const ids = new Set(cards.map((card) => card.imageId).filter((id): id is string => !!id));
+    const cards = await repository.listCards(projectId, false); const ids = new Set(cards.map((card) => card.imageId).filter((id): id is string => !!id));
+    const missingLocally: string[] = [];
     for (const imageId of ids) {
       if (!active) return;
       let stored = await repository.getImage(imageId);
       if (!stored) {
-        const image = await transport.readImage(projectId, imageId);
-        if (!active || !image) continue; // Its originating browser may still be uploading.
+        let image: BoardImage | null = null;
+        try { image = await transport.readImage(projectId, imageId); }
+        catch (error) { options.onError(error); }
+        if (!active || !image) { missingLocally.push(imageId); continue; } // Its originating browser may still be uploading.
         // Shared assets are untrusted input: strict MIME allowlist, size and
         // dimension limits, and the card's hash-derived id must match the decoded
         // bytes. This binds every image to its authenticated digest (the SHA-256
         // imageId signed into the card mutation/asset record), so a hash supplied
         // alongside modified bytes fails here before storage or display.
-        if (typeof image.dataUrl !== "string" || !image.dataUrl.startsWith("data:image/") ||
-            image.dataUrl.length > MAX_IMAGE_FILE_BYTES * 1.5 || !image.mimeType?.startsWith("image/") ||
-            !SUPPORTED_SHARED_IMAGE_MIME.has(image.mimeType) ||
-            !Number.isInteger(image.width) || !Number.isInteger(image.height) ||
-            image.width < 1 || image.height < 1 || image.width > MAX_STORED_IMAGE_EDGE || image.height > MAX_STORED_IMAGE_EDGE) {
-          throw new Error("Invalid shared image data");
-        }
-        const blob = await imageToBlob(image.dataUrl);
-        if (blob.size > MAX_IMAGE_FILE_BYTES || blob.type !== image.mimeType || await hashBlob(blob) !== imageId) {
-          throw new Error("Shared image failed integrity verification");
-        }
+        const blob = await verifyImageAsset(imageId, image);
         if (!active) return;
         await repository.blobs.putBlob(blob, image);
         stored = await repository.getImage(imageId);
@@ -61,8 +55,20 @@ export function createProjectImageSync(options: {
       if (!active) return;
       if (options.canWrite && stored && !published.has(imageId)) {
         const image: BoardImage = { dataUrl: await blobToDataUrl(stored.blob), mimeType: stored.mimeType, width: stored.width, height: stored.height };
-        await transport.writeImage(projectId, imageId, image);
-        published.add(imageId);
+        try {
+          await transport.writeImage(projectId, imageId, image);
+          published.add(imageId);
+        } catch (error) { options.onError(error); }
+      }
+    }
+    if (missingLocally.length && options.requestFromPeers) {
+      // Authorized peers may hold the bytes; each receiver verifies the hash
+      // itself, so a served asset cannot forge anything. A failed request keeps
+      // the attachment pending; the next poll retries.
+      if (!active) return;
+      for (let index = 0; active && index < missingLocally.length; index += 16) {
+        try { await options.requestFromPeers(missingLocally.slice(index, index + 16)); }
+        catch (error) { options.onError(error); }
       }
     }
   }

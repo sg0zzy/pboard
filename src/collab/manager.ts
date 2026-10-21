@@ -6,6 +6,7 @@ import type { BoardPermissionManifest } from "./security/manifest";
 import { manifestHash, manifestIsCurrent, roleForDevice, validateManifest } from "./security/manifest";
 import type { VerifiedSessionContext } from "./security/session";
 import type { MutationGuardInstall } from "./security/mutation";
+import type { RelayAuthorization } from "./security/relayAdmission";
 import type { RxRepository } from "../storage/rxdbRepository";
 import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
@@ -13,12 +14,13 @@ import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
 import { scopeMasterChanges } from "./scopedPull";
 import { createProjectImageSync, type SharedImageTransport } from "./imageSync";
+import type { PeerHistorySession } from "./peerHistory";
 
 /**
- * pboard role as resolved for a project, used to gate replication direction and
- * UI mutability. "private" = the project is not shared (or the user has no Drive
- * role for it); "viewer" = Drive reader; "editor" = Drive writer; "owner" = the
- * owner's own account.
+ * Current project role from the selected collaboration policy. Independent
+ * collaboration uses board grants; legacy Drive sharing retains its adapter.
+ * Roles gate direction/UI, while trusted manifests and signed writes independently
+ * enforce board admission and mutation authorization.
  */
 export type CollaborationRole = PboardRole | "private";
 
@@ -37,7 +39,7 @@ export type CollaborationState = {
 };
 
 export interface CollaborationManagerOptions {
-  /** Resolves the caller's Drive role for the shared file; null when not shared. */
+  /** Resolves the selected policy's project role; null when not shared. */
   myRole: (projectId: string) => Promise<PboardRole | null>;
   /** The shared Drive file id the owner created, or null when never shared. */
   getSharedFileId: (projectId: string) => Promise<string | null>;
@@ -54,12 +56,17 @@ export interface CollaborationManagerOptions {
    * once per collection with the topic, so the transport is swappable (Drive for
    * the shipped extension, memory/WebSocket for dev and tests).
    */
-  signalingFor: (topic: string) => PboardSignaling;
+  signalingFor: (topic: string, security?: CollaborationSecurityOptions) => PboardSignaling;
   getRepository: () => Promise<RxRepository | null>;
   wrtc?: PboardWrtc;
-  imageTransport?: SharedImageTransport;
+  imageTransport?: SharedImageTransport | (() => Promise<SharedImageTransport>);
+  /** Some signaling-only boards have no shared image backend; it may also depend on account connectivity. */
+  useImageTransport?: () => Promise<boolean> | boolean;
   /** Stable normalized account identity hash; null when Drive is disconnected. */
   getAccountId?: () => Promise<string | null>;
+  /** Private preference scope, independent of live room admission. Undefined
+   * preserves the scope already verified by private persistence. */
+  getProjectOrderAccountId?: (fallback: string | null) => Promise<string | null | undefined>;
   /**
    * Protocol-2 board security, verified against the pinned authority by the runtime.
    * Missing providers or null contexts block collaboration. Account-order rooms
@@ -67,9 +74,13 @@ export interface CollaborationManagerOptions {
    */
   boardSecurity?: (projectId: string) => Promise<CollaborationSecurityOptions | null>;
   accountSecurity?: (account: string) => Promise<CollaborationSecurityOptions | null>;
+  /** Opt-in broker polling; ordinary providers have no additional work. */
+  securityChanged?: (projectId: string) => Promise<boolean>;
   /** Install per-project mutation verification on the repository (protocol 2). */
-  installMutationGuard?: (projectId: string) => Promise<MutationGuardInstall | null>;
+  installMutationGuard?: (projectId: string, security?: CollaborationSecurityOptions) => Promise<MutationGuardInstall | null>;
   removeMutationGuard?: (projectId: string) => Promise<void>;
+  /** Durable private-backup intent; no remote I/O or authorization is performed here. */
+  onHistoryReceived?: (projectId: string) => Promise<void>;
 }
 
 /** Everything the connection handler needs to run protocol 2 for one room. */
@@ -78,6 +89,11 @@ export type CollaborationSecurityOptions = {
   manifest: BoardPermissionManifest;
   boardId: string;
   ownSessionId: string;
+  relayAuthorization?: RelayAuthorization;
+  manifestHistory?: ReadonlyMap<number, BoardPermissionManifest>;
+  grantHistory?: import("./security/manifest").SignedManifest[];
+  /** Local root capability only; never serialized onto a transport. */
+  historyAuthority?: { privateJwk: JsonWebKey; deviceKeyId: string };
 };
 
 export interface CollaborationManager {
@@ -94,7 +110,7 @@ const isEditorRole = (role: CollaborationRole) => role === "owner" || role === "
  * One shared project's live collaboration plus account-only project ordering.
  *
  * The manager owns the full lifecycle for a single project:
- *   1. resolve the caller's role from Drive permissions (the authoritative ACL);
+ *   1. resolve the selected policy's role and require a trusted board manifest;
  *   2. bootstrap a viewer/editor that has no local copy from the shared file;
  *   3. run two WebRTC pools — one per shared collection — with role-based
  *      direction and project-scoped pull/push modifiers.
@@ -135,6 +151,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   let recovery: Promise<void> | null = null;
   let imageSync: ReturnType<typeof createProjectImageSync> | null = null;
   let activeGuard: MutationGuardInstall | null = null;
+  /** Live history sessions for the active independent board; drained on stop. */
+  const historySessions = new Set<PeerHistorySession>();
 
   function collectPeers(): string[] {
     const ids = new Set<string>();
@@ -213,14 +231,17 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       collection: ref,
       topic: topicFor(projectId, collection),
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
-        signaling: options.signalingFor(topicFor(projectId, collection)),
+        signaling: options.signalingFor(topicFor(projectId, collection), securityContext),
         scopeDocument: scopeProjectDoc,
+        existingDocuments: async ids => [...(await ref.findByIds(ids).exec()).values()].map(doc => doc.toJSON()),
         beforeReconnect,
+        ...(startedRepo ? { history: { repository: startedRepo, security: securityContext, beforeReceive: () => options.onHistoryReceived?.(projectId) ?? Promise.resolve(),
+          registry: { add: s => historySessions.add(s), remove: s => historySessions.delete(s), all: () => [...historySessions] } } } : {}),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
         security: {
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection,
-          ownSessionId: securityContext.ownSessionId,
+          ownSessionId: `${securityContext.ownSessionId}:${collection}:${crypto.randomUUID()}`,
           ...securityHooksFor(securityContext)
         }
       }),
@@ -250,7 +271,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   }
 
   async function startAccountOrder(rx: RxRepository, account: string | null, securityContext: CollaborationSecurityOptions | null): Promise<void> {
-    await rx.setProjectOrderAccount(account);
+    const orderAccount = options.getProjectOrderAccountId ? await options.getProjectOrderAccountId(account) : account;
+    if (orderAccount !== undefined) await rx.setProjectOrderAccount(orderAccount);
     if (!account || !securityContext) return;
     const id = `projectOrder:${account}`;
     const topic = `pboard-account-${account}-order`;
@@ -260,12 +282,13 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
       collection: rx.db.settings, topic,
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
-        signaling: options.signalingFor(topic), scopeDocument: scoped,
+        signaling: options.signalingFor(topic, securityContext), scopeDocument: scoped,
+        existingDocuments: async ids => [...(await rx.db.settings.findByIds(ids).exec()).values()].map(doc => doc.toJSON()),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
         security: {
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection: "accountOrder" as const,
-          ownSessionId: securityContext.ownSessionId,
+          ownSessionId: `${securityContext.ownSessionId}:accountOrder:${crypto.randomUUID()}`,
           ...securityHooksFor(securityContext)
         }
       }),
@@ -317,20 +340,34 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // viewer that is the master would otherwise leak local writes to peers even
     // though its pool is pull-only. Rejecting mutations at the repository layer
     // means no divergent local write exists to stream.
-    rx.setMutatorRole(projectId, role);
+    await rx.setMutatorRole(projectId, role);
     if (!(await rx.getProject(projectId))) {
       await options.bootstrapFromDrive(projectId);
     }
-    activeGuard = options.installMutationGuard ? await options.installMutationGuard(projectId) : null;
+    activeGuard = options.installMutationGuard ? await options.installMutationGuard(projectId, boardSecurity) : null;
     if (!activeGuard || activeGuard.projectId !== projectId) {
       throw new Error("Collaboration requires verified mutation protection. Local boards remain available.");
     }
+    if (isEditorRole(role)) await rx.admitPendingWork(projectId);
     await startAccountOrder(rx, account, accountSecurity);
     await startPool("cards", projectId, rx.db.cards, boardSecurity);
     await startPool("projects", projectId, rx.db.projects, boardSecurity);
-    if (options.imageTransport) {
-      imageSync = createProjectImageSync({ projectId, repository: rx, transport: options.imageTransport,
-        canWrite: isEditorRole(role), onError: (err) => { error = err instanceof Error ? err.message : String(err); } });
+    if (options.imageTransport && await (options.useImageTransport?.() ?? true)) {
+      const transport = typeof options.imageTransport === "function" ? await options.imageTransport() : options.imageTransport;
+      imageSync = createProjectImageSync({ projectId, repository: rx, transport,
+        canWrite: isEditorRole(role),
+        requestFromPeers: async imageIds => {
+          let missing = imageIds, lastError: unknown;
+          for (const session of [...historySessions]) {
+            if (!historySessions.has(session)) continue;
+            try { await session.requestImages(missing); } catch (error) { lastError = error; }
+            const availability = await Promise.all(missing.map(id => rx.hasImage(id)));
+            missing = missing.filter((_, index) => !availability[index]);
+            if (!missing.length) return;
+          }
+          if (missing.length && lastError) throw lastError;
+        },
+        onError: (err) => { error = err instanceof Error ? err.message : String(err); } });
       imageSync.start();
     }
   }
@@ -338,11 +375,16 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   async function doStop(): Promise<void> {
     ++sessionGeneration;
     recovery = null;
+    for (const session of historySessions) session.close();
+    historySessions.clear();
     await imageSync?.stop();
     imageSync = null;
     while (pools.length > 0) await (pools.pop() as SharedPool).cancel();
-    await startedRepo?.setProjectOrderAccount(null);
-    if (startedProjectId) startedRepo?.setMutatorRole(startedProjectId, null);
+    if (startedRepo) {
+      const orderAccount = options.getProjectOrderAccountId ? await options.getProjectOrderAccountId(null) : null;
+      if (orderAccount !== undefined) await startedRepo.setProjectOrderAccount(orderAccount);
+    }
+    // Stopping transports must not clear durable offline permissions.
     if (activeGuard) {
       await options.removeMutationGuard?.(activeGuard.projectId).catch(() => {});
       await activeGuard.uninstall().catch(() => {});
@@ -365,7 +407,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const previousFileId = sharedFileId;
     try {
       await applyRole(startedProjectId);
-      if (!wasReady || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
+      const securityChanged = await options.securityChanged?.(projectId) ?? false;
+      if (!wasReady || securityChanged || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
         await doStart(startedProjectId);
       }
     } catch (err) {

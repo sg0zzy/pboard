@@ -154,7 +154,7 @@ export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getR
   async function read(projectId: string): Promise<ProjectSnapshot> {
     const rx = await getRx();
     if (!rx) return legacy.read(projectId);
-    const { project, items } = await rx.exportProject(projectId);
+    const { project, items } = await rx.exportProject(projectId, false);
     return deserializeProjectSnapshot(serializeProjectSnapshot(project, items));
   }
   async function list(): Promise<ProjectSnapshot[]> {

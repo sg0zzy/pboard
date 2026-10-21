@@ -25,7 +25,7 @@ let options: CollaborationManagerOptions;
 beforeEach(() => {
   vi.clearAllMocks();
   const repo = {
-    setProjectOrderAccount: vi.fn(async () => {}), setMutatorRole: vi.fn(),
+    setProjectOrderAccount: vi.fn(async () => {}), setMutatorRole: vi.fn(), admitPendingWork: vi.fn(async () => {}),
     getProject: vi.fn(async () => ({ id: "shared" })),
     db: { cards: { name: "cards" }, projects: { name: "projects" }, settings: { name: "settings" } }
   } as unknown as RxRepository;

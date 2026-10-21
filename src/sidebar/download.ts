@@ -46,6 +46,16 @@ export async function buildBoardArchive(
     seen.set(key, name);
     files[name] = new Uint8Array(await entry.blob.arrayBuffer());
   }
+  files["board.json"] = strToU8(JSON.stringify({
+    format: "pboard-download", version: 1, name: project.name, template: project.template,
+    cards: [...items].filter(item => item.status !== "trash").sort((a, b) => a.order - b.order).map(item => ({
+      type: item.type, status: item.status, title: item.title, content: item.content,
+      displayMode: item.displayMode, source: item.source,
+      imagePath: seen.get(item.imageId ?? (item.image ? `data:${item.image.dataUrl}` : "")),
+      imageWidth: item.image?.width ?? item.imageWidth,
+      imageHeight: item.image?.height ?? item.imageHeight
+    }))
+  }));
   return { filename: boardArchiveFileName(project), data: zipSync(files) };
 }
 

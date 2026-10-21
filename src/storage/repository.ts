@@ -11,6 +11,8 @@ export interface KeyValueStorage {
 }
 
 export type RepositoryEvents = {
+  /** Local legacy-copy cleanup; must not perform network I/O. */
+  projectErased?: (projectId: string) => void | Promise<void>;
   projectChanged?: (projectId: string) => void | Promise<void>;
   projectDeleting?: (project: Project) => void | Promise<void>;
   projectDeleted?: (projectId: string) => void | Promise<void>;

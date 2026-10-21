@@ -539,3 +539,42 @@ describe("Firefox loopback redirect", () => {
     );
   });
 });
+
+it('manual sync checks a locally clean board immediately without waiting for account preferences', async () => {
+  const storage = new MemoryStorage(); storage.data.projectBoardState = stateWithProject();
+  const syncState = createDriveSyncStateStore(storage), snapshots = createProjectSnapshotStore(storage);
+  const syncPreferences = vi.fn(() => new Promise<void>(() => {}));
+  const upload = vi.fn(async () => ({ id: 'manual-file', name: 'project-project-1.pboard' }));
+  const provider = createGoogleDriveProvider({ auth: connectedAuth(), syncState, snapshots, syncPreferences,
+    tombstones: createDriveTombstoneStore(storage), transport: { listProjectFiles: async () => [], findProjectFile: async () => null,
+      download: async () => '', upload, delete: async () => {} } });
+  await expect(provider.syncProject(project.id, { force: true })).resolves.toBe('pushed');
+  expect(upload).toHaveBeenCalledOnce(); expect(syncPreferences).not.toHaveBeenCalled();
+  expect(await syncState.get(project.id)).toMatchObject({ dirty: false, status: 'synced' });
+});
+
+it('manual sync follows an older in-flight upload with the latest local revision and coalesces repeated requests', async () => {
+  const storage = new MemoryStorage(); storage.data.projectBoardState = stateWithProject();
+  const syncState = createDriveSyncStateStore(storage), snapshots = createProjectSnapshotStore(storage);
+  let release!: () => void, started!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }), beginning = new Promise<void>(resolve => { started = resolve; });
+  const payloads: string[] = [];
+  const upload = vi.fn(async (_id: string, contents: string) => { payloads.push(contents); if (payloads.length === 1) { started(); await gate; } return { id: 'manual-file', name: 'project-project-1.pboard' }; });
+  const provider = createGoogleDriveProvider({ auth: connectedAuth(), syncState, snapshots,
+    tombstones: createDriveTombstoneStore(storage), transport: { listProjectFiles: async () => [], findProjectFile: async () => null,
+      download: async () => payloads[0], upload, delete: async () => {} } });
+  await syncState.markDirty(project.id);
+  const older = provider.syncProject(project.id); await beginning;
+  const latest = structuredClone(stateWithProject());
+  latest.boardItems[0].content = 'Newest manual edit';
+  latest.projects[0].revision++;
+  latest.projects[0].updatedAt = '2026-01-03T00:00:00.000Z';
+  storage.data.projectBoardState = latest;
+  await syncState.markDirty(project.id);
+  const first = provider.syncProject(project.id, { force: true });
+  const second = provider.syncProject(project.id, { force: true }); expect(second).toBe(first);
+  release(); await older; await first;
+  expect(upload).toHaveBeenCalledTimes(2);
+  expect(JSON.parse(payloads[1]).items[0].content).toBe('Newest manual edit');
+  expect(await syncState.get(project.id)).toMatchObject({ dirty: false, status: 'synced' });
+});

@@ -1,4 +1,4 @@
-import { type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type CSSProperties, type KeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getCardTypeDefinition, getTemplateDefinition } from "../../templates/boardTemplates";
 import { nextCardDisplayMode, normalizeCardDisplayMode } from "../../cardDisplayModes";
 import { statusClassName } from "../../statuses";
@@ -9,6 +9,7 @@ import { cardTextForClipboard } from "../cardText";
 import { toSafeWebHref } from "../linkify";
 import { MarkdownContent, MarkdownInline, setTaskCheckedAtLine } from "../markdown";
 import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag";
+import { HoldWordSelector } from "../holdWordSelector";
 import type { DropPosition } from "../reorder";
 import { CheckIcon, CopyIcon, DragHandleIcon, TrashIcon } from "./icons";
 import { CategoryPicker } from "./CategoryPicker";
@@ -97,6 +98,7 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
     const cardRef = useRef<HTMLElement>(null);
   const pointerDragRef = useRef<PointerDragSession | null>(null);
   const suppressClickRef = useRef(false);
+  const holdWordSelectorRef = useRef<HoldWordSelector | null>(null);
   const pointerCallbacksRef = useRef({ onDragStart, onDragOver, onDrop, onDragEnd });
   pointerCallbacksRef.current = { onDragStart, onDragOver, onDrop, onDragEnd };
   const templateDefinition = getTemplateDefinition(template);
@@ -166,6 +168,16 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
   }, [focusRequested, editing]);
 
   useEffect(() => () => clearPointerDrag(), []);
+
+  useEffect(() => () => {
+    holdWordSelectorRef.current?.cancel();
+    holdWordSelectorRef.current = null;
+  }, []);
+
+  // Leaving the editor removes the fields, so a pending hold has nothing to select.
+  useEffect(() => {
+    if (!editing) holdWordSelectorRef.current?.cancel();
+  }, [editing]);
 
   function clearPointerDrag() {
     const session = pointerDragRef.current;
@@ -338,6 +350,20 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
     }
   }
 
+  // The editor keeps the double-click for saving, so a word is picked by
+  // holding the left button on it. A second click of a double-click is
+  // ignored, because that click belongs to the gesture that saves the card.
+  function handleEditFieldMouseDown(event: ReactMouseEvent<HTMLInputElement | HTMLTextAreaElement>) {
+    if (event.button !== 0) return;
+    if (event.detail > 1) {
+      holdWordSelectorRef.current?.cancel();
+      return;
+    }
+    const selector = holdWordSelectorRef.current ?? new HoldWordSelector();
+    holdWordSelectorRef.current = selector;
+    selector.begin(event.currentTarget, event.clientX, event.clientY);
+  }
+
   async function copyText() {
     await navigator.clipboard.writeText(cardTextForClipboard(item));
     setCopied(true);
@@ -466,8 +492,8 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
           className="edit-form"
           onDoubleClick={(event) => { event.stopPropagation(); void save(); }}
         >
-          <input value={title} onChange={(event) => setTitle(event.target.value)} onKeyDown={handleEditKeyDown} placeholder="Optional title" />
-          <textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={handleEditKeyDown} rows={5} autoFocus />
+          <input value={title} onChange={(event) => setTitle(event.target.value)} onKeyDown={handleEditKeyDown} onMouseDown={handleEditFieldMouseDown} placeholder="Optional title" />
+          <textarea value={content} onChange={(event) => setContent(event.target.value)} onKeyDown={handleEditKeyDown} onMouseDown={handleEditFieldMouseDown} rows={5} autoFocus />
           <small className="edit-hint">Enter saves · Ctrl+Enter saves and adds below · Shift+Enter for a new line · Esc to cancel</small>
         </div>
       ) : (

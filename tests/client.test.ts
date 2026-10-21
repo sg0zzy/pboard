@@ -31,7 +31,7 @@ describe("requestProjectSync", () => {
     await requestProjectSync("p1");
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith({ type: DRIVE_SYNC_MESSAGE, projectId: "p1" });
+    expect(sendMessage).toHaveBeenCalledWith({ type: DRIVE_SYNC_MESSAGE, projectId: "p1", force: true });
   });
 
   it("returns the response object on success", async () => {

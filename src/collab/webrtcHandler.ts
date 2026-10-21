@@ -1,3 +1,11 @@
+import { parseStrictJson } from "./security/canonical";
+import { createPeerHistorySession, isHistoryFrame, type PeerHistorySession } from "./peerHistory";
+/** Live per-peer history sessions, for attachment recovery and cleanup. */
+export type PeerHistorySessionRegistry = { add(session: PeerHistorySession): void; remove(session: PeerHistorySession): void; all(): PeerHistorySession[] };
+import type { CollaborationSecurityOptions } from "./manager";
+import type { RxRepository } from "../storage/rxdbRepository";
+import { validateReplicationRequest } from "./security/replicationRequests";
+import { collaborationDiagnostic } from "./diagnostics";
 // The package root requires Node globals and stream APIs. Use the bundled
 // browser entry, as RxDB's own WebRTC handler does, in extension contexts.
 import Peer from "simple-peer/simplepeer.min.js";
@@ -16,11 +24,11 @@ import type {
 import type { PboardSignaling } from "./signaling";
 import type { SigningInput } from "./security/session";
 import {
-  buildSessionProof, buildSignedSignal, buildPresence, verifySessionProof, verifySignedSignal, createReplayCache,
+  buildSessionProof, buildSignedSignal, buildPresence, verifyPresence, verifySessionProof, verifySignedSignal, createReplayCache,
   type EnvelopeContext, type ProtocolCollection, type VerifiedSessionContext
 } from "./security/session";
 import type { BoardPermissionManifest } from "./security/manifest";
-import { manifestHash, AUTH_TIMEOUT_MS } from "./security/manifest";
+import { manifestHash, manifestIsCurrent, AUTH_TIMEOUT_MS } from "./security/manifest";
 
 /**
  * The simple-peer WebRTC seam. In the browser simple-peer uses the global
@@ -49,8 +57,14 @@ export type PboardWebRTCConnectionOptions = {
    * scoped separately by the replication push modifier.
    */
   scopeDocument?: (doc: unknown) => boolean;
+  existingDocuments?: (ids: string[]) => Promise<unknown[]>;
   /** Await a read-only recovery step after the cooldown, before replacing a failed peer. */
   beforeReconnect?: () => Promise<void>;
+  history?: {
+    repository: RxRepository; security: CollaborationSecurityOptions; beforeReceive?: () => Promise<void>;
+    /** Tracks live sessions so attachment recovery can request missing bytes from peers. */
+    registry?: PeerHistorySessionRegistry;
+  };
   /**
    * Protocol-2 authentication. When set, a peer signals only through signed,
    * session-bound envelopes; both sides exchange challenge proofs after DTLS
@@ -166,12 +180,23 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     const replay = security ? createReplayCache() : { accepted: new Map() };
     /** Per-peer protocol-2 admission state: null until the peer is fully proven. */
     const verified = new Map<string, VerifiedSessionContext>();
+    const histories = new Map<string, PeerHistorySession>();
+    const rejectedPeers = new WeakSet<PboardPeer>();
+    const historyRates = new Map<string, { start: number; count: number }>();
     const authTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const remoteSessions = new Map<string, string>();
     const remoteDeviceKeys = new Map<string, string>();
     const transcripts = new Map<string, string[]>();
     /** Random challenge we sent to each remote peer (proof round-trip binding). */
     const challengesIssued = new Map<string, string>();
+    const proofSent = new Set<string>();
+    const proofVerified = new Map<string, VerifiedSessionContext>();
+    const remoteChallenges = new Map<string, string>();
+    const presenceExpiry = new Map<string, number>();
+    const presenceTasks = new Map<string, Promise<void>>();
+    const activeRoster = new Set<string>();
+    const dataQueues = new Map<string, Promise<void>>();
+    let presenceTimer: ReturnType<typeof setInterval> | undefined;
     let ownSequence = 0;
     let closed = false;
     let ownPeerId: string | null = null;
@@ -184,8 +209,10 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     }
 
     function rejectSession(remotePeerId: string, reason: string) {
+      collaborationDiagnostic("webrtc.session_rejected", { peer: remotePeerId, room: security?.collection });
       if (!closed) security?.onSessionRejected?.(remotePeerId, reason);
-      peers.get(remotePeerId)?.destroy();
+      const historySession = histories.get(remotePeerId); historySession?.close(); if (historySession) options.history?.registry?.remove(historySession); histories.delete(remotePeerId);
+      const peer = peers.get(remotePeerId); if (peer) { rejectedPeers.add(peer); peer.destroy(); }
       verified.delete(remotePeerId);
       const timer = authTimers.get(remotePeerId);
       if (timer) { clearTimeout(timer); authTimers.delete(remotePeerId); }
@@ -193,15 +220,21 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
 
     function createPeerConnection(remotePeerId: string) {
       if (closed || !ownPeerId || remotePeerId === ownPeerId || peers.has(remotePeerId) || reconnectTimers.has(remotePeerId)) return;
+      if (security && (!remoteSessions.has(remotePeerId) || !remoteDeviceKeys.has(remotePeerId) || (presenceExpiry.get(remotePeerId) ?? 0) < now())) return;
       let disconnected = false;
+      let resolveTransportReady!: () => void;
+      const transportReady = new Promise<void>(resolve => { resolveTransportReady = resolve; });
       const peer = new Peer({ initiator: remotePeerId > ownPeerId, wrtc, config, trickle }) as PboardPeer;
       peer.id = remotePeerId;
       peers.set(remotePeerId, peer);
+      collaborationDiagnostic("webrtc.negotiating", { peer: remotePeerId, room: security?.collection });
       const state: HandshakeState = { initiator: remotePeerId > ownPeerId, jsepState: "new" };
       handshake.set(remotePeerId, state);
       // This connection attempt gets a fresh session id; old buffered signals
       // must not migrate to it (plan: reconnection anti-replay).
-      remoteSessions.set(remotePeerId, remoteSessionIdFor(remotePeerId));
+      proofSent.delete(remotePeerId);
+      proofVerified.delete(remotePeerId);
+      remoteChallenges.delete(remotePeerId);
       transcripts.set(remotePeerId, []);
       peer.on("signal", (signal) => {
         if (closed || peers.get(remotePeerId) !== peer) return;
@@ -216,9 +249,24 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
           }
         });
       });
+      let queuedFrames = 0, queuedBytes = 0;
       peer.on("data", (payload) => {
-        if (closed || peers.get(remotePeerId) !== peer) return;
-        void onData(peer, remotePeerId, payload);
+        if (closed || peers.get(remotePeerId) !== peer || rejectedPeers.has(peer)) return;
+        // Bound input before adding async verification work to the FIFO. This
+        // also covers an authenticated peer flooding faster than validation.
+        if (queuedFrames >= 128 || queuedBytes + payload.byteLength > 16 * 1024 * 1024) {
+          rejectSession(remotePeerId, "DataChannel receive queue quota exceeded"); return;
+        }
+        queuedFrames++; queuedBytes += payload.byteLength;
+        const next = (dataQueues.get(remotePeerId) ?? Promise.resolve()).then(async () => {
+          await transportReady;
+          if (peers.get(remotePeerId) === peer && !rejectedPeers.has(peer)) return onData(peer, remotePeerId, payload);
+        }).catch(error => {
+          if (!closed && peers.get(remotePeerId) === peer) rejectSession(remotePeerId, String(error));
+        }).finally(() => {
+          queuedFrames--; queuedBytes -= payload.byteLength;
+        });
+        dataQueues.set(remotePeerId, next);
       });
       peer.on("error", (error) => {
         if (closed || peers.get(remotePeerId) !== peer) return;
@@ -233,21 +281,30 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       });
       peer.on("connect", () => {
         if (closed || peers.get(remotePeerId) !== peer) return;
+        collaborationDiagnostic("webrtc.datachannel_connected", { peer: remotePeerId, room: security?.collection });
         state.transportConnected = true;
+        resolveTransportReady();
         if (security) beginMutualProof(peer, remotePeerId);
         else connect$.next(peer);
       });
       peer.on("close", () => {
+        collaborationDiagnostic("webrtc.closed", { peer: remotePeerId, room: security?.collection });
+        resolveTransportReady();
         if (closed || peers.get(remotePeerId) !== peer) return;
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
         if (peers.get(remotePeerId) === peer) peers.delete(remotePeerId);
         pendingSignals.delete(remotePeerId);
         handshake.delete(remotePeerId);
         verified.delete(remotePeerId);
+        const historySession = histories.get(remotePeerId); historySession?.close(); if (historySession) options.history?.registry?.remove(historySession); histories.delete(remotePeerId); historyRates.delete(remotePeerId);
+        challengesIssued.delete(remotePeerId);
         const timer = authTimers.get(remotePeerId);
         if (timer) { clearTimeout(timer); authTimers.delete(remotePeerId); }
         // Keep roster updates from bypassing the cooldown, and buffer valid
         // incoming signals until the replacement peer is created.
+        proofSent.delete(remotePeerId); proofVerified.delete(remotePeerId); remoteChallenges.delete(remotePeerId);
+        dataQueues.delete(remotePeerId);
+        if (security && !activeRoster.has(remotePeerId)) return;
         reconnectTimers.set(remotePeerId, setTimeout(() => {
           // Keep the timer entry until Drive finishes so roster updates cannot
           // bypass recovery. Shutdown invalidates this attempt without waiting
@@ -261,7 +318,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
             }
             if (closed) return;
             reconnectTimers.delete(remotePeerId);
-            createPeerConnection(remotePeerId);
+            if (!security || activeRoster.has(remotePeerId)) createPeerConnection(remotePeerId);
           })();
         }, 2_000));
       });
@@ -277,25 +334,47 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       }
     }
 
-    /** Stable per-peer session salt for this handler instance (debug aid only). */
-    function remoteSessionIdFor(remotePeerId: string): string {
-      // The *remote* session id is learned from the peer's signed presence; a
-      // placeholder keeps the admission stage deterministic until then.
-      return `${ownSessionId}:${remotePeerId}`;
-    }
-
     /** Complete admission: store the verified context, then emit connect$. */
     function completeAdmission(peer: PboardPeer, remotePeerId: string, context: VerifiedSessionContext) {
       if (closed || peers.get(remotePeerId) !== peer) return;
+      if (verified.has(remotePeerId)) return;
       verified.set(remotePeerId, context);
+      collaborationDiagnostic("webrtc.replication_authorized", { peer: remotePeerId, room: security?.collection });
       const timer = authTimers.get(remotePeerId);
       if (timer) { clearTimeout(timer); authTimers.delete(remotePeerId); }
       security?.onSessionVerified?.(remotePeerId, context);
+      if (options.history && security?.collection !== "accountOrder") {
+        const peerHistorySession = createPeerHistorySession({ ...options.history, context,
+          send: async frame => {
+            // Bound bursts from large histories without depending on an eager
+            // DataChannel implementation's unbounded internal send queue.
+            await new Promise(resolve => setTimeout(resolve, 10));
+            if (closed || peer.destroyed || peers.get(remotePeerId) !== peer) throw new Error("History transport closed");
+            peer.send(JSON.stringify(frame));
+          }, active: () => !closed && peers.get(remotePeerId) === peer && verified.get(remotePeerId) === context,
+          onError: error => {
+            if (closed || peers.get(remotePeerId) !== peer) return;
+            // Classify known failures without exposing document/error payloads.
+            const message = error.message;
+            const code = /acknowledgement timed out/.test(message) ? "ack-timeout"
+              : /no longer authorized|authorization|manifest/.test(message) ? "authorization"
+              : /changed continuously/.test(message) ? "busy"
+              : /quota|exceeds|limit|capacity|rate/.test(message) ? "quota"
+              : /Unexpected|Invalid history acknowledgement|unoffered/.test(message) ? "protocol"
+              : /Mutation|proof|signature|ancestry/.test(message) ? "proof" : "projection";
+            rejectSession(remotePeerId, `Causal history exchange failed (${code}); local history remains retained`);
+          }
+        });
+        histories.set(remotePeerId, peerHistorySession);
+        options.history?.registry?.add(peerHistorySession);
+      }
       connect$.next(peer);
     }
 
-    function transcriptHashFor(remotePeerId: string): string {
-      return hashTranscript(transcripts.get(remotePeerId) ?? []);
+    async function transcriptHashFor(remotePeerId: string): Promise<string> {
+      const bytes = new TextEncoder().encode((transcripts.get(remotePeerId) ?? []).join("\u0000"));
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
     }
 
     /** SDP description transcript entry: the type plus the exact emitted SDP text. */
@@ -306,22 +385,14 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       return `${type}:`;
     }
 
-    /** Ordered offer/answer transcript hash; binds proofs to this connection. */
-    function hashTranscript(transcript: string[]): string {
-      const joined = transcript.join("\u0000");
-      return Array.from(new TextEncoder().encode(joined), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    }
-
-    // Protocol-2 flow helpers. All envelope construction/verification lives in
-    // security/session; this handler only sequences the exchange.
-
     async function sendSigned(remotePeerId: string, signal: unknown): Promise<void> {
       if (!security || !signedManifest) {
         await signaling.sendSignal(remotePeerId, signal);
         return;
       }
-      const remoteSession = remoteSessions.get(remotePeerId) ?? remoteSessionIdFor(remotePeerId);
-      const remoteDevice = remoteDeviceKeys.get(remotePeerId) ?? remotePeerId;
+      const remoteSession = remoteSessions.get(remotePeerId);
+      const remoteDevice = remoteDeviceKeys.get(remotePeerId);
+      if (!remoteSession || !remoteDevice) throw new Error("Remote session has no verified presence");
       const signedEnvelope = await buildSignedSignal(
         { privateJwk: security.signer.privateJwk, deviceKeyId: security.signer.deviceKeyId },
         { boardId: security.boardId, collection: security.collection, manifest: signedManifest, ownSessionId, now: now() },
@@ -333,29 +404,34 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       await signaling.sendSignal(remotePeerId, signedEnvelope);
     }
 
-    /** Starts the post-DTLS mutual proof: send our proof, arm the auth timeout. */
+    /** Challenge is issued over this DTLS channel and answered by the remote key. */
     function beginMutualProof(peer: PboardPeer, remotePeerId: string) {
-      if (!security || !signedManifest) return;
-      const remoteSession = remoteSessions.get(remotePeerId) ?? remoteSessionIdFor(remotePeerId);
-      const remoteDevice = remoteDeviceKeys.get(remotePeerId) ?? remotePeerId;
+      if (!security || challengesIssued.has(remotePeerId)) return;
       const challenge = crypto.randomUUID();
       challengesIssued.set(remotePeerId, challenge);
-      const timeout = setTimeout(() => {
-        rejectSession(remotePeerId, `Mutual authentication timed out after ${AUTH_TIMEOUT_MS}ms`);
-      }, AUTH_TIMEOUT_MS);
-      authTimers.set(remotePeerId, timeout);
-      void (async () => {
-        const proof = await buildSessionProof(
-          { privateJwk: security.signer.privateJwk, deviceKeyId: security.signer.deviceKeyId },
-          {
-            boardId: security.boardId, collection: security.collection,
-            ownSessionId, remoteDeviceKeyId: remoteDevice, remoteSessionId: remoteSession,
-            manifest: signedManifest
-          },
-          challenge, transcriptHashFor(remotePeerId), now()
-        );
-        if (!closed && peers.get(remotePeerId) === peer) peer.send(JSON.stringify({ protocol: 2, kind: "sessionProof", proof }));
-      })().catch((error) => rejectSession(remotePeerId, `Proof construction failed: ${String(error)}`));
+      authTimers.set(remotePeerId, setTimeout(() => {
+        if (!closed && peers.get(remotePeerId) === peer) rejectSession(remotePeerId, "Mutual authentication timed out");
+      }, AUTH_TIMEOUT_MS));
+      peer.send(JSON.stringify({ protocol: 2, kind: "sessionChallenge", challenge }));
+    }
+
+    async function answerChallenge(peer: PboardPeer, remotePeerId: string, parsed: { challenge?: unknown; protocol?: unknown }) {
+      if (!security || !signedManifest || parsed.protocol !== 2 || !handshake.get(remotePeerId)?.transportConnected ||
+          typeof parsed.challenge !== "string" || !/^[A-Za-z0-9-]{16,100}$/.test(parsed.challenge) || remoteChallenges.has(remotePeerId)) {
+        throw new Error("Invalid or repeated DTLS challenge");
+      }
+      remoteChallenges.set(remotePeerId, parsed.challenge);
+      const remoteSessionId = remoteSessions.get(remotePeerId);
+      const remoteDeviceKeyId = remoteDeviceKeys.get(remotePeerId);
+      if (!remoteSessionId || !remoteDeviceKeyId) throw new Error("Missing verified session identity");
+      const proof = await buildSessionProof(security.signer, { boardId: security.boardId,
+        collection: security.collection, ownSessionId, remoteSessionId, remoteDeviceKeyId, manifest: signedManifest },
+        parsed.challenge, await transcriptHashFor(remotePeerId), now());
+      if (closed || peers.get(remotePeerId) !== peer) return;
+      peer.send(JSON.stringify({ protocol: 2, kind: "sessionProof", proof }));
+      proofSent.add(remotePeerId);
+      const context = proofVerified.get(remotePeerId);
+      if (context) completeAdmission(peer, remotePeerId, context);
     }
 
     /** Application data gate: only fully proven sessions may deliver frames. */
@@ -363,6 +439,12 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       let parsed: unknown;
       try { parsed = JSON.parse(new TextDecoder().decode(payload)); }
       catch { rejectSession(remotePeerId, "Unparseable data channel frame"); return; }
+      if (security && (!signedManifest || !manifestIsCurrent(signedManifest, now()))) {
+        rejectSession(remotePeerId, "Authorization manifest expired"); return;
+      }
+      if (security && parsed && typeof parsed === "object" && "kind" in parsed && parsed.kind === "sessionChallenge") {
+        await answerChallenge(peer, remotePeerId, parsed as { challenge?: unknown; protocol?: unknown }); return;
+      }
       if (isProofFrame(parsed)) {
         if (security) { await acceptSessionProof(peer, remotePeerId, parsed); }
         return;
@@ -373,6 +455,15 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         rejectSession(remotePeerId, "Application frame received before mutual authentication");
         return;
       }
+      if (isHistoryFrame(parsed)) {
+        const history = histories.get(remotePeerId);
+        if (!history) { rejectSession(remotePeerId, "History is unavailable for this room"); return; }
+        const rate = historyRates.get(remotePeerId) ?? { start: now(), count: 0 };
+        if (now() - rate.start >= 1000) { rate.start = now(); rate.count = 0; }
+        historyRates.set(remotePeerId, rate);
+        if (payload.byteLength > 65536 || ++rate.count > 200) throw new Error("History frame quota exceeded");
+        await history.receive(parseStrictJson(new TextDecoder().decode(payload), 65536)); return;
+      }
       // Replication wire frames carry an `id` plus either `result` (a response)
       // or `method`/`params` (a request); the shapes are RxDB contract.
       if (parsed && typeof parsed === "object" && "id" in parsed && typeof parsed.id === "string" &&
@@ -380,6 +471,11 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         if ("result" in parsed) {
           response$.next({ peer, response: { ...parsed, id: parsed.id, result: scopeResult(parsed.result) } as WebRTCResponse });
         } else {
+          if (security) {
+            try {
+              await validateReplicationRequest(parsed as { method: string; params?: unknown }, scopeDocument ?? (() => false), options.existingDocuments);
+            } catch (error) { rejectSession(remotePeerId, String(error)); return; }
+          }
           message$.next({ peer, message: parsed as WebRTCMessage });
         }
       }
@@ -392,41 +488,32 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     /** Verifies the remote proof, answers with our own, completes admission. */
     async function acceptSessionProof(peer: PboardPeer, remotePeerId: string, parsed: unknown) {
       if (!security || !signedManifest) return;
-      const remoteSession = remoteSessions.get(remotePeerId) ?? remoteSessionIdFor(remotePeerId);
+      const remoteSession = remoteSessions.get(remotePeerId);
       const frame = (parsed as { proof?: unknown }).proof;
-      const context = verified.get(remotePeerId);
+
       try {
         const verifiedProof = await verifySessionProof(frame, signedManifest, {
           boardId: security.boardId, collection: security.collection,
           ownDeviceKeyId: security.signer.deviceKeyId, ownSessionId,
           manifestHash: manifestHash(signedManifest),
           issuedChallenge: challengeIssuedTo(remotePeerId),
-          transcriptHash: transcriptHashFor(remotePeerId),
+          transcriptHash: await transcriptHashFor(remotePeerId),
           now: now()
         });
-        remoteDeviceKeys.set(remotePeerId, verifiedProof.deviceKeyId);
-        if (!context) {
-          // First proof received: answer with our own proof, then complete.
-          completeAdmission(peer, remotePeerId, {
-            boardId: security.boardId,
-            collection: security.collection,
-            ownDeviceKeyId: security.signer.deviceKeyId,
-            remoteDeviceKeyId: verifiedProof.deviceKeyId,
-            remoteRole: verifiedProof.role,
-            ownSessionId,
-            remoteSessionId: String((frame as { payload?: { fromSessionId?: unknown } }).payload?.fromSessionId ?? remoteSession),
-            manifestEpoch: signedManifest.epoch,
-            manifestHash: manifestHash(signedManifest),
-            transcriptHash: transcriptHashFor(remotePeerId),
-            manifestExpiresAt: signedManifest.expiresAt
-          });
-          beginMutualProof(peer, remotePeerId);
-        } else if (verified.has(remotePeerId)) {
-          // Both proofs complete.
-          completeAdmission(peer, remotePeerId, { ...context, remoteDeviceKeyId: verifiedProof.deviceKeyId, remoteRole: verifiedProof.role });
-        }
+        const payload = (frame as { payload: { fromSessionId: string } }).payload;
+        if (verifiedProof.deviceKeyId !== remoteDeviceKeys.get(remotePeerId) || payload.fromSessionId !== remoteSession || !challengesIssued.has(remotePeerId)) throw new Error("Proof sender/session differs from verified presence");
+        const context: VerifiedSessionContext = {
+          boardId: security.boardId, collection: security.collection,
+          ownDeviceKeyId: security.signer.deviceKeyId, remoteDeviceKeyId: verifiedProof.deviceKeyId,
+          remoteRole: verifiedProof.role, ownSessionId, remoteSessionId: payload.fromSessionId,
+          manifestEpoch: signedManifest.epoch, manifestHash: manifestHash(signedManifest),
+          transcriptHash: await transcriptHashFor(remotePeerId), manifestExpiresAt: signedManifest.expiresAt
+        };
+        if (closed || peers.get(remotePeerId) !== peer) return;
+        proofVerified.set(remotePeerId, context);
+        if (proofSent.has(remotePeerId)) completeAdmission(peer, remotePeerId, context);
       } catch (error) {
-        rejectSession(remotePeerId, `Session proof rejected: ${error instanceof Error ? error.message : String(error)}`);
+        if (!closed && peers.get(remotePeerId) === peer) rejectSession(remotePeerId, `Session proof rejected: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
@@ -436,9 +523,33 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     }
 
     function handleRoster(roster: string[]) {
-      if (closed || !ownPeerId) return;
+      if (closed) return;
+      activeRoster.clear(); roster.forEach(id => activeRoster.add(id));
+      if (security) for (const [id, peer] of peers) if (!activeRoster.has(id)) {
+        remoteSessions.delete(id); remoteDeviceKeys.delete(id); presenceExpiry.delete(id);
+        challengesIssued.delete(id); peer.destroy();
+      }
+      if (!ownPeerId) return;
       for (const id of roster) createPeerConnection(id);
     }
+
+    signaling.onPresence?.((from, envelope) => {
+      if (!security || !signedManifest || closed || from === ownPeerId) return;
+      const task = (async () => {
+        const identity = await verifyPresence(envelope.presence, signedManifest, {
+          boardId: security.boardId, collection: security.collection, manifestHash: manifestHash(signedManifest), now: now()
+        });
+        if (closed) return;
+        if (remoteSessions.has(from) && remoteSessions.get(from) !== identity.sessionId) {
+          // Retire the prior incarnation before replacing its verified identity.
+          peers.get(from)?.destroy(); challengesIssued.delete(from);
+        }
+        remoteSessions.set(from, identity.sessionId); remoteDeviceKeys.set(from, identity.deviceKeyId);
+        presenceExpiry.set(from, (envelope.presence as { payload: { expiresAt: number } }).payload.expiresAt);
+        if (activeRoster.has(from)) createPeerConnection(from);
+      })().catch(error => security.onSessionRejected?.(from, `Presence rejected: ${String(error)}`));
+      presenceTasks.set(from, task);
+    });
 
     /** Buffer or apply a verified inner signal for a remote peer. */
     function applyOrBufferVerifiedSignal(from: string, data: unknown) {
@@ -449,6 +560,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         // dropped. Before `join()` resolves the role is unknown, so buffer everything.
         if (ownPeerId && !signalIsValid({ initiator: from > ownPeerId, jsepState: "new" }, data)) return;
         const list = pendingSignals.get(from) ?? [];
+        if (list.length >= 32) return;
         list.push(data);
         pendingSignals.set(from, list);
         return;
@@ -470,7 +582,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       // signal arrives through the transport's `security` member when supported.
       void (async () => {
         try {
-          const innerSignal = (data && typeof data === "object" && "signal" in data) ? data.signal : undefined;
+          await presenceTasks.get(from);
           const check = {
             manifest: signedManifest,
             expected: {
@@ -486,8 +598,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
           const envelope = (data && typeof data === "object" && "payload" in data ? data : null) as { payload?: { fromSessionId?: unknown; fromDeviceKeyId?: unknown } } | null;
           const payloadSession = envelope?.payload?.fromSessionId;
           const payloadDevice = envelope?.payload?.fromDeviceKeyId;
-          if (typeof payloadSession === "string") remoteSessions.set(from, payloadSession);
-          if (typeof payloadDevice === "string") remoteDeviceKeys.set(from, payloadDevice);
+          if (payloadSession !== remoteSessions.get(from) || payloadDevice !== remoteDeviceKeys.get(from)) throw new Error("Signal sender/session has no matching verified presence");
           applyOrBufferVerifiedSignal(from, verifiedSignal);
         } catch (error) {
           security.onSessionRejected?.(from, `Signal envelope rejected: ${error instanceof Error ? error.message : String(error)}`);
@@ -515,6 +626,17 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
             { boardId: security.boardId, collection: security.collection, manifest: signedManifest, ownSessionId, now: now() }
           );
           await signaling.publishPresence({ manifest: signedManifest, presence });
+          presenceTimer = setInterval(() => {
+            if (closed) return;
+            if (!manifestIsCurrent(signedManifest, now())) {
+              for (const id of peers.keys()) rejectSession(id, "Authorization manifest expired");
+              return;
+            }
+            void buildPresence(security.signer, { boardId: security.boardId, collection: security.collection,
+              manifest: signedManifest, ownSessionId, now: now() }).then(value => signaling.publishPresence?.({ manifest: signedManifest, presence: value })).catch(error => {
+                if (!closed) error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+              });
+          }, 30_000);
         }
         for (const id of new Set([...initial, ...latestRoster])) createPeerConnection(id);
       } catch (error) {
@@ -526,12 +648,22 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
     const handler: WebRTCConnectionHandler<PboardPeer> = {
       connect$, disconnect$, message$, response$, error$,
       async send(peer, message) {
+        // In-flight replication reads can finish after stop/disconnect. Their
+        // responses belong to the old session; a reconnect starts a fresh pool.
+        if (closed || peer.destroyed || rejectedPeers.has(peer)) return;
+        // Send authenticated history first so an RxDB observation can reuse its
+        // original identity instead of manufacturing unknown ancestry.
+        await histories.get(String(peer.id))?.flush();
+        if (closed || peer.destroyed || rejectedPeers.has(peer)) return;
         peer.send(JSON.stringify(message));
       },
       async close() {
         closed = true;
+        clearInterval(presenceTimer);
+        for (const timer of authTimers.values()) clearTimeout(timer);
         for (const timer of reconnectTimers.values()) clearTimeout(timer);
         reconnectTimers.clear();
+        for (const history of histories.values()) { history.close(); options.history?.registry?.remove(history); } histories.clear();
         for (const peer of peers.values()) peer.destroy();
         handshake.clear();
         peers.clear();

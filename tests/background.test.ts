@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { browser } from "../src/platform/browser";
-import { googleDrive } from "../src/sync/browser";
+import { googleDrive, driveSyncState } from "../src/sync/browser";
 import { DRIVE_PROJECT_STATE_PREFIX } from "../src/sync/state";
 import {
   DRIVE_RECONCILE_MESSAGE,
   DRIVE_SYNC_MESSAGE,
 } from "../src/sync/messages";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../src/sync/background";
+import { recoveryDelayMs } from "../src/sync/recoveryScheduler";
 
 vi.mock("../src/platform/browser", () => ({
   browser: {
@@ -16,6 +17,11 @@ vi.mock("../src/platform/browser", () => ({
       getExtensionState: vi.fn(),
     },
     storage: {
+      local: {
+        get: vi.fn(async (key: string) => ({})),
+        set: vi.fn(async () => undefined),
+        remove: vi.fn(async () => undefined),
+      },
       onChanged: {
         addListener: vi.fn(),
         removeListener: vi.fn(),
@@ -37,6 +43,7 @@ vi.mock("../src/sync/browser", () => ({
     syncProject: vi.fn(),
     getConnectionState: vi.fn(),
   },
+  driveSyncState: { get: vi.fn(async () => ({ dirty: false, status: "synced" })) },
 }));
 
 const browserMock = vi.mocked(browser);
@@ -90,6 +97,7 @@ function driveState(projectId: string, overrides: Record<string, unknown> = {}) 
 
 beforeEach(() => {
   connected("connected");
+  vi.mocked(driveSyncState.get).mockResolvedValue({ projectId: "p1", dirty: false, status: "synced" });
   reconcileAll.mockResolvedValue(reconcileResult);
   syncProject.mockResolvedValue("pushed");
 });
@@ -233,6 +241,28 @@ describe("registerDriveBackgroundSync", () => {
     expect(syncProject).toHaveBeenCalledWith("p1");
   });
 
+  it("applies bounded durable exponential backoff after a failed alarm retry and clears on progress", async () => {
+    const alarm = alarmListener();
+    syncProject.mockRejectedValueOnce(new Error("Drive unavailable")).mockRejectedValueOnce(new Error("Drive unavailable")).mockResolvedValue("pushed");
+    vi.mocked(browser.storage.local.get).mockResolvedValue({});
+    await alarm({ name: "pboard-drive-sync:p1" });
+    await awaitMicrotasks(6);
+    // The first failure schedules the second ceiling's jitter and stores the attempt.
+    expect(browser.storage.local.set).toHaveBeenCalledWith({ "pboard-drive-retry:p1": 1 });
+    vi.mocked(browser.storage.local.get).mockImplementation(async () => ({ "pboard-drive-retry:p1": 1 }));
+    await alarm({ name: "pboard-drive-sync:p1" });
+    await awaitMicrotasks(6);
+    expect(browser.storage.local.set).toHaveBeenCalledWith({ "pboard-drive-retry:p1": 2 });
+    // Verified progress clears the durable attempt state.
+    await alarm({ name: "pboard-drive-sync:p1" });
+    await awaitMicrotasks(6);
+    expect(browser.storage.local.remove).toHaveBeenCalledWith("pboard-drive-retry:p1");
+    // Bounded: attempt indices clamp at the final 30s ceiling.
+    // attempt indices clamp at the final 30s ceiling; jitter stays within [half, ceiling].
+    const clamped = recoveryDelayMs({ attempt: 99, random: () => 0.5 }, 0);
+    expect(clamped).toBeGreaterThanOrEqual(15_000); expect(clamped).toBeLessThanOrEqual(30_000);
+  });
+
   it("ignores alarm names that are not a drive-sync alarm", async () => {
     const listener = alarmListener();
     listener({ name: "other" });
@@ -249,4 +279,33 @@ describe("registerDriveBackgroundSync", () => {
     expect(syncProject).toHaveBeenCalledTimes(1);
     expect(syncProject).toHaveBeenCalledWith("p2");
   });
+});
+
+
+it('does not clear recovery backoff when a resolved sync leaves durable work pending', async () => {
+  const alarm = alarmListener();
+  syncProject.mockResolvedValue('not-dirty');
+  vi.mocked(driveSyncState.get).mockResolvedValue({ projectId: 'p1', dirty: true, status: 'pending' });
+  vi.mocked(browser.storage.local.get).mockResolvedValue({ 'pboard-drive-retry:p1': 2 });
+  alarm({ name: 'pboard-drive-sync:p1' }); await awaitMicrotasks(12);
+  expect(browser.storage.local.remove).not.toHaveBeenCalled();
+  expect(browser.storage.local.set).toHaveBeenCalledWith({ 'pboard-drive-retry:p1': 3 });
+  expect(alarmsCreate).toHaveBeenCalled();
+});
+it('keeps retrying explicit private deletion while disconnected', async () => {
+  vi.mocked(googleDrive.getConnectionState).mockResolvedValue('disconnected');
+  vi.mocked(driveSyncState.get).mockResolvedValue({ projectId: 'p1', dirty: true, status: 'pending', permanentDeletion: true });
+  const listener = alarmListener();
+  syncProject.mockResolvedValue('not-dirty');
+  listener({ name: 'pboard-drive-sync:p1' });
+  await awaitMicrotasks(20);
+  expect(alarmsCreate).toHaveBeenCalled();
+  expect(browser.storage.local.remove).not.toHaveBeenCalled();
+});
+it('routes an explicit sync to an immediate provider pass and returns its actual pending state', async () => {
+  syncProject.mockResolvedValue('not-dirty');
+  vi.mocked(driveSyncState.get).mockResolvedValue({ projectId: 'p1', dirty: true, status: 'pending' });
+  const result = await handleDriveSyncMessage({ type: DRIVE_SYNC_MESSAGE, projectId: 'p1', force: true });
+  expect(syncProject).toHaveBeenCalledWith('p1', { force: true });
+  expect(result).toEqual({ ok: true, result: 'not-dirty', pending: true });
 });

@@ -30,6 +30,7 @@ The implemented product behavior and limitations are recorded in [`SPECIFICATION
 - Ctrl+middle-click a card to duplicate it directly beneath the original as a Candidate; Command+middle-click provides the same behavior on macOS.
 - After saving an edited or middle-click-created card, press Enter again to open the next draft directly below it.
 - Double-click a card to edit it; save with Enter or another double-click, and copy its text (tagged by category and status, e.g., `[issue] [confirmed]`) with the overlapping-sheets copy action.
+- While editing a card, keep the left mouse button pressed on a word to select it; releasing the button keeps the word selected. Moving the pointer cancels the selection, and the double-click that saves the card keeps working.
 - Use Ctrl+Enter while editing to save without arming the follow-up Enter shortcut that creates a card below; Command+Enter is the macOS equivalent.
 - While editing a card, Tab and Shift+Tab cycle through its controls and text fields without leaving the card.
 - Cancel card editing with Escape while keeping that card selected for continued keyboard navigation.
@@ -57,6 +58,7 @@ The implemented product behavior and limitations are recorded in [`SPECIFICATION
 - Image cards render the stored image above the card text; captures keep the source page URL and title.
 - Copy the current board as a clean, structured prompt: ongoing cards in their board order, then Done cards, then Rejected cards. Trash is excluded; every exported card carries its category and status tags (e.g., `[issue] [confirmed]`).
 - Download the current board as a zip: `board.txt` holds the exact copy-board prompt, and `images/` holds every card image the board displays (shared images once, trash excluded). The browser download starts only once the whole archive is built.
+- Use **Import pboard** to restore a downloaded ZIP as a new local board. New downloads include `board.json` for structured restoration. Older ZIPs import prompt text and images with a notice about missing title/image associations; existing boards are preserved.
 - Persist boards in RxDB/IndexedDB and images in a separate local Blob store across browser restarts; extension preferences and Drive credentials remain in browser extension storage. The legacy repository is retained for migration, fallback, and rollback.
 - Reopen the Pboard sidebar from Firefox's toolbar button or `Alt+Shift+P`, even after it has been closed or replaced by another sidebar such as Bookmarks.
 

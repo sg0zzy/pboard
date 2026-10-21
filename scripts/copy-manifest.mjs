@@ -1,4 +1,4 @@
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { globSync } from "node:fs";
 import { dirname, basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,4 +29,15 @@ for (const iconPath of logoIcons) {
     iconPath,
     join(root, outputDir, "icons", basename(iconPath))
   );
+}
+
+// Local experiment only: tracked manifests and OAuth declarations are untouched.
+if (process.env.PBOARD_SIGNALING_DEV_BUILD === '1') {
+  const path = join(root, outputDir, 'manifest.json');
+  const manifest = JSON.parse(await readFile(path, 'utf8'));
+  const endpoint = new URL(process.env.VITE_PBOARD_SIGNALING_WS_URL || 'ws://127.0.0.1:8787/ws');
+  const scheme = endpoint.protocol === 'wss:' ? 'https:' : 'http:';
+  manifest.name = 'Pboard (signaling experiment)';
+  manifest.host_permissions.push(`${scheme}//${endpoint.hostname}/*`);
+  await writeFile(path, JSON.stringify(manifest, null, 2) + '\n');
 }

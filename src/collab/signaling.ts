@@ -51,6 +51,8 @@ export interface PboardSignaling {
    * in the peer's own record; insecure providers (memory/tests) ignore it.
    */
   publishPresence?(presence: SignedPresenceEnvelope): Promise<void>;
+  /** Signed remote identity; receiver verifies against its own pinned manifest. */
+  onPresence?(handler: (peerId: string, envelope: SignedPresenceEnvelope) => void): void;
   /** Report transport failures after join, such as a failed presence poll. */
   onError?(handler: (error: unknown) => void): void;
   /** Leave the room and release transport resources. */
@@ -308,6 +310,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   const security = options.security ?? null;
   const replay: ReplayCache = security ? createReplayCache() : { accepted: new Map() };
   let presenceEnvelope: SignedPresenceEnvelope | null = null;
+  let onPresence: ((peerId: string, envelope: SignedPresenceEnvelope) => void) | null = null;
   let outboxSequence = 0;
 
   let onRoster: ((peerIds: string[]) => void) | null = null;
@@ -364,7 +367,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
         const pruned = own.outbox.filter((s) => now - (s.sentAt ?? own.updatedAt) < signalTtlMs);
         await store.writeOwn({
           updatedAt: now, peers: own.peers, outbox: pruned,
-          ...(security && presenceEnvelope ? { security: presenceEnvelope } : {})
+          ...(presenceEnvelope ? { security: presenceEnvelope } : {})
         });
       });
       // (b) Read every peer, deliver new signals, then reconcile presence.
@@ -372,6 +375,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       if (!started) return;
       for (const [peerId, record] of Object.entries(all)) {
         if (peerId === me || !record || now - record.updatedAt >= presenceTtlMs) continue;
+        if (record.security?.presence) onPresence?.(peerId, record.security);
         const seen = delivered.get(peerId) ?? new Set<string>();
         // Bound per-remote-session pending work before verification (flood guard).
         const incoming = record.outbox.filter((s) => s.toPeerId === me && now - (s.sentAt ?? record.updatedAt) < signalTtlMs).slice(0, MAX_PENDING_SIGNALS_PER_SESSION);
@@ -443,9 +447,10 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       own.peers = Array.from(new Set([...own.peers, to]));
       await store.writeOwn({
         updatedAt: now, peers: own.peers, outbox: own.outbox,
-        ...(security && presenceEnvelope ? { security: presenceEnvelope } : {})
+        ...(presenceEnvelope ? { security: presenceEnvelope } : {})
       });
     }); },
+    onPresence(handler) { onPresence = handler; },
     publishPresence(envelope) {
       presenceEnvelope = envelope;
       return Promise.resolve();

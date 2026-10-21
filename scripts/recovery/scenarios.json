@@ -1,0 +1,624 @@
+{
+  "version": 1,
+  "contract": "docs/architecture/synchronization-contract.md",
+  "scope": "Component/native fixture evidence is not a full acceptance or release claim.",
+  "scenarios": [
+    {
+      "id": "M01",
+      "scenario": "Fresh installation, no Google account",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Local offline RxDB/image/export component covered; full UI/remote-activity boundary still needs browser/platform coverage.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "M02",
+      "scenario": "Successful Google connection with required platform permissions",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Operating-mode/account-generation lifecycle is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "M03",
+      "scenario": "Google connection fails or is cancelled",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Operating-mode/account-generation lifecycle is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "M04",
+      "scenario": "Browser denies rendezvous host permission",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Operating-mode/account-generation lifecycle is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "M05",
+      "scenario": "Login with previously unbound local boards",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Connect-time durable disclosure enrolls previously unbound local boards via an explicit allowBinding gate; bounded boards and their local data are retained. Full UI/account-generation lifecycle and live-account coverage remain.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "src/sidebar/components/DriveSyncControls.tsx",
+        "tests/background.test.ts"
+      ]
+    },
+    {
+      "id": "M06",
+      "scenario": "Explicit logout",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Private causal recovery component now passes this regression; broader transport/lifecycle acceptance remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "M07",
+      "scenario": "Switch from account A to account B",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Established durable board/account bindings are enforced and an unbound local board is never uploaded to another connected account through reconciliation; binding enrollment for previously unbound boards happens through the disclosed connect gate. Full UI/account-generation lifecycle acceptance remains Job 11.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "M08",
+      "scenario": "Restart or resume with an existing account connection",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Operating-mode/account-generation lifecycle is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "PR01",
+      "scenario": "A user's original device is permanently unavailable; a fresh device has only Google login",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Component and native Chromium restore private history, images, conflicts, drafts and resolutions after source-profile destruction with no peers or legacy discovery. Google HTTP is simulated; full platform/lifecycle acceptance remains open.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts"
+      ]
+    },
+    {
+      "id": "PR02",
+      "scenario": "Recovered private data includes a previously signed shared-board copy",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Signed bytes and detached causal proofs restore without authority keys, pins or grants. Complete trusted authority recovery and live Google remain unverified.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "S01",
+      "scenario": "Drive acknowledges current state and attachments; no peers online; signaling healthy",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "The four contract labels with approved precedence (Local only, Conflict requires resolution, Synchronization pending, Synced) are implemented as a tested resolver: src/sync/boardStatus.ts. UI wiring into the sidebar status surface and live peer/acknowledgement integration remain.",
+      "evidence": [
+        "tests/boardStatus.test.ts",
+        "src/sync/boardStatus.ts"
+      ]
+    },
+    {
+      "id": "S02",
+      "scenario": "Peers receive edits but Drive is unavailable",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Unified, causally acknowledged user-visible status is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "S03",
+      "scenario": "Drive succeeds but signaling is unavailable",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Unified, causally acknowledged user-visible status is not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "S04",
+      "scenario": "An unresolved conflict is safely persisted remotely",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Private history durably preserves unresolved variants and manual drafts; conflict panel remains visible after backup. Unified synchronization status remains pending.",
+      "evidence": [
+        "tests/recovery/conflictResolution.test.ts",
+        "tests/conflictResolutionControls.test.tsx",
+        "tests/recovery/privateDriveHistory.test.ts"
+      ]
+    },
+    {
+      "id": "C01",
+      "scenario": "Same change delivered twice or by both Drive and WebRTC",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Private persistence and authenticated peer history deduplicate content IDs, offer only missing changes and scope receipts by destination. Complete mode/platform acceptance remains open.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C02",
+      "scenario": "A change demonstrably descends from the current variant",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Proven descendants outrank reversed document clocks in private history and the existing RxDB conflict handler; native same/different-account WebRTC tests pass. Full lifecycle/platform acceptance remains open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C03",
+      "scenario": "Two devices edit different cards from the same board state",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Private history and authenticated peer exchange preserve independent offline card edits; full cross-platform/recovery lifecycle acceptance remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C04",
+      "scenario": "Two devices change independent fields of one card with a known common ancestor",
+      "nextJob": 6,
+      "status": "partial",
+      "reason": "Engine creates unsigned previews for independent title/content/display-mode fields with a unique common ancestor; originals persist. Authorized publication and cross-document invariants await integration.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts"
+      ]
+    },
+    {
+      "id": "C05",
+      "scenario": "Devices make the same value change from a common ancestor",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Peer exchange retains concurrent text branches and transfers a newly signed reviewed resolution. Historical authorization, offline policy and full platform acceptance remain open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C06",
+      "scenario": "Devices change the same text field to different values",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Signed offline text variants survive native two-browser reconnect and require explicit resolution. Full offline/historical permission acceptance remains open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/conflictResolution.test.ts",
+        "tests/conflictResolutionControls.test.tsx",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C07",
+      "scenario": "Concurrent structural edits, incompatible template/type changes, or insufficient ancestry",
+      "nextJob": 6,
+      "status": "partial",
+      "reason": "Engine preserves unknown ancestry, structural changes and incompatible project changes conservatively. Board-wide invariants and transport intake remain pending.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts"
+      ]
+    },
+    {
+      "id": "C08",
+      "scenario": "Concurrent card/board ordering changes",
+      "nextJob": 6,
+      "status": "partial",
+      "reason": "Engine conservatively retains incompatible orderKey changes as conflicts. Deterministic board ordering and transport integration remain pending.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts"
+      ]
+    },
+    {
+      "id": "C09",
+      "scenario": "A stale device reconnects after a conflict exists",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Missing ancestry remains retained; bounded peer exchange accepts parent/child arrival order and reprojects after new records. Complete lifecycle/platform acceptance remains open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "C10",
+      "scenario": "Clock skew, clock rollback or delayed delivery",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Ancestry outranks reversed document clocks through native WebRTC/RxDB and private persistence. Complete credential/sleep/account lifecycle remains open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "D01",
+      "scenario": "An authorized deletion with no concurrent content change",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Private and peer history retain causal tombstones and source proofs. Complete shared-board deletion/permission acceptance remains open.",
+      "evidence": [
+        "tests/sync.test.ts",
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "D02",
+      "scenario": "Deletion concurrent with an edit",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Authenticated peer exchange retains edit/delete branches; private history and global UI preserve hidden-board evidence. Board-wide deletion resolution and offline permission acceptance remain open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "D03",
+      "scenario": "A replica acknowledges an edit and later observes an authorized descendant deletion",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Retained history prevents ancestor resurrection and catches up after reconnect/database loss. Complete lifecycle/platform acceptance remains open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "D04",
+      "scenario": "User removes a board from their own list",
+      "nextJob": 5,
+      "status": "partial",
+      "reason": "Account-only removal/preference handling is tested under fixtures; independent-path deletion/account-binding migration remains incomplete.",
+      "evidence": [
+        "tests/accountPreferences.test.ts"
+      ]
+    },
+    {
+      "id": "D05",
+      "scenario": "User deletes a shared board",
+      "nextJob": 5,
+      "status": "gap",
+      "reason": "Persistent edit/delete and concurrent resolution semantics are not implemented yet.",
+      "evidence": []
+    },
+    {
+      "id": "D06",
+      "scenario": "Authorized editor resolves a card/content conflict",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Native signed offline authors exchange an explicit authorized two-parent resolution, retaining source variants. Private backups recover the proof without authority transfer. Board-wide and historical permission cases remain open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/conflictResolution.test.ts",
+        "tests/conflictResolutionControls.test.tsx",
+        "services/pboard-signaling/secure-browser-smoke.mjs",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts"
+      ]
+    },
+    {
+      "id": "D07",
+      "scenario": "Another change or another resolution arrives concurrently",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Stale reviews and concurrent resolutions remain retained; separate personal drafts stay local/private. Transported history is authenticated, but complete historical/offline permissions remain open.",
+      "evidence": [
+        "tests/recovery/causalReconciliation.test.ts",
+        "tests/recovery/changeJournal.test.ts",
+        "tests/recovery/conflictResolution.test.ts",
+        "tests/conflictResolutionControls.test.tsx",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "D08",
+      "scenario": "Viewer, revoked device or unknown identity attempts resolution",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Resolution rejects viewers, expired/revoked/missing grants, foreign-authority variants, cross-board requests and editor board-deletion decisions. Durable offline-role policies and transport-level resolution acceptance remain incomplete.",
+      "evidence": [
+        "tests/securityAdversarial.test.ts",
+        "tests/recovery/conflictResolution.test.ts",
+        "tests/conflictResolutionControls.test.tsx"
+      ]
+    },
+    {
+      "id": "A01",
+      "scenario": "Same Google identity on a new device",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Verified-identity fixture and native same-account enrollment work in opt-in mode; automatic Connected lifecycle and original-device-independent authority renewal remain incomplete.",
+      "evidence": [
+        "tests/googleIdentitySharing.test.ts"
+      ]
+    },
+    {
+      "id": "A02",
+      "scenario": "Different Google identity with an explicit board invitation",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Explicit email invitations issue root-signed device grants; native separate-account fixture passes. Target Google-required socket admission and full platform coverage remain incomplete.",
+      "evidence": [
+        "tests/googleIdentitySharing.test.ts"
+      ]
+    },
+    {
+      "id": "A03",
+      "scenario": "Valid Google login without board membership",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Uninvited identities see no board; real local sockets reject nonmembers and cross-board proofs. Target default mode and Google-required WS gate remain incomplete.",
+      "evidence": [
+        "services/pboard-signaling/tests/admission.rs"
+      ]
+    },
+    {
+      "id": "A04",
+      "scenario": "Grant expires or freshness cannot be checked while a previously authorized editor is offline",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Expired-grant card edits and buffered structural commands are durable local-only pending work with original device/base; private-Drive backup/restore of held work is component-tested. Full UI acceptance and command-type breadth remain incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/pendingWorkBackup.test.ts",
+        "tests/recovery/offlineAuthorization.test.ts"
+      ]
+    },
+    {
+      "id": "A05",
+      "scenario": "Fresh authorization confirms the editor still has access",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Original-device pending card edits are admitted under renewed grants with stable operation identity and retained concurrent branches; other commands and full browser lifecycle remain incomplete.",
+      "evidence": [
+        "tests/recovery/offlineAuthorization.test.ts",
+        "tests/serviceAdmission.test.ts",
+        "services/pboard-signaling/src/identity_enrollment.rs",
+        "services/pboard-signaling/tests/hardening.rs"
+      ]
+    },
+    {
+      "id": "A06",
+      "scenario": "Removal/downgrade is confirmed before pending work is admitted",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Verified newer grants persist downgrade/removal, block publication and further edits, and retain private pending work; full UI/account-lifecycle coverage remains incomplete.",
+      "evidence": [
+        "tests/recovery/offlineAuthorization.test.ts",
+        "tests/serviceAdmission.test.ts",
+        "services/pboard-signaling/src/identity_enrollment.rs",
+        "services/pboard-signaling/tests/hardening.rs"
+      ]
+    },
+    {
+      "id": "A07",
+      "scenario": "An offline author claims their change predates revocation",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Exact locally verified historical bytes remain usable under retained local evidence; new timestamp claims fail. Transferable admission evidence and fresh-peer transitive recovery remain incomplete.",
+      "evidence": [
+        "tests/recovery/offlineAuthorization.test.ts",
+        "tests/serviceAdmission.test.ts",
+        "services/pboard-signaling/src/identity_enrollment.rs",
+        "services/pboard-signaling/tests/hardening.rs"
+      ]
+    },
+    {
+      "id": "A08",
+      "scenario": "Viewer or device with no established editing entitlement goes offline or logs out",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Viewer permissions survive restart and transport stop; signed recovered boards without local entitlement fail closed. Full browser/logout acceptance remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/offlineAuthorization.test.ts"
+      ]
+    },
+    {
+      "id": "A09",
+      "scenario": "Original authority browser is unavailable",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Explicitly owner-authorized sealed-root recovery works after permanent profile/key loss and service restart, natively (different and same account) and in components; legacy-client treatment and Google-verified live deployment remain for Jobs 11/12.",
+      "evidence": [
+        "tests/authorityRecovery.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "A10",
+      "scenario": "Claimed authority differs from an existing pin; metadata/signature is invalid",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Current pins/signatures and invalid mutation paths fail closed; target unified recovery/actionable status and migration still require work.",
+      "evidence": [
+        "tests/securityAdversarial.test.ts"
+      ]
+    },
+    {
+      "id": "A11",
+      "scenario": "Missing Google service proof, forged/replayed credentials, cross-board signals or quota abuse",
+      "nextJob": 8,
+      "status": "partial",
+      "reason": "Google-required public service admission is single-use and session/room/device-bound, with independent board authorization and tested resource quotas. Proxy/TCP, live Google and measured capacity remain unverified.",
+      "evidence": [
+        "tests/recovery/offlineAuthorization.test.ts",
+        "tests/serviceAdmission.test.ts",
+        "services/pboard-signaling/src/identity_enrollment.rs",
+        "services/pboard-signaling/tests/hardening.rs"
+      ]
+    },
+    {
+      "id": "R01",
+      "scenario": "Drive fails while authorized WebRTC is available",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Opt-in native Chromium fixture covers independent Drive/signaling outages and an actual process kill/reopen. Full scheduler, actual sleep, all platforms and live Google remain unverified.",
+      "evidence": [
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "R02",
+      "scenario": "Signaling or peer transport fails while Drive is available",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Opt-in native Chromium fixture covers independent Drive/signaling outages and an actual process kill/reopen. Full scheduler, actual sleep, all platforms and live Google remain unverified.",
+      "evidence": [
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "R03",
+      "scenario": "Both remote channels fail",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Complete transport-independent restart/resume recovery is not established yet.",
+      "evidence": []
+    },
+    {
+      "id": "R04",
+      "scenario": "Process ends after a successful local save but before upload/acknowledgement",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Journal crash-window tests and native process restart preserve local history; fresh-device recovery restores completed private backups. Full scheduler/platform crash acceptance remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "R05",
+      "scenario": "Remote write succeeds but its acknowledgement is lost",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Lost private-upload acknowledgements and interrupted peer transfers retain pending data. New peer sessions offer again despite old receipts; complete scheduler/platform acceptance remains open.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts",
+        "tests/recovery/peerHistory.test.ts",
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "R06",
+      "scenario": "New local edit occurs during an upload/download",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "New edits during history and compatibility uploads retain pending state; no account HTTP holds the local materialization queue. Full account-generation lifecycle remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts",
+        "tests/recovery/privateDriveHistory.test.ts"
+      ]
+    },
+    {
+      "id": "R07",
+      "scenario": "Device sleeps, resumes, or receives repeated connectivity/focus events",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Opt-in native Chromium fixture covers independent Drive/signaling outages and an actual process kill/reopen. Full scheduler, actual sleep, all platforms and live Google remain unverified.",
+      "evidence": [
+        "services/pboard-signaling/secure-browser-smoke.mjs"
+      ]
+    },
+    {
+      "id": "R08",
+      "scenario": "Repeated transient errors or service throttling",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Controlled-clock seeded-jitter test verifies existing bounded request retries. A durable cross-channel recovery scheduler with the approved defaults is not implemented yet.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "R09",
+      "scenario": "Permanent authorization denial, invalid trust, or rejected scope",
+      "nextJob": 11,
+      "status": "partial",
+      "reason": "Remote-list failure preserves local content/images and markers; authorization/quota scheduler behavior remains incomplete.",
+      "evidence": [
+        "tests/recovery/recovery.test.ts"
+      ]
+    },
+    {
+      "id": "R10",
+      "scenario": "Image metadata arrives before its bytes",
+      "nextJob": 9,
+      "status": "partial",
+      "reason": "Expired-grant and independent-path attachments: image metadata before bytes keeps the reference and pending attachment; peer DataChannel transfer verifies the hash before storage; private appDataFolder assets persist immutably. Full browser/Android and out-of-order chunk recovery acceptance remains.",
+      "evidence": [
+        "tests/recovery/peerImageTransfer.test.ts",
+        "src/collab/imageSync.ts"
+      ]
+    },
+    {
+      "id": "R11",
+      "scenario": "Two different users are never online together and have no intervening authorized peer",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Complete transport-independent restart/resume recovery is not established yet.",
+      "evidence": []
+    },
+    {
+      "id": "R12",
+      "scenario": "State, conflict evidence or an attachment fails durable storage",
+      "nextJob": 11,
+      "status": "gap",
+      "reason": "Complete transport-independent restart/resume recovery is not established yet.",
+      "evidence": []
+    }
+  ]
+}

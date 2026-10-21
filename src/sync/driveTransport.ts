@@ -88,7 +88,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
       if (pageToken) params.set("pageToken", pageToken);
       const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
       const body = await response.json() as { files?: DriveAppDataFile[]; nextPageToken?: string };
-      files.push(...(body.files ?? []));
+      files.push(...(body.files ?? []).filter(file => file.name.startsWith(filePrefix)));
       pageToken = body.nextPageToken;
     } while (pageToken);
     return files;

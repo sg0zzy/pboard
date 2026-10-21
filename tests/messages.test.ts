@@ -84,3 +84,8 @@ describe("isDriveReconcileMessage", () => {
     }
   });
 });
+
+it('rejects malformed force flags on explicit project synchronization', () => {
+  expect(isDriveSyncProjectMessage({ type: DRIVE_SYNC_MESSAGE, projectId: 'board', force: 'yes' })).toBe(false);
+  expect(isDriveSyncProjectMessage({ type: DRIVE_SYNC_MESSAGE, projectId: 'board', force: true })).toBe(true);
+});

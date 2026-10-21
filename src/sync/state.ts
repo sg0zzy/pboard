@@ -17,6 +17,7 @@ export type DriveProjectSyncState = {
   lastSyncedRevision?: number;
   remoteFileId?: string;
   error?: string;
+  permanentDeletion?: boolean;
 };
 
 export type DriveProjectTombstone = {
@@ -48,11 +49,12 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
     });
   }
 
-  async function markDirty(projectId: string): Promise<void> {
+  async function markDirty(projectId: string, permanentDeletion = false): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
       await storage.set({ [projectSyncStorageKey(projectId)]: {
         ...current,
+        ...(permanentDeletion ? { permanentDeletion: true } : {}),
         projectId,
         dirty: true,
         changeToken: (current.changeToken ?? 0) + 1,

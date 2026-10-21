@@ -149,3 +149,12 @@ describe("permission manifests", () => {
     expect(manifestHash(signed)).not.toBe(manifestHash({ ...signed, epoch: 2 }));
   });
 });
+
+it('counts JSON nesting outside quoted chunk/content strings while preserving the depth limit', () => {
+  for (const text of ['}', '{{{{{{{{{{{{{{{{{{{{{{{{{{', 'escaped \\" quote and \\ slash } ][']) {
+    const value = { data: text, nested: [{ literal: '}' }] };
+    expect(parseStrictJson(JSON.stringify(value))).toEqual(value);
+  }
+  const deep = '{"padding":"' + '}'.repeat(30) + '","nested":' + '['.repeat(17) + '0' + ']'.repeat(17) + '}';
+  expect(() => parseStrictJson(deep)).toThrow(/nesting/);
+});
