@@ -13,6 +13,12 @@ import { MAX_IMAGE_FILE_BYTES } from "../images/processing";
 
 const KIND = "pboard-history";
 const MAX_BYTES = 512 * 1024, MAX_RECORDS = 10000;
+/**
+ * The most rounds one exchange may spend. A round offers the records the
+ * peer still needs, so a board with a long history needs more rounds; the
+ * bound keeps a peer that keeps changing the history from stalling forever.
+ */
+const MAX_EXCHANGE_ROUNDS = 4096;
 const IMAGE_PART = 32 * 1024;
 const MAX_IMAGE_JSON = Math.ceil(MAX_IMAGE_FILE_BYTES * 4 / 3) + 2048;
 const clean = ({ version, id, boardId, collection, documentId, parents, ancestry, value }: Change): Change => ({ version, id, boardId, collection, documentId, parents, ancestry, value });
@@ -39,6 +45,13 @@ export function createPeerHistorySession(options: {
   let scheduled: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | null = null;
   const delivered = new Set<string>();
+  /**
+   * The records the peer confirmed it already holds. The peer verifies a
+   * record it has and answers with an empty request, which means the record is
+   * delivered. Keeping that answer for the whole session stops the same
+   * record from being offered again in every later exchange.
+   */
+  const confirmed = new Set<string>();
   /**
    * Already verified history records, by change id. Verifying a record means
    * checking its author signature against the board manifest, which is
@@ -165,26 +178,50 @@ export function createPeerHistorySession(options: {
   }
   async function exchange() {
     authorize();
-    for (let round = 0; round < 8; round++) {
-    const work = (await records()).filter(record => !delivered.has(record.change.id));
-    if (!work.length) return;
-    for (const record of work) {
-      if (delivered.has(record.change.id)) continue;
-      const wanted = await request("offer", { ids: [record.change.id] });
-      if (wanted.op !== "wanted") throw new Error("Unexpected history response");
-      const missing = ids(wanted.ids);
-      if (missing.some(id => id !== record.change.id)) throw new Error("History requested an unoffered change");
-      if (missing.length) {
-        const ack = await request("put", { records: [record] });
-        if (ack.op !== "ack" || canonicalize(ids(ack.ids)) !== canonicalize([record.change.id])) throw new Error("Invalid history acknowledgement");
+    // The board's history is read once for the whole exchange. Reading it
+    // again in every round re-read and re-verified the whole log, so the
+    // cost of one exchange grew with the square of the history.
+    const history = await records();
+    // One round offers the records that the peer still needs. A board with a
+    // long history therefore needs more rounds than a small one: the budget
+    // follows the pending work, so a large history is transferred completely
+    // instead of failing after a fixed number of rounds.
+    const pending = history.filter(record => !delivered.has(record.change.id) && !confirmed.has(record.change.id));
+    const maxRounds = Math.min(MAX_EXCHANGE_ROUNDS, Math.max(8, pending.length + 8));
+    for (let round = 0; round < maxRounds; round++) {
+      const work = history.filter(record => !delivered.has(record.change.id) && !confirmed.has(record.change.id));
+      if (!work.length) return;
+      // A round that offers nothing new has nothing left to deliver. The
+      // records it skipped were already delivered or confirmed, so the
+      // exchange is complete even though the work list was not empty.
+      let offered = 0;
+      for (const record of work) {
+        if (delivered.has(record.change.id) || confirmed.has(record.change.id)) continue;
+        offered++;
+        const wanted = await request("offer", { ids: [record.change.id] });
+        if (wanted.op !== "wanted") throw new Error("Unexpected history response");
+        const missing = ids(wanted.ids);
+        if (missing.some(id => id !== record.change.id)) throw new Error("History requested an unoffered change");
+        if (missing.length) {
+          const ack = await request("put", { records: [record] });
+          if (ack.op !== "ack" || canonicalize(ids(ack.ids)) !== canonicalize([record.change.id])) throw new Error("Invalid history acknowledgement");
+        } else {
+          // The peer already holds this record and verified it. It is delivered
+          // from this side's point of view, so it is not offered again. Without
+          // this the same record was offered in every round and the exchange
+          // never settled.
+          confirmed.add(record.change.id);
+        }
+        authorize();
+        // Normalized legacy roots need not exist in our journal: only original IDs receive receipts.
+        const local = await rx.journal.entries.get(record.change.id);
+        if (local?.state === "committed") await rx.journal.acknowledge(record.change.id, `peer:${security.boardId}:${context.remoteDeviceKeyId}`);
+        delivered.add(record.change.id);
       }
-      authorize();
-      // Normalized legacy roots need not exist in our journal: only original IDs receive receipts.
-      const local = await rx.journal.entries.get(record.change.id);
-      if (local?.state === "committed") await rx.journal.acknowledge(record.change.id, `peer:${security.boardId}:${context.remoteDeviceKeyId}`);
-      delivered.add(record.change.id);
+      if (!offered) return;
     }
-    }
+    // The rounds ran out with work left. The records that remain are retained
+    // locally and offered again by the next exchange.
     throw new Error("History changed continuously during transfer; delivery remains pending");
   }
   async function flush() {
@@ -297,19 +334,26 @@ export function createPeerHistorySession(options: {
       return;
     }
     if (frame.op === "offer") {
+      // One change may be in flight at a time. The offered set is released
+      // when the change arrives, or when the peer answers that it already
+      // holds the record, so the next offer is accepted.
       if (offered.size) throw new Error("History offer quota exceeded");
+      const asked = ids(frame.ids);
       const wanted: string[] = [];
-      for (const id of ids(frame.ids)) {
+      for (const id of asked) {
         const entry = await rx.journal.entries.get(id);
         if (!entry || entry.state !== "committed" || entry.boardId !== security.boardId || entry.collection !== context.collection || !entry.proof && entry.ancestry !== "unknown" || !entry.admission && !security.manifest.devices.some(d => d.deviceKeyId === (entry.value._sec as any)?.provenance?.authorKeyId && d.role !== "viewer")) { wanted.push(id); offered.add(id); }
         else {
           // Presence in a private recovery file is not itself proof of peer
           // authorization. Reverify stored evidence before confirming delivery.
+          // The peer holds this record, so nothing is in flight for it and the
+          // next offer is accepted.
           await validateChange(entry); validateRecord(entry); await verifyJournalChange(entry, entry.proof, security, entry.admission);
         }
       }
       await send({ kind: KIND, version: 1, op: "wanted", id: frame.id, ids: wanted }); return;
     }
+
     if (frame.op === "put") {
       if (!Array.isArray(frame.records) || frame.records.length !== 1) throw new Error("Invalid history batch");
       const entries: JournalEntry[] = [];

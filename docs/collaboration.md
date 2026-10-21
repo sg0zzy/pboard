@@ -357,3 +357,28 @@ like a failed attempt instead of rescheduling immediately.
 
 `tests/recovery/uploadStaleLoop.test.ts` and
 `tests/recovery/backgroundSyncLoop.test.ts` pin both properties.
+
+### The account order and the peer history re-read what they had already read
+
+Two paths repeated work that had already been done, and both grew with the size
+of the board.
+
+The account order merged the saved order with the local one, and the merge
+always produced a `deletedProjectIds` key — even when no side had recorded a
+deletion. The stored order then differed from the uploaded file by that empty
+key, so every sync uploaded the difference again. The merge now leaves the key
+absent when no side recorded a deletion, and the stored order and the uploaded
+file stay identical.
+
+The peer history read the board's whole change log again in every round of an
+exchange, and verified each record's author signature each time. A record the
+peer already holds was answered with an empty request, which meant the record
+was delivered, but the answer was forgotten when the exchange ended, so the
+record was offered again in the next exchange. The exchange now reads the
+history once, keeps the peer's answer for the whole session, and spends its
+rounds on the records the peer still needs rather than on a fixed number. A
+board with a long history is transferred completely instead of failing with
+"History changed continuously during transfer".
+
+`tests/recovery/accountOrderSync.test.ts` and
+`tests/recovery/peerHistoryExchange.test.ts` pin both properties.

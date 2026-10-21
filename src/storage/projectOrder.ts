@@ -64,8 +64,11 @@ export function mergeProjectOrder(current: ProjectOrderPreference, incoming: Pro
   return { ...newest,
     ids: [...new Set([...newest.ids, ...Object.keys(restoreEvents)])].filter(id => !deleted.includes(id)),
     // `newest` may carry its own deletion list; the merged decision always
-    // replaces it — an empty list is the observable restore outcome.
-    deletedProjectIds: deleted,
+    // replaces it — an empty list is the observable restore outcome. When no
+    // side recorded a deletion, the key stays absent: an invented empty list
+    // would make the stored order differ from a remote copy that never had
+    // one, and the account order would then be re-uploaded on every sync.
+    ...(deleted.length || newest.deletedProjectIds ? { deletedProjectIds: deleted } : {}),
     ...(Object.keys(restoreEvents).length ? { restoreEvents } : {}) };
 }
 

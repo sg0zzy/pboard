@@ -51,6 +51,12 @@ it('uploads the account order once per sync and settles', async () => {
   // The sync must settle within one run: it does not upload in a loop.
   expect(afterFirst).toBeLessThanOrEqual(3);
   expect((await rx.getProjectOrder(account))?.ids).toContain(board.id);
+
+  // A later sync with an unchanged local order must not upload again. The
+  // stored order and the uploaded file must be the same bytes, or every sync
+  // would upload the difference again.
+  await sync();
+  expect(drive.uploads()).toBe(afterFirst);
 });
 
 it('settles when the saved order lists a board that no longer exists', async () => {
