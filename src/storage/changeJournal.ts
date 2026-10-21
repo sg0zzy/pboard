@@ -79,7 +79,15 @@ export class ChangeJournal {
   /** Device-local verification evidence; never accepted from backup or peers. */
   readonly publicGrants = new JournalTable<PublicGrant>(this, "publicGrants");
   readonly admissions = new JournalTable<{ id: string; boardId: string; authorityKeyId: string; epoch: number }>(this, "admissions");
-  private listeners = new Set<() => void>();
+  private listeners = new Set<(tables: string[]) => void>();
+  private changeListeners = new Set<(tables: string[]) => void>();
+  /**
+   * Counts journal changes. A cached table is only kept when the generation
+   * did not move while it was being read: a value read before a change must
+   * not be published as if it were read after it.
+   */
+  private generation = 0;
+
   private channel: BroadcastChannel | null = null;
   private database?: IDBDatabase;
   constructor(name: string) { this.name = `${name}-change-journal-v1`; }
@@ -106,17 +114,39 @@ export class ChangeJournal {
       request.onerror = () => reject(request.error);
     });
   }
-  close(): void { this.channel?.close(); this.channel = null; this.listeners.clear(); this.database?.close(); this.database = undefined; }
-  subscribe(listener: () => void): () => void {
+  close(): void { this.channel?.close(); this.channel = null; this.listeners.clear(); this.changeListeners.clear(); this.database?.close(); this.database = undefined; }
+  subscribe(listener: (tables: string[]) => void): () => void {
     this.listeners.add(listener);
     if (!this.channel && typeof BroadcastChannel !== "undefined") {
       this.channel = new BroadcastChannel(`pboard:journal:${this.name}`);
-      this.channel.onmessage = () => { for (const next of this.listeners) next(); };
+      this.channel.onmessage = () => { for (const next of this.listeners) next([]); };
     }
     return () => { this.listeners.delete(listener); if (!this.listeners.size) { this.channel?.close(); this.channel = null; } };
   }
-  private notify(): void {
-    for (const listener of this.listeners) listener();
+  /**
+   * Runs on every journal change, including changes another browser made.
+   * The listener receives the names of the stores that changed, so a reader
+   * that mirrors one store is not forced to re-read it because an unrelated
+   * store changed.
+   */
+  onChange(listener: (tables: string[]) => void): () => void {
+    this.changeListeners.add(listener);
+    return () => { this.changeListeners.delete(listener); };
+  }
+  /**
+   * Notifies listeners that the journal changed. `tables` names the stores
+   * that actually changed, so a reader that mirrors one store is not forced
+   * to re-read it because an unrelated store changed.
+   */
+  private notify(tables: string[] = []): void {
+    this.generation++;
+    // Only the store that holds the cached data invalidates it. An erasure
+    // marker lives in the receipts store, so a change to the change log
+    // leaves the marker copy valid.
+    if (!tables.length || tables.includes("receipts")) this.erasureCache = null;
+    if (!tables.length || tables.includes("entries")) this.committedCache = null;
+    for (const listener of this.changeListeners) listener(tables);
+    for (const listener of this.listeners) listener(tables);
     const sender = this.channel ?? (typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(`pboard:journal:${this.name}`));
     sender?.postMessage("changed");
     if (sender !== this.channel) sender?.close();
@@ -132,7 +162,13 @@ export class ChangeJournal {
   async write(name: string, operation: (store: IDBObjectStore) => void): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const transaction = this.database!.transaction(name === 'receipts' ? [name] : [name, 'receipts'], "readwrite", { durability: "strict" });
-      transaction.oncomplete = () => { resolve(); if (["entries", "pendingEdits", "permissions"].includes(name)) this.notify(); };
+      transaction.oncomplete = () => {
+        resolve();
+        // A receipts write can add or update a board-erasure marker, so the
+        // shared marker copy is dropped even though no notification is sent.
+        if (name === 'receipts') { this.erasureCache = null; return; }
+        if (["entries", "pendingEdits", "permissions"].includes(name)) this.notify([name]);
+      };
       transaction.onerror = transaction.onabort = () => reject(transaction.error ?? new Error("Journal transaction aborted"));
       const run = (erased: Set<string>) => {
         const store = transaction.objectStore(name);
@@ -148,6 +184,9 @@ export class ChangeJournal {
       };
       if (name === 'receipts') run(new Set());
       else {
+        // The write guard refuses to write to a permanently deleted board. The
+        // markers are read inside the same transaction as the write, so a
+        // board erased concurrently cannot be written to.
         const request = transaction.objectStore('receipts').index('destination').getAll('local-board-erasure');
         request.onsuccess = () => run(new Set(request.result.map(value => value.boardId)));
       }
@@ -262,7 +301,7 @@ export class ChangeJournal {
     await new Promise<void>((resolve, reject) => {
       const tx = this.database!.transaction(['pendingEdits', 'receipts'], 'readwrite', { durability: 'strict' });
       let failure: Error | undefined;
-      tx.oncomplete = () => { resolve(); this.notify(); };
+      tx.oncomplete = () => { resolve(); this.notify(["pendingEdits", "receipts"]); };
       tx.onerror = tx.onabort = () => reject(failure ?? tx.error ?? new Error('Retained work could not be deleted'));
       const store = tx.objectStore('pendingEdits'), request = store.getAll();
       request.onsuccess = () => {
@@ -288,7 +327,7 @@ export class ChangeJournal {
     await new Promise<void>((resolve, reject) => {
       const tx = this.database!.transaction(['pendingEdits', 'receipts'], 'readwrite', { durability: 'strict' });
       let failure: unknown, changed = false;
-      tx.oncomplete = () => { resolve(); if (changed) this.notify(); };
+      tx.oncomplete = () => { resolve(); if (changed) this.notify(["pendingEdits"]); };
       tx.onerror = tx.onabort = () => reject(failure ?? tx.error ?? new Error('Pending work could not be restored'));
       const boardMarker = tx.objectStore('receipts').get(JSON.stringify([edit.boardId, 'local-board-erasure']));
       const marker = tx.objectStore('receipts').get(JSON.stringify([edit.id, `local-pending-discard:${edit.boardId}`]));
@@ -304,23 +343,63 @@ export class ChangeJournal {
       };
     });
   }
+  /**
+   * Board-erasure markers live in the receipts table. Every card and project
+   * read asks for one, so the markers are read once and shared, and the
+   * shared copy is dropped whenever the journal changes.
+   */
+  private erasureCache: Map<string, BoardErasure> | null = null;
+  private erasureLoad: Promise<Map<string, BoardErasure>> | null = null;
+  private erasureGeneration = -1;
+  private async erasureMarkers(): Promise<Map<string, BoardErasure>> {
+    if (this.erasureCache && this.erasureGeneration === this.generation) return this.erasureCache;
+    const generation = this.generation;
+    this.erasureLoad ??= this.receipts.where('destination').equals('local-board-erasure').toArray().then(markers => {
+      const map = new Map<string, BoardErasure>();
+      for (const marker of markers) {
+        const erasure = marker as unknown as BoardErasure;
+        if (typeof erasure.boardId === "string") map.set(erasure.boardId, erasure);
+      }
+      // A change that landed during the read invalidates the copy.
+      if (generation === this.generation) { this.erasureCache = map; this.erasureGeneration = generation; }
+      this.erasureLoad = null;
+      return map;
+    });
+    return this.erasureLoad;
+  }
   async boardErasure(boardId: string): Promise<BoardErasure | undefined> {
-    return await this.receipts.get(JSON.stringify([boardId, 'local-board-erasure'])) as BoardErasure | undefined;
+    return (await this.erasureMarkers()).get(boardId);
   }
   async boardErasures(): Promise<BoardErasure[]> {
-    return await this.receipts.where('destination').equals('local-board-erasure').toArray() as BoardErasure[];
+    return [...(await this.erasureMarkers()).values()];
+  }
+  /**
+   * The committed change log. The conflict panel reconciles the whole log,
+   * and the private backup reads it, so the committed rows are read once and
+   * shared, and the shared copy is dropped whenever the journal changes.
+   */
+  private committedCache: JournalEntry[] | null = null;
+  private committedLoad: Promise<JournalEntry[]> | null = null;
+  async committedEntries(): Promise<JournalEntry[]> {
+    if (this.committedCache) return this.committedCache;
+    this.committedLoad ??= this.entries.where("state").equals("committed").toArray().then(value => {
+      this.committedCache = value;
+      this.committedLoad = null;
+      return value;
+    });
+    return this.committedLoad;
   }
   async beginBoardErasure(boardId: string, accountId: string | null, imageIds: string[], cardIds: string[]) {
     if (await this.boardErasure(boardId)) return;
     await this.receipts.put({ id: JSON.stringify([boardId, 'local-board-erasure']), changeId: boardId,
       destination: 'local-board-erasure', boardId, accountId, imageIds, cardIds, cloudPending: !!accountId } as BoardErasure);
-    this.notify();
+    this.notify(["receipts"]);
   }
   async purgeBoardHistory(boardId: string) {
     const names = ['entries', 'pendingEdits', 'drafts', 'permissions', 'publicGrants', 'admissions'];
     await new Promise<void>((resolve, reject) => {
       const tx = this.database!.transaction([...names, 'receipts'], 'readwrite', { durability: 'strict' });
-      tx.oncomplete = () => { resolve(); this.notify(); };
+      tx.oncomplete = () => { resolve(); this.notify(["entries", "pendingEdits", "receipts"]); };
       tx.onabort = tx.onerror = () => reject(tx.error ?? new Error('Board erasure remains pending'));
       const removedIds = new Set<string>(); let remaining = names.length;
       const cleanupReceipts = () => {

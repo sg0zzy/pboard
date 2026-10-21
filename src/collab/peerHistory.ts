@@ -39,6 +39,14 @@ export function createPeerHistorySession(options: {
   let scheduled: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | null = null;
   const delivered = new Set<string>();
+  /**
+   * Already verified history records, by change id. Verifying a record means
+   * checking its author signature against the board manifest, which is
+   * expensive relative to a local edit. A committed journal row does not
+   * change, so its verification stays valid while the board's authorization
+   * does. The cache is dropped when the session closes.
+   */
+  const verifiedRecords = new Map<string, Record>();
   const pending = new Map<string, { resolve(frame: Frame): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
   const offered = new Set<string>();
   const requestedImages = new Set<string>();
@@ -135,6 +143,12 @@ export function createPeerHistorySession(options: {
     const portable = portableJournalChanges(entries);
     for (const entry of entries) {
       if (!entry.value._sec) continue; // Pre-enrollment private history is never disclosed.
+      // A committed entry that was already verified for this board does not
+      // need its signature checked again: the journal is append-only for
+      // committed rows, and a cached verification stays valid until the
+      // board's authorization changes.
+      const cached = verifiedRecords.get(entry.id);
+      if (cached) { result.set(entry.id, cached); continue; }
       const proof = portable.has(entry.id) ? entry.proof : undefined;
       const change = proof ? clean(entry) : await makeChange({ ...clean(entry), parents: [], ancestry: "unknown" });
       try {
@@ -142,7 +156,9 @@ export function createPeerHistorySession(options: {
         const admission = ((change.id === entry.id ? entry.admission : entries.find(e => e.id === change.id)?.admission)) ?? await certifyHistory(change, proof, security);
         if (admission && change.id === entry.id && !entry.admission) await rx.journal.entries.update(entry.id, { admission });
         if (admission && change.id !== entry.id && !entries.some(e => e.id === change.id && e.admission)) await rx.journal.accept([{ ...change, admission, state: 'committed', origin: 'observed' }]);
-        result.set(change.id, { change, ...(proof ? { proof } : {}), ...(admission ? { admission } : {}) });
+        const record: Record = { change, ...(proof ? { proof } : {}), ...(admission ? { admission } : {}) };
+        verifiedRecords.set(entry.id, record);
+        result.set(change.id, record);
       } catch { /* Historical authorization unavailable: retain locally, never attest it as a relay. */ }
     }
     return [...result.values()].sort((a, b) => a.change.id.localeCompare(b.change.id));
@@ -324,7 +340,7 @@ export function createPeerHistorySession(options: {
   }
   void send({ kind: KIND, version: 1, op: "hello", id: crypto.randomUUID() }).catch(fail);
   return { receive, flush, requestImages, close() {
-    if (closed) return; closed = true; unsubscribe(); clearTimeout(capabilityTimer); clearTimeout(scheduled); clearTimeout(assemblyTimer); clearTimeout(imageTimer); negotiate(); assembly = null; imageAssembly = null; offered.clear(); requestedImages.clear();
+    if (closed) return; closed = true; unsubscribe(); clearTimeout(capabilityTimer); clearTimeout(scheduled); clearTimeout(assemblyTimer); clearTimeout(imageTimer); negotiate(); assembly = null; imageAssembly = null; offered.clear(); requestedImages.clear(); verifiedRecords.clear();
     for (const waiting of pending.values()) { clearTimeout(waiting.timer); waiting.reject(new Error("History session closed before acknowledgement")); }
     pending.clear();
   } };

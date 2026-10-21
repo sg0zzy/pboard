@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
+    "test:ui:perf": "node experiments/collaboration/ui-perf.mjs",
     "test:recovery": "node scripts/recovery/run.mjs",
     "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
     "demo:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs --interactive",

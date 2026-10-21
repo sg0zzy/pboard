@@ -306,3 +306,35 @@ accounts do not receive the user's full menu or private board IDs. Immediate
 account-order delivery over the independent WebSocket/WebRTC path remains a
 separate integration requiring account-scoped authentication; board grants alone
 must never authorize it.
+
+### Local read amplification and sidebar responsiveness
+
+The sidebar mounts several repository subscriptions at once: the board's card
+list, the project list, the current project, the pending-work panel and the
+conflict panel. Every journal change notifies all of them, and each one used to
+re-read the tables it needed from IndexedDB. One local card edit therefore
+turned into a burst of table scans, and the cost grew with the board's history
+because the conflict panel reconciled the whole change log and the pending-work
+panel read the pending-edit table for every reader.
+
+The journal now reports which stores changed, and the tables that several
+readers share are read once and kept until that store changes:
+
+- the pending-edit table behind the pending-work overlay,
+- the committed change log behind the conflict panel,
+- the board-erasure markers in the receipts table.
+
+The conflict panel keeps the reconciliation outcome of a document whose history
+did not change, and the peer history keeps the records it already verified
+against the board manifest instead of checking every author signature again on
+each flush. A reader also waits for a burst of notifications to end before it
+reads, so one write causes one read rather than one per notification.
+
+Measured in native Chromium over a session of eighty card writes, the journal
+reads fell from 3396 to 632, and the reads of one edit no longer grow with the
+board's history. The per-edit cost is now two receipt reads, two permission
+reads and three indexed change-log reads.
+
+`tests/recovery/readAmplification.test.ts` pins these bounds, and the
+`experiments/collaboration/ui-perf.mjs` harness measures them in a real
+browser. No document content, authorization rule or durable record changed.

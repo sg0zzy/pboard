@@ -36,6 +36,15 @@ export type RxCollections = {
 
 const now = () => new Date().toISOString();
 const newId = () => crypto.randomUUID();
+/**
+ * How long a reader waits for a burst of journal notifications to end before
+ * it reads. One write produces several notifications in quick succession, and
+ * each of them completes an IndexedDB transaction, so the notifications of one
+ * write are spread over tens of milliseconds. Reading between them would
+ * publish an intermediate value and start another read. The window is short
+ * enough to stay imperceptible while typing.
+ */
+const SETTLE_MS = 8;
 const isVisible = (card: { deletedAt?: string }) => !card.deletedAt;
 
 // Migration strategies fire when a stored collection's schema version is lower
@@ -180,6 +189,33 @@ export async function createRxRepository(options: {
     throw error;
   }
   const permissionWrites = new Map<string, Promise<void>>();
+  /**
+   * The pending-edit table is read by every card and project read, by the
+   * pending-work panel and by the mutation gate. Each read was a separate
+   * IndexedDB scan, and every journal write notified every reader. The table
+   * is therefore read once and shared, and the shared copy is dropped when
+   * the journal changes.
+   */
+  let pendingCache: PendingEdit[] | null = null;
+  let pendingLoad: Promise<PendingEdit[]> | null = null;
+  const pendingEdits = async (): Promise<PendingEdit[]> => {
+    if (pendingCache) return pendingCache;
+    // One in-flight read: concurrent readers share it instead of each
+    // scanning the table. The copy is dropped when the pending-edit table
+    // itself changes.
+    pendingLoad ??= journal.pendingEdits.toArray().then(value => {
+      pendingCache = value;
+      pendingLoad = null;
+      return value;
+    });
+    return pendingLoad;
+  };
+  const invalidatePendingEdits = () => { pendingCache = null; pendingLoad = null; };
+  // The pending-edit overlay mirrors one journal table, so the shared copy is
+  // dropped when that table changes — including changes made by another
+  // browser, and whether or not a UI subscription is mounted. A change to an
+  // unrelated table leaves the copy valid.
+  journal.onChange((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); });
   db.onClose.push(async () => { await Promise.all(permissionWrites.values()); journal.close(); });
   const reconciliation = createCausalReconciliation(journal);
   const blobs = options.blobs ?? createIndexedDbBlobStore();
@@ -216,14 +252,14 @@ export async function createRxRepository(options: {
     if (observed === 'revoked' || permission?.role === "revoked") throw new Error("Board editing permission was removed; pending work remains available for export");
     if (observed === "viewer" || liveBoardRole(cards, projectId) === "viewer" || (permission?.role ?? options.mutatorRole) === "viewer") throw new Error("You have view-only access to this shared project");
     const signed = permission?.authorityKeyId || (await projects.findOne(projectId).exec())?._sec
-      || (await journal.entries.where("boardId").equals(projectId).toArray()).some(e => !!e.value._sec)
-      || (await journal.pendingEdits.toArray()).some(e => e.boardId === projectId);
+      || (await journal.committedEntries()).some(e => e.boardId === projectId && !!e.value._sec)
+      || (await pendingEdits()).some(e => e.boardId === projectId);
     if (signed && !liveBoardRole(cards, projectId) && !(allowPending && permission?.deviceKeyId && permission.role !== "viewer")) {
       throw new Error("Current board authorization is required; cached content remains readable and exportable");
     }
   }
   async function pendingFor(documentId: string): Promise<PendingEdit[]> {
-    const edits = (await journal.pendingEdits.toArray()).filter(e => e.base.documentId === documentId);
+    const edits = (await pendingEdits()).filter(e => e.base.documentId === documentId);
     const superseded = new Set(edits.flatMap(e => e.supersedes ?? []));
     return edits.filter(e => !e.admittedChangeId && !superseded.has(e.id));
   }
@@ -235,7 +271,7 @@ export async function createRxRepository(options: {
   async function admitPendingWork(boardId: string) {
     const admitted = await locked(async () => {
       await assertCanMutate(boardId);
-      const edits = (await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId);
+      const edits = (await pendingEdits()).filter(e => e.boardId === boardId);
       // An immutable private archive may predate a later signed admission.
       // Recover its receipt from verified history, never from backup flags or
       // device identity alone. This also works after loss of the original key.
@@ -284,7 +320,7 @@ export async function createRxRepository(options: {
     await locked(async () => {
       await assertCanMutate(boardId);
       await touchProject(boardId);
-      for (const edit of await journal.pendingEdits.toArray()) if (edit.boardId === boardId && edit.admittedChangeId && !edit.projected) {
+      for (const edit of await pendingEdits()) if (edit.boardId === boardId && edit.admittedChangeId && !edit.projected) {
         await journal.pendingEdits.update(edit.id, { projected: true });
       }
     });
@@ -304,7 +340,7 @@ export async function createRxRepository(options: {
   }
   async function overlay(name: 'cards' | 'projects', records: Record<string, any>[], boardId?: string) {
     const byId = new Map(records.map(row => [String(row.id), row]));
-    const edits = pendingHeads((await journal.pendingEdits.toArray()).filter(e => e.base.collection === name && (!boardId || e.boardId === boardId)));
+    const edits = pendingHeads((await pendingEdits()).filter(e => e.base.collection === name && (!boardId || e.boardId === boardId)));
     const counts = new Map<string, number>(); for (const edit of edits) counts.set(edit.base.documentId, (counts.get(edit.base.documentId) ?? 0) + 1);
     for (const edit of edits) if (counts.get(edit.base.documentId) === 1) byId.set(edit.base.documentId, edit.value);
     return [...byId.values()].filter(row => !row._deleted).sort((a, b) => compareOrdered(a as { id: string; orderKey: string }, b as { id: string; orderKey: string }));
@@ -430,7 +466,7 @@ export async function createRxRepository(options: {
     }
   }
   async function deleteImage(imageId: string): Promise<void> {
-    if ((await journal.pendingEdits.toArray()).some(e => e.value.imageId === imageId || e.base.value.imageId === imageId)) return;
+    if ((await pendingEdits()).some(e => e.value.imageId === imageId || e.base.value.imageId === imageId)) return;
     // Tombstoned cards retain references for rollback and future replication.
     if ((await cards.find().exec()).some((doc) => doc.imageId === imageId)) throw new Error("Image is still referenced by a card");
     if ((await journal.entries.toArray()).some(entry => entry.value.imageId === imageId)) {
@@ -888,18 +924,24 @@ export async function createRxRepository(options: {
     await changed(projectId);
   }
   function subscribe<T>(query: { $: { subscribe: (next: () => void) => { unsubscribe(): void } } }, read: () => Promise<T>, listener: (value: T) => void) {
-    const { refresh, stop } = subscribeRead(read, listener);
+    const { refresh, readNow, stop } = subscribeRead(read, listener);
     const sub = query.$.subscribe(refresh);
-    const stopJournal = journal.subscribe(refresh);
-    refresh();
+    // Every journal change can alter the pending-edit overlay, so the
+    // shared copy is dropped before the readers re-read it.
+    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); });
+    readNow();
     return () => { stop(); sub.unsubscribe(); stopJournal(); };
   }
   // A signed write emits several WAL notifications. Bound reads to one in
   // flight plus a trailing refresh, including bursts from another browser.
+  //
+  // The notifications of one write arrive one after another, so a read that
+  // finishes between two of them would publish an intermediate value and
+  // start another read. A short settling window turns a burst into a single
+  // read: the reader waits for the burst to end before it reads once.
   function subscribeRead<T>(read: () => Promise<T>, listener: (value: T) => void) {
-    let active = true, running = false, dirty = false;
-    const refresh = () => {
-      dirty = true;
+    let active = true, running = false, dirty = false, settling: ReturnType<typeof setTimeout> | undefined;
+    const start = () => {
       if (!active || running) return;
       running = true;
       void Promise.resolve().then(async () => {
@@ -910,20 +952,35 @@ export async function createRxRepository(options: {
         }
       }).finally(() => { running = false; if (active && dirty) refresh(); });
     };
-    return { refresh, stop: () => { active = false; } };
+    // A change notification waits for the burst to end. Reading between two
+    // notifications of the same write would publish an intermediate value and
+    // start another read.
+    const refresh = () => {
+      dirty = true;
+      if (!active) return;
+      clearTimeout(settling);
+      settling = setTimeout(() => { settling = undefined; start(); }, SETTLE_MS);
+    };
+    return {
+      refresh,
+      // The first read is immediate: a subscription must publish its current
+      // value without waiting for a settling window.
+      readNow: () => { dirty = true; start(); },
+      stop: () => { active = false; clearTimeout(settling); }
+    };
   }
   const subscribeProjects = (listener: (value: Project[]) => void) => {
-    const { refresh, stop } = subscribeRead(listProjects, listener);
+    const { refresh, readNow, stop } = subscribeRead(listProjects, listener);
     const first = projects.find().$.subscribe(refresh);
     const second = settings.find().$.subscribe(refresh);
-    const stopJournal = journal.subscribe(refresh); refresh();
+    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); readNow();
     return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
-    const { refresh, stop } = subscribeRead(getCurrentProject, listener);
+    const { refresh, readNow, stop } = subscribeRead(getCurrentProject, listener);
     const first = settings.find().$.subscribe(refresh);
     const second = projects.find().$.subscribe(refresh);
-    const stopJournal = journal.subscribe(refresh); refresh();
+    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); refresh();
     return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCards = (projectId: string, listener: (value: BoardItem[]) => void) =>
@@ -936,7 +993,7 @@ export async function createRxRepository(options: {
     canDraft: async boardId => { try { await assertCanMutate(boardId, true); return !!(await journal.permissions.get(boardId))?.authorityKeyId && !liveBoardRole(cards, boardId); } catch { return false; } } });
   const privateRecovery = createPrivateRecovery({ db, journal, blobs, locked });
   async function listPendingWork() {
-    const heads = pendingHeads(await journal.pendingEdits.toArray());
+    const heads = pendingHeads(await pendingEdits());
     if (!heads.length) return [];
     // "No handle" check: a board the current account list does not show — removed
     // (hidden), hard-removed, or filtered by the active account scope — leaves its
@@ -948,7 +1005,7 @@ export async function createRxRepository(options: {
       const role = liveBoardRole(cards, boardId);
       const boardMissing = !visible.has(boardId);
       const boardDoc = await projects.findOne(boardId).exec();
-      const boardName = boardDoc?.name ?? (await journal.entries.where('boardId').equals(boardId).toArray()).find(e => e.collection === 'projects')?.value.name;
+      const boardName = boardDoc?.name ?? (await journal.committedEntries()).find(e => e.collection === 'projects' && e.boardId === boardId)?.value.name;
       return { permission, role, boardMissing, boardName };
     })());
     return Promise.all(heads.map(async edit => {
@@ -963,7 +1020,7 @@ export async function createRxRepository(options: {
     await locked(async () => {
       const selected = await journal.pendingEdits.get(id); if (!selected) throw new Error('Pending version is missing');
       await assertCanMutate(selected.boardId);
-      const current = pendingHeads(await journal.pendingEdits.toArray()).filter(e => e.boardId === selected.boardId && e.base.collection === selected.base.collection && e.base.documentId === selected.base.documentId);
+      const current = pendingHeads(await pendingEdits()).filter(e => e.boardId === selected.boardId && e.base.collection === selected.base.collection && e.base.documentId === selected.base.documentId);
       if (canonicalize(current.map(e => e.id).sort()) !== canonicalize([...reviewedIds].sort()) || !current.some(e => e.id === id)) throw new Error('Pending versions changed; review them again');
       const permission = (await journal.permissions.get(selected.boardId))!;
       if (selected.base.collection === 'projects' && selected.value._deleted && permission.role !== 'owner') throw new Error('Only an owner may approve board deletion');
@@ -976,7 +1033,7 @@ export async function createRxRepository(options: {
     const reviewed = [...reviewedIds];
     await locked(async () => {
       if ((await listProjects()).some(project => project.id === boardId)) throw new Error('Remove this board from the list before permanently deleting its retained work.');
-      const retained = (await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId);
+      const retained = (await pendingEdits()).filter(edit => edit.boardId === boardId);
       await eraseLocalBoardData(boardId, privateAccount, retained, reviewed);
     });
   }
@@ -984,7 +1041,7 @@ export async function createRxRepository(options: {
   async function eraseLocalBoardData(boardId: string, privateAccount?: string, retained: PendingEdit[] = [], reviewed?: string[]) {
     if ((await journal.boardErasure(boardId))?.localPurged) { await events.projectErased?.(boardId); return; }
     const history = await journal.entries.where('boardId').equals(boardId).toArray();
-    const pending = [...retained, ...(await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId)];
+    const pending = [...retained, ...(await pendingEdits()).filter(edit => edit.boardId === boardId)];
     const live = await cards.find({ selector: { projectId: boardId } }).exec();
     const values = [...history.map(entry => entry.value), ...pending.flatMap(edit => [edit.value, edit.base.value]), ...live.map(doc => doc.toJSON())];
     const bound = (await settings.findOne(`privateDrive:${await hashBlob(new Blob([boardId]))}`).exec())?.value;
@@ -1010,7 +1067,7 @@ export async function createRxRepository(options: {
     await journal.purgeBoardHistory(boardId);
     for (const imageId of marker.imageIds) {
       const referenced = (await journal.entries.toArray()).some(entry => entry.value.imageId === imageId)
-        || (await journal.pendingEdits.toArray()).some(edit => edit.value.imageId === imageId || edit.base.value.imageId === imageId)
+        || (await pendingEdits()).some(edit => edit.value.imageId === imageId || edit.base.value.imageId === imageId)
         || (await cards.find().exec()).some(doc => doc.imageId === imageId);
       if (!referenced) await blobs.deleteBlob(imageId);
     }
@@ -1020,7 +1077,7 @@ export async function createRxRepository(options: {
   }
   async function permanentlyDeleteBoard(boardId: string, privateAccount?: string) {
     await locked(async () => {
-      const retained = (await journal.pendingEdits.toArray()).filter(edit => edit.boardId === boardId);
+      const retained = (await pendingEdits()).filter(edit => edit.boardId === boardId);
       await eraseLocalBoardData(boardId, privateAccount, retained, pendingHeads(retained).map(edit => edit.id));
     });
   }
@@ -1033,13 +1090,13 @@ export async function createRxRepository(options: {
   }
   const api = { db, blobs, journal, reconciliation, privateRecovery, installBoardSecurity, admitPendingWork, listPendingWork, reviewPendingWork, discardRemovedBoardWork, permanentlyDeleteBoard, applyPrivateBoardErasure,
     subscribePendingWork(listener: (value: Awaited<ReturnType<typeof listPendingWork>>) => void) {
-      const { refresh, stop } = subscribeRead(listPendingWork, listener);
-      const unsubscribe = journal.subscribe(refresh); refresh();
+      const { refresh, readNow, stop } = subscribeRead(listPendingWork, listener);
+      const unsubscribe = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); readNow();
       return () => { stop(); unsubscribe(); };
     },
     async exportPendingWork(boardId: string) { return { format: "pboard-pending-work-v1" as const, boardId,
-      edits: (await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId),
-      images: await Promise.all([...new Set((await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId).flatMap(e => [e.value.imageId, e.base.value.imageId]).filter((id): id is string => typeof id === 'string'))].map(async imageId => {
+      edits: (await pendingEdits()).filter(e => e.boardId === boardId),
+      images: await Promise.all([...new Set((await pendingEdits()).filter(e => e.boardId === boardId).flatMap(e => [e.value.imageId, e.base.value.imageId]).filter((id): id is string => typeof id === 'string'))].map(async imageId => {
         const image = await blobs.getBlob(imageId); if (!image) throw new Error('A pending image is missing; the draft remains locally recoverable');
         return { ...image, imageId, blob: undefined, dataUrl: await blobToDataUrl(image.blob) };
       })) }; }, ...conflicts, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
@@ -1058,12 +1115,12 @@ export async function createRxRepository(options: {
       await locked(async () => {
         const result = await reconciliation.inspect(request);
         if (!["conflict", "mergeable"].includes(result.kind) || canonicalize([...request.heads].sort()) !== canonicalize([...result.heads].sort()) || result.heads.length > 8) throw new Error('Conflict changed; review its current versions');
-        if (pendingHeads(await journal.pendingEdits.toArray()).some(e => e.boardId === request.boardId && e.base.documentId === request.documentId)) throw new Error('Review existing pending versions before drafting another resolution');
+        if (pendingHeads(await pendingEdits()).some(e => e.boardId === request.boardId && e.base.documentId === request.documentId)) throw new Error('Review existing pending versions before drafting another resolution');
         const selected = result.variants.find(e => e.id === request.variantId); if (!selected) throw new Error('Select a reviewed version');
         if (request.collection === 'projects' && result.variants.some(e => e.value._deleted) && permission.role !== 'owner') throw new Error('Only an owner may resolve board deletion');
         const value = pendingValue(selected.value);
         if (request.edits) Object.assign(value, request.edits);
-        const edit: PendingEdit = { id: newId(), boardId: request.boardId, base: selected, value, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, parents: result.heads, supersedes: pendingHeads(await journal.pendingEdits.toArray()).filter(e => e.base.documentId === request.documentId).map(e => e.id) };
+        const edit: PendingEdit = { id: newId(), boardId: request.boardId, base: selected, value, deviceKeyId: permission.deviceKeyId!, authorityKeyId: permission.authorityKeyId!, parents: result.heads, supersedes: pendingHeads(await pendingEdits()).filter(e => e.base.documentId === request.documentId).map(e => e.id) };
         await validatePending(edit, request.boardId);
         await journal.pendingEdits.put(edit); await changed(request.boardId);
       });
@@ -1080,10 +1137,10 @@ export async function createRxRepository(options: {
         if (!boardId) return original(...args);
         const permission = await journal.permissions.get(boardId);
         if (!permission?.authorityKeyId) {
-          if (command !== 'deleteProject' && (await journal.pendingEdits.toArray()).some(e => e.boardId === boardId)) await assertCanMutate(boardId);
+          if (command !== 'deleteProject' && (await pendingEdits()).some(e => e.boardId === boardId)) await assertCanMutate(boardId);
           return original(...args);
         }
-        if (liveBoardRole(cards, boardId) && !pendingHeads((await journal.pendingEdits.toArray()).filter(e => e.boardId === boardId)).length) return original(...args);
+        if (liveBoardRole(cards, boardId) && !pendingHeads((await pendingEdits()).filter(e => e.boardId === boardId)).length) return original(...args);
         // Viewer removal still hides only that account's copy.
         if (command === 'deleteProject' && permission.role !== 'owner') return original(...args);
         await assertCanMutate(boardId, true);

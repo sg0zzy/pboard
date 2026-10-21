@@ -28,6 +28,14 @@ export function createConflictResolution(options: {
   locked<T>(operation: () => Promise<T>): Promise<T>;
 }) {
   const { journal, collections } = options;
+  /**
+   * The reconciliation outcome per document, with the change ids it was
+   * computed from. Reconciling walks a document's whole change history, and
+   * the panel is refreshed on every journal change, so an unchanged document
+   * keeps its previous outcome.
+   */
+  const reconciled = new Map<string, { fingerprint: string; outcome: Reconciliation }>();
+  journal.onChange((tables) => { if (tables.includes("entries")) reconciled.clear(); });
   async function history(target: ConflictTarget) {
     return (await journal.entries.where("boardId").equals(target.boardId).toArray()).filter(e => e.state === "committed");
   }
@@ -50,7 +58,7 @@ export function createConflictResolution(options: {
   }
   async function listConflicts(): Promise<ConflictRecord[]> {
     const erased = new Set((await journal.boardErasures()).map(entry => entry.boardId));
-    const entries = (await journal.entries.toArray()).filter(e => e.state === "committed" && !erased.has(e.boardId));
+    const entries = (await journal.committedEntries()).filter(e => !erased.has(e.boardId));
     const groups = new Map<string, typeof entries>();
     const signedBoards = new Set(entries.filter(e => e.value._sec).map(e => e.boardId));
     // "No handle" boards: anything the current account list cannot show gets a
@@ -62,15 +70,23 @@ export function createConflictResolution(options: {
     }
     const records: ConflictRecord[] = [];
     for (const [id, changes] of groups) {
-      const result = reconcile(changes);
-      if (result.kind !== "conflict" && result.kind !== "mergeable") continue;
+      // Reconciling a document walks its whole change history. The result only
+      // changes when that document's history does, so an unchanged document
+      // keeps its previous outcome instead of being reconciled again.
+      const fingerprint = changes.map(change => change.id).join("|");
+      let result = reconciled.get(id);
+      if (!result || result.fingerprint !== fingerprint) {
+        result = { fingerprint, outcome: reconcile(changes) };
+        reconciled.set(id, result);
+      }
+      if (result.outcome.kind !== "conflict" && result.outcome.kind !== "mergeable") continue;
       const { boardId, collection, documentId } = changes[0];
       const target = { boardId, collection, documentId };
       const board = await collections.projects.findOne(boardId).exec();
       const boardMissing = !board || !visibleBoards.has(boardId);
       const name = board?.name ?? entries.find(e => e.collection === "projects" && e.boardId === boardId)?.value.name;
-      records.push({ ...target, result, boardMissing, boardName: typeof name === "string" ? name : "Recovered board",
-        pendingAuthorization: !boardMissing && signedBoards.has(boardId) && !!await options.canDraft?.(boardId), restriction: await restriction(target, result, signedBoards.has(boardId)), drafts: await journal.drafts.where("target").equals(id).toArray() });
+      records.push({ ...target, result: result.outcome, boardMissing, boardName: typeof name === "string" ? name : "Recovered board",
+        pendingAuthorization: !boardMissing && signedBoards.has(boardId) && !!await options.canDraft?.(boardId), restriction: await restriction(target, result.outcome, signedBoards.has(boardId)), drafts: await journal.drafts.where("target").equals(id).toArray() });
     }
     return records.sort((a, b) => scope(a).localeCompare(scope(b)));
   }
