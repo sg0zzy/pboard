@@ -9,13 +9,25 @@ const ALARM_PREFIX = "pboard-drive-sync:";
 
 export function registerDriveBackgroundSync() {
   const attempts = recoveryAttempts();
+  // The boards that already have an idle sync scheduled. A sync that leaves
+  // the board pending writes the state again, and scheduling another one for
+  // it would make the board sync in a tight loop.
+  const scheduled = new Set<string>();
+  const schedule = async (projectId: string, delayMs = IDLE_SYNC_DELAY_MS) => {
+    if (await googleDrive.getConnectionState() !== "connected" && !(await driveSyncState.get(projectId)).permanentDeletion) return;
+    scheduled.add(projectId);
+    await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: Date.now() + delayMs });
+  };
   browser.storage.onChanged.addListener((changes: Record<string, { newValue?: unknown }>, area: string) => {
     if (area !== "local") return;
     for (const [key, change] of Object.entries(changes)) {
       if (!key.startsWith(DRIVE_PROJECT_STATE_PREFIX)) continue;
       const next = change.newValue as DriveProjectSyncState | undefined;
       if (!next?.dirty || next.status !== "pending") continue;
-      void scheduleIdleSync(next.projectId);
+      // A board that is already scheduled must not get another one: the sync
+      // that is already pending is the one that will pick this change up.
+      if (scheduled.has(next.projectId)) continue;
+      void schedule(next.projectId);
     }
   });
 
@@ -23,17 +35,26 @@ export function registerDriveBackgroundSync() {
     if (!alarm.name.startsWith(ALARM_PREFIX)) return;
     const projectId = alarm.name.slice(ALARM_PREFIX.length);
     if (!projectId) return;
+    scheduled.delete(projectId);
     void (async () => {
       try {
         await googleDrive.syncProject(projectId);
         const state = await driveSyncState.get(projectId);
-        if (state.dirty || state.status !== "synced") throw new Error("Private recovery is still pending");
+        if (state.dirty || state.status !== "synced") {
+          // The sync did not settle the board. Back off like a failed attempt,
+          // so a board that stays pending does not reschedule itself in a
+          // tight loop. The durable attempt count survives a restart.
+          const attempt = await attempts.get(projectId);
+          await attempts.set(projectId, attempt + 1);
+          await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+          return;
+        }
         await attempts.clear(projectId);
       } catch {
         // Bounded exponential backoff; the durable attempt count survives restart.
         const attempt = await attempts.get(projectId);
         await attempts.set(projectId, attempt + 1);
-        await scheduleIdleSync(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+        await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
       }
     })();
   });
@@ -55,11 +76,6 @@ function recoveryAttempts(): RecoveryAttempts {
     async set(projectId, value) { await browser.storage.local.set({ [key(projectId)]: Math.min(value, 5) }); },
     async clear(projectId) { await browser.storage.local.remove(key(projectId)); }
   };
-}
-
-async function scheduleIdleSync(projectId: string, delayMs = IDLE_SYNC_DELAY_MS) {
-  if (await googleDrive.getConnectionState() !== "connected" && !(await driveSyncState.get(projectId)).permanentDeletion) return;
-  await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: Date.now() + delayMs });
 }
 
 export function handleDriveSyncMessage(message: unknown): Promise<unknown> | undefined {

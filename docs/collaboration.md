@@ -338,3 +338,22 @@ reads and three indexed change-log reads.
 `tests/recovery/readAmplification.test.ts` pins these bounds, and the
 `experiments/collaboration/ui-perf.mjs` harness measures them in a real
 browser. No document content, authorization rule or durable record changed.
+
+### The background worker's idle sync loop
+
+The background service worker schedules an idle sync for a board whose sync
+state is pending. A sync whose upload was superseded by a newer local change
+left that state pending without advancing the change token, so the worker
+scheduled the same superseded upload again, and again: the board synced in a
+tight loop, keeping the extension's background process at full CPU and
+producing a steady stream of Drive requests.
+
+Two changes stop it. A superseded upload now advances the change token, so
+each attempt is a new one rather than a repeat of the attempt that was just
+superseded. The worker also keeps the set of boards that already have a sync
+scheduled, so the state change that follows a sync that stayed pending does
+not schedule a second one, and a sync that does not settle its board backs off
+like a failed attempt instead of rescheduling immediately.
+
+`tests/recovery/uploadStaleLoop.test.ts` and
+`tests/recovery/backgroundSyncLoop.test.ts` pin both properties.

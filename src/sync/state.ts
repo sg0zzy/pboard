@@ -98,6 +98,10 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         remoteFileId,
         dirty: true,
         status: "pending",
+        // The upload was superseded by a newer local change. The change token
+        // moves so the next sync is a new attempt: without it the background
+        // worker would reschedule the same superseded upload forever.
+        changeToken: (current.changeToken ?? 0) + 1,
         error: undefined
       } satisfies DriveProjectSyncState });
     });
