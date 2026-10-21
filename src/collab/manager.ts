@@ -13,7 +13,7 @@ import type { PboardSignaling } from "./signaling";
 import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
 import { scopeMasterChanges } from "./scopedPull";
-import { createProjectImageSync, type SharedImageTransport } from "./imageSync";
+import { createProjectImageSync, type ProjectImageSync, type SharedImageTransport } from "./imageSync";
 import type { PeerHistorySession } from "./peerHistory";
 
 /**
@@ -146,17 +146,55 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   let startedProjectId: string | null = null;
   let startedRepo: RxRepository | null = null;
   type SharedPool = RxWebRTCReplicationPool<CardRecord, PboardPeer> | RxWebRTCReplicationPool<ProjectRecord, PboardPeer> | RxWebRTCReplicationPool<SettingRecord, PboardPeer>;
-  const pools: SharedPool[] = [];
+
+  /**
+   * One board's live collaboration resources.
+   *
+   * A session owns every resource that belongs to one board: its replication
+   * pools, its history sessions, its image sync and its mutation guard. Sessions
+   * are replaced on a board switch, so the outgoing session can be torn down
+   * asynchronously while the incoming one already connects on its own channel.
+   * A session that is being retired is marked stale; its own callbacks then
+   * cannot write into the manager's current state.
+   */
+  type BoardSession = {
+    projectId: string;
+    /** Live rooms by signaling topic. */
+    rooms: Map<string, SharedPool>;
+    historySessions: Set<PeerHistorySession>;
+    imageSync: ProjectImageSync | null;
+    guard: MutationGuardInstall | null;
+    /** False once the session was retired; its late callbacks become no-ops. */
+    active: boolean;
+  };
+
+  let session: BoardSession | null = null;
   let sessionGeneration = 0;
   let recovery: Promise<void> | null = null;
-  let imageSync: ReturnType<typeof createProjectImageSync> | null = null;
-  let activeGuard: MutationGuardInstall | null = null;
-  /** Live history sessions for the active independent board; drained on stop. */
-  const historySessions = new Set<PeerHistorySession>();
+  /**
+   * Releases still in progress: the mutation guard by project, and a room by
+   * signaling topic. A new session waits for the matching release, so the
+   * runtime keeps one guard entry per board and the rendezvous keeps one
+   * session per device and room.
+   */
+  const guardReleases = new Map<string, Promise<void>>();
+  const roomReleases = new Map<string, Promise<void>>();
+  /**
+   * Guard installs and removals are serialized. The guard wraps the shared
+   * collection's storage instance, so an install that overlapped a removal
+   * would leave two wrappers chained and the removed board's rule would keep
+   * rejecting the new board's writes.
+   */
+  let guardChain: Promise<unknown> = Promise.resolve();
+  function runGuardOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = guardChain.then(operation, operation);
+    guardChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
 
   function collectPeers(): string[] {
     const ids = new Set<string>();
-    for (const pool of pools) {
+    for (const pool of session?.rooms.values() ?? []) {
       if (pool.collection.name === "settings") continue;
       for (const peer of pool.peerStates$.getValue().keys()) ids.add(String(peer.id));
     }
@@ -167,12 +205,14 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   const verifiedContexts = new Map<string, VerifiedSessionContext>();
 
   /** Handler callback wiring: track verified contexts, drop them on teardown. */
-  function securityHooksFor(securityContext: CollaborationSecurityOptions) {
+  function securityHooksFor(owner: BoardSession) {
     return {
       onSessionVerified: (remotePeerId: string, context: VerifiedSessionContext) => {
+        if (!owner.active) return;
         verifiedContexts.set(remotePeerId, context);
       },
       onSessionRejected: (remotePeerId: string, reason: string) => {
+        if (!owner.active) return;
         verifiedContexts.delete(remotePeerId);
         error = `Peer session rejected: ${reason}`;
       }
@@ -208,12 +248,13 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     collection: SharedCollection,
     projectId: string,
     ref: RxCollection<T>,
-    securityContext: CollaborationSecurityOptions
+    securityContext: CollaborationSecurityOptions,
+    owner: BoardSession
   ): Promise<void> {
     const editable = isEditorRole(role);
     const generation = sessionGeneration;
     const beforeReconnect = async () => {
-      const isActive = () => generation === sessionGeneration && startedProjectId === projectId;
+      const isActive = () => owner.active && generation === sessionGeneration && startedProjectId === projectId;
       if (!isActive() || !options.refreshFromDrive) return;
       recovery ??= options.refreshFromDrive(projectId, isActive).finally(() => {
         if (generation === sessionGeneration) recovery = null;
@@ -227,26 +268,31 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       if (collection === "cards") return "projectId" in doc && doc.projectId === projectId;
       return "id" in doc && doc.id === projectId;
     };
+    const topic = topicFor(projectId, collection);
+    // A room may only be opened once the previous session released it: the
+    // rendezvous admits one session per device and room.
+    await awaitRoomRelease(topic);
     const pool = await replicateWebRTC<T, PboardPeer>({
       collection: ref,
-      topic: topicFor(projectId, collection),
+      topic,
       connectionHandlerCreator: createPboardWebRTCConnectionHandler({
-        signaling: options.signalingFor(topicFor(projectId, collection), securityContext),
+        signaling: options.signalingFor(topic, securityContext),
         scopeDocument: scopeProjectDoc,
         existingDocuments: async ids => [...(await ref.findByIds(ids).exec()).values()].map(doc => doc.toJSON()),
         beforeReconnect,
         ...(startedRepo ? { history: { repository: startedRepo, security: securityContext, beforeReceive: () => options.onHistoryReceived?.(projectId) ?? Promise.resolve(),
-          registry: { add: s => historySessions.add(s), remove: s => historySessions.delete(s), all: () => [...historySessions] } } } : {}),
+          registry: { add: s => owner.historySessions.add(s), remove: s => owner.historySessions.delete(s), all: () => [...owner.historySessions] } } } : {}),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
         security: {
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection,
           ownSessionId: `${securityContext.ownSessionId}:${collection}:${crypto.randomUUID()}`,
-          ...securityHooksFor(securityContext)
+          ...securityHooksFor(owner)
         }
       }),
       // Only a mutually proven session under this room's manifest may replicate.
       isPeerValid: async (peer) => {
+        if (!owner.active) return false;
         const context = verifiedContexts.get(String(peer.id));
         return Boolean(context) && roleAllowsReplication(securityContext, context!);
       },
@@ -256,11 +302,15 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       ...(editable ? { push: { batchSize: 100, modifier: (doc: WithDeleted<T>) => (scopeProjectDoc(doc) ? doc : null) } } : {})
     });
     scopeMasterChanges(pool.masterReplicationHandler, scopeProjectDoc);
-    pools.push(pool as SharedPool);
+    // The session may have been retired while the transport was opening; that
+    // pool must not survive its own session.
+    if (!owner.active) { await pool.cancel(); return; }
+    owner.rooms.set(topic, pool as SharedPool);
     pool.subs.push(pool.error$.subscribe((err) => {
+      if (!owner.active) return;
       error = String(err.parameters?.errorText ?? err.message ?? err);
     }));
-    pool.subs.push(pool.connectionHandler.connect$.subscribe(() => { error = null; }));
+    pool.subs.push(pool.connectionHandler.connect$.subscribe(() => { if (owner.active) error = null; }));
   }
 
   async function applyRole(projectId: string): Promise<void> {
@@ -270,13 +320,14 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     ready = true;
   }
 
-  async function startAccountOrder(rx: RxRepository, account: string | null, securityContext: CollaborationSecurityOptions | null): Promise<void> {
+  async function startAccountOrder(rx: RxRepository, account: string | null, securityContext: CollaborationSecurityOptions | null, owner: BoardSession): Promise<void> {
     const orderAccount = options.getProjectOrderAccountId ? await options.getProjectOrderAccountId(account) : account;
     if (orderAccount !== undefined) await rx.setProjectOrderAccount(orderAccount);
     if (!account || !securityContext) return;
     const id = `projectOrder:${account}`;
     const topic = `pboard-account-${account}-order`;
     const scoped = (doc: unknown) => !!doc && typeof doc === "object" && "id" in doc && doc.id === id;
+    await awaitRoomRelease(topic);
     // The account room enforces its own scoped identity: shared-board credentials
     // are rejected by collection binding inside the handler (protocol 2).
     const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
@@ -289,10 +340,11 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection: "accountOrder" as const,
           ownSessionId: `${securityContext.ownSessionId}:accountOrder:${crypto.randomUUID()}`,
-          ...securityHooksFor(securityContext)
+          ...securityHooksFor(owner)
         }
       }),
       isPeerValid: async (peer) => {
+        if (!owner.active) return false;
         const context = verifiedContexts.get(String(peer.id));
         return Boolean(context) && roleAllowsReplication(securityContext, context!);
       },
@@ -300,8 +352,13 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       push: { batchSize: 100, modifier: (doc) => scoped(doc) ? doc : null }
     });
     scopeMasterChanges(pool.masterReplicationHandler, scoped);
-    pools.push(pool);
-    pool.subs.push(pool.error$.subscribe((err) => { error = String(err.parameters?.errorText ?? err.message ?? err); }));
+    // The session may have been retired while the transport was opening.
+    if (!owner.active) { await pool.cancel(); return; }
+    owner.rooms.set(topic, pool);
+    pool.subs.push(pool.error$.subscribe((err) => {
+      if (!owner.active) return;
+      error = String(err.parameters?.errorText ?? err.message ?? err);
+    }));
   }
 
   /** Serialize start/stop so a rapid project switch or unmount never races the shared pool list. */
@@ -312,8 +369,88 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     return run;
   }
 
+  /**
+   * Retire a session's live resources.
+   *
+   * The transport teardown is asynchronous: cancelling a WebRTC pool closes a
+   * signaling connection and its DataChannel, which is not instantaneous and
+   * must not delay the next board. The retiring session is therefore marked
+   * inactive immediately — its late callbacks can no longer write into the
+   * manager's state — while its rooms and guard are released in the background.
+   *
+   * The releases are registered before the first await, so a session that opens
+   * one of the same rooms waits for the release instead of overlapping it. The
+   * rendezvous admits one session per device and room, and the runtime keeps
+   * one mutation guard per board.
+   */
+  function retireSession(retiring: BoardSession): Promise<void> {
+    retiring.active = false;
+    for (const history of retiring.historySessions) history.close();
+    retiring.historySessions.clear();
+    const guard = retiring.guard;
+    const rooms = [...retiring.rooms.entries()];
+    retiring.rooms.clear();
+    retiring.guard = null;
+    const roomReleasesForSession = rooms.map(([topic, pool]) => {
+      const release = Promise.resolve(pool.cancel()).catch(() => {}).then(() => {
+        if (roomReleases.get(topic) === release) roomReleases.delete(topic);
+      });
+      roomReleases.set(topic, release);
+      return release;
+    });
+    // The guard is released as soon as the board's rooms are closing. It must
+    // not wait for them to finish: a new session for the same board waits for
+    // this release, and that session's rooms in turn wait for the room
+    // releases. Waiting for the rooms here would close that cycle.
+    const guardRelease = guard ? (async () => {
+      await runGuardOperation(async () => {
+        // Stopping transports must not clear durable offline permissions.
+        await options.removeMutationGuard?.(guard.projectId).catch(() => {});
+        await guard.uninstall().catch(() => {});
+      });
+    })() : Promise.resolve();
+    if (guard) {
+      guardReleases.set(retiring.projectId, guardRelease);
+      void guardRelease.then(() => {
+        if (guardReleases.get(retiring.projectId) === guardRelease) guardReleases.delete(retiring.projectId);
+      });
+    }
+    const release = (async () => {
+      try {
+        await retiring.imageSync?.stop();
+        retiring.imageSync = null;
+        await Promise.all(roomReleasesForSession);
+        await guardRelease;
+      } catch {
+        // The teardown runs in the background: a failure must not surface as an
+        // unhandled rejection or affect the board that replaced it.
+      }
+    })();
+    return release;
+  }
+
+  /** Wait until a previous session released the room for this topic. */
+  async function awaitRoomRelease(topic: string): Promise<void> {
+    const pending = roomReleases.get(topic);
+    if (pending) await pending;
+  }
+
+  /** Wait until a previous session released the mutation guard of this board. */
+  async function awaitGuardRelease(projectId: string): Promise<void> {
+    const pending = guardReleases.get(projectId);
+    if (pending) await pending;
+  }
+
   async function doStart(projectId: string): Promise<void> {
-    await doStop();
+    // Retire the previous board without waiting for its transports to close:
+    // the new board opens its own signaling and DataChannel meanwhile.
+    const previous = session;
+    session = null;
+    if (previous) void retireSession(previous);
+    ++sessionGeneration;
+    recovery = null;
+    verifiedContexts.clear();
+    error = null;
     startedProjectId = projectId;
     await applyRole(projectId);
 
@@ -331,10 +468,18 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const boardSecurity = role !== "private"
       ? requireSecurity(await options.boardSecurity?.(projectId), projectId)
       : null;
+    // The account room is independent of the board rooms; it opens in parallel.
+    const owner: BoardSession = { projectId, rooms: new Map(), historySessions: new Set(), imageSync: null, guard: null, active: true };
+    session = owner;
     if (!boardSecurity) {
-      await startAccountOrder(rx, account, accountSecurity);
+      await startAccountOrder(rx, account, accountSecurity, owner);
       return;
     }
+    // The board's previous mutation guard must be released before this board's
+    // documents are written: the runtime keeps one guard entry per board, and a
+    // still-installed guard would reject the import as unsigned. A different
+    // board has no pending release, so a switch never waits for the old one.
+    await awaitGuardRelease(projectId);
     // Authoritative viewer write-restriction. WebRTC picks master/slave by token
     // hash, not role, and the master streams its change log unconditionally, so a
     // viewer that is the master would otherwise leak local writes to peers even
@@ -344,51 +489,51 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     if (!(await rx.getProject(projectId))) {
       await options.bootstrapFromDrive(projectId);
     }
-    activeGuard = options.installMutationGuard ? await options.installMutationGuard(projectId, boardSecurity) : null;
-    if (!activeGuard || activeGuard.projectId !== projectId) {
+    owner.guard = options.installMutationGuard
+      ? await runGuardOperation(() => options.installMutationGuard!(projectId, boardSecurity))
+      : null;
+    if (!owner.guard || owner.guard.projectId !== projectId) {
       throw new Error("Collaboration requires verified mutation protection. Local boards remain available.");
     }
     if (isEditorRole(role)) await rx.admitPendingWork(projectId);
-    await startAccountOrder(rx, account, accountSecurity);
-    await startPool("cards", projectId, rx.db.cards, boardSecurity);
-    await startPool("projects", projectId, rx.db.projects, boardSecurity);
+    // The two collection rooms negotiate on their own signaling channels, so
+    // they start in parallel instead of one after the other. The account room
+    // is independent of both and opens alongside them.
+    await Promise.all([
+      startAccountOrder(rx, account, accountSecurity, owner),
+      startPool("cards", projectId, rx.db.cards, boardSecurity, owner),
+      startPool("projects", projectId, rx.db.projects, boardSecurity, owner)
+    ]);
     if (options.imageTransport && await (options.useImageTransport?.() ?? true)) {
       const transport = typeof options.imageTransport === "function" ? await options.imageTransport() : options.imageTransport;
-      imageSync = createProjectImageSync({ projectId, repository: rx, transport,
+      owner.imageSync = createProjectImageSync({ projectId, repository: rx, transport,
         canWrite: isEditorRole(role),
         requestFromPeers: async imageIds => {
           let missing = imageIds, lastError: unknown;
-          for (const session of [...historySessions]) {
-            if (!historySessions.has(session)) continue;
-            try { await session.requestImages(missing); } catch (error) { lastError = error; }
+          for (const history of [...owner.historySessions]) {
+            if (!owner.historySessions.has(history)) continue;
+            try { await history.requestImages(missing); } catch (error) { lastError = error; }
             const availability = await Promise.all(missing.map(id => rx.hasImage(id)));
             missing = missing.filter((_, index) => !availability[index]);
             if (!missing.length) return;
           }
           if (missing.length && lastError) throw lastError;
         },
-        onError: (err) => { error = err instanceof Error ? err.message : String(err); } });
-      imageSync.start();
+        onError: (err) => { if (owner.active) error = err instanceof Error ? err.message : String(err); } });
+      owner.imageSync.start();
     }
   }
 
   async function doStop(): Promise<void> {
     ++sessionGeneration;
     recovery = null;
-    for (const session of historySessions) session.close();
-    historySessions.clear();
-    await imageSync?.stop();
-    imageSync = null;
-    while (pools.length > 0) await (pools.pop() as SharedPool).cancel();
+    const retiring = session;
+    session = null;
+    // A full stop waits for the teardown: nothing replaces it.
+    if (retiring) await retireSession(retiring);
     if (startedRepo) {
       const orderAccount = options.getProjectOrderAccountId ? await options.getProjectOrderAccountId(null) : null;
       if (orderAccount !== undefined) await startedRepo.setProjectOrderAccount(orderAccount);
-    }
-    // Stopping transports must not clear durable offline permissions.
-    if (activeGuard) {
-      await options.removeMutationGuard?.(activeGuard.projectId).catch(() => {});
-      await activeGuard.uninstall().catch(() => {});
-      activeGuard = null;
     }
     verifiedContexts.clear();
     startedRepo = null;
@@ -408,7 +553,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     try {
       await applyRole(startedProjectId);
       const securityChanged = await options.securityChanged?.(projectId) ?? false;
-      if (!wasReady || securityChanged || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && pools.length === 0)) {
+      if (!wasReady || securityChanged || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && !session?.rooms.size)) {
         await doStart(startedProjectId);
       }
     } catch (err) {

@@ -11,6 +11,16 @@ export interface SharedImageTransport {
   writeImage(projectId: string, imageId: string, image: BoardImage): Promise<void>;
 }
 
+/** A running image transfer for one board. */
+export interface ProjectImageSync {
+  /** Run one transfer pass now. */
+  tick(): Promise<void>;
+  /** Begin the periodic transfer and the card/image subscriptions. */
+  start(): void;
+  /** Stop the transfer and release its subscriptions. */
+  stop(): Promise<void>;
+}
+
 /** Transfer immutable image bytes through Drive without replacing live card documents. */
 export function createProjectImageSync(options: {
   projectId: string;
@@ -25,7 +35,7 @@ export function createProjectImageSync(options: {
   const { projectId, repository, transport } = options;
   const published = new Set<string>();
   let active = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | null = null;
   let stopCards: (() => void) | undefined;
   let stopImages: (() => void) | undefined;
@@ -74,8 +84,8 @@ export function createProjectImageSync(options: {
   }
 
   function schedule() {
-    if (!active || timer !== null) return;
-    timer = setTimeout(() => { timer = null; void tick(); }, options.pollMs ?? 2000);
+    if (!active || timer !== undefined) return;
+    timer = setTimeout(() => { timer = undefined; void tick(); }, options.pollMs ?? 2000);
   }
 
   function tick(): Promise<void> {
@@ -98,10 +108,10 @@ export function createProjectImageSync(options: {
     },
     async stop() {
       active = false;
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
+      clearTimeout(timer);
+      timer = undefined;
       stopCards?.(); stopImages?.();
       await running;
     }
-  };
+  } satisfies ProjectImageSync;
 }

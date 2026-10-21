@@ -225,13 +225,31 @@ export async function isForkAgainst(otherPeerToken: string): Promise<boolean> {
   return (await hash([own, otherPeerToken].join("|"))) < (await hash([otherPeerToken, own].join("|")));
 }
 
+// Board-switch timing. The switch must not wait for the previous board's
+// transports to close, so the measured time covers opening the new board's
+// rooms only, not the old board's teardown.
+export type SwitchTiming = { startMs: number; ready: boolean; error: string | null };
+
+export async function switchTiming(projectId: string): Promise<SwitchTiming> {
+  const began = performance.now();
+  try {
+    await manager.start(projectId);
+    return { startMs: performance.now() - began, ready: manager.state().ready, error: manager.state().error };
+  } catch (error) {
+    return { startMs: performance.now() - began, ready: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 const testWindow = window as typeof window & {
   probe: {
     rx: typeof rx; manager: typeof manager; peerId: string; errors: string[]; done: boolean;
     gate: { run: () => Promise<GateProofResult> };
     conflict: { observe: () => Promise<ConflictProofResult>; isFork: (otherPeerToken: string) => Promise<boolean> };
+    boardSwitch: { timing: (projectId: string) => Promise<SwitchTiming> };
   }
 };
-testWindow.probe = { rx, manager, peerId, errors: [], done: false, gate: { run: gateProof }, conflict: { observe: conflictObservation, isFork: isForkAgainst } };
+testWindow.probe = { rx, manager, peerId, errors: [], done: false, gate: { run: gateProof },
+  conflict: { observe: conflictObservation, isFork: isForkAgainst },
+  boardSwitch: { timing: switchTiming } };
 manager.start(project.id).then(() => { testWindow.probe.done = true; })
   .catch((error) => testWindow.probe.errors.push(String(error)));

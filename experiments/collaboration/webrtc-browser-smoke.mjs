@@ -208,6 +208,23 @@ try {
   await second(`probe.rx.updateItem(${JSON.stringify(cardTwo)},{type:"feature"})`);
   await until(async () => (await first(`probe.rx.getCard(${JSON.stringify(cardTwo)})`))?.type === "feature",
     "Card category failed to replicate in the reverse direction", 5000);
+  // A board switch must open the new board without waiting for the old board's
+  // transports to close. The first side switches to its private board; the
+  // switch is timed in native Chromium.
+  const switched = await first('probe.boardSwitch.timing("private-project")');
+  if (switched.error) throw new Error(`The board switch failed: ${switched.error}`);
+  if (!switched.ready) throw new Error("The board switch did not reach a ready state");
+  if (switched.startMs > 2000) throw new Error(`The board switch took ${switched.startMs} ms`);
+  console.log(`A board switch opened the new board in ${Math.round(switched.startMs)} ms without waiting for the previous board's transports to close.`);
+  await first('probe.manager.start("shared-project")');
+  await until(async () => (await first("window.probe?.manager.state()"))?.ready,
+    "The board did not reopen after the switch", 10000);
+  // The reopened board renegotiates its own DataChannel; the peers must be
+  // connected again before content can replicate.
+  await until(async () => {
+    const states = await Promise.all([first("window.probe?.manager.state()"), second("window.probe?.manager.state()")]);
+    return states.every((state) => state?.connectedPeers.length);
+  }, "The peers did not reconnect after the board switch", 30000);
   await first(`probe.rx.deleteItem(${JSON.stringify(cardOne)})`);
   await until(async () => await second(`(async()=>{const doc=await probe.rx.db.cards.findOne(${JSON.stringify(cardOne)}).exec();return doc?.deletedAt??null})()`),
     "Card deletion failed to replicate", 5000);

@@ -34,7 +34,7 @@ Reviewed against the implementation on 12 October 2026. Google Drive provides pe
 
 ## Runtime wiring
 
-`src/sync/browser.ts` constructs the permission service, shared snapshot sync, shared-board discovery, and collaboration manager. `src/sidebar/App.tsx` starts the manager for the current project and stops it on project changes or unmount. Start, stop, and role refresh operations are serialized.
+`src/sync/browser.ts` constructs the permission service, shared snapshot sync, shared-board discovery, and collaboration manager. `src/sidebar/App.tsx` starts the manager for the current project and stops it on unmount. A project change starts the new board, which retires the previous board's session in the background; it does not stop first. Start, stop, and role refresh operations are serialized.
 
 The sidebar discovers shared boards on load, every 30 seconds, on focus, and after Drive/sharing changes. Background reconciliation also runs discovery. Discovery skips existing local boards and removed projects, isolates per-board failures, and rejects snapshots with a mismatched project ID. Access is refreshed every 10 seconds while the board is open. Changes to the resolved role or shared file restart the pools.
 
@@ -208,13 +208,42 @@ ownership. Google HTTP is simulated; no public service is changed by this test.
 ### Active-board connection lifecycle and repeated grant checks
 
 Independent WebSocket collaboration opens two collection pools for the selected
-board, not two pools per saved board. `manager.doStart()` awaits `doStop()` before
-starting the new board; stop cancels the previous pools and history sessions while
-retaining durable offline permissions and journal entries. Switching therefore
-does not promise delivery of the final peer message. Pending history is retained
-for later authorized exchange, and independent private Drive work can finish in
-the background. The pool lifecycle regression checks cancellation on switch and
-on stop. No new draining pool or per-board connection cache was introduced.
+board, not two pools per saved board. The two collection rooms negotiate on
+their own signaling topics, so they open in parallel rather than one after the
+other.
+
+A board switch no longer waits for the previous board's transports to close.
+The manager keeps one session object per board, holding that board's rooms,
+history sessions, image transfer and mutation guard. `doStart()` retires the
+outgoing session and opens the incoming one immediately: the old rooms are
+cancelled in the background while the new board connects on its own channel.
+The retired session is marked inactive at once, so its late callbacks can no
+longer write into the manager's current state. The sidebar no longer stops the
+session on a board switch for the same reason; closing the sidebar still stops
+it.
+
+Two ordering rules keep the overlap safe. A room waits for the previous session
+to release the same signaling topic, because the rendezvous admits one session
+per device and room. A board waits for the previous session to release its
+mutation guard, because the runtime keeps one guard entry per board and the
+guard wraps the shared collection's storage instance; guard installs and
+removals are serialized so two wrappers can never be chained. A switch to a
+different board waits for neither.
+
+Switching still does not promise delivery of the final peer message. Pending
+history is retained for later authorized exchange, and independent private
+Drive work can finish in the background. The pool lifecycle regression checks
+cancellation on switch and on stop, and the board-switch regression checks that
+the new board opens while the old rooms are still closing and that a reopened
+room waits for its predecessor. No new draining pool or per-board connection
+cache was introduced.
+
+The native Chromium smoke harness times a real switch between two boards with
+live WebRTC and RxDB replication. The switch opens the new board in single-digit
+milliseconds because it no longer waits for the previous board's transports to
+close; the peers then renegotiate the reopened board's own DataChannel. The
+harness asserts the switch completes, that the board reopens, and that the
+peers reconnect before content replicates again.
 
 Identity discovery still polls for current signed membership. It now avoids
 repeating `grants.trust()` and invalidating the security context when a previously

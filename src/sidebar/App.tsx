@@ -212,9 +212,17 @@ export function App() {
       window.clearInterval(statusTimer);
       window.clearInterval(accessTimer);
       browser.storage.onChanged.removeListener(onStorage);
-      void collaborationManager.stop().catch(console.error);
+      // A board switch does not stop the live session here: the next start()
+      // retires it and opens the new board's rooms on their own channels. The
+      // teardown would otherwise delay the new board until the old transports
+      // had closed. The unmount effect below stops the session for good.
     };
   }, [currentProject?.id, collaborationRevision]);
+
+  // Closing the sidebar ends live collaboration for the browser. A board switch
+  // does not reach this effect, so it keeps the old board's channels open until
+  // the next board replaces them.
+  useEffect(() => () => { void collaborationManager.stop().catch(console.error); }, []);
 
   useEffect(() => {
     let mounted = true;
