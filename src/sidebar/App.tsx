@@ -39,10 +39,15 @@ import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
 import { samePinContext } from "./pinContext";
+import { collaborationCounters } from "../collab/counters";
 
 const STATUS_MOVE_DELAY_MS = 800;
 
 export function App() {
+  // The recurring-work counters, so a sustained CPU load can be attributed to a
+  // component without a profiler. A production build does not collect them.
+  if (collaborationCounters.enabled) globalThis.pboardCounters = collaborationCounters;
+  collaborationCounters.countRender("App");
   const [projects, setProjects] = useState<import("../types").Project[]>([]);
   const [currentProject, setCurrentProject] = useState<import("../types").Project | null>(null);
   const [items, setItems] = useState<BoardItem[]>([]);
@@ -108,13 +113,14 @@ export function App() {
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    collaborationCounters.countEffect("mount");
     let active = true;
     let stopProjects: (() => void) | undefined;
     let stopCurrent: (() => void) | undefined;
-    void repository.subscribeProjects((value) => { if (active) { setProjects(value); setBoardReady(true); } }).then((stop) => {
+    void repository.subscribeProjects((value) => { if (active) { collaborationCounters.countEmission("projects"); setProjects(value); } setBoardReady(true); }).then((stop) => {
       if (active) stopProjects = stop; else stop();
     });
-    void repository.subscribeCurrentProject((value) => { if (active) setCurrentProject(value); }).then((stop) => {
+    void repository.subscribeCurrentProject((value) => { if (active) { collaborationCounters.countEmission("currentProject"); setCurrentProject(value); } }).then((stop) => {
       if (active) stopCurrent = stop; else stop();
     });
     void requestDriveReconciliation();
@@ -145,6 +151,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    collaborationCounters.countEffect("discovery");
     let active = true;
     let discoveryNotice: string | null = null;
     const discover = () => { void discoverSharedBoards().then(() => {
@@ -176,17 +183,19 @@ export function App() {
   }, [collaborationRevision]);
 
   useEffect(() => {
+    collaborationCounters.countEffect("subscribeCards");
     if (!currentProject?.id) { setItems([]); return; }
     let active = true;
     let stop: (() => void) | undefined;
     setItems([]);
-    void repository.subscribeCards(currentProject.id, (value) => { if (active) setItems(value); }).then((unsubscribe) => {
+    void repository.subscribeCards(currentProject.id, (value) => { if (active) { collaborationCounters.countEmission("cards"); setItems(value); } }).then((unsubscribe) => {
       if (active) stop = unsubscribe; else unsubscribe();
     });
     return () => { active = false; stop?.(); };
   }, [currentProject?.id]);
 
   useEffect(() => {
+    collaborationCounters.countEffect("collaboration");
     const projectId = currentProject?.id;
     if (!projectId) { void collaborationManager.stop().catch(console.error); return; }
     let active = true;
@@ -204,6 +213,7 @@ export function App() {
     // A second browser can enable this project remotely while this view stays
     // open. Re-resolve its role without recreating healthy WebRTC pools.
     const accessTimer = window.setInterval(() => {
+      collaborationCounters.countEffect("refreshRole");
       void collaborationManager.refreshRole().catch((error) => {
         if (active) setLiveStatus(`Live collaboration: ${error instanceof Error ? error.message : String(error)}`);
       });

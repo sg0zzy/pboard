@@ -3,6 +3,7 @@ import { googleDrive, driveSyncState } from "./browser";
 import { isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
 import { recoveryDelayMs } from "./recoveryScheduler";
+import { collaborationCounters } from "../collab/counters";
 
 const IDLE_SYNC_DELAY_MS = 25_000;
 const ALARM_PREFIX = "pboard-drive-sync:";
@@ -13,6 +14,21 @@ export function registerDriveBackgroundSync() {
   // the board pending writes the state again, and scheduling another one for
   // it would make the board sync in a tight loop.
   const scheduled = new Set<string>();
+  /**
+   * The boards the worker is currently retrying.
+   *
+   * The worker writes the board's sync state while it syncs, and that write is
+   * a storage change. The change listener below sees the worker's own write
+   * and would schedule the board again, with the idle delay and without the
+   * backoff. The two paths then race for the same alarm name, so the later
+   * writer wins and the board is resynced far more often than the backoff
+   * allows.
+   *
+   * A board in this set is already being retried, so its own state writes are
+   * not a reason to schedule it again. The set is held for the whole attempt,
+   * which is why the sync itself is not delayed by reading the attempt count.
+   */
+  const retrying = new Set<string>();
   const schedule = async (projectId: string, delayMs = IDLE_SYNC_DELAY_MS) => {
     if (await googleDrive.getConnectionState() !== "connected" && !(await driveSyncState.get(projectId)).permanentDeletion) return;
     scheduled.add(projectId);
@@ -27,6 +43,10 @@ export function registerDriveBackgroundSync() {
       // A board that is already scheduled must not get another one: the sync
       // that is already pending is the one that will pick this change up.
       if (scheduled.has(next.projectId)) continue;
+      // A board the worker is already retrying is not rescheduled by the
+      // worker's own state write. The retry that is already armed decides when
+      // it runs, so the backoff is not defeated.
+      if (retrying.has(next.projectId)) continue;
       void schedule(next.projectId);
     }
   });
@@ -36,6 +56,11 @@ export function registerDriveBackgroundSync() {
     const projectId = alarm.name.slice(ALARM_PREFIX.length);
     if (!projectId) return;
     scheduled.delete(projectId);
+    // The board is being retried from this moment, so the state writes the
+    // sync makes are not a reason to schedule it again.
+    retrying.add(projectId);
+    collaborationCounters.countBackgroundSync("attempts");
+    collaborationCounters.setRetryingBoards(retrying.size);
     void (async () => {
       try {
         await googleDrive.syncProject(projectId);
@@ -46,14 +71,19 @@ export function registerDriveBackgroundSync() {
           // tight loop. The durable attempt count survives a restart.
           const attempt = await attempts.get(projectId);
           await attempts.set(projectId, attempt + 1);
+          collaborationCounters.countBackgroundSync("unsettled");
           await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
           return;
         }
         await attempts.clear(projectId);
+        retrying.delete(projectId);
+        collaborationCounters.countBackgroundSync("settled");
+        collaborationCounters.setRetryingBoards(retrying.size);
       } catch {
         // Bounded exponential backoff; the durable attempt count survives restart.
         const attempt = await attempts.get(projectId);
         await attempts.set(projectId, attempt + 1);
+        collaborationCounters.countBackgroundSync("failed");
         await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
       }
     })();

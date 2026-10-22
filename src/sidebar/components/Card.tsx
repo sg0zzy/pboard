@@ -15,6 +15,7 @@ import { CheckIcon, CopyIcon, DragHandleIcon, TrashIcon } from "./icons";
 import { CategoryPicker } from "./CategoryPicker";
 import { CardDisplayModeControls } from "./CardDisplayModeControls";
 import { StatusPicker } from "./StatusPicker";
+import { collaborationCounters } from "../../collab/counters";
 
 type Props = {
   item: BoardItem;
@@ -89,6 +90,7 @@ function ensureCardVisible(card: HTMLElement | null) {
 }
 
 export function Card({ item, getImage, subscribeImage, pendingStatus, template, onUpdate, onStatusChange, onDelete, onDiscardEmpty, onDragStart, onDragOver, onDrop, onDragEnd, isDragging, isMergeTarget, isMergeSource, onInsertAfter, onDuplicate, selected, onSelect, onNavigate, onKeyboardMove, focusRequested, startEditingOnFocus, onFocusHandled }: Props) {
+  collaborationCounters.countRender("Card");
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(item.title ?? "");
   const [content, setContent] = useState(item.content);

@@ -1,0 +1,147 @@
+/**
+ * Lightweight counters for the extension's recurring work.
+ *
+ * The counters exist so a sustained CPU problem can be attributed to a
+ * component without a profiler. They are only incremented, never logged from
+ * a hot path, and the collection itself is disabled outside a development
+ * build, so the production cost is a single boolean check per call site.
+ */
+
+/** The counters a development build exposes. */
+export type CollaborationCounters = {
+  /** Drive requests issued, by purpose. */
+  driveRequests: { sync: number; reconcile: number; discovery: number; identity: number; other: number };
+  /** Background sync attempts, and how they ended. */
+  backgroundSync: { attempts: number; settled: number; unsettled: number; failed: number; scheduled: number };
+  /** The boards the background worker is currently retrying. */
+  retryingBoards: number;
+  /** The shared-project discovery listings, and how many were served from the cache. */
+  sharedDiscovery: { listings: number; cached: number };
+  /** The account identity lookups, and how many were served from the cache. */
+  accountIdentity: { lookups: number; cached: number };
+  /** The collaboration manager's live rooms and peers. */
+  rooms: number;
+  peers: number;
+  /** React renders, by component. */
+  renders: Record<string, number>;
+  /** Effect executions, by name. */
+  effects: Record<string, number>;
+  /** Repository subscription emissions, by subscription. */
+  emissions: Record<string, number>;
+  /** Replication and room initialisations. */
+  initialisations: Record<string, number>;
+};
+
+const counters: CollaborationCounters = {
+  driveRequests: { sync: 0, reconcile: 0, discovery: 0, identity: 0, other: 0 },
+  backgroundSync: { attempts: 0, settled: 0, unsettled: 0, failed: 0, scheduled: 0 },
+  retryingBoards: 0,
+  sharedDiscovery: { listings: 0, cached: 0 },
+  accountIdentity: { lookups: 0, cached: 0 },
+  rooms: 0,
+  peers: 0,
+  renders: {},
+  effects: {},
+  emissions: {},
+  initialisations: {}
+};
+
+/**
+ * Whether the counters are collected.
+ *
+ * A production build does not collect them, so the cost of the call sites is a
+ * single boolean test. A build can turn them on with
+ * `VITE_PBOARD_DIAGNOSTICS=1`, which is how a sustained CPU problem is
+ * attributed to a component without a profiler.
+ */
+declare const __PBOARD_DIAGNOSTICS__: boolean;
+const DIAGNOSTICS: boolean = typeof __PBOARD_DIAGNOSTICS__ === "undefined" ? false : __PBOARD_DIAGNOSTICS__;
+const enabled = (): boolean => DIAGNOSTICS;
+
+export const collaborationCounters = {
+  /** Whether the counters are collected in this build. */
+  enabled: DIAGNOSTICS,
+  /** The current counters. Always readable, so a report can be produced. */
+  snapshot(): CollaborationCounters {
+    return {
+      driveRequests: { ...counters.driveRequests },
+      backgroundSync: { ...counters.backgroundSync },
+      retryingBoards: counters.retryingBoards,
+      sharedDiscovery: { ...counters.sharedDiscovery },
+      accountIdentity: { ...counters.accountIdentity },
+      rooms: counters.rooms,
+      peers: counters.peers,
+      renders: { ...counters.renders },
+      effects: { ...counters.effects },
+      emissions: { ...counters.emissions },
+      initialisations: { ...counters.initialisations }
+    };
+  },
+  /** Reset every counter. */
+  clear(): void {
+    counters.driveRequests = { sync: 0, reconcile: 0, discovery: 0, identity: 0, other: 0 };
+    counters.backgroundSync = { attempts: 0, settled: 0, unsettled: 0, failed: 0, scheduled: 0 };
+    counters.retryingBoards = 0;
+    counters.sharedDiscovery = { listings: 0, cached: 0 };
+    counters.accountIdentity = { lookups: 0, cached: 0 };
+    counters.rooms = 0;
+    counters.peers = 0;
+    counters.renders = {};
+    counters.effects = {};
+    counters.emissions = {};
+    counters.initialisations = {};
+  },
+  countDriveRequest(purpose: keyof CollaborationCounters["driveRequests"]): void {
+    if (!enabled()) return;
+    counters.driveRequests[purpose] += 1;
+  },
+  countBackgroundSync(outcome: "attempts" | "settled" | "unsettled" | "failed" | "scheduled"): void {
+    if (!enabled()) return;
+    counters.backgroundSync[outcome] += 1;
+  },
+  setRetryingBoards(count: number): void {
+    if (!enabled()) return;
+    counters.retryingBoards = count;
+  },
+  countSharedDiscovery(cached: boolean): void {
+    if (!enabled()) return;
+    counters.sharedDiscovery.listings += 1;
+    if (cached) counters.sharedDiscovery.cached += 1;
+  },
+  countAccountIdentity(cached: boolean): void {
+    if (!enabled()) return;
+    counters.accountIdentity.lookups += 1;
+    if (cached) counters.accountIdentity.cached += 1;
+  },
+  setRooms(rooms: number, peers: number): void {
+    if (!enabled()) return;
+    counters.rooms = rooms;
+    counters.peers = peers;
+  },
+  countRender(component: string): void {
+    if (!enabled()) return;
+    counters.renders[component] = (counters.renders[component] ?? 0) + 1;
+  },
+  countEffect(effect: string): void {
+    if (!enabled()) return;
+    counters.effects[effect] = (counters.effects[effect] ?? 0) + 1;
+  },
+  countEmission(subscription: string): void {
+    if (!enabled()) return;
+    counters.emissions[subscription] = (counters.emissions[subscription] ?? 0) + 1;
+  },
+  countInitialisation(what: string): void {
+    if (!enabled()) return;
+    counters.initialisations[what] = (counters.initialisations[what] ?? 0) + 1;
+  }
+};
+
+declare global {
+  /**
+   * The recurring work counters, exposed on the background page's global in a
+   * development build so a developer can read them from the console.
+   */
+  var pboardCounters: typeof collaborationCounters | undefined;
+  /** Set by the build when the counters are collected. */
+  var __PBOARD_DIAGNOSTICS__: boolean;
+}

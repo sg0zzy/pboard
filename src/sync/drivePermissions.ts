@@ -1,6 +1,7 @@
 import type { GoogleAuthProvider } from "./googleAuth";
 import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
 import type { PboardDriveSignalRecord, PboardDriveSignalStore } from "../collab/signaling";
+import { collaborationCounters } from "../collab/counters";
 import type { BoardImage } from "../types";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
@@ -315,21 +316,29 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
   }
 
   /**
-   * Resolve the shared layout, preferring the local cache. A collaborator with no
-   * local copy has an empty cache, so fall back to discovery: list the
-   * project.json files the account can reach and match by parent folder name.
+   * The shared projects this account can reach, and when the list was taken.
+   *
+   * `resolveLayout` falls back to discovery when a board's layout is not
+   * cached. A board that is not shared never gets a cached layout, so every
+   * resolution of it listed every shared `project.json` in the account again.
+   * The sidebar resolves the board's role every ten seconds, and the role
+   * resolution and the shared-file resolution run in parallel, so a local
+   * board produced a steady stream of Drive listings.
+   *
+   * The list is therefore kept for a short while and reused. A board that
+   * becomes shared is picked up by the next list, and the shared board's own
+   * layout is cached as soon as it is found.
    */
-  async function resolveLayout(projectId: string): Promise<DriveSharedProjectRecord> {
-    const cached = await sharedProjects.get(projectId);
-    if (cached.folderId && cached.projectFileId) return cached;
-    const match = (await discoverSharedProjects()).find((entry) => entry.projectId === projectId);
-    if (!match) return { folderId: cached.folderId, projectFileId: cached.projectFileId, realtimeFolderId: cached.realtimeFolderId };
-    const folderId = (await transport.getFileParents(match.fileId))[0] ?? null;
-    if (folderId) await sharedProjects.set(projectId, { folderId, projectFileId: match.fileId });
-    return { folderId, projectFileId: match.fileId, realtimeFolderId: cached.realtimeFolderId };
-  }
+  let discovered: { at: number; entries: DiscoveredSharedProject[] } | null = null;
+  const DISCOVERY_TTL_MS = 60_000;
 
   async function discoverSharedProjects(): Promise<DiscoveredSharedProject[]> {
+    const now = Date.now();
+    if (discovered && now - discovered.at < DISCOVERY_TTL_MS) {
+      collaborationCounters.countSharedDiscovery(true);
+      return discovered.entries;
+    }
+    collaborationCounters.countSharedDiscovery(false);
     const files = await transport.listFilesByName(PROJECT_FILE_NAME, JSON_MIME);
     const byProject = new Map<string, DiscoveredSharedProject>();
     for (const file of files) {
@@ -345,7 +354,24 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
       }
       if (!byProject.has(projectId)) byProject.set(projectId, { projectId, name: projectId, fileId: file.id });
     }
-    return [...byProject.values()];
+    const entries = [...byProject.values()];
+    discovered = { at: now, entries };
+    return entries;
+  }
+
+  /**
+   * Resolve the shared layout, preferring the local cache. A collaborator with no
+   * local copy has an empty cache, so fall back to discovery: list the
+   * project.json files the account can reach and match by parent folder name.
+   */
+  async function resolveLayout(projectId: string): Promise<DriveSharedProjectRecord> {
+    const cached = await sharedProjects.get(projectId);
+    if (cached.folderId && cached.projectFileId) return cached;
+    const match = (await discoverSharedProjects()).find((entry) => entry.projectId === projectId);
+    if (!match) return { folderId: cached.folderId, projectFileId: cached.projectFileId, realtimeFolderId: cached.realtimeFolderId };
+    const folderId = (await transport.getFileParents(match.fileId))[0] ?? null;
+    if (folderId) await sharedProjects.set(projectId, { folderId, projectFileId: match.fileId });
+    return { folderId, projectFileId: match.fileId, realtimeFolderId: cached.realtimeFolderId };
   }
 
   async function ensureSharedProject(projectId: string): Promise<string> {

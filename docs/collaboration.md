@@ -145,6 +145,40 @@ room starts.
 
 ## Verification
 
+### Attributing a sustained CPU load without a profiler
+
+A build with `VITE_PBOARD_DIAGNOSTICS=1` collects counters for the work that
+repeats: the Drive requests by purpose, the background sync attempts and how
+they ended, the boards being retried, the shared-project discovery listings,
+the account identity lookups, the React renders, the effect executions, the
+repository subscription emissions, and the collaboration session
+initialisations.
+
+A production build does not collect them: each call site is a single boolean
+test. The counters are read from the background page's console, and from the
+sidebar's console:
+
+```js
+pboardCounters.snapshot()
+pboardCounters.clear()
+```
+
+The counters are the fastest way to attribute a load to a component: a
+`renders` count that grows while the board is idle points at a subscription
+that publishes more often than it should, a `backgroundSync.unsettled` count
+that grows points at a board the worker cannot settle, and a
+`sharedDiscovery.listings` count that grows points at a layout that is not
+being cached.
+
+For a stack-level view, record a Firefox Profiler run instead. Open
+`about:profiler`, choose **Record**, leave the sidebar open and idle for a
+minute, stop the recording, and in the flame graph look for the busiest
+self-time frames. The ones that matter here are the extension's own bundle
+(`sidebar-*.js` and `background.js`): a long `JSON.parse` or `canonicalize`
+frame inside `privateDriveHistory` points at the archive verification, a
+`setState`-shaped frame inside the sidebar bundle points at a render, and
+repeated `IDBObjectStore.getAll` frames point at a subscription re-reading.
+
 Admission regressions are in `tests/collaborationAdmission.test.ts`. The existing
 manager convergence tests and browser smoke harness explicitly double the
 authentication boundary while retaining real WebRTC transport and storage. They
@@ -431,6 +465,73 @@ The answer is now compared field by field, and only a changed answer is
 stored. A changed answer still re-renders the board, as it must.
 
 `tests/sidebarPinContext.test.ts` pins the comparison.
+
+### The sidebar re-rendered the board continuously while it was open
+
+The sidebar observes the whole settings collection from its project list and
+its current project. Two writes to that collection happened on every
+account-preference sync, which the sidebar runs on a timer:
+
+- the account's project order was merged and written unconditionally, and the
+  merge produces a new value each time, so the write changed the collection
+  even when the order had not changed;
+- the local order was written unconditionally as well.
+
+Each write re-read the list and the current project and published a new
+array, so the board re-rendered. Every render re-rendered every card, and
+every card re-parsed its markdown. The render also asked Drive for the board's
+role and shared file, so the idle sidebar produced a steady stream of Drive
+requests.
+
+The order is now compared by content before it is written, so an unchanged
+order is not written at all, and the settings collection is not touched.
+
+The change log was a second source of the same churn. The journal announces
+its changes to the other extension contexts over a broadcast channel, and the
+announcement carried no table names, so a reader in the other context could
+not tell that a change to the change log did not affect it. The table names
+now travel with the announcement, and a subscription refreshes only for the
+tables it mirrors.
+
+Measured in real Firefox with the real extension, over 60 seconds with the
+sidebar open and no user activity: the board re-rendered 14 times and the
+project list and the current project were published 7 times each. After the
+change the board re-renders 0 times, both publications are 0, and the
+extension's process uses 1.7 % of one core.
+
+`tests/recovery/projectOrderWrites.test.ts` and
+`tests/recovery/subscriptionEmissions.test.ts` pin both properties.
+
+### The background worker resynced a board faster than its own backoff
+
+The worker writes the board's sync state while it syncs, and that write is a
+storage change. The worker's own change listener saw the write and
+scheduled the board again, with the idle delay and without the backoff. The
+two paths raced for the same alarm name, and the later writer won, so a board
+that could not settle was resynced far more often than the backoff allows,
+and each attempt ran the whole Drive pipeline.
+
+The worker now holds the board in a retry set for the length of the attempt,
+so its own state write is not a reason to schedule it again, and the armed
+retry decides when the board runs.
+
+`tests/recovery/backgroundResyncSchedule.test.ts` pins the properties: one
+alarm per unsettled sync, a delay that grows between the retries, and a fresh
+local change that still gets the idle delay.
+
+### The shared board's layout and the account's identity were fetched again and again
+
+A board that is not shared has no shared layout to cache, so every resolution
+of its layout fell back to discovery, which lists every shared `project.json`
+in the account. The sidebar resolves the board's role every ten seconds, and
+the role and the shared file are resolved in parallel, so a local board
+produced a full Drive listing several times a minute. The discovered list is
+now kept for a minute and reused.
+
+The account's identity was fetched from Drive on every check of the private
+history, and one board's sync makes several checks. The account is now read
+once per sync and once more at the end, so a different account signed in
+mid-sync is still noticed.
 
 ### The account order and the peer history re-read what they had already read
 

@@ -16,7 +16,7 @@ import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, B
 import type { CollaborationRole } from "../collab/manager";
 import { blobToDataUrl, createIndexedDbBlobStore, hashBlob, imageToBlob, type BlobStore } from "./blobStore";
 import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
-import { mergeProjectOrder, parseProjectOrder, type ProjectOrderPreference } from "./projectOrder";
+import { mergeProjectOrder, parseProjectOrder, sameProjectOrder, type ProjectOrderPreference } from "./projectOrder";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
 import type { MutationGuardInstall } from "../collab/security/mutation";
 import type { RepositoryEvents } from "./repository";
@@ -378,11 +378,18 @@ export async function createRxRepository(options: {
     const preference = (projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null)
       ?? await settings.findOne(localOrderId).exec();
     const value = preference?.value ?? JSON.stringify((await orderedProjects()).map((record) => record.id));
-    if (projectOrderAccount) await settings.upsert({ id: "localProjectOrderAccount", value: projectOrderAccount });
+    if (projectOrderAccount) {
+      const saved = await settings.findOne("localProjectOrderAccount").exec();
+      if (saved?.value !== projectOrderAccount) await settings.upsert({ id: "localProjectOrderAccount", value: projectOrderAccount });
+    }
     projectOrderAccount = account;
     // Preserve local ordering before shared project documents can arrive, and
     // retain the last visible order when disconnecting or changing accounts.
-    await settings.upsert({ id: localOrderId, value });
+    // The settings collection is observed by the sidebar's project list and
+    // current project, so an unchanged value is not written: the write would
+    // re-render the whole board for nothing.
+    const local = await settings.findOne(localOrderId).exec();
+    if (local?.value !== value) await settings.upsert({ id: localOrderId, value });
   }
   async function getProjectOrder(account: string): Promise<ProjectOrderPreference | null> {
     const preference = await settings.findOne(accountOrderId(account)).exec();
@@ -398,8 +405,21 @@ export async function createRxRepository(options: {
         await settings.upsert({ id, value: JSON.stringify(preference) });
         return;
       }
-      await doc.incrementalModify((current) => ({ ...current,
-        value: JSON.stringify(mergeProjectOrder(parseProjectOrder(current.value), preference)) }));
+      const current = doc.value;
+      const mergedOrder = mergeProjectOrder(parseProjectOrder(current), preference);
+      const merged = JSON.stringify(mergedOrder);
+      // The account's order is merged on every account-preference sync. The
+      // merge returns a new value each time, so writing it unconditionally
+      // would change the settings collection on every sync. The settings
+      // collection is observed by the sidebar's project list and current
+      // project, so that write re-rendered the whole board — and the
+      // re-render started the next sync.
+      //
+      // The merged order is compared by content, not by its text: the same
+      // order serializes differently when the merge reorders the keys, and
+      // that difference is not a change.
+      if (sameProjectOrder(parseProjectOrder(current), mergedOrder)) return;
+      await doc.incrementalModify((existing) => ({ ...existing, value: merged }));
     });
   }
   async function projectCardRecords(projectId: string, includeDeleted = false, includePending = true) {
@@ -926,9 +946,13 @@ export async function createRxRepository(options: {
   function subscribe<T>(query: { $: { subscribe: (next: () => void) => { unsubscribe(): void } } }, read: () => Promise<T>, listener: (value: T) => void) {
     const { refresh, readNow, stop } = subscribeRead(read, listener);
     const sub = query.$.subscribe(refresh);
-    // Every journal change can alter the pending-edit overlay, so the
-    // shared copy is dropped before the readers re-read it.
-    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); });
+    // A card's list is the documents plus the pending-edit overlay over them.
+    // A journal change in the change log, the receipts or the drafts does not
+    // alter either, so it must not re-read the cards and re-render the board.
+    const stopJournal = journal.subscribe((tables) => {
+      if (tables.includes("pendingEdits")) invalidatePendingEdits();
+      if (!tables.length || tables.includes("pendingEdits") || tables.includes("receipts")) refresh();
+    });
     readNow();
     return () => { stop(); sub.unsubscribe(); stopJournal(); };
   }
@@ -973,14 +997,27 @@ export async function createRxRepository(options: {
     const { refresh, readNow, stop } = subscribeRead(listProjects, listener);
     const first = projects.find().$.subscribe(refresh);
     const second = settings.find().$.subscribe(refresh);
-    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); readNow();
+    // The project list mirrors the project documents, the settings that record
+    // the account's order, the pending-edit overlay and the board-erasure
+    // markers. A journal change in another table — the change log, the
+    // permissions, the drafts — does not change it, so it must not re-read
+    // the list and re-render the board.
+    const stopJournal = journal.subscribe((tables) => {
+      if (tables.includes("pendingEdits")) invalidatePendingEdits();
+      if (!tables.length || tables.includes("pendingEdits") || tables.includes("receipts")) refresh();
+    });
+    readNow();
     return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
     const { refresh, readNow, stop } = subscribeRead(getCurrentProject, listener);
     const first = settings.find().$.subscribe(refresh);
     const second = projects.find().$.subscribe(refresh);
-    const stopJournal = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); refresh();
+    const stopJournal = journal.subscribe((tables) => {
+      if (tables.includes("pendingEdits")) invalidatePendingEdits();
+      if (!tables.length || tables.includes("pendingEdits") || tables.includes("receipts")) refresh();
+    });
+    refresh();
     return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCards = (projectId: string, listener: (value: BoardItem[]) => void) =>

@@ -4,6 +4,7 @@ import { identifyLegacyBoard, legacyTransitionFor, transitionLegacyBoard } from 
 import { COLLABORATION_SETTINGS, createBoardGrantService, type CollaborationSettings } from "../collab/boardGrants";
 import { createDeviceEnrollment, storageManifestEpochs } from "../collab/security/enrollment";
 import { collaborationDiagnostic } from "../collab/diagnostics";
+import { collaborationCounters } from "../collab/counters";
 import { createGoogleBrokerEnrollment, googleBrokerEnabled } from "../collab/googleBrokerEnrollment";
 import { experimentalSignalingEnabled, selectRuntimeSignaling } from "../collab/signalingSelection";
 import { createDriveTransport } from "./driveTransport";
@@ -111,9 +112,8 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         if (!await driveConnected()) return null;
         const token = await googleAuth.getAccessToken();
         const boundAuth = { ...googleAuth, getAccessToken: async () => token };
-        const identity = await createDrivePermissionTransport(boundAuth, fetcher).currentIdentity();
-        if (!identity) throw new Error("Could not bind private recovery to the Google account");
-        return { account: await hashBlob(new Blob([identity.email.trim().toLowerCase()])),
+        const email = await connectedAccountEmail();
+        return { account: await hashBlob(new Blob([email])),
           history: createDriveTransport(boundAuth, fetcher, "history-"), snapshots: createDriveTransport(boundAuth, fetcher),
           erasures: createDriveTransport(boundAuth, fetcher, 'erased-'), images: createDriveTransport(boundAuth, fetcher, 'image-') };
       } }),
@@ -533,11 +533,26 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   /** Drive I/O only when connected; private/unconnected projects resolve null locally. */
   const driveConnected = async () => (await googleAuth.getConnectionState()) === "connected";
 
-  async function connectedAccountId(): Promise<string | null> {
-    if (!await driveConnected()) return null;
+  /**
+   * The connected account's identity.
+   *
+   * The account is asked for on every private-history sync, twice: once for
+   * the erasure inventory and once for the history itself. The answer is not
+   * cached here: a different Google account can be signed in without the
+   * stored token changing, so a cached identity could report the previous
+   * account and let a board be written under it. The shared permission
+   * transport caches the identity for the short-lived checks that need it.
+   */
+  async function connectedAccountEmail(): Promise<string> {
+    collaborationCounters.countAccountIdentity(false);
     const identity = await createDrivePermissionTransport(googleAuth, fetcher).currentIdentity();
     if (!identity) throw new Error("Could not identify the Google Drive account");
-    return hashBlob(new Blob([identity.email.trim().toLowerCase()]));
+    return identity.email.trim().toLowerCase();
+  }
+
+  async function connectedAccountId(): Promise<string | null> {
+    if (!await driveConnected()) return null;
+    return hashBlob(new Blob([await connectedAccountEmail()]));
   }
   async function privateErasureAccount(boardId: string): Promise<string | null> {
     const rx = await getRepository();

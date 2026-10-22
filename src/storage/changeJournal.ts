@@ -119,7 +119,16 @@ export class ChangeJournal {
     this.listeners.add(listener);
     if (!this.channel && typeof BroadcastChannel !== "undefined") {
       this.channel = new BroadcastChannel(`pboard:journal:${this.name}`);
-      this.channel.onmessage = () => { for (const next of this.listeners) next([]); };
+      // The tables that changed travel with the message, so a reader that
+      // mirrors one store is not re-read because an unrelated store changed in
+      // another context. A message without table names means "everything
+      // changed", which is what an older peer sends.
+      this.channel.onmessage = (event: MessageEvent) => {
+        const tables = Array.isArray(event.data?.tables)
+          ? (event.data.tables as string[]).filter((table) => typeof table === "string")
+          : [];
+        for (const next of this.listeners) next(tables);
+      };
     }
     return () => { this.listeners.delete(listener); if (!this.listeners.size) { this.channel?.close(); this.channel = null; } };
   }
@@ -148,7 +157,10 @@ export class ChangeJournal {
     for (const listener of this.changeListeners) listener(tables);
     for (const listener of this.listeners) listener(tables);
     const sender = this.channel ?? (typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(`pboard:journal:${this.name}`));
-    sender?.postMessage("changed");
+    // The table names travel with the message. A reader in another context
+    // that mirrors one store is then not re-read because an unrelated store
+    // changed there.
+    sender?.postMessage({ tables });
     if (sender !== this.channel) sender?.close();
   }
   async read<T>(name: string, operation: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {

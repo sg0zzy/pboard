@@ -18,6 +18,7 @@ import { getToolbarPinContext, pinFromToolbar, type PinApi } from "./toolbarPins
 import { togglePboardSidebar } from "./sidebar";
 import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
+import { collaborationCounters } from "../collab/counters";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
@@ -28,6 +29,16 @@ const WEB_PAGES = ["http://*/*", "https://*/*"];
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();
 registerDriveBackgroundSync();
+
+/**
+ * The recurring work counters, for a development build. A developer can read
+ * them from the background page's console with
+ * `pboardCounters.snapshot()` to attribute a sustained CPU load to a
+ * component without a profiler. A production build does not collect them.
+ */
+if (collaborationCounters.enabled) {
+  globalThis.pboardCounters = collaborationCounters;
+}
 
 if (browser.sidePanel?.setPanelBehavior) {
   void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });

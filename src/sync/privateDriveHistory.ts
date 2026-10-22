@@ -152,7 +152,27 @@ export function createPrivateDriveHistory(options: {
     const rx = await options.getRepository(), account = session?.account ?? await options.getAccountId();
     if (!rx || !account || options.captureSession && !session) return null;
     const using = session?.history ?? transport, compatibility = session?.snapshots ?? options.snapshotTransport;
-    const currentSession = async () => await options.getAccountId() === account;
+    /**
+     * Whether the connected account is still the one this sync started with.
+     *
+     * The account was read once, above. The check used to read it again on
+     * every call, and one board's sync makes several, so the account's
+     * identity was fetched from Drive repeatedly during a single sync. The
+     * account cannot change in the middle of a sync, so the check compares
+     * against the value read at the start, and the account is read again once
+     * when the sync is about to finish.
+     */
+    let accountChanged = false;
+    let accountChecked = false;
+    const currentSession = async () => {
+      if (accountChanged) return false;
+      if (accountChecked) return true;
+      const current = await options.getAccountId();
+      accountChecked = true;
+      if (current === account) return true;
+      accountChanged = true;
+      return false;
+    };
     if (!await currentSession()) return null;
     const erasures = session?.erasures ?? options.erasureTransport;
     if (erasures) {
@@ -297,6 +317,9 @@ export function createPrivateDriveHistory(options: {
     const groups = new Map<string, Change[]>();
     for (const entry of latest) { const id = scope(entry), group = groups.get(id); if (group) group.push(entry); else groups.set(id, [entry]); }
     const completeAncestry = [...groups.values()].every(group => reconcile(group).reason !== "missing-ancestry");
+    // The account is read again here, once, to confirm it did not change
+    // during the sync.
+    accountChecked = false;
     return await currentSession() && completeAncestry && latest.every(change => remotelySaved.has(change.id)) && latestDrafts.every(draft => savedDrafts.has(json(draft)))
       && (await rx.journal.pendingEdits.toArray()).filter(e => e.boardId === boardId && !e.admittedChangeId).every(e => savedPending.has(json(cleanPending(e))))
       && (await rx.journal.publicGrants.where('boardId').equals(boardId).toArray()).every(g => savedGrants.has(json(g)))

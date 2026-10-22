@@ -13,6 +13,7 @@ import type { PboardSignaling } from "./signaling";
 import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
 import { scopeMasterChanges } from "./scopedPull";
+import { collaborationCounters } from "./counters";
 import { createProjectImageSync, type ProjectImageSync, type SharedImageTransport } from "./imageSync";
 import type { PeerHistorySession } from "./peerHistory";
 
@@ -222,6 +223,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
       if (pool.collection.name === "settings") continue;
       for (const peer of pool.peerStates$.getValue().keys()) ids.add(String(peer.id));
     }
+    collaborationCounters.setRooms(session?.rooms.size ?? 0, ids.size);
     return Array.from(ids).sort();
   }
 
@@ -329,6 +331,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // The session may have been retired while the transport was opening; that
     // pool must not survive its own session.
     if (!owner.active) { await pool.cancel(); return; }
+    collaborationCounters.countInitialisation(`pool:${collection}`);
     owner.rooms.set(topic, pool as SharedPool);
     pool.subs.push(pool.error$.subscribe((err) => {
       if (!owner.active) return;

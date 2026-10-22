@@ -1,5 +1,26 @@
 export type ProjectOrderPreference = { ids: string[]; updatedAt: string; deletedProjectIds?: string[]; restoreEvents?: Record<string, string> };
 
+/**
+ * Whether two project orders describe the same thing.
+ *
+ * The order is compared by content, not by its serialized text: the same
+ * order can serialize differently when the merge reorders the keys, and that
+ * difference is not a change worth writing.
+ */
+export function sameProjectOrder(left: ProjectOrderPreference, right: ProjectOrderPreference): boolean {
+  const sameIds = left.ids.length === right.ids.length && left.ids.every((id, index) => id === right.ids[index]);
+  if (!sameIds) return false;
+  if (left.updatedAt !== right.updatedAt) return false;
+  const leftDeleted = left.deletedProjectIds ?? [];
+  const rightDeleted = right.deletedProjectIds ?? [];
+  if (leftDeleted.length !== rightDeleted.length) return false;
+  if (!leftDeleted.every((id, index) => id === rightDeleted[index])) return false;
+  const leftRestores = Object.entries(left.restoreEvents ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  const rightRestores = Object.entries(right.restoreEvents ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  if (leftRestores.length !== rightRestores.length) return false;
+  return leftRestores.every(([id, when], index) => id === rightRestores[index][0] && when === rightRestores[index][1]);
+}
+
 /** Accepts the pre-preference array format and the object format, plus an additive `restoreEvents` map (project id → ISO restore time). */
 export function parseProjectOrder(value: string): ProjectOrderPreference {
   const parsed: unknown = JSON.parse(value);
