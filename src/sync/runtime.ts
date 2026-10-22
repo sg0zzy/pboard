@@ -159,11 +159,22 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       async set(projectId, patch) {
         const all = await readAll();
         const existing = all[projectId] ?? { folderId: null, projectFileId: null, realtimeFolderId: null };
-        all[projectId] = { ...existing, ...patch };
+        const next = { ...existing, ...patch };
+        // The layout is re-recorded on every discovery pass and on every
+        // signaling round trip. Writing it when nothing changed is not free:
+        // the sidebar watches this key and restarts its Drive reconciliation
+        // and its collaboration session on every write, so an unchanged
+        // layout would keep both running. Firefox fires the change event for
+        // an identical value as well, so the write must be skipped here.
+        if (next.folderId === existing.folderId &&
+            next.projectFileId === existing.projectFileId &&
+            next.realtimeFolderId === existing.realtimeFolderId) return;
+        all[projectId] = next;
         await writeAll(all);
       },
       async delete(projectId) {
         const all = await readAll();
+        if (!(projectId in all)) return;
         delete all[projectId];
         await writeAll(all);
       }

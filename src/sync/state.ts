@@ -30,6 +30,24 @@ export type DriveProjectTombstone = {
 
 export const projectSyncStorageKey = (projectId: string) => `${DRIVE_PROJECT_STATE_PREFIX}${projectId}`;
 
+/**
+ * Two state records are equal when every stored field matches. An absent
+ * field and an explicit `undefined` field are the same, because the record is
+ * stored as JSON and the field is then absent.
+ */
+export function sameSyncState(left: DriveProjectSyncState | undefined, right: DriveProjectSyncState | undefined): boolean {
+  if (!left || !right) return left === right;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    const a = (left as Record<string, unknown>)[key];
+    const b = (right as Record<string, unknown>)[key];
+    if (a === b) continue;
+    if (a === undefined && b === undefined) continue;
+    return false;
+  }
+  return true;
+}
+
 export function createDriveSyncStateStore(storage: KeyValueStorage) {
   async function load(projectId: string): Promise<DriveProjectSyncState> {
     const key = projectSyncStorageKey(projectId);
@@ -43,16 +61,34 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
     return load(projectId);
   }
 
+  /**
+   * Write the record only when it actually differs from what is stored.
+   *
+   * Firefox fires `storage.onChanged` for a write whose value is identical to
+   * the stored one, while Chromium does not. A write that changes nothing is
+   * therefore not free: the background worker watches this key and would treat
+   * the worker's own state transitions as new work, so a board whose sync
+   * cannot settle would keep the worker busy. Skipping the no-op write
+   * removes that trigger on every browser.
+   *
+   * The caller holds the per-board lock; this helper must not take it again.
+   */
+  async function write(projectId: string, next: DriveProjectSyncState): Promise<void> {
+    const current = await load(projectId);
+    if (sameSyncState(current, next)) return;
+    await storage.set({ [projectSyncStorageKey(projectId)]: next });
+  }
+
   async function set(state: DriveProjectSyncState): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(state.projectId), async () => {
-      await storage.set({ [projectSyncStorageKey(state.projectId)]: state });
+      await write(state.projectId, state);
     });
   }
 
   async function markDirty(projectId: string, permanentDeletion = false): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
-      await storage.set({ [projectSyncStorageKey(projectId)]: {
+      await write(projectId, {
         ...current,
         ...(permanentDeletion ? { permanentDeletion: true } : {}),
         projectId,
@@ -61,14 +97,14 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         status: "pending",
         dirtyAt: new Date().toISOString(),
         error: undefined
-      } satisfies DriveProjectSyncState });
+      });
     });
   }
 
   async function markSyncing(projectId: string): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
-      await storage.set({ [projectSyncStorageKey(projectId)]: { ...current, status: "syncing", error: undefined } });
+      await write(projectId, { ...current, status: "syncing", error: undefined });
     });
   }
 
@@ -76,7 +112,7 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
       const changedDuringSync = expectedChangeToken !== undefined && (current.changeToken ?? 0) !== expectedChangeToken;
-      await storage.set({ [projectSyncStorageKey(projectId)]: {
+      await write(projectId, {
         ...current,
         projectId,
         dirty: changedDuringSync,
@@ -85,14 +121,14 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         lastSyncedRevision: revision,
         remoteFileId,
         error: undefined
-      } satisfies DriveProjectSyncState });
+      });
     });
   }
 
   async function markUploadStale(projectId: string, remoteFileId: string): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
-      await storage.set({ [projectSyncStorageKey(projectId)]: {
+      await write(projectId, {
         ...current,
         projectId,
         remoteFileId,
@@ -103,14 +139,14 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         // worker would reschedule the same superseded upload forever.
         changeToken: (current.changeToken ?? 0) + 1,
         error: undefined
-      } satisfies DriveProjectSyncState });
+      });
     });
   }
 
   async function markError(projectId: string, message: string): Promise<void> {
     await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
       const current = await load(projectId);
-      await storage.set({ [projectSyncStorageKey(projectId)]: { ...current, dirty: true, status: "error", error: message } });
+      await write(projectId, { ...current, dirty: true, status: "error", error: message });
     });
   }
 

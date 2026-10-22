@@ -38,6 +38,7 @@ import { BoardCollaborationControls } from "./components/BoardCollaborationContr
 import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
+import { samePinContext } from "./pinContext";
 
 const STATUS_MOVE_DELAY_MS = 800;
 
@@ -156,6 +157,10 @@ export function App() {
         setNotice(discoveryNotice);
       }
     }); };
+    // A new collaboration revision means the Drive state changed, so the
+    // boards are discovered again. The interval and the event listeners stay
+    // in place: rebuilding them on every revision would drop and re-arm the
+    // 30-second timer each time the collaboration state changed.
     discover();
     const timer = window.setInterval(discover, 30_000);
     const onVisible = () => { if (document.visibilityState === "visible") discover(); };
@@ -204,7 +209,15 @@ export function App() {
       });
     }, 10_000);
     const onStorage = (changes: Record<string, unknown>, area: string) => {
-      if (area === "local" && (DRIVE_AUTH_STORAGE_KEY in changes || SHARED_PROJECTS_KEY in changes)) refreshCollaboration();
+      if (area !== "local") return;
+      // A new Google authorization means the account may have changed, so the
+      // board's role must be resolved again. A token refresh keeps the same
+      // account and only extends the token's lifetime; restarting the board's
+      // live session for it would tear down healthy rooms for nothing.
+      const auth = changes[DRIVE_AUTH_STORAGE_KEY] as { oldValue?: { refreshToken?: string } | null; newValue?: { refreshToken?: string } | null } | undefined;
+      const accountChanged = auth !== undefined &&
+        auth.oldValue?.refreshToken !== auth.newValue?.refreshToken;
+      if (accountChanged || SHARED_PROJECTS_KEY in changes) refreshCollaboration();
     };
     browser.storage.onChanged.addListener(onStorage);
     return () => {
@@ -229,9 +242,15 @@ export function App() {
     const refresh = async () => {
       try {
         const context = await browser.runtime.sendMessage({ type: "GET_TOOLBAR_PIN_CONTEXT" }) as ToolbarPinContext;
-        if (mounted) setPinContext(context);
+        // The poll runs every 1.5 seconds and the answer is a fresh object
+        // every time. Storing it unchanged re-rendered the whole board, and
+        // every card re-parsed its markdown. Only a changed answer is a
+        // change the user can see.
+        if (mounted) setPinContext((current) => samePinContext(current, context) ? current : context);
       } catch {
-        if (mounted) setPinContext({ page: false, selection: false, link: false, accessible: false });
+        if (mounted) setPinContext((current) => samePinContext(current, { page: false, selection: false, link: false, accessible: false })
+          ? current
+          : { page: false, selection: false, link: false, accessible: false });
       }
     };
     void refresh();

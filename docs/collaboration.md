@@ -358,6 +358,80 @@ like a failed attempt instead of rescheduling immediately.
 `tests/recovery/uploadStaleLoop.test.ts` and
 `tests/recovery/backgroundSyncLoop.test.ts` pin both properties.
 
+### Firefox fires a storage change for a write that changed nothing
+
+Firefox reports `storage.onChanged` for a write whose value is identical to
+the stored one; Chromium does not. The extension watched two storage keys, so
+on Firefox a write that changed nothing was still a trigger.
+
+Three writes are now conditional. The board's sync state is written only when
+a field differs from the stored record, and the shared board's layout is
+recorded only when its folder, file or realtime folder differs. The state
+store's comparison treats an absent field and an explicit `undefined` field as
+the same, because the record is stored as JSON.
+
+`tests/recovery/syncStateWrite.test.ts` and
+`tests/recovery/sharedProjectsWrite.test.ts` pin both properties.
+
+### The sidebar restarted the board's live session every ten seconds
+
+The sidebar refreshes the board's collaboration role every ten seconds, to
+notice a remote change of the role. A board that cannot open a live room —
+one without a collaboration security manifest, or with an expired one — failed
+that refresh, and the failure made the manager start the board again. Every
+ten seconds the sidebar therefore repeated the whole start-up path: the role
+and the shared file were resolved again, the session was torn down, and a new
+one was attempted. With Drive connected, each attempt is a Drive round trip.
+
+The manager now records why a board could not start, together with the role
+and the shared file it had resolved. A refresh that finds the same board, the
+same role and the same shared file does not repeat the start-up path. The
+attempt is made again when the board's authorization is reported as changed,
+or when the room whose trust was missing now has it — the account room and
+the board room are checked separately, so a board that becomes trusted later
+is still opened.
+
+The sidebar also no longer restarts the board's session for a Google token
+refresh. A refresh keeps the same account and only extends the token's
+lifetime; a new authorization, which may name a different account, still
+does.
+
+`tests/collaborationManagerIdle.test.ts` pins the properties: the start-up
+path is not repeated while nothing changed, the board is opened once its
+authorization arrives, and a deliberate stop makes the next start try again.
+
+### The private history was downloaded and verified again on every reconciliation
+
+The private history is append-only: every sync stores a new immutable
+archive, and the archives grow with the board's history. Every reconciliation
+downloaded and re-verified every archive of every board, so the cost of one
+reconciliation grew without bound and ran on the sidebar's main thread.
+
+An archive's name carries its content fingerprint, and an archive is
+immutable, so a fingerprint this device already verified is remembered and its
+bytes are not fetched again. A file id is remembered with it, so an archive
+that was replaced under a new id is fetched again.
+
+Measured in real Firefox with the real extension against a mock Drive, the
+archives of a board with a growing history were downloaded eight times over
+ninety seconds before the change and twice after it. The archive inventory
+read is flat in the number of archives.
+
+`tests/recovery/historyArchiveCache.test.ts` and
+`tests/recovery/historyCost.test.ts` pin both properties.
+
+### The board was re-rendered for a pin context that had not changed
+
+The sidebar asks the background page every 1.5 seconds whether the current
+page can be pinned. The answer is a fresh object every time, so storing it
+re-rendered the whole board. A card is not a memoized component, so every
+card re-rendered and re-parsed its markdown.
+
+The answer is now compared field by field, and only a changed answer is
+stored. A changed answer still re-renders the board, as it must.
+
+`tests/sidebarPinContext.test.ts` pins the comparison.
+
 ### The account order and the peer history re-read what they had already read
 
 Two paths repeated work that had already been done, and both grew with the size

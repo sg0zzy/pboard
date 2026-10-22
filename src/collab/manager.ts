@@ -172,6 +172,30 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   let sessionGeneration = 0;
   let recovery: Promise<void> | null = null;
   /**
+   * The board whose session could not be started, and why.
+   *
+   * A board that has no collaboration security manifest, or whose authority is
+   * not available, cannot open a live room. The sidebar refreshes the role
+   * every 10 seconds to notice a remote change; without this record, each of
+   * those refreshes would repeat the whole start-up path (several Drive round
+   * trips, a teardown, and a fresh start) for a board that cannot start. The
+   * failure is remembered until something that can change the outcome
+   * changes: the board, the resolved role, or the security state.
+   */
+  let startFailure: {
+    projectId: string;
+    role: CollaborationRole;
+    sharedFileId: string | null;
+    message: string;
+    /** Which rooms had no trust at the time of the failed attempt. */
+    missing: { board: boolean; account: boolean };
+  } | null = null;
+  /**
+   * The rooms whose trust was missing during the current attempt. The values
+   * are set before the rooms are opened and read when the attempt fails.
+   */
+  const missingTrust = { board: false, account: false };
+  /**
    * Releases still in progress: the mutation guard by project, and a room by
    * signaling topic. A new session waits for the matching release, so the
    * runtime keeps one guard entry per board and the rendezvous keeps one
@@ -452,6 +476,9 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     verifiedContexts.clear();
     error = null;
     startedProjectId = projectId;
+    // A different board has its own outcome; the previous board's failure no
+    // longer applies.
+    if (startFailure && startFailure.projectId !== projectId) startFailure = null;
     await applyRole(projectId);
 
     // A viewer/editor with no local copy pulls the full snapshot (cards + blobs)
@@ -459,14 +486,45 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const rx = await options.getRepository();
     if (!rx) return;
     startedRepo = rx;
+    try {
+      missingTrust.board = false;
+      missingTrust.account = false;
+      await openRooms(projectId, rx);
+      // The board opened; a previous failure no longer applies.
+      startFailure = null;
+    } catch (err) {
+      // Remember why the board could not start, so the role refresh does not
+      // repeat the whole start-up path for a board that cannot open a room. The
+      // role and the shared file are the ones this attempt resolved, and the
+      // missing rooms say whether the trust may still arrive.
+      startFailure = {
+        projectId,
+        role,
+        sharedFileId,
+        message: err instanceof Error ? err.message : String(err),
+        missing: { board: missingTrust.board, account: missingTrust.account }
+      };
+      throw err;
+    }
+  }
+
+  /** Resolve the board's rooms and open them. */
+  async function openRooms(projectId: string, rx: RxRepository): Promise<void> {
     // Resolve every requested room before creating transports, including account rooms
     // opened while viewing a private board. Null must never mean legacy admission.
     const account = await options.getAccountId?.() ?? null;
+    const accountContext = account ? await options.accountSecurity?.(account) : null;
+    const boardContext = role !== "private" ? await options.boardSecurity?.(projectId) : null;
+    // A room whose trust is not available yet is not an error: the board may
+    // become trusted later. The failure records which rooms were missing, so
+    // the role refresh can tell "still missing" from "now available".
+    if (account && !accountContext) missingTrust.account = true;
+    if (role !== "private" && !boardContext) missingTrust.board = true;
     const accountSecurity = account
-      ? requireSecurity(await options.accountSecurity?.(account), `account:${account}`)
+      ? requireSecurity(accountContext, `account:${account}`)
       : null;
     const boardSecurity = role !== "private"
-      ? requireSecurity(await options.boardSecurity?.(projectId), projectId)
+      ? requireSecurity(boardContext, projectId)
       : null;
     // The account room is independent of the board rooms; it opens in parallel.
     const owner: BoardSession = { projectId, rooms: new Map(), historySessions: new Set(), imageSync: null, guard: null, active: true };
@@ -524,6 +582,29 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     }
   }
 
+  /**
+   * Whether the room whose trust was missing at the failed attempt has it now.
+   *
+   * A failure that was not caused by missing trust — a rejected manifest, an
+   * expired one, a missing mutation guard — is not resolved this way: only a
+   * change of the board's authorization makes such a board worth retrying.
+   */
+  async function missingTrustResolved(
+    failure: { missing: { board: boolean; account: boolean } },
+    projectId: string
+  ): Promise<boolean> {
+    if (!failure.missing.board && !failure.missing.account) return false;
+    if (failure.missing.account) {
+      const account = await options.getAccountId?.() ?? null;
+      if (!account) return false;
+      if (!await options.accountSecurity?.(account)) return false;
+    }
+    if (failure.missing.board) {
+      if (!await options.boardSecurity?.(projectId)) return false;
+    }
+    return true;
+  }
+
   async function doStop(): Promise<void> {
     ++sessionGeneration;
     recovery = null;
@@ -544,6 +625,23 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     startedProjectId = null;
   }
 
+  /**
+   * Tear down after a failed start, keeping the board and the resolved role.
+   *
+   * The role is what the next refresh compares against, so it must survive the
+   * teardown: a board whose role is still "editor" after a failed start is
+   * still the same board with the same role, and the next refresh must not
+   * repeat the start.
+   */
+  async function doStopAfterFailure(projectId: string): Promise<void> {
+    const failedRole = role;
+    const failedFileId = sharedFileId;
+    await doStop();
+    startedProjectId = projectId;
+    role = failedRole;
+    sharedFileId = failedFileId;
+  }
+
   const refreshRole = () => runExclusive(async () => {
     if (!startedProjectId) return;
     const projectId = startedProjectId;
@@ -552,13 +650,38 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const previousFileId = sharedFileId;
     try {
       await applyRole(startedProjectId);
+      // A board that already failed to open a room must not be retried on
+      // every tick while nothing relevant changed. The role refresh runs every
+      // 10 seconds; repeating the start-up path each time kept the sidebar
+      // busy and the board never opened. A new board, a new role, a new
+      // shared file, or a changed security state makes the attempt again.
+      // The failure describes the situation of the last attempt. It still
+      // applies when the board, the resolved role and the shared file are the
+      // same as they were then. The live role is re-resolved above, so the
+      // comparison uses the role the failed attempt had.
+      //
+      // The recorded failure is the readiness signal: `applyRole` marks the
+      // manager ready as soon as the role is known, even when the rooms could
+      // not be opened.
+      const failure = startFailure;
       const securityChanged = await options.securityChanged?.(projectId) ?? false;
+      if (failure && failure.projectId === projectId && failure.role === previousRole &&
+          failure.sharedFileId === previousFileId && !securityChanged) {
+        // The trust may have become available since the failed attempt, so the
+        // security providers are asked. When the room whose trust was missing
+        // still has none, the failure stands and the start-up path is not
+        // repeated; the sidebar calls this every 10 seconds.
+        const trustAvailable = await missingTrustResolved(failure, projectId);
+        if (!trustAvailable) {
+          error = failure.message;
+          return;
+        }
+      }
       if (!wasReady || securityChanged || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && !session?.rooms.size)) {
         await doStart(startedProjectId);
       }
     } catch (err) {
-      await doStop();
-      startedProjectId = projectId;
+      await doStopAfterFailure(projectId);
       error = err instanceof Error ? err.message : String(err);
       throw err;
     }
@@ -568,13 +691,14 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     start: (projectId) => runExclusive(async () => {
       try { await doStart(projectId); }
       catch (err) {
-        await doStop();
-        startedProjectId = projectId;
+        await doStopAfterFailure(projectId);
         error = err instanceof Error ? err.message : String(err);
         throw err;
       }
     }),
-    stop: () => runExclusive(doStop),
+    // A deliberate stop ends the collaboration; the next start must try again
+    // regardless of a previous failure.
+    stop: () => runExclusive(async () => { startFailure = null; await doStop(); }),
     refreshRole,
     state: () => ({ role, sharedFileId, connectedPeers: collectPeers(), ready, error })
   };

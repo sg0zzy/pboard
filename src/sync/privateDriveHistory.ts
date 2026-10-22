@@ -52,6 +52,22 @@ export function createPrivateDriveHistory(options: {
   imageTransport?: DriveTransport;
 }): PrivateDriveHistory {
   const { transport } = options;
+  /**
+   * The archives this device has already downloaded, parsed and verified, by
+   * the file's content fingerprint.
+   *
+   * The archive's name carries its content fingerprint, and an archive is
+   * immutable: the same fingerprint always means the same bytes. The sidebar
+   * reconciles every 30 seconds, and every reconciliation used to download
+   * and re-verify every archive of every board. The archives grow with the
+   * board's history, so that cost grew without bound and ran on the sidebar's
+   * main thread. A verified fingerprint is remembered and its bytes are not
+   * downloaded again.
+   */
+  const verifiedArchives = new Map<string, Saved>();
+  /** The file id a verified fingerprint was seen under, so a renamed file is fetched again. */
+  const verifiedFileIds = new Map<string, string>();
+
   async function read(file: DriveAppDataFile, using = transport, downloaded?: string): Promise<Saved> {
     const contents = downloaded ?? await using.download(file.id);
     const value = parseStrictJson(contents, LIMIT) as unknown as Bundle;
@@ -89,13 +105,29 @@ export function createPrivateDriveHistory(options: {
         const prefix = `history-${boardId.replace(/[^a-zA-Z0-9_-]/g, '_')}_`;
         if (!file.name.startsWith(prefix) || !/^[a-f0-9]{64}\.pboard$/.test(file.name.slice(prefix.length))) continue;
       }
+      // The archive's name carries its content fingerprint, and an archive is
+      // immutable, so an archive this device already verified is not fetched
+      // and parsed again.
+      const fingerprint = /_([a-f0-9]{64})\.pboard$/.exec(file.name)?.[1];
+      const known = fingerprint ? verifiedArchives.get(fingerprint) : undefined;
+      if (fingerprint && known && verifiedFileIds.get(fingerprint) === file.id) {
+        result.push(known);
+        continue;
+      }
       let contents: string;
       try { contents = await using.download(file.id); }
       catch (error) { if (!onError) throw error; onError(error); continue; }
       // Invalid archives still count against the aggregate processing limit.
       bytes += new TextEncoder().encode(contents).length;
       if (bytes > 128 * 1024 * 1024) throw new Error("Private history exceeds this client's 128 MiB recovery window; data is retained");
-      try { result.push(await read(file, using, contents)); }
+      try {
+        const saved = await read(file, using, contents);
+        if (fingerprint) {
+          verifiedArchives.set(fingerprint, saved);
+          verifiedFileIds.set(fingerprint, file.id);
+        }
+        result.push(saved);
+      }
       catch (error) { if (!onError) throw error; onError(error); }
     }
     return result;
