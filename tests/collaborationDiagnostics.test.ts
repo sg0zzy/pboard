@@ -16,11 +16,14 @@ it("keeps diagnostics local, bounded, and projects only safe metadata", () => {
   expect(listener).toHaveBeenCalledTimes(110);
   unsubscribe(); collaborationDiagnostics.clear(); expect(listener).toHaveBeenCalledTimes(110);
 });
-it("does not emit diagnostic history or console events in ordinary builds", () => {
+it("records only when the websocket provider is built in, never for other builds", () => {
   const log = vi.spyOn(console, "info").mockImplementation(() => {});
-  vi.stubEnv("DEV", false); vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "websocket");
+  vi.stubEnv("DEV", false); vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "drive");
   collaborationDiagnostic("relay.joined");
-  vi.stubEnv("DEV", true); vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "drive");
+  vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "");
   collaborationDiagnostic("relay.joined");
   expect(collaborationDiagnostics.snapshot()).toEqual([]); expect(log).not.toHaveBeenCalled();
+  vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "websocket");
+  collaborationDiagnostic("relay.joined");
+  expect(collaborationDiagnostics.snapshot()).toHaveLength(1);
 });

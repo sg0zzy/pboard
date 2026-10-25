@@ -18,7 +18,7 @@ import { ConflictResolutionControls } from "./components/ConflictResolutionContr
 import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
-import { CloseIcon, CopyIcon, DownloadIcon, EditIcon, NewProjectIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
+import { CloseIcon, CopyIcon, DebugIcon, DownloadIcon, EditIcon, NewProjectIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
 import { CaptureToolbar } from "./components/CaptureToolbar";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
@@ -42,6 +42,7 @@ import { samePinContext } from "./pinContext";
 import { collaborationCounters } from "../collab/counters";
 
 const STATUS_MOVE_DELAY_MS = 800;
+const DEBUG_SECTION_STORAGE_KEY = "pboardDebugSection";
 
 export function App() {
   // The recurring-work counters, so a sustained CPU load can be attributed to a
@@ -65,6 +66,7 @@ export function App() {
   const [dropTarget, setDropTarget] = useState<{ id: string; position: DropPosition } | null>(null);
   const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
+  const [debugSection, setDebugSection] = useState(import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket");
   const [notice, setNotice] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
@@ -127,6 +129,9 @@ export function App() {
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
+    void browser.storage.local.get(DEBUG_SECTION_STORAGE_KEY).then((result: Record<string, unknown>) => {
+      if (typeof result[DEBUG_SECTION_STORAGE_KEY] === "boolean") setDebugSection(result[DEBUG_SECTION_STORAGE_KEY] as boolean);
+    });
     void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result: Record<string, unknown>) => {
       const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
       if (cardId) void consumePinnedCardFocus(cardId);
@@ -137,6 +142,9 @@ export function App() {
     const listener = (changes: Record<string, { newValue?: unknown }>, area: string) => {
       if (area === "local" && changes[UI_SCALE_STORAGE_KEY]) {
         setUiScale(normalizeUiScale(changes[UI_SCALE_STORAGE_KEY].newValue));
+      }
+      if (area === "local" && typeof changes[DEBUG_SECTION_STORAGE_KEY]?.newValue === "boolean") {
+        setDebugSection(changes[DEBUG_SECTION_STORAGE_KEY].newValue as boolean);
       }
       if (area === "local" && changes[PINNED_CARD_FOCUS_KEY]) {
         const cardId = changes[PINNED_CARD_FOCUS_KEY].newValue as string | null | undefined;
@@ -867,8 +875,22 @@ export function App() {
         <div className="app-title-row">
           <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
           <ShareControls projectId={currentProject?.id ?? null} permissions={sharePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
-          {import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
+          {debugSection && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
+          {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
+            <button
+              type="button"
+              className="scale-button"
+              aria-label="Toggle debugging section"
+              title="Toggle debugging section"
+              aria-pressed={debugSection}
+              onClick={() => {
+                const next = !debugSection;
+                setDebugSection(next);
+                void browser.storage.local.set({ [DEBUG_SECTION_STORAGE_KEY]: next });
+              }}
+            ><DebugIcon /></button>
+          )}
           <div className="font-scale-controls" aria-label="Board font size">
             <button
               className="scale-button"

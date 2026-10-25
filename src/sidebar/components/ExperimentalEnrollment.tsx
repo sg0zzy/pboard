@@ -5,7 +5,7 @@ import { browser } from "../../platform/browser";
 import { experimentalEnrollment, collaborationManager } from "../../sync/browser";
 import { downloadBlob } from "../download";
 
-/** Only rendered in the explicit local experimental extension build. */
+/** Rendered when the debugging section is open: automatically in development, via the header toggle in built extensions. */
 export function ExperimentalEnrollment({ projectId, onChanged }: { projectId: string | null; onChanged: () => void }) {
   const [text, setText] = useState("");
   const [fingerprint, setFingerprint] = useState("");

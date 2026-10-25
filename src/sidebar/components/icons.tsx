@@ -202,3 +202,11 @@ export function ExpandedViewIcon() {
     </Icon>
   );
 }
+
+export function DebugIcon() {
+  return (
+    <Icon>
+      <path d="M8 4.5 6.5 3M16 4.5 17.5 3M9.5 7.2v-1.2a2.5 2.5 0 0 1 5 0v1.2M12 20c-3 0-5.5-2.5-5.5-5.5v-2A3.5 3.5 0 0 1 10 9h4a3.5 3.5 0 0 1 3.5 3.5v2c0 3-2.5 5.5-5.5 5.5ZM12 20v-11M6.5 11h-3M6.5 15.5h-3M17.5 11h3M17.5 15.5h3M9.5 21.5c.6-1.1 1.5-1.7 2.5-1.7s1.9.6 2.5 1.7" />
+    </Icon>
+  );
+}

@@ -738,7 +738,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   });
 
   const enrollmentTransport = createDrivePermissionTransport(googleAuth, fetcher);
-  const experimentalEnrollment = import.meta.env.DEV ? createDeviceEnrollment({
+  const experimentalEnrollment = createDeviceEnrollment({
     storage,
     async identity(kind, scope) {
       if (!await driveConnected()) throw new Error("Connect Google Drive before enrolling devices");
@@ -776,7 +776,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       if (id.kind === "account") return email === id.email ? "owner" : null;
       return (await drivePermissions.listCollaborators(id.scope)).find(person => person.email.trim().toLowerCase() === email)?.role ?? null;
     }
-  }) : null;
+  });
 
   const googleBroker = createGoogleBrokerEnrollment({ storage, getAccessToken: () => googleAuth.getAccessToken(), fetcher, canAccessEndpoint: hasSignalingHostPermission });
   const collaborationManager: CollaborationManager = createCollaborationManager({

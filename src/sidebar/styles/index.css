@@ -110,6 +110,7 @@ header { border-bottom: 1px solid var(--md-sys-color-outline-variant); padding-b
 .scale-button { display: inline-grid; width: 1.75em; height: 1.75em; place-items: center; border: 1px solid var(--md-sys-color-outline-variant); border-radius: 5px; background: transparent; color: #565851; padding: 0; font-size: .875em; font-weight: 750; line-height: 1; }
 .scale-button svg { width: 1em; height: 1em; }
 .scale-button:hover { border-color: #9b9e95; background: var(--md-sys-color-surface-container-high); color: #171816; }
+.scale-button[aria-pressed="true"] { border-color: #9b9e95; background: var(--md-sys-color-surface-container-high); color: #171816; }
 .scale-value { min-width: 3.4em; color: var(--md-sys-color-on-surface-variant); font-size: .625em; font-variant-numeric: tabular-nums; font-weight: 700; text-align: center; }
 h1 { margin: 0; font-size: 1.125em; }
 .project-row { display: flex; align-items: center; gap: 4px; }
@@ -455,6 +456,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--md-sys-color-out
   .scale-button { border-color: #50514c; color: #bbbbb5; }
   .scale-button:hover { border-color: #73766d; background: var(--md-sys-color-surface-container-high); color: white; }
   .scale-value { color: var(--md-sys-color-on-surface-variant); }
+  .scale-button[aria-pressed="true"] { border-color: #73766d; background: var(--md-sys-color-surface-container-high); color: white; }
   .card-icon-button { color: #bbbbb5; }
   .card-icon-button:hover { background: var(--md-sys-color-surface-container-high); color: white; }
   .card-icon-button.danger:hover { background: #4b302e; color: #efaaa4; }

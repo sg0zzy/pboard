@@ -260,6 +260,12 @@ secret (`VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`, documented in
 `.env.example`) is embedded when supplied through the environment or `.env.local`; from
 a clean review checkout it is absent and the build still succeeds.
 
+Building with `VITE_PBOARD_SIGNALING_PROVIDER=websocket` additionally shows a
+debugging-section button in the sidebar header. The button toggles the
+experimental device enrollment and live collaboration diagnostics panel —
+otherwise reserved for development builds — and the choice persists across
+reloads. It changes no collaboration transport or trust behavior.
+
 ## 4. Compare against the submitted package
 
 The production extension was packaged with:
