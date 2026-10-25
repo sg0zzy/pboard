@@ -18,6 +18,8 @@ export type DrivePermission = {
   role: "reader" | "writer" | "owner" | "fileOrganizer";
   emailAddress?: string;
   displayName?: string;
+  /** Server-set grant time (ISO), requested so re-invitations outrank old deletions. */
+  createdTime?: string;
 };
 
 export type DriveFileRef = { id: string; name: string; mimeType: string; modifiedTime?: string; parents?: string[] };
@@ -57,11 +59,21 @@ export interface DrivePermissionTransport {
   getFileParents(fileId: string): Promise<string[]>;
   /** List non-trashed files by exact name and MIME type (what the account can access). */
   listFilesByName(name: string, mimeType: string): Promise<DriveFileRef[]>;
+  /**
+   * The account's shared-with-me shelf. Unlike name search, Drive populates
+   * it for freshly granted items without the (sometimes minutes-long) search
+   * index delay, so discovery uses it to catch invitations immediately.
+   */
+  listSharedWithMe(): Promise<DriveFileRef[]>;
   listPermissions(fileId: string): Promise<DrivePermission[]>;
   createPermission(fileId: string, role: PboardCollaboratorRole, email: string): Promise<DrivePermission>;
   updatePermission(fileId: string, permissionId: string, role: PboardCollaboratorRole): Promise<DrivePermission>;
   deletePermission(fileId: string, permissionId: string): Promise<void>;
 }
+
+/** Storage key (browser.storage.local / platform KV) carrying boards whose
+ * self-removal from a shared board's ACL is still pending delivery. */
+export const PENDING_BOARD_LEAVES_KEY = "pboardPendingBoardLeaves";
 
 const SHARED_ROOT_NAME = "Pboard";
 const PROJECT_FILE_NAME = "project.json";
@@ -214,9 +226,20 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
       const body = await response.json() as { files?: DriveFileRef[] };
       return body.files ?? [];
     },
+    async listSharedWithMe() {
+      const params = new URLSearchParams({
+        spaces: "drive",
+        q: "sharedWithMe = true and trashed = false",
+        fields: "files(id,name,mimeType,modifiedTime)",
+        pageSize: "100"
+      });
+      const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
+      const body = await response.json() as { files?: DriveFileRef[] };
+      return body.files ?? [];
+    },
     async listPermissions(fileId) {
       const response = await authorizedFetch(
-        `${DRIVE_API}/files/${encodeURIComponent(fileId)}/permissions?fields=permissions(id,type,role,emailAddress,displayName)&pageSize=100`
+        `${DRIVE_API}/files/${encodeURIComponent(fileId)}/permissions?fields=permissions(id,type,role,emailAddress,displayName,createdTime)&pageSize=100`
       );
       const body = await response.json() as { permissions?: DrivePermission[] };
       return body.permissions ?? [];
@@ -292,8 +315,25 @@ export interface DrivePermissionService {
    * grouping by the parent folder name, which is the projectId.
    */
   discoverSharedProjects(): Promise<DiscoveredSharedProject[]>;
+  /** Drop the short discovery cache; an explicit user sync must see grants
+   * made seconds ago, not the cached listing. */
+  invalidateSharedDiscovery(): void;
   /** The caller's role for the shared project; null when not shared or no permission. */
   myRole(projectId: string): Promise<PboardRole | null>;
+  /**
+   * Self-removal for a non-owner's board "delete": revoke the caller's own
+   * collaborator and realtime permission so the owner's share list reflects
+   * the departure. Resolves quietly when there is nothing to revoke (board
+   * not Drive-shared, caller is the owner, or permission already gone);
+   * transport failures reject so a pending-leave retry can re-run.
+   */
+  removeSelfFromProject(projectId: string): Promise<void>;
+  /**
+   * True when the caller's own collaborator permission on this board was
+   * granted strictly after `sinceMs` (plus a clock-skew margin): the owner
+   * re-invited after the local removal, so a deletion marker must yield.
+   */
+  wasReinvitedSince(projectId: string, sinceMs: number): Promise<boolean>;
   listCollaborators(projectId: string): Promise<Collaborator[]>;
   invite(projectId: string, email: string, role: PboardCollaboratorRole): Promise<void>;
   updateRole(projectId: string, email: string, role: PboardCollaboratorRole): Promise<void>;
@@ -330,6 +370,9 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
    * layout is cached as soon as it is found.
    */
   let discovered: { at: number; entries: DiscoveredSharedProject[] } | null = null;
+  /** Drop the discovery cache so the next listing hits Drive again. */
+  function invalidateSharedDiscovery() { discovered = null; }
+
   const DISCOVERY_TTL_MS = 60_000;
 
   async function discoverSharedProjects(): Promise<DiscoveredSharedProject[]> {
@@ -340,21 +383,48 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     }
     collaborationCounters.countSharedDiscovery(false);
     const files = await transport.listFilesByName(PROJECT_FILE_NAME, JSON_MIME);
-    const byProject = new Map<string, DiscoveredSharedProject>();
+    const byProject = new Map<string, DiscoveredSharedProject[]>();
+    const note = async (projectId: string, file: DriveFileRef, knownFolderId?: string) => {
+      const cached = await sharedProjects.get(projectId);
+      const folderId = knownFolderId ?? (await transport.getFileParents(file.id))[0];
+      if (cached.folderId !== folderId || cached.projectFileId !== file.id) {
+        await sharedProjects.set(projectId, { ...(folderId ? { folderId } : {}), projectFileId: file.id });
+      }
+      if (!byProject.has(projectId)) byProject.set(projectId, []);
+      byProject.get(projectId)!.push({ projectId, name: projectId, fileId: file.id });
+    };
     for (const file of files) {
       const folderId = (await transport.getFileParents(file.id))[0];
       if (!folderId) continue;
       const folder = await transport.getFile(folderId);
       if (folder.mimeType !== FOLDER_MIME) continue;
       // The folder is named after the projectId (see ensureSharedProject).
-      const projectId = folder.name;
-      const cached = await sharedProjects.get(projectId);
-      if (cached.folderId !== folderId || cached.projectFileId !== file.id) {
-        await sharedProjects.set(projectId, { folderId, projectFileId: file.id });
-      }
-      if (!byProject.has(projectId)) byProject.set(projectId, { projectId, name: projectId, fileId: file.id });
+      await note(folder.name, file, folderId);
     }
-    const entries = [...byProject.values()];
+    // Drive name search can lag real permission changes by minutes, which
+    // looks like "the invitation never arrived" even after a browser
+    // restart. The shared-with-me shelf reflects fresh grants immediately;
+    // expand it (board folders and directly shared project files) as a
+    // best-effort supplement — its failure never cancels the name results.
+    try {
+      const seen = new Set(files.map((file) => file.id));
+      for (const shared of await transport.listSharedWithMe()) {
+        if (shared.mimeType === FOLDER_MIME) {
+          const marker = await transport.findFile(PROJECT_FILE_NAME, shared.id);
+          if (marker && !seen.has(marker.id)) { seen.add(marker.id); await note(shared.name, marker); }
+        } else if (shared.name === PROJECT_FILE_NAME && shared.mimeType === JSON_MIME && !seen.has(shared.id)) {
+          seen.add(shared.id);
+          const parentId = (await transport.getFileParents(shared.id))[0];
+          if (parentId) {
+            const parent = await transport.getFile(parentId);
+            if (parent.mimeType === FOLDER_MIME) await note(parent.name, shared);
+          }
+        }
+      }
+    } catch {
+      // Name-search results stand; the next discovery pass retries the shelf.
+    }
+    const entries = [...byProject.values()].map((group) => group[0]);
     discovered = { at: now, entries };
     return entries;
   }
@@ -486,6 +556,34 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     await revokeRealtimeAccess(projectId, normalized);
   }
 
+  async function removeSelfFromProject(projectId: string): Promise<void> {
+    const layout = await resolveLayout(projectId);
+    if (!layout.folderId) return;
+    const identity = await transport.currentIdentity();
+    if (!identity?.email) return;
+    const email = identity.email.trim().toLowerCase();
+    const permissions = await transport.listPermissions(layout.folderId);
+    // Owners delete the board itself (content path); they never leave.
+    if (permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email)) return;
+    const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email);
+    if (mine) await transport.deletePermission(layout.folderId, mine.id);
+    await revokeRealtimeAccess(projectId, email);
+  }
+
+  async function wasReinvitedSince(projectId: string, sinceMs: number): Promise<boolean> {
+    const layout = await resolveLayout(projectId);
+    if (!layout.folderId) return false;
+    const identity = await transport.currentIdentity();
+    if (!identity?.email) return false;
+    const email = identity.email.trim().toLowerCase();
+    const mine = (await transport.listPermissions(layout.folderId))
+      .find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email && p.role !== "owner");
+    // A minute of skew tolerance between Drive's server clock and local
+    // preference timestamps; without a recorded grant time nothing outranks
+    // the deletion.
+    return !!mine?.createdTime && Date.parse(mine.createdTime) > sinceMs + 60_000;
+  }
+
   async function findCollaborator(projectId: string, email: string): Promise<{ folderId: string; permission: DrivePermission }> {
     const layout = await resolveLayout(projectId);
     if (!layout.folderId) throw new Error("Project is not shared");
@@ -532,11 +630,14 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     },
     realtimeFolderId: ensureRealtimeFolder,
     discoverSharedProjects,
+    invalidateSharedDiscovery,
     myRole,
     listCollaborators,
     invite,
     updateRole,
-    removeCollaborator
+    removeCollaborator,
+    removeSelfFromProject,
+    wasReinvitedSince
   };
 }
 

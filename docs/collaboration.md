@@ -36,7 +36,7 @@ Reviewed against the implementation on 12 October 2026. Google Drive provides pe
 
 `src/sync/browser.ts` constructs the permission service, shared snapshot sync, shared-board discovery, and collaboration manager. `src/sidebar/App.tsx` starts the manager for the current project and stops it on unmount. A project change starts the new board, which retires the previous board's session in the background; it does not stop first. Start, stop, and role refresh operations are serialized.
 
-The sidebar discovers shared boards on load, every 30 seconds, on focus, and after Drive/sharing changes. Background reconciliation also runs discovery. Discovery skips existing local boards and removed projects, isolates per-board failures, and rejects snapshots with a mismatched project ID. Access is refreshed every 10 seconds while the board is open. Changes to the resolved role or shared file restart the pools.
+The sidebar discovers shared boards on load, every 30 seconds, on focus, and after Drive/sharing changes; the Drive **Sync now** button additionally reconciles immediately with a fresh (uncached) listing, so a just-received invitation surfaces on click. Background reconciliation also runs discovery. Because Drive name search can lag a fresh grant by minutes, discovery additionally expands the shared-with-me shelf (board folders and directly shared `project.json` markers) as a best-effort supplement, so invitations surface without waiting for the index. Discovery skips existing local boards and isolates per-board failures, and rejects snapshots with a mismatched project ID. A locally removed (left) board normally stays hidden forever; it is restored only when the owner re-invited — the caller's own Drive collaborator permission was created after the removal (one minute of clock-skew tolerance) — and no leave revocation is still pending. Access is refreshed every 10 seconds while the board is open. Changes to the resolved role or shared file restart the pools.
 
 The Share dialog manages invitations, viewer/editor roles, and member removal. **Enable live collaboration** creates a shared layout without inviting another account, allowing two browsers on the same account to connect. The dialog shows waiting, connected-browser, and error messages.
 
@@ -61,8 +61,10 @@ The project **folder** is the main permission target; child files inherit access
 | Role | Board content | Membership | Project removal |
 | --- | --- | --- | --- |
 | Owner | Read and write | Invite, change roles, remove members | Delete shared content |
-| Editor | Read and write | No membership controls in Pboard | Remove from own account list |
-| Viewer | Read | No membership controls in Pboard | Remove from own account list |
+| Editor | Read and write | No membership controls in Pboard | Leave: own list, own Drive ACL, own realtime ACL |
+| Viewer | Read | No membership controls in Pboard | Leave: own list, own Drive ACL, own realtime ACL |
+
+Only the owner's removal deletes shared content. A non-owner "delete" is a **leave**: the repository hides the board (order entry dropped, `deletedProjectIds` marker so discovery ignores it unless the owner later re-invites), then `drivePermissions.removeSelfFromProject` revokes the caller's own folder and realtime permissions so the owner's member list updates. The revocation is recorded in `pboardPendingBoardLeaves` and retried after every reconcile round, so an offline leave still lands; while a marker is pending, a re-appear cannot undo the leave. A subsequent genuine invitation (permission created after the removal) restores the board automatically. The deletion-role resolver (`src/sync/projectDeletion.ts`) maps shared-offline or unknown-role boards to viewer, so a non-owner can never reach the content-deleting path. Signed independent boards gate deletion on the owner's authority grant and additionally re-check the Drive ACL (`reverifySharedDeletionRole`, wired to `drivePermissions.myRole`) immediately before destroying content: a Drive editor/viewer permission downgrades the delete to a leave even when the locally imported grant says owner; a Drive failure or an unshared board keeps the grant's verdict. Boards without any Drive ACL leave locally only — the owner's device manifest still lists departed devices until the owner removes them.
 
 Google OAuth requests both `drive.appdata` and full `drive`. The broad Drive permission supports incoming shared-board discovery and files owned by other accounts; `drive.file` was not retained for that path. Search calls use `drive` for shared files and `appDataFolder` for private records. Both transports bypass HTTP caches for discovery and media reads.
 
@@ -151,11 +153,23 @@ A build with `VITE_PBOARD_DIAGNOSTICS=1` collects counters for the work that
 repeats: the Drive requests by purpose, the background sync attempts and how
 they ended, the boards being retried, the shared-project discovery listings,
 the account identity lookups, the React renders, the effect executions, the
-repository subscription emissions, and the collaboration session
-initialisations.
+repository subscription emissions, the collaboration session initialisations,
+and — since the idle-CPU investigation — the wall-clock `timings` of the
+recurring operations (`reconcile`, `sync:project`, `collab:refreshRole`,
+`collab:start`).
+
+The Drive counter is wired into the fetcher every Drive provider uses:
+identity endpoints are classified by URL, everything else by the operation
+that issued it (`withDrivePurpose` marks `sync` and `reconcile` runs;
+unscoped traffic counts as `other`). A session rebuild names the gate branch
+that reopened it: `effects["collab:start:rooms-empty"]` growing on a steady
+cadence is the manager's rebuild storm, `collab:start:security` is the grant
+poll reporting a change, `timings["collab:start"].runs` counts the rebuilds
+and `timings.reconcile` the reconciliations, their counts and durations.
 
 A production build does not collect them: each call site is a single boolean
-test. The counters are read from the background page's console, and from the
+test, and the fetcher wrapper and duration wrappers are not created at all.
+The counters are read from the background page's console, and from the
 sidebar's console:
 
 ```js
@@ -166,9 +180,18 @@ pboardCounters.clear()
 The counters are the fastest way to attribute a load to a component: a
 `renders` count that grows while the board is idle points at a subscription
 that publishes more often than it should, a `backgroundSync.unsettled` count
-that grows points at a board the worker cannot settle, and a
+that grows points at a board the worker cannot settle, a
 `sharedDiscovery.listings` count that grows points at a layout that is not
-being cached.
+being cached, and a `driveRequests.identity` count that grows by units of
+three per board sync points at the uncached account identity.
+
+To take a 60-second idle report in Firefox: load a diagnostics build, open
+the sidebar on the board that shows the problem, in both the sidebar's and
+the background script's console (about:debugging → this extension → inspect)
+run `pboardCounters.clear()`, wait a full minute without touching anything,
+then capture `JSON.stringify(pboardCounters.snapshot())` from each console
+twice, 30 seconds apart. Compare which counters moved; that names the
+component while a profiler capture shows its stack.
 
 For a stack-level view, record a Firefox Profiler run instead. Open
 `about:profiler`, choose **Record**, leave the sidebar open and idle for a
@@ -557,3 +580,192 @@ board with a long history is transferred completely instead of failing with
 
 `tests/recovery/accountOrderSync.test.ts` and
 `tests/recovery/peerHistoryExchange.test.ts` pin both properties.
+
+### A missing shared image was probed on Drive forever
+
+A card that references a shared image the receiver does not hold starts a
+retry loop that asks Drive (and, once authorized peers exist, asks them) for
+the asset. The retry ran on a fixed two-second poll. When the asset simply
+does not exist in Drive — its owner closed its browser before uploading it,
+or it was deleted there — the receiver asked every two seconds forever, per
+missing asset, on an otherwise idle board: a steady stream of Drive requests
+and signature work that nothing could ever answer.
+
+The periodic retry now doubles its wait per consecutive pass that ends with
+an asset still missing or a transfer that failed, up to a 60-second ceiling,
+and a clean pass resets it to the base poll. An explicit tick — a card edit,
+a new blob, a manual sync — always runs the transfer immediately and
+recomputes the next wait, so a late upload is picked up as soon as any local
+activity happens and the repair itself restores the base cadence.
+
+`tests/recovery/imageSyncBackoff.test.ts` pins the properties: probes grow
+sub-linearly against a fixed poll, retries never stop, an explicit tick
+probes through the backoff, and a clean pass brings the base cadence back.
+
+### An empty Drive signaling room was polled at the connect cadence
+
+Each open shared board keeps its Drive signaling rooms polling so peers can
+discover each other and exchange offers. The poll ran at the full cadence —
+two seconds, and once per collection room — even when the room had held no
+peer since the board was opened: an idle sidebar kept roughly 90 Drive round
+trips a minute going out for a room that could not deliver anything, and any
+response processing with it.
+
+The poll now tracks when the room last saw activity: a live peer in the
+roster, a delivered signal, or an outbound signal. Past the presence TTL of
+silence the next schedule waits a slow interval (15 seconds, kept below a
+quarter of the presence TTL so the presence heartbeat stays visible) instead
+of the fast cadence; discovering an idle peer then costs at most one slow
+poll per side. Writing a signal re-arms the fast cadence immediately, so an
+actual connection attempt is never slowed by an idle past, and a live roster
+holds the room at the fast cadence for as long as peers are present.
+
+`tests/recovery/signalingIdleBackoff.test.ts` pins the cadence: dense polls
+while a room is young, silence after the idle boundary, one poll per slow
+interval thereafter, the fast cadence held by a live peer and re-armed by a
+send.
+
+## Sync v2 components (unified storage wired; buffered realtime opt-in per board)
+
+The v2 redesign (local-first RxDB + user-visible Drive snapshots + server
+buffer + single-writer leader) was approved with these decisions: buffer
+encrypted by default, private-board history archives relocate to the visible
+folder, split-brain is detect-and-repair (accepted Drive limitation),
+Drive-hosted `realtime/` signaling stays as the fallback transport for the
+legacy Drive-provider mode only. Canonical storage (audit of 2026-10) is one
+unified path for every board — `My Drive/pboard/<boardId>/board.json.gz`
+plus `attachments/` — and Google Drive AppData has no role in websocket
+(Sync v2) persistence; the AppData-backed provider serves only the legacy
+Drive-provider mode. An automatic legacy pass (decision 2026-10-24: connect
+is consent, no prompt) relocates AppData copies and legacy `Pboard/` shared
+folders into the unified layout on the first Sync v2 reconcile — uploads are
+read-back verified before the flip, sources are deleted only after the
+90-day read-only window, and relocated shared boards carry their
+collaborator ACL before any write (a failed ACL listing skips the board
+rather than downgrade access; the old folder is never touched). Building
+blocks landed first, each standalone-tested before integration:
+
+- [`src/sync/snapshotV2.ts`](../src/sync/snapshotV2.ts): `pboard-board-v2`
+  gzip snapshot (`CompressionStream`) with `snapshotSeq`, leader `epoch`,
+  per-collection checkpoint digests and per-device op `watermarks`; strict
+  size caps and v1↔v2 upgrade/rollback helpers.
+- [`src/sync/bufferCrypto.ts`](../src/sync/bufferCrypto.ts) +
+  [`src/storage/contentKeyStore.ts`](../src/storage/contentKeyStore.ts):
+  AES-256-GCM op envelope (opId authenticated as AAD) under a per-board
+  content key held in a dedicated IndexedDB database; only editors provision
+  keys, and the signaling server only ever stores ciphertext.
+- [`src/sync/bufferProtocol.ts`](../src/sync/bufferProtocol.ts): client pump —
+  same-tick batch coalescing, in-order halt-and-backoff, drop only after the
+  server durably acknowledges, zero timers while idle, `pagehide` stop that
+  keeps pending ops for the next session. `seal` is injectable (tests run
+  synchronously; production uses AES-GCM).
+- [`src/sync/snapshotMerge.ts`](../src/sync/snapshotMerge.ts): the repair
+  rule for the accepted split-brain limit — merge two snapshot views by
+  (snapshotSeq, epoch) base plus per-document causal retention and per-device
+  watermark max; order-independent and idempotent, so every leader repairs
+  identically without coordinating.
+- [`src/sync/drivePublish.ts`](../src/sync/drivePublish.ts): leader publish
+  path — metadata probe, conditional media upload with `If-Match` (412 →
+  re-merge), 403 mapped to immediate leadership surrender.
+- [`src/sync/bufferClient.ts`](../src/sync/bufferClient.ts): typed client for
+  those endpoints; `authorize(board)` is injected so the collab runtime adapter
+  supplies grant-bound signatures from the same device key as WebRTC admission.
+  429 maps to pump backpressure; `lease_busy` reads as "not now".
+- [`src/sync/leaderLoop.ts`](../src/sync/leaderLoop.ts): one publish cycle
+  (claim → probe → download → decrypt+merge → serialize → conditional upload →
+  buffer commit → leader commit); conflict commits nothing, forbidden ends
+  leadership immediately. Scheduling and lease heartbeat belong to the caller.
+- [`services/pboard-signaling/src/op_buffer.rs`](../services/pboard-signaling/src/op_buffer.rs):
+  durable buffer — append-only fsync'd journal, torn-tail truncation on
+  replay, idempotent insert by op id, ordered replay, per-board/global bounds
+  with backpressure, commit marks with retention and atomic compaction. No new
+  crate dependencies; ciphertext fields are opaque.
+- [`services/pboard-signaling/src/buffer_api.rs`](../services/pboard-signaling/src/buffer_api.rs)
+  + `App::with_op_buffer`: HTTP endpoints `/buffer/challenge|ops|list|commit`
+  and `/leader/claim|observe|commit`, each authorized by the existing
+  board-grant admission proof (fresh single-use challenge + device signature
+  over the authority-signed manifest; viewers rejected for writes). Gated on
+  `PBOARD_SIGNALING_BUFFER_DIR` — inert when unconfigured. Only
+  independent-grant manifests (no Drive bindings) authenticate here;
+  Google-shared boards keep using Drive ACLs.
+- [`services/pboard-signaling/src/leader.rs`](../services/pboard-signaling/src/leader.rs):
+  leases (45 s, renewal keeps epoch, takeover bumps it), `observe`/`commit`
+  reporting with monotonic `snapshotSeq` and a `stale` flag that marks
+  out-of-order overwrites for the repair merge.
+
+Integration (complete, opt-in):
+
+- [`src/sync/bufferAuth.ts`](../src/sync/bufferAuth.ts): the per-call
+  `Authorizer` adapter — fetches a single-use challenge and signs it with the
+  same device key and manifest as WebRTC admission, so buffer writes require a
+  current authority-signed editor grant.
+- [`src/collab/peerHistory.ts`](../src/collab/peerHistory.ts): content keys
+  ride the mutually authenticated peer history channel (`key-want`/`key-put`):
+  served only to owner/editor peers, stored only after id/material validation,
+  and a viewer never receives or stores one. The manager exposes
+  `requestContentKey()`/`ensureContentKey()` for first-writer provisioning.
+- [`src/sync/bufferRuntime.ts`](../src/sync/bufferRuntime.ts): composes the
+  pump, the change journal and the leader publish cycle — nothing touches the
+  network until a local committed mutation fires; repeat notifications reuse
+  one armed cycle; stop is instant. Ops from foreign content keys stay
+  buffered (never dropped) until key converges.
+- [`src/sync/driveBoardStore.ts`](../src/sync/driveBoardStore.ts): the
+  canonical store — find-or-create `pboard` root and per-board folder
+  (single-flight; a rival copy created mid-operation is caught by the
+  post-create re-list; cached ids expire after 60 s so an instance whose
+  copy was merged away elsewhere adopts the survivor rather than writing
+  into the trashed duplicate; duplicate trees merge by content — oldest
+  folder survives, children move in, same-name files keep the newer copy,
+  the loser in Drive trash), `board.json.gz` lifecycle
+  with cached `If-Match` revisions plus cached-id eviction when a snapshot
+  vanished underneath, folder-listing board discovery and `attachments/`
+  CRUD; private boards are simply folders without extra ACLs, so sharing
+  never relocates data. Media downloads use the v3 host — the upload host
+  rejects GETs with 405.
+- [`src/sync/boardSyncV2.ts`](../src/sync/boardSyncV2.ts): board persistence
+  over that store for websocket mode on the exact triggers the legacy path
+  used (background loop, blur/pagehide flush, connect, delete) — no parallel
+  pipeline, no new loops. `runtime.ts` routes `googleDrive.syncProject/
+  reconcileAll/deleteProject/pullProject/pushProject` by the persisted
+  collaboration setting; `runtime.bufferRealtime.start(boardId)` starts a
+  buffer runtime for connected writers (unified folder + board grant).
+  Tests: `tests/sync/driveBoardStore.test.ts`, `boardSyncV2.test.ts` and
+  `unifiedMode.test.ts` (persistence issues zero AppData requests in v2
+  mode, the legacy probe is a single read-only listing per session, and the
+  first reconcile auto-migrates a seeded AppData board including
+  fresh-profile import).
+- [`src/sync/bufferSnapshotStore.ts`](../src/sync/bufferSnapshotStore.ts):
+  snapshot file lifecycle inside a folder (find-or-create, cached `If-Match`
+  revision); in the unified layout it publishes the same canonical
+  `board.json.gz` as board sync.
+- [`services/pboard-signaling/buffer-probe.mjs`](../services/pboard-signaling/buffer-probe.mjs)
+  (`npm run test:buffer`) spawns the real server binary against a scratch
+  buffer directory and verifies the wire contract end to end: inert without
+  configuration, single-use challenges, forged-signature and viewer rejection,
+  dedupe, ordered list, lease enforcement, commit, op size/charset limits, and
+  durability of uncommitted ops across restart. Buffer/leader routes carry a
+  5 MiB body envelope (the 16 KiB API default could not fit op batches).
+- Startup/maintenance modules (pure, unit-tested):
+  [`src/sync/startupReconcile.ts`](../src/sync/startupReconcile.ts) (pull/buffer
+  ladder from snapshot etag + watermarks; not yet called from UI),
+  [`src/sync/privateMigration.ts`](../src/sync/privateMigration.ts) (audited
+  resumable migration ladder for one legacy `appDataFolder` board:
+  folder → export → upload → history → **read-back verify** → flip → seal;
+  verification failure re-uploads once, then aborts unverified; source
+  read-only, 90-day recovery window),
+  [`src/sync/legacyMigration.ts`](../src/sync/legacyMigration.ts) (the
+  automatic pass driving that engine per AppData board plus the shared
+  `Pboard/` ACL-copy relocation and window-gated source cleanup; wired into
+  `runtime.ts` once per session on v2 `reconcileAll`),
+  [`src/sync/attachmentGc.ts`](../src/sync/attachmentGc.ts) (attachments
+  collectable only after absence from two snapshot revisions).
+
+Verification: `tests/snapshotV2.test.ts`, `tests/bufferPump.test.ts`,
+`tests/snapshotMerge.test.ts`, `tests/leaderLoop.test.ts`,
+`tests/sync/bufferRuntime.test.ts`, `tests/sync/startupReconcile.test.ts`,
+`tests/sync/privateMigration.test.ts`, `tests/sync/legacyMigration.test.ts`,
+`tests/sync/attachmentGc.test.ts`, `tests/sync/driveBoardStore.test.ts`,
+`tests/sync/boardSyncV2.test.ts`, `tests/sync/unifiedMode.test.ts`,
+`tests/collab/contentKeyExchange.test.ts` (live linked-peer key exchange),
+plus `npm run test:buffer` (21 live-server checks) and `cargo test --lib`
+(21 tests including the buffer/leader/API set) with `cargo clippy` clean.

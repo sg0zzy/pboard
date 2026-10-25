@@ -5,6 +5,24 @@ the [journal](causal-change-journal.md) and [manual resolutions](conflict-resolu
 RxDB remains the local data store. Drive/WebRTC can operate independently; signaling
 selection and defaults are unchanged. [Job 7](peer-causal-history.md) adds authenticated peer history exchange.
 
+> **Scope note (24 October 2026):** this AppDataFolder-based design describes
+> the legacy Drive-provider mode only. Under Sync v2 (websocket provider) no
+> board data touches AppData; every board persists to the unified visible
+> store `My Drive/pboard/<boardId>/board.json.gz` (+ `attachments/`) — see
+> [`docs/collaboration.md`](../collaboration.md) "Sync v2 components" and
+> `src/sync/driveBoardStore.ts`. AppData is read/written only by the audited
+> migration engine (`src/sync/privateMigration.ts`) driven by the automatic
+> legacy pass (`src/sync/legacyMigration.ts`, once per session on v2
+> reconcile: read-back verified before the flip, sources deleted only after
+> the 90-day window). Account ordering preferences intentionally stay in
+> AppData under v2 as device-independent account metadata (product decision,
+> 24 October 2026); they are account settings, not board content. Their sync
+> paths: an immediate upload on every reorder, a pull/upload round-trip on
+> every reconcile (legacy provider internally; Sync v2 via `reconcileAll`),
+> and live propagation between same-account sessions over the WebRTC account
+> room `pboard-account-<account>-order`, which replicates only the single
+> `projectOrder:<account>` settings document.
+
 ## Data flow and compatibility
 
 For the RxDB private-persistence path, a sync reads the user's immutable recovery

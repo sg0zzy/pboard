@@ -23,8 +23,11 @@ use std::{
 use tokio::sync::{Semaphore, mpsc, watch};
 pub mod admission;
 pub mod board_grants;
+pub mod buffer_api;
 pub mod google_enrollment;
 pub mod identity_enrollment;
+pub mod leader;
+pub mod op_buffer;
 pub mod policy;
 pub mod signals;
 mod strict_json;
@@ -197,6 +200,9 @@ pub struct App {
     board_grants: bool,
     grant_cache: Arc<Mutex<board_grants::GrantCache>>,
     grant_permits: Arc<Semaphore>,
+    op_buffer: Option<Arc<std::sync::Mutex<op_buffer::OpBuffer>>>,
+    leader_registry: Arc<std::sync::Mutex<leader::LeaderRegistry>>,
+    buffer_challenges: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     admissions: Arc<Mutex<HashMap<String, AcceptedAdmission>>>,
     auth_window: Arc<Mutex<(Instant, u32)>>,
     traffic: Arc<Mutex<Traffic>>,
@@ -233,6 +239,9 @@ impl App {
             board_grants: false,
             grant_cache: Arc::new(Mutex::new(board_grants::GrantCache::default())),
             grant_permits: Arc::new(Semaphore::new(1)),
+            op_buffer: None,
+            leader_registry: Arc::new(std::sync::Mutex::new(leader::LeaderRegistry::default())),
+            buffer_challenges: Arc::new(std::sync::Mutex::new(HashMap::new())),
             admissions: Arc::new(Mutex::new(HashMap::new())),
             auth_window: Arc::new(Mutex::new((Instant::now(), 0))),
             traffic: Arc::new(Mutex::new(Traffic {
@@ -271,6 +280,32 @@ impl App {
         window.bytes = window.bytes.saturating_add(bytes);
         window.messages <= self.limits.global_messages_per_second
             && window.bytes <= self.limits.global_bytes_per_second
+    }
+    /// Enables the durable op buffer (Sync v2). The leader registry is
+    /// always available in memory, but the HTTP surface opens only when a
+    /// buffer directory is configured, keeping the feature inert by default.
+    pub fn with_op_buffer(mut self, directory: &std::path::Path) -> Result<Self, String> {
+        let buffer = op_buffer::OpBuffer::open(directory.join("buffer-journal"), op_buffer::BufferLimits::default())
+            .map_err(|error| format!("op_buffer_open_failed: {error}"))?;
+        self.op_buffer = Some(Arc::new(std::sync::Mutex::new(buffer)));
+        Ok(self)
+    }
+    pub fn op_buffer(&self) -> Option<&Arc<std::sync::Mutex<op_buffer::OpBuffer>>> {
+        self.op_buffer.as_ref()
+    }
+    pub fn op_buffer_lock(&self) -> &Arc<std::sync::Mutex<op_buffer::OpBuffer>> {
+        self.op_buffer
+            .as_ref()
+            .expect("op buffer routes require with_op_buffer")
+    }
+    pub fn leader_registry(&self) -> &Arc<std::sync::Mutex<leader::LeaderRegistry>> {
+        &self.leader_registry
+    }
+    pub fn buffer_challenges(&self) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+        self.buffer_challenges.lock().unwrap()
+    }
+    pub fn grant_permits(&self) -> Arc<Semaphore> {
+        self.grant_permits.clone()
     }
     pub fn with_board_grants(mut self, enabled: bool) -> Self {
         self.board_grants = enabled;
@@ -362,6 +397,20 @@ impl App {
                     .layer(axum::extract::DefaultBodyLimit::max(bundle_limit)),
             )
             .route("/grants/{scope}", get(board_grants::read))
+            // Buffer batches: up to 64 client ops of the 64 KiB ct ceiling
+            // (512-op batches stay well under this envelope at typical sizes);
+            // the per-op and per-board byte limits live in `op_buffer`.
+            .merge(
+                Router::new()
+                    .route("/buffer/ops", axum::routing::post(buffer_api::insert_ops))
+                    .route("/buffer/list", axum::routing::post(buffer_api::list_ops))
+                    .route("/buffer/commit", axum::routing::post(buffer_api::commit_ops))
+                    .route("/leader/claim", axum::routing::post(buffer_api::leader_claim))
+                    .route("/leader/observe", axum::routing::post(buffer_api::leader_observe))
+                    .route("/leader/commit", axum::routing::post(buffer_api::leader_commit))
+                    .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024)),
+            )
+            .route("/buffer/challenge", get(buffer_api::challenge))
             .route("/healthz", get(|| async { "ok\n" }))
             .route("/ws", get(upgrade))
             .route(

@@ -70,3 +70,20 @@ it('keeps permitted invitations actionable when another board hits the directory
   expect(container.textContent).toContain('private Drive synchronization continue independently');
   expect(f.start).not.toHaveBeenCalled();
 });
+it('separates the account’s own boards from invitations and routes them to Drive restore', async () => {
+  f.sync.mockResolvedValue({ email: 'b@example.test', boards: [
+    { publication: { policy: { boardId: 'own-board', ownerEmail: 'B@Example.test' } } },
+    { publication: { policy: { boardId: 'invited-board', ownerEmail: 'a@example.test' } } }
+  ], ready: ['own-board', 'invited-board'] });
+  await act(async () => root.render(<BoardCollaborationControls projectId={null} onChanged={() => {}} />));
+  const own = container.querySelector('[aria-label="Your boards to restore"]')!;
+  const inbox = container.querySelector('[aria-label="Shared board invitations"]')!;
+  expect(own.textContent).toContain('own-board'.slice(0, 8));
+  expect(own.textContent).toContain('Connect Google Drive');
+  expect(own.querySelector('button')).toBeNull();
+  // Only the foreign board counts as an invitation, and case-insensitively.
+  expect(inbox.textContent).toContain('1 shared board');
+  expect(inbox.textContent).not.toContain('own-board'.slice(0, 8));
+  expect(buttons()).toHaveLength(1);
+  expect(f.start).not.toHaveBeenCalled();
+});

@@ -1,7 +1,7 @@
 import { importLocalBoard, type ImportedCard } from './importBoard';
 import { createRepository, STORAGE_KEY } from "./repository";
 import { browser } from "../platform/browser";
-import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount } from "../sync/browser";
+import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount, leaveSharedBoard } from "../sync/browser";
 import { createProjectDeletionRoleResolver } from "../sync/projectDeletion";
 import { createRxRepository, type RxRepository } from "./rxdbRepository";
 import type { AppState, BoardItem, BoardItemStatus, Project } from "../types";
@@ -33,9 +33,17 @@ let migrationPromise: Promise<RxRepository> | null = null;
 const resolveDeletionRole = createProjectDeletionRoleResolver({ sharedProjects, permissions: drivePermissions,
   connected: async () => await googleAuth.getConnectionState() === "connected" });
 async function openRxRepository(): Promise<RxRepository> {
-  if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ resolveDeletionRole, events: {
+  if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ resolveDeletionRole,
+    reverifySharedDeletionRole: async (projectId) => await googleAuth.getConnectionState() === "connected" ? await drivePermissions.myRole(projectId) : null,
+    events: {
     projectErased: projectId => eraseLegacyBoardCopies(browser.storage.local, projectId),
-    projectHidden: async () => { await syncAccountPreferences(); },
+    // A non-owner "delete" is a leave: hide locally, drop the account
+    // ordering slot, and revoke our own collaborator permission (pending
+    // marker + reconcile-time retry keep this honest across transports).
+    projectHidden: async (projectId) => {
+      await syncAccountPreferences();
+      void leaveSharedBoard(projectId).catch(() => undefined);
+    },
     projectChanged: (projectId) => driveSyncState.markDirty(projectId),
     projectDeleting: async (project) => {
       const syncState = await driveSyncState.get(project.id);

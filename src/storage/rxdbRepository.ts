@@ -112,6 +112,16 @@ export async function createRxRepository(options: {
   /** Recheck Drive ownership before writing shared content deletion records. */
   resolveDeletionRole?: (projectId: string) => Promise<CollaborationRole>;
   /**
+   * Recheck the Drive ACL before a SIGNED board's content delete. "Independent"
+   * collaboration never consults the Drive ACL for roles, so a board that is
+   * still Drive-shared (its usual origin) must not let a collaborator whose
+   * Drive permission is non-owner destroy the shared content even if the
+   * locally imported grant says owner. A null result (not Drive-shared) or a
+   * transport failure keeps the manifest's verdict; an editor/viewer result
+   * forces the leave-only path.
+   */
+  reverifySharedDeletionRole?: (projectId: string) => Promise<"owner" | "editor" | "viewer" | null>;
+  /**
    * Protocol-2 mutation security. The collaboration manager installs a verifier
    * for a shared project when it starts secured pools; every persistence path
    * for that project's documents then requires valid signed provenance.
@@ -216,6 +226,30 @@ export async function createRxRepository(options: {
   // browser, and whether or not a UI subscription is mounted. A change to an
   // unrelated table leaves the copy valid.
   journal.onChange((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); });
+  // Cross-context writers — the extension worker handling the page context
+  // menu's pin commands — never hold live board authority, so their commands
+  // land as pending drafts that only a context with the board's verified
+  // session (the open sidebar) may admit. Without this sweep such a draft
+  // reads as "Synchronization pending" until the user manually verifies
+  // board access. Admit promptly instead: only boards whose live role in
+  // THIS context is an editor are swept, admitPendingWork re-asserts every
+  // precondition under its own lock (foreign-device drafts stay retained
+  // for review), and one sweep per board is in flight at a time; its own
+  // writes re-enter here as a no-op once no heads remain. The subscription
+  // (not onChange) is deliberate: journal notifications from the worker's
+  // context arrive only on subscribed listeners.
+  const sweeping = new Map<string, Promise<void>>();
+  if (!options.pendingScratch) journal.subscribe((tables) => {
+    if (!tables.includes("pendingEdits")) return;
+    invalidatePendingEdits();
+    void (async () => {
+      for (const boardId of new Set(pendingHeads(await pendingEdits()).map((edit) => edit.boardId))) {
+        if (!["owner", "editor"].includes(liveBoardRole(cards, boardId) ?? "") || sweeping.has(boardId)) continue;
+        const sweep = admitPendingWork(boardId).catch(() => undefined).finally(() => { sweeping.delete(boardId); });
+        sweeping.set(boardId, sweep);
+      }
+    })();
+  });
   db.onClose.push(async () => { await Promise.all(permissionWrites.values()); journal.close(); });
   const reconciliation = createCausalReconciliation(journal);
   const blobs = options.blobs ?? createIndexedDbBlobStore();
@@ -268,7 +302,22 @@ export async function createRxRepository(options: {
     // Parallel drafts are retained for explicit review, never selected by clocks.
     return pending.length === 1 ? pending[0].value as unknown as CardRecord : record as CardRecord;
   }
-  async function admitPendingWork(boardId: string) {
+  /** One admission pass per board at a time. Concurrent callers (manual
+   * review, the pending-edit sweeper, the manager) wait for the in-flight
+   * pass and then re-run: the pass is idempotent once heads are admitted,
+   * while two overlapping passes would double-project (an extra
+   * touchProject entry per interleaving). */
+  const admitting = new Map<string, Promise<void>>();
+  function admitPendingWork(boardId: string): Promise<void> {
+    const running = admitting.get(boardId);
+    if (!running) {
+      const work = admitBoardWork(boardId).finally(() => { if (admitting.get(boardId) === work) admitting.delete(boardId); });
+      admitting.set(boardId, work);
+      return work;
+    }
+    return running.catch(() => undefined).then(() => admitPendingWork(boardId));
+  }
+  async function admitBoardWork(boardId: string) {
     const admitted = await locked(async () => {
       await assertCanMutate(boardId);
       const edits = (await pendingEdits()).filter(e => e.boardId === boardId);
@@ -364,6 +413,19 @@ export async function createRxRepository(options: {
   }
   async function isDeletedProject(projectId: string): Promise<boolean> {
     return !!await journal.boardErasure(projectId) || (await deletedProjectIds()).includes(projectId);
+  }
+  /** When this account removed the board from its list (hidden), for re-share detection. */
+  async function projectDeletionTime(projectId: string): Promise<number | null> {
+    const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+    const preference = await settings.findOne(id).exec() ?? await settings.findOne(localOrderId).exec();
+    if (!preference) return null;
+    const parse = parseProjectOrder(preference.value);
+    if (!(parse.deletedProjectIds ?? []).includes(projectId)) return null;
+    // Legacy markers predate per-entry times; the preference timestamp that
+    // carried the deletion stands in, like mergeProjectOrder's own rule.
+    const restored = Date.parse(parse.restoreEvents?.[projectId] ?? "");
+    const best = Math.max(Date.parse(parse.updatedAt), Number.isFinite(restored) ? restored : Number.NEGATIVE_INFINITY);
+    return Number.isFinite(best) ? best : null;
   }
   async function orderedProjects() {
     const records = await allProjectRecords();
@@ -663,8 +725,19 @@ export async function createRxRepository(options: {
     // Keep its handle visible until signed tombstones are durable: selection
     // changes stop the collaboration manager and uninstall the signing guard.
     if (!signed) await hide();
-    const role = signed ? liveBoardRole(projects, projectId) ?? permission?.role
+    let role = signed ? liveBoardRole(projects, projectId) ?? permission?.role
       : options.resolveDeletionRole ? await options.resolveDeletionRole(projectId) : permission?.role ?? options.mutatorRole ?? "owner";
+    if (signed && role === "owner" && options.reverifySharedDeletionRole) {
+      // Independent mode hides the Drive ACL from the local role cache: a
+      // board that is Drive-shared must still honour Drive ownership before
+      // shared content is destroyed.
+      try {
+        const drive = await options.reverifySharedDeletionRole(projectId);
+        if (drive && drive !== "owner") role = drive;
+      } catch {
+        // Unverifiable: keep the verified grant's verdict.
+      }
+    }
     const canDeleteContent = role === "owner" && (!signed || liveBoardRole(projects, projectId) === "owner");
     // Non-owners remove only their account's list handle. Cached rows, images,
     // pending work and conflicts are retained independently of transport state.
@@ -1137,7 +1210,7 @@ export async function createRxRepository(options: {
         const image = await blobs.getBlob(imageId); if (!image) throw new Error('A pending image is missing; the draft remains locally recoverable');
         return { ...image, imageId, blob: undefined, dataUrl: await blobToDataUrl(image.blob) };
       })) }; }, ...conflicts, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
-    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, renameProject, deleteProject, changeProjectTemplate, unhideProject,
+    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, projectDeletionTime, renameProject, deleteProject, changeProjectTemplate, unhideProject,
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,
     subscribeProjects, subscribeCurrentProject, subscribeCards, subscribeCard,

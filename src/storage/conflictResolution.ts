@@ -2,7 +2,7 @@ import type { RxCollection } from "rxdb";
 import { BOARD_TEMPLATES, BOARD_ITEM_STATUSES, CARD_DISPLAY_MODES } from "../types";
 import { isTypeSupported } from "../templates/boardTemplates";
 import { liveBoardRole, isUntrustedImport, verifyLiveBoardVariant } from "../collab/security/liveMutations";
-import { documentValue, scope, type Change, type ChangeJournal, type ConflictDraft } from "./changeJournal";
+import { documentValue, scope, type Change, type ChangeJournal, type ConflictDraft, type JournalEntry } from "./changeJournal";
 import { canonicalize } from "../collab/security/canonical";
 import { reconcile, type Reconciliation } from "./causalReconciliation";
 import { withResolutionOrigin } from "./resolutionOrigin";

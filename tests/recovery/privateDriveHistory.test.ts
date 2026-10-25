@@ -7,6 +7,9 @@ import { createDriveTombstoneStore } from '../../src/sync/state';
 import { canonicalize, type Json } from '../../src/collab/security/canonical';
 import { hashBlob } from '../../src/storage/blobStore';
 import { makeChange } from '../../src/storage/changeJournal';
+import { generateDeviceKey } from '../../src/collab/security/keys';
+import { signManifest, verifyManifest } from '../../src/collab/security/manifest';
+import { installLiveBoardMutations, withUntrustedImport } from '../../src/collab/security/liveMutations';
 
 const devices: RecoveryDevice[] = [];
 afterEach(async () => { for (const device of devices.splice(0)) await device.destroy(); });
@@ -346,4 +349,50 @@ it('syncs the selected board without downloading another board’s history', asy
   await expect(history.sync(selected.id, [], async () => true)).resolves.not.toBeNull();
   expect(download).toHaveBeenCalled();
   expect(download.mock.calls.every(([id]) => !unrelated.has(id))).toBe(true);
+});
+
+// The user-reported same-account asymmetry: two browsers on one Google
+// account share the private history chain, so the second browser's
+// private-backup capture seeds `baseline` journal roots. When the first
+// browser later deletes a card, those unproven roots must rebaseline against
+// the verified author chain silently — like cross-browser bootstrap residue —
+// instead of parking a "Conflict requires resolution" panel on a board where
+// nobody authored a competing edit.
+it('replicates a signed card delete to a second same-account browser without a conflict panel', async () => {
+  const cloud = new DriveFixture(), a = await open(cloud), b = await open(cloud);
+  const board = await a.repo.createProject('Signed two-browser board', 'project');
+  const legacy = await a.repo.addItem({ projectId: board.id, content: 'Created before sharing' });
+  await a.provider.syncProject(board.id);
+  await b.provider.reconcileAll(); // B holds the card with baseline capture residue only.
+  const keyA = await generateDeviceKey(), keyB = await generateDeviceKey();
+  const payload = { protocol: 2 as const, boardId: board.id, driveProjectFileId: '', driveFolderId: '',
+    authorityKeyId: keyA.keyId, epoch: 1, issuedAt: Date.now() - 1000, expiresAt: Date.now() + 300000,
+    devices: [{ deviceKeyId: keyA.keyId, publicKey: keyA.publicJwk, role: 'owner' as const }, { deviceKeyId: keyB.keyId, publicKey: keyB.publicJwk, role: 'editor' as const }] };
+  const manifest = await verifyManifest(await signManifest(payload, { privateJwk: keyA.privateJwk }), keyA.publicJwk, keyA.keyId);
+  const securityA = { boardId: board.id, manifest, signer: { deviceKeyId: keyA.keyId, privateJwk: keyA.privateJwk }, ownSessionId: 'session-a' };
+  const securityB = { boardId: board.id, manifest, signer: { deviceKeyId: keyB.keyId, privateJwk: keyB.privateJwk }, ownSessionId: 'session-b' };
+  const guardA = await installLiveBoardMutations({ projectId: board.id, cards: a.repo.db.cards, projects: a.repo.db.projects, security: securityA, attestExisting: true });
+  await a.repo.updateItem(legacy.id, { content: 'Edited after sharing' });
+  await a.provider.syncProject(board.id);
+  await b.provider.reconcileAll();
+  // B's document bytes drift from the signed chain (pre-seal snapshot era):
+  // exactly the state where B's private-backup capture seeds a `baseline`
+  // journal root for the card.
+  const doc = (await b.repo.db.cards.findOne(legacy.id).exec())!;
+  await withUntrustedImport([b.repo.db.cards], async () => {
+    await doc.incrementalPatch({ _sec: null as never, updatedAt: new Date(Date.now() - 60000).toISOString() });
+  });
+  await b.repo.privateRecovery.capture(board.id);
+  await installLiveBoardMutations({ projectId: board.id, cards: b.repo.db.cards, projects: b.repo.db.projects, security: securityB });
+  expect(await b.repo.listConflicts()).toEqual([]);
+  // The author deletes; the second browser replicates through Drive history.
+  await a.repo.deleteItem(legacy.id);
+  await a.provider.syncProject(board.id);
+  await b.provider.reconcileAll();
+  expect(await b.repo.listConflicts()).toEqual([]);
+  expect((await b.repo.getCard(legacy.id))).toBeNull();
+  expect((await b.repo.db.cards.findOne(legacy.id).exec())?.toJSON().deletedAt).toBeTruthy();
+  expect((await b.repo.reconciliation.inspect({ boardId: board.id, collection: 'cards', documentId: legacy.id })).kind).toBe('deleted');
+  expect(await a.repo.listConflicts()).toEqual([]);
+  await guardA.uninstall();
 });

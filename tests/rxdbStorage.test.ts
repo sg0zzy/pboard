@@ -156,6 +156,25 @@ describe("RxDB local repository", () => {
     } finally { await rx.db.close(); }
   });
 
+  it("reports when a board was removed from this account's list, for re-share detection", async () => {
+    const name = unique();
+    const rx = await createRxRepository({ name, blobs: createIndexedDbBlobStore(`${name}images`),
+      resolveDeletionRole: async () => "editor" as const });
+    try {
+      const board = await rx.createProject("Shared");
+      const other = await rx.createProject("Other");
+      expect(await rx.projectDeletionTime(board.id)).toBeNull();
+      await rx.deleteProject(board.id);
+      expect(await rx.isDeletedProject(board.id)).toBe(true);
+      const when = await rx.projectDeletionTime(board.id);
+      expect(when).not.toBeNull();
+      expect(Math.abs(when! - Date.now())).toBeLessThan(60_000);
+      expect(await rx.projectDeletionTime(other.id)).toBeNull();
+      await rx.unhideProject(board.id);
+      expect(await rx.projectDeletionTime(board.id)).toBeNull();
+    } finally { await rx.db.close(); }
+  });
+
   it("persists account-specific project order without changing shared documents or viewer permissions", async () => {
     const name = unique();
     const rx = await open(name);

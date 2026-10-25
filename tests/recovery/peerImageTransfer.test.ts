@@ -10,7 +10,6 @@ import { manifestHash, signManifest, verifyManifest } from '../../src/collab/sec
 import type { CollaborationSecurityOptions } from '../../src/collab/manager';
 import type { VerifiedSessionContext } from '../../src/collab/security/session';
 import { parseStrictJson } from '../../src/collab/security/canonical';
-import { createPrivateImageTransport } from '../../src/sync/privateImageTransport';
 
 const repos: RxRepository[] = [], sessions: PeerHistorySession[] = [];
 afterEach(async () => { vi.useRealTimers(); for (const s of sessions.splice(0)) s.close(); for (const r of repos.splice(0)) await r.db.close(); });
@@ -92,45 +91,6 @@ it('image requests fail closed without a negotiated, authorized session', async 
   expect(await f.b.hasImage('a'.repeat(64))).toBe(false);
 });
 
-it('private image assets persist immutably in appDataFolder and tolerate an interrupted upload', async () => {
-  const files = new Map<string, { id: string; name: string; contents: string }>();
-  let sequence = 0, failureCount = 1;
-  const auth = { getConnectionState: async () => 'connected' as const, getAccessToken: async () => 'token', connect: async () => {}, disconnect: async () => {}, isConfigured: () => true };
-  const listFiles = (q: string) => {
-    const name = q.match(/name = '([^']+)'/)?.[1] ?? '', contains = q.match(/name contains '([^']+)'/)?.[1] ?? '';
-    return [...files.values()].filter(file => (!name || file.name === name) && (!contains || file.name.startsWith(contains)));
-  };
-  const parseMultipart = (text: string) => text.split(/--[^\r\n]+/).filter(part => part.includes('Content-Type')).map(part => part.split('\r\n\r\n')[1].trim());
-  const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = new URL(String(input));
-    if (failureCount) { failureCount--; return new Response('{}', { status: 500 }); }
-    if (url.pathname.endsWith('/files') && url.searchParams.has('q')) return new Response(JSON.stringify({ files: listFiles(url.searchParams.get('q')!).map(({ contents: _, ...meta }) => meta) }));
-    if (url.pathname.endsWith('/files') && init?.method === 'POST') {
-      const parts = parseMultipart(String(init.body));
-      const file = { id: `f${++sequence}`, name: JSON.parse(parts[0]).name, contents: parts[1] };
-      files.set(file.id, file);
-      return new Response(JSON.stringify({ id: file.id, name: file.name }));
-    }
-    const id = url.pathname.split('/files/')[1]?.split('?')[0];
-    const file = files.get(id);
-    if (!file) return new Response('{}', { status: 404 });
-    return new Response(url.searchParams.get('alt') === 'media' ? file.contents : JSON.stringify({ id: file.id, name: file.name }));
-  }) as typeof fetch;
-  const repo = await createRxRepository({ name: `privimg-${crypto.randomUUID()}`, blobs: createIndexedDbBlobStore(`blob-t-${crypto.randomUUID()}`) }); repos.push(repo);
-  await repo.createProject('Private images', 'project');
-  const imageId = await repo.putImage(editor_image);
-  const transport = createPrivateImageTransport(auth as never, fetcher);
-  // The first write hits a transient Drive failure; the transport's bounded
-  // replay must produce the complete immutable asset on the retried attempt.
-  await transport.writeImage('private-image-board', imageId, editor_image);
-  const readBack = await transport.readImage('private-image-board', imageId);
-  expect(await hashBlob(await imageToBlob(readBack!.dataUrl))).toBe(imageId);
-  const bytesBefore = [...files.values()][0].contents.length;
-  await transport.writeImage('private-image-board', imageId, editor_image); // Immutable no-op.
-  expect([...files.values()][0].contents.length).toBe(bytesBefore);
-  expect([...files.values()].every(file => file.name.startsWith('image-'))).toBe(true);
-});
-
 it('imageSync recovers a missing attachment through the peer bridge without replacing newer card text', async () => {
   const f = await imageFixture();
   const card = await f.a.addItem({ projectId: f.board.id, content: 'Original', image: editor_image });
@@ -190,22 +150,6 @@ it('Drive failures do not prevent peer recovery and other image uploads do not b
   expect(requests).toEqual([['b'.repeat(64)]]);
   expect(errors).toHaveLength(2);
 });
-
-it('pins the Google credential through a mid-operation account switch and never uploads using the new account', async () => {
-  let token = 'account-a'; const uploads: string[] = [];
-  const auth = { getAccessToken: async () => token, getConnectionState: async () => 'connected' as const } as never;
-  const fetcher = (async (_input: unknown, init: RequestInit) => {
-    if (init.method === 'POST') { uploads.push(new Headers(init.headers).get('Authorization')!); return new Response(JSON.stringify({ id: 'f' })); }
-    token = 'account-b'; return new Response(JSON.stringify({ files: [] }));
-  }) as typeof fetch;
-  const imageId = await hashBlob(await imageToBlob(editor_image.dataUrl));
-  await createPrivateImageTransport(auth, fetcher).writeImage('a-board', imageId, editor_image);
-  expect(uploads).toEqual(['Bearer account-a']);
-  const protectedTransport = createPrivateImageTransport(auth, fetcher, async () => async () => false);
-  await expect(protectedTransport.writeImage('a-board', imageId, editor_image)).rejects.toThrow('account changed');
-  expect(uploads).toHaveLength(1);
-});
-
 
 it('discards an interrupted partial image and recovers the exact bytes on a new session', async () => {
   const f = await imageFixture();

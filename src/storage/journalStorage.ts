@@ -23,7 +23,12 @@ export function installJournalStorage<T>(collection: RxCollection<T>, name: Chan
         if (context === 'pboard-local-erasure' && isJournalMaterialization(collection, row.document as any) && row.document._deleted) continue;
         throw new Error('This board was permanently deleted');
       }
-      if (isJournalMaterialization(collection, row.document as Record<string, unknown>)) continue;
+      // Snapshot/bootstrap imports replicate remote state; they are not
+      // authored changes and must never fabricate journal heads (each pull
+      // would otherwise become an unrelated-history conflict). Genuine
+      // history arrives through the verified exchange or the first local
+      // edit, which anchors on the imported bytes as its baseline.
+      if (isJournalMaterialization(collection, row.document as Record<string, unknown>) || isUntrustedImport(collection)) continue;
       const parents = local ? resolutionParents(collection, row.document as Record<string, unknown>) : undefined;
       if (parents && !local) throw new Error("Resolution origin is not a local command");
       const boardId = String(name === "projects" ? (row.document as Record<string, unknown>).id : (row.document as Record<string, unknown>).projectId);

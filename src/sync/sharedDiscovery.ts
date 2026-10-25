@@ -8,6 +8,15 @@ export function createSharedBoardDiscovery(options: {
   permissions: Pick<DrivePermissionService, "discoverSharedProjects" | "readSharedSnapshot" | "myRole">;
   getRepository: () => Promise<RxRepository | null>;
   isDeleted: (projectId: string) => Promise<boolean>;
+  /**
+   * A locally deleted (left) board whose Drive grant demonstrably postdates
+   * the deletion — the owner re-invited. Returning true authorizes the
+   * restore below; pending self-removals must report false so a queued
+   * leave revocation is never eaten by a stale-looking grant check.
+   */
+  isReshared?: (projectId: string) => Promise<boolean>;
+  /** Clears this account's deletion marker so the import below can land. */
+  onReshared?: (projectId: string) => Promise<void>;
 }) {
   let running: Promise<void> | null = null;
   async function discover() {
@@ -17,7 +26,10 @@ export function createSharedBoardDiscovery(options: {
     const failures: string[] = [];
     for (const entry of await options.permissions.discoverSharedProjects()) {
       try {
-        if (await options.isDeleted(entry.projectId) || await rx.getProject(entry.projectId)) continue;
+        if (await options.isDeleted(entry.projectId)) {
+          if (!await options.isReshared?.(entry.projectId)) continue;
+          await options.onReshared?.(entry.projectId);
+        } else if (await rx.getProject(entry.projectId)) continue;
         const snapshot = deserializeProjectSnapshot(await options.permissions.readSharedSnapshot(entry.projectId));
         if (snapshot.project.id !== entry.projectId) throw new Error("Shared board snapshot belongs to a different project");
         const role = await options.permissions.myRole(entry.projectId);

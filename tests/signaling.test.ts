@@ -174,6 +174,7 @@ function makeFakeTransport() {
     }),
     getFileParents: vi.fn().mockResolvedValue([]),
     listFilesByName: vi.fn().mockResolvedValue([]),
+    listSharedWithMe: vi.fn(async () => [] as any[]),
     listPermissions: vi.fn().mockResolvedValue([]),
     createPermission: vi.fn().mockResolvedValue({}),
     updatePermission: vi.fn().mockResolvedValue({}),

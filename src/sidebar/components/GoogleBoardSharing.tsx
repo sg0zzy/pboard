@@ -76,11 +76,21 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
       throw error;
     }
   }
+  const ownEmail = email.trim().toLowerCase();
+  const mine = boards.filter(board => board.ownerEmail.toLowerCase() === ownEmail);
+  const invited = boards.filter(board => board.ownerEmail.toLowerCase() !== ownEmail);
   return <section className="google-board-sharing">
-    {boards.length > 0 && <aside className="shared-board-inbox" aria-label="Shared board invitations">
+    {mine.length > 0 && <aside className="own-board-inbox" aria-label="Your boards to restore">
+      <strong>Your boards on this account</strong>
+      <p>{mine.length} board{mine.length === 1 ? ' is' : 's are'} saved by this account. Connect Google Drive to restore {mine.length === 1 ? 'it' : 'them'} from the private Drive copy — no other browser needs to be open.</p>
+      <ul>{mine.map(board => <li key={board.boardId}>
+        <span title={board.boardId}>Your board · {board.boardId.slice(0, 8)}</span>
+      </li>)}</ul>
+    </aside>}
+    {invited.length > 0 && <aside className="shared-board-inbox" aria-label="Shared board invitations">
       <strong>Shared boards available</strong>
-      <p>{boards.length} shared board{boards.length === 1 ? '' : 's'}. Keep the owner’s Pboard open to connect.</p>
-      <ul>{boards.map(board => <li key={board.boardId}>
+      <p>{invited.length} shared board{invited.length === 1 ? '' : 's'}. Keep the owner’s Pboard open to connect.</p>
+      <ul>{invited.map(board => <li key={board.boardId}>
         <span title={board.boardId}>From {board.ownerEmail} · {board.boardId.slice(0, 8)}</span>
         {board.ready
           ? <button disabled={busy} onClick={() => void run(() => openBoard(board.boardId))} aria-label={`Open shared board ${board.boardId}`}>Open board</button>

@@ -966,7 +966,7 @@ export function App() {
         {currentProject && pendingDelete?.kind === "project" && pendingDelete.id === currentProject.id && (
           <DeleteConfirmation
             message={`Remove “${currentProject.name}”?`}
-            detail="Projects shared with you are removed only from your list. Projects you own and their cards are deleted."
+            detail="Only the board owner can delete a board. Boards you own and their cards are deleted. A board shared with you is removed from your list and your collaborator access is given up; the owner can share it with you again."
             confirmLabel="Remove"
             onCancel={() => setPendingDelete(null)}
             onConfirm={removeCurrentProject}

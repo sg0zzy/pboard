@@ -19,11 +19,20 @@ export function createPrivateRecovery(options: {
   async function capture(boardId: string) {
     return options.locked(async () => {
       const existing = (await journal.entries.where("boardId").equals(boardId).toArray()).filter(e => e.state === "committed");
+      // Documents that already have journal history never get a baseline
+      // root: a value mismatch there means replication seal churn or an
+      // untrusted snapshot update, and a parentless root would fork the
+      // author's own chain — every later author entry then parents to one
+      // branch while the capture root anchors the other, which surfaces on
+      // every collaborator as an authorship conflict. Baseline capture
+      // exists only to carry genuine pre-journal documents.
+      const journaled = new Set(existing.map(e => `${e.collection}\u0000${e.documentId}`));
       const records = [
         ...(await db.projects.storageInstance.findDocumentsById([boardId], true)).map(value => ({ collection: "projects" as const, value })),
         ...(await db.cards.find({ selector: { projectId: boardId } }).exec()).map(doc => ({ collection: "cards" as const, value: doc.toJSON(true) }))
       ];
       for (const { collection, value } of records) {
+        if (journaled.has(`${collection}\u0000${value.id}`)) continue;
         const normalized = documentValue(value);
         if (existing.some(e => e.collection === collection && e.documentId === value.id && canonicalize(e.value) === canonicalize(normalized))) continue;
         const change = await makeChange({ boardId, collection, documentId: value.id, parents: [], ancestry: "unknown", value: normalized });

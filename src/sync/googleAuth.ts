@@ -3,11 +3,14 @@ import { DRIVE_AUTH_STORAGE_KEY } from "./state";
 
 /**
  * Both scopes are requested together:
- *  - `drive.appdata` — the private per-user sync path (app-data folder), unchanged.
- *  - `drive` — discovery and collaboration on boards shared by another user.
- *    `drive.file` only covers app-authorized files and cannot reliably discover
- *    incoming invitations without a Picker step. Automatic discovery needs Drive
- *    access; the app still limits content operations to Pboard board files.
+ *  - `drive` — the canonical Sync v2 store: create/manage the user-visible
+ *    `pboard/` board folders, discover boards, share via folder ACLs. (A
+ *    future least-privilege move toward `drive.file` is open work; it needs
+ *    a Picker/authorization step for boards shared by other accounts.)
+ *  - `drive.appdata` — legacy-only: read/restore the historical per-user
+ *    appDataFolder copies and run the explicit reviewed migration. Sync v2
+ *    never writes AppData; the scope stays until existing users have safely
+ *    migrated (removal requires re-consent, so it is deliberately deferred).
  */
 export const DRIVE_SCOPE = [
   "https://www.googleapis.com/auth/drive.appdata",

@@ -36,9 +36,9 @@ struct Device {
     public_key: PublicKey,
     role: Role,
 }
-#[derive(Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-enum Role {
+pub enum Role {
     Owner,
     Editor,
     Viewer,
@@ -49,6 +49,7 @@ pub struct VerifiedAdmission {
     pub digest: String,
     pub epoch: u64,
     pub expires_at: u64,
+    pub role: Role,
     pub context: crate::signals::Context,
 }
 fn hash(bytes: &[u8]) -> String {
@@ -203,6 +204,7 @@ impl AdmissionProof {
         verify_signature(&self.authority.key()?, &self.manifest_signature, &signed)?;
         let mut ids = HashSet::new();
         let mut member = None;
+        let mut member_role = None;
         let mut owner = false;
         for d in &m.devices {
             if d.device_key_id != d.public_key.fingerprint() || !ids.insert(&d.device_key_id) {
@@ -211,6 +213,7 @@ impl AdmissionProof {
             let key = d.public_key.key()?;
             if d.device_key_id == peer {
                 member = Some(key);
+                member_role = Some(d.role);
             }
             owner |= d.role == Role::Owner;
         }
@@ -241,6 +244,7 @@ impl AdmissionProof {
             digest,
             epoch: m.epoch,
             expires_at: m.expires_at,
+            role: member_role.ok_or("unauthorized")?,
             context: crate::signals::Context {
                 board_id: m.board_id.clone(),
                 collection: if m.board_id.starts_with("account:") {

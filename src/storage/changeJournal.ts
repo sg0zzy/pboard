@@ -218,11 +218,38 @@ export class ChangeJournal {
       // RxDB's storage wrapper generates revisions after our WAL boundary.
       // Match the complete immutable previous value, never a timestamp.
       const previousValue = canonicalize(documentValue(previous));
-      const matches = candidates.filter(c => c.boardId === boardId && c.state === "committed" && canonicalize(c.value) === previousValue
-        && (!authenticated || !previous._sec || portable.has(c.id)));
+      // Entries include state "prepared": a write whose durable document
+      // committed but whose journal finish never ran (interrupted worker)
+      // would otherwise strand the next write into a baseline fork.
+      const matches = candidates.filter(c => c.boardId === boardId && (c.state === "committed" || c.state === "prepared")
+        && canonicalize(c.value) === previousValue
+        // A portable chain proves ancestry to a root; independently, an entry
+        // this board's own authority signed AND proved IS evidence for these
+        // exact bytes. Without that second form, an attested board — whose
+        // pre-signing root is unsigned and therefore never portable — would
+        // invent a duplicate baseline root on every signed write, and the
+        // resulting unrelated chains surface as a conflict once the board is
+        // deleted ("retained conflict evidence on removed boards").
+        && (!authenticated || !previous._sec || portable.has(c.id) || (!!c.value._sec && !!c.proof)));
       // Multiple indistinguishable payloads with different ancestry are not
       // evidence that this writer observed either specific branch.
       parent = matches.length === 1 ? matches[0] : undefined;
+
+      // A remove write bumps updatedAt and re-signs the document in place,
+      // so RxDB hands those mutations back as previous and no journal entry
+      // can byte-match them. Anchor removals on content identity instead:
+      // everything except the two fields the delete path itself rewrites.
+      // Ambiguous content still synthesizes a baseline root.
+      if (!parent && document._deleted === true && previous._sec) {
+        const content = (value: DocumentValue) => canonicalize(documentValue(
+          Object.fromEntries(Object.entries(value).filter(([k]) => k !== "_sec" && k !== "updatedAt"))));
+        const previousContent = content(previous as unknown as DocumentValue);
+        const found = candidates.filter(c => c.boardId === boardId && (c.state === "committed" || c.state === "prepared")
+          && content(c.value) === previousContent
+          && (!authenticated || portable.has(c.id) || (!!c.value._sec && !!c.proof)));
+        if (found.length === 1) parent = found[0];
+      }
+
       if (!parent) {
         parent = { ...await makeChange({ ...common, parents: [], ancestry: "unknown", value: documentValue(previous) }),
           state: "committed", origin: "baseline" };
@@ -236,6 +263,12 @@ export class ChangeJournal {
         const request = store.get(candidate.id);
         request.onsuccess = () => {
           if (!request.result || request.result.state === "rejected") store.put(candidate);
+          // A parent matched from a never-finished write commits now: the
+          // byte match proves its document is durable, and reconcile only
+          // walks committed entries, so a child must never reference one
+          // still marked prepared.
+          else if (candidate === parent && parent.state === "prepared" && request.result.state === "prepared")
+            store.put({ ...parent, state: "committed" });
         };
       }
     });

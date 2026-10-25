@@ -58,6 +58,42 @@ export function reconcile(changes: Change[]): Reconciliation {
   heads.forEach(h => ancestors(h.id));
   if (missing || !heads.length) return conflict("missing-ancestry");
   if (heads.length === 1) return { ...base, kind: deleted(heads[0]) ? "deleted" : "current", preview: preview(heads[0]) };
+  // Journals written before snapshot imports stopped entering the WAL hold a
+  // parentless observation root per pull generation, and every private
+  // backup's `capture` seeds a parentless `baseline` root on a device whose
+  // documents arrived from Drive. Such entries assert no authorship — no
+  // proof, unknown ancestry, root-only — so they are observations of one
+  // serialized history, never authored branches. When every head is
+  // unowned, the newest observation is the document's state; when exactly
+  // one head carries a verified author proof, that author chain IS the
+  // document and the residue roots are inert. Same-account second browsers
+  // hit this constantly: their backup capture seeds baseline roots beside
+  // the replicated author chain, and a subsequent author delete must
+  // replicate as an ordinary update, not a conflict panel.
+  const residue = (change: Change) => { const e = change as JournalEntry; return !e.proof && e.ancestry === "unknown" && !e.parents.length && (e.origin === "observed" || e.origin === "baseline"); };
+  const unowned = (change: Change) => residue(change) && !(change as JournalEntry).value._sec;
+  if (heads.every(unowned)) {
+    const newest = [...heads].sort((a, b) => (Date.parse(String(b.value.updatedAt ?? "")) || 0) - (Date.parse(String(a.value.updatedAt ?? "")) || 0))[0];
+    return { heads: heads.map(h => h.id), variants: [newest], kind: deleted(newest) ? "deleted" : "current", preview: preview(newest) };
+  }
+  const provenHeads = heads.filter(h => (h as JournalEntry).proof && h.value._sec);
+  if (provenHeads.length === 1 && heads.some(residue) && heads.every(h => h === provenHeads[0] || residue(h))) {
+    const author = provenHeads[0];
+    return { heads: heads.map(h => h.id), variants: [author], kind: deleted(author) ? "deleted" : "current", preview: preview(author) };
+  }
+  // A fork whose extra heads all descend from synthetic `baseline` roots —
+  // an interrupted write's re-anchor or a private-backup capture seed — is
+  // not concurrent authorship: this device serialized its writes and the
+  // baseline chain merely continues the durable bytes. Observation roots
+  // stay conflicting (a peer's unknown-history snapshot is a real variant).
+  const syntheticChain = (change: Change) => {
+    const roots = [...ancestors(change.id)].filter(id => !(graph.get(id)?.parents.length ?? 1));
+    return roots.length > 0 && roots.every(id => { const e = graph.get(id)! as JournalEntry; return residue(e) && e.origin === "baseline"; });
+  };
+  if (heads.some(syntheticChain) && heads.filter(h => !syntheticChain(h)).length <= 1) {
+    const newest = [...heads].sort((a, b) => (Date.parse(String(b.value.updatedAt ?? "")) || 0) - (Date.parse(String(a.value.updatedAt ?? "")) || 0))[0];
+    return { heads: heads.map(h => h.id), variants: [newest], kind: deleted(newest) ? "deleted" : "current", preview: preview(newest) };
+  }
   const shared = [...ancestors(heads[0].id)].filter(id => heads.every(h => ancestors(h.id).has(id)));
   // A unique maximal common ancestor is required; criss-cross merge bases are ambiguous.
   const nonMaximal = new Set(shared.flatMap(id => parentsOf(graph.get(id)!)));

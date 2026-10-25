@@ -8,6 +8,8 @@ import type { VerifiedSessionContext } from "./security/session";
 import type { MutationGuardInstall } from "./security/mutation";
 import type { RelayAuthorization } from "./security/relayAdmission";
 import type { RxRepository } from "../storage/rxdbRepository";
+import { createContentKeyStore } from "../storage/contentKeyStore";
+const contentKeyStore = createContentKeyStore();
 import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
 import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
@@ -101,6 +103,10 @@ export interface CollaborationManager {
   start(projectId: string): Promise<void>;
   stop(): Promise<void>;
   refreshRole(): Promise<void>;
+  /** Writer-only: fetch the board buffer content key from a peer; false = none offered. */
+  requestContentKey(): Promise<boolean>;
+  /** Request from peers first, then provision a fresh key locally. */
+  ensureContentKey(): Promise<boolean>;
   state(): CollaborationState;
 }
 
@@ -307,6 +313,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
         existingDocuments: async ids => [...(await ref.findByIds(ids).exec()).values()].map(doc => doc.toJSON()),
         beforeReconnect,
         ...(startedRepo ? { history: { repository: startedRepo, security: securityContext, beforeReceive: () => options.onHistoryReceived?.(projectId) ?? Promise.resolve(),
+          keyExchange: { load: (board: string) => contentKeyStore.loadRaw(board), store: async (board: string, value: { material: string }) => { await contentKeyStore.put(board, value.material); } },
           registry: { add: s => owner.historySessions.add(s), remove: s => owner.historySessions.delete(s), all: () => [...owner.historySessions] } } } : {}),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
         security: {
@@ -645,7 +652,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     sharedFileId = failedFileId;
   }
 
-  const refreshRole = () => runExclusive(async () => {
+  const refreshRole = () => runExclusive(() => collaborationCounters.timed("collab:refreshRole", async () => {
+    collaborationCounters.countEffect("collab:refreshRole");
     if (!startedProjectId) return;
     const projectId = startedProjectId;
     const wasReady = ready;
@@ -681,18 +689,23 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
         }
       }
       if (!wasReady || securityChanged || role !== previousRole || sharedFileId !== previousFileId || (role !== "private" && !session?.rooms.size)) {
-        await doStart(startedProjectId);
+        // Attribute every rebuild to the gate branch that opened it again: a
+        // "rooms-empty" rebuild repeating every role-refresh tick is the
+        // rebuild storm, and the counter names it without a profiler.
+        collaborationCounters.countEffect(!wasReady ? "collab:start:first" : securityChanged ? "collab:start:security" : role !== previousRole ? "collab:start:role" : sharedFileId !== previousFileId ? "collab:start:file" : "collab:start:rooms-empty");
+        await collaborationCounters.timed("collab:start", () => doStart(projectId));
       }
     } catch (err) {
       await doStopAfterFailure(projectId);
       error = err instanceof Error ? err.message : String(err);
       throw err;
     }
-  });
+  }));
 
   return {
     start: (projectId) => runExclusive(async () => {
-      try { await doStart(projectId); }
+      collaborationCounters.countEffect("collab:start:external");
+      try { await collaborationCounters.timed("collab:start", () => doStart(projectId)); }
       catch (err) {
         await doStopAfterFailure(projectId);
         error = err instanceof Error ? err.message : String(err);
@@ -703,6 +716,31 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // regardless of a previous failure.
     stop: () => runExclusive(async () => { startFailure = null; await doStop(); }),
     refreshRole,
+    /** Ask one writer peer for the board's buffer content key; false means none was offered. */
+    async requestContentKey() {
+      const owner = session;
+      if (!owner) return false;
+      for (const history of [...owner.historySessions]) {
+        if (!owner.historySessions.has(history)) continue;
+        try {
+          if (await history.requestContentKey()) return true;
+        } catch { /* peer may simply not hold a key; try the next one */ }
+      }
+      return false;
+    },
+    /** Request from peers first, then provision a fresh key (writers only). */
+    async ensureContentKey() {
+      const owner = session;
+      if (!owner) return false;
+      for (const history of [...owner.historySessions]) {
+        if (!owner.historySessions.has(history)) continue;
+        try {
+          if (await history.requestContentKey()) return true;
+        } catch { /* peer may simply not hold a key; try the next one */ }
+      }
+      await contentKeyStore.ensure(owner.projectId);
+      return true;
+    },
     state: () => ({ role, sharedFileId, connectedPeers: collectPeers(), ready, error })
   };
 }

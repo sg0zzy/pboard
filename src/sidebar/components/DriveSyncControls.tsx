@@ -78,6 +78,11 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
     try {
       await authorizePrivatePersistence(projectId);
       const result = await requestProjectSync(projectId);
+      // An explicit sync is the moment the user expects everything Drive has:
+      // reconcile now, so boards other accounts shared surface immediately
+      // instead of on the sidebar's next discovery tick. Fire-and-forget;
+      // the reactive project list picks up any import.
+      void requestDriveReconciliation();
       if (selectedProject.current !== projectId) return;
       if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
       else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Drive sync complete.');

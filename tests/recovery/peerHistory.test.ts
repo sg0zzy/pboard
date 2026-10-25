@@ -100,6 +100,51 @@ it('preserves an edit/delete conflict and never resurrects a causally deleted ca
   await f.a.deleteItem(card.id); await f.b.updateItem(card.id, { content: 'Concurrent edit' }); await link(f).sync();
   expect((await f.b.reconciliation.inspect({ boardId: f.board.id, collection: 'cards', documentId: card.id })).reason).toBe('concurrent-delete');
 });
+it('keeps a created-edited-deleted card conflict-free for both sessions (no spurious panel)', async () => {
+  const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Root' });
+  const wire = link(f); await wire.sync();
+  await f.a.updateItem(card.id, { content: 'Edit 1' }); await wire.sync();
+  await f.a.updateItem(card.id, { content: 'Edit 2' }); await wire.sync();
+  expect(await f.a.listConflicts()).toEqual([]);
+  expect(await f.b.listConflicts()).toEqual([]);
+  await f.a.deleteItem(card.id); await wire.sync();
+  expect(await f.a.listConflicts()).toEqual([]);
+  expect(await f.b.listConflicts()).toEqual([]);
+  expect(await f.b.reconciliation.inspect({ boardId: f.board.id, collection: 'cards', documentId: card.id })).toMatchObject({ kind: 'deleted' });
+  expect((await f.b.getCard(card.id))).toBeNull();
+});
+it('re-delivers a delete whose delivery raced a disconnect (no orphan tombstone head)', async () => {
+  const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Root' });
+  const first = link(f); await first.sync();
+  await f.a.updateItem(card.id, { content: 'Edit' }); await first.sync();
+  // The delete lands while the wire is torn down mid-flight.
+  await f.a.deleteItem(card.id); first.close();
+  await link(f).sync(); await new Promise(r => setTimeout(r, 50)); await link(f).sync();
+  const target = { boardId: f.board.id, collection: 'cards' as const, documentId: card.id };
+  expect((await f.b.reconciliation.inspect(target)).kind).toBe('deleted');
+  expect(await f.b.listConflicts()).toEqual([]);
+  expect(await f.a.listConflicts()).toEqual([]);
+});
+it('silently rebaselines unsigned bootstrap residue against the verified author chain after a delete', async () => {
+  const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Signed root' });
+  const wire = link(f); await wire.sync();
+  // Session B's pre-guard era: an observed, unsigned root of the same card,
+  // exactly what importing legacy snapshot bytes leaves in the journal.
+  const copy = { ...structuredClone((await f.b.db.cards.findOne(card.id).exec())!.toJSON()) } as Record<string, unknown>;
+  delete copy._sec; copy.updatedAt = '2020-01-01T00:00:00.000Z';
+  const { makeChange: mc } = await import('../../src/storage/changeJournal');
+  const residue = await mc({ boardId: f.board.id, collection: 'cards', documentId: card.id, parents: [], ancestry: 'unknown', value: copy as never });
+  await f.b.journal.accept([{ ...residue, state: 'committed', origin: 'observed' } as never]);
+  // The author then deletes the card; B converges over history.
+  await f.a.deleteItem(card.id); await wire.sync();
+  const target = { boardId: f.board.id, collection: 'cards' as const, documentId: card.id };
+  expect(await f.b.listConflicts()).toEqual([]);
+  expect((await f.b.reconciliation.inspect(target)).kind).toBe('deleted');
+  expect((await f.a.listConflicts()).map(r => r.documentId)).not.toContain(card.id);
+  // The healed tombstone is a signed local resolution, visible as deleted.
+  const tomb = (await f.b.db.cards.findOne(card.id).exec())!.toJSON() as Record<string, unknown>;
+  expect(typeof tomb.deletedAt).toBe('string'); expect(tomb._sec).toBeTruthy();
+});
 it('relays another author proof unchanged and never exchanges drafts, images or unsigned private records', async () => {
   const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Signed' });
   const wire = link(f); await wire.sync();
@@ -264,7 +309,10 @@ it.each(['live', 'deleted'])('keeps signed projection guards active beside a leg
   expect(projected.content).toBe('Signed descendant');
   expect(!!projected.deletedAt).toBe(state === 'deleted');
   expect(await f.a.journal.entries.get(legacy.id)).toBeDefined();
-  expect((await f.a.reconciliation.inspect(target)).kind).toBe('conflict');
+  // An unowned baseline root beside a single verified author head collapses
+  // silently (same-account backup residue must not raise a review panel);
+  // the legacy entry stays retained but never wins projection.
+  expect((await f.a.reconciliation.inspect(target)).kind).toBe(state === 'deleted' ? 'deleted' : 'current');
 });
 it('journals concurrent signed replication normally while exact projection/resolution intents are active', async () => {
   const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Ancestor' });

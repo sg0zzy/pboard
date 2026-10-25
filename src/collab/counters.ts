@@ -30,6 +30,8 @@ export type CollaborationCounters = {
   emissions: Record<string, number>;
   /** Replication and room initialisations. */
   initialisations: Record<string, number>;
+  /** Wall-clock durations of the recurring operations, by name. */
+  timings: Record<string, { runs: number; lastMs: number; totalMs: number }>;
 };
 
 const counters: CollaborationCounters = {
@@ -43,7 +45,8 @@ const counters: CollaborationCounters = {
   renders: {},
   effects: {},
   emissions: {},
-  initialisations: {}
+  initialisations: {},
+  timings: {}
 };
 
 /**
@@ -74,7 +77,8 @@ export const collaborationCounters = {
       renders: { ...counters.renders },
       effects: { ...counters.effects },
       emissions: { ...counters.emissions },
-      initialisations: { ...counters.initialisations }
+      initialisations: { ...counters.initialisations },
+      timings: Object.fromEntries(Object.entries(counters.timings).map(([name, entry]) => [name, { ...entry }]))
     };
   },
   /** Reset every counter. */
@@ -90,6 +94,7 @@ export const collaborationCounters = {
     counters.effects = {};
     counters.emissions = {};
     counters.initialisations = {};
+    counters.timings = {};
   },
   countDriveRequest(purpose: keyof CollaborationCounters["driveRequests"]): void {
     if (!enabled()) return;
@@ -133,8 +138,54 @@ export const collaborationCounters = {
   countInitialisation(what: string): void {
     if (!enabled()) return;
     counters.initialisations[what] = (counters.initialisations[what] ?? 0) + 1;
+  },
+  /** Record one measured execution of a named operation. */
+  time(name: string, ms: number): void {
+    if (!enabled()) return;
+    const entry = counters.timings[name] ?? { runs: 0, lastMs: 0, totalMs: 0 };
+    entry.runs += 1;
+    entry.lastMs = Math.round(ms);
+    entry.totalMs = Math.round(entry.totalMs + ms);
+    counters.timings[name] = entry;
+  },
+  /** Measure one execution of `run` under `name`. A passthrough when disabled. */
+  async timed<T>(name: string, run: () => Promise<T> | T): Promise<T> {
+    if (!enabled()) return await run();
+    const started = Date.now();
+    try { return await run(); } finally { this.time(name, Date.now() - started); }
+  },
+  /**
+   * Label the Drive requests issued while `run` is awaited so `driveRequests`
+   * attributes traffic to the operation that caused it. Operations interleave
+   * on one thread and share the innermost label — good enough to attribute
+   * idle traffic, not a per-request audit. A passthrough when disabled.
+   */
+  async withDrivePurpose<T>(purpose: DrivePurpose, run: () => Promise<T>): Promise<T> {
+    if (!enabled()) return await run();
+    const previous = drivePurpose;
+    drivePurpose = purpose;
+    try { return await run(); } finally { drivePurpose = previous; }
+  },
+  /**
+   * Wrap the fetcher every Drive provider uses, counting requests by the
+   * active purpose (identity endpoints always by URL). Returns the same
+   * fetcher in a production build.
+   */
+  instrumentFetcher(fetcher: typeof fetch): typeof fetch {
+    if (!DIAGNOSTICS) return fetcher;
+    return (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input instanceof Request ? input.url : "";
+      const purpose: DrivePurpose = /drive\/v3\/about|\/oauth2\/v1\/userinfo|oauth2\.googleapis\.com\/(token|revoke)/.test(url)
+        ? "identity"
+        : drivePurpose ?? "other";
+      counters.driveRequests[purpose] += 1;
+      return fetcher(input, init);
+    };
   }
 };
+
+type DrivePurpose = keyof CollaborationCounters["driveRequests"];
+let drivePurpose: DrivePurpose | null = null;
 
 declare global {
   /**

@@ -39,8 +39,18 @@ export function createProjectImageSync(options: {
   let running: Promise<void> | null = null;
   let stopCards: (() => void) | undefined;
   let stopImages: (() => void) | undefined;
+  const baseDelay = options.pollMs ?? 2000;
+  /**
+   * Consecutive transfer passes that ended with an asset still missing or a
+   * transfer that failed. The periodic retry grows exponentially with this
+   * count: an asset no peer holds and Drive does not have must not be probed
+   * on every poll forever. An explicit `tick()` — a card change, a new blob,
+   * a manual retry — always runs the transfer immediately.
+   */
+  let failedPasses = 0;
 
   async function transfer() {
+    let unfinished = false;
     const cards = await repository.listCards(projectId, false); const ids = new Set(cards.map((card) => card.imageId).filter((id): id is string => !!id));
     const missingLocally: string[] = [];
     for (const imageId of ids) {
@@ -49,8 +59,8 @@ export function createProjectImageSync(options: {
       if (!stored) {
         let image: BoardImage | null = null;
         try { image = await transport.readImage(projectId, imageId); }
-        catch (error) { options.onError(error); }
-        if (!active || !image) { missingLocally.push(imageId); continue; } // Its originating browser may still be uploading.
+        catch (error) { options.onError(error); unfinished = true; }
+        if (!active || !image) { missingLocally.push(imageId); unfinished = true; continue; } // Its originating browser may still be uploading.
         // Shared assets are untrusted input: strict MIME allowlist, size and
         // dimension limits, and the card's hash-derived id must match the decoded
         // bytes. This binds every image to its authenticated digest (the SHA-256
@@ -68,7 +78,7 @@ export function createProjectImageSync(options: {
         try {
           await transport.writeImage(projectId, imageId, image);
           published.add(imageId);
-        } catch (error) { options.onError(error); }
+        } catch (error) { options.onError(error); unfinished = true; }
       }
     }
     if (missingLocally.length && options.requestFromPeers) {
@@ -78,21 +88,29 @@ export function createProjectImageSync(options: {
       if (!active) return;
       for (let index = 0; active && index < missingLocally.length; index += 16) {
         try { await options.requestFromPeers(missingLocally.slice(index, index + 16)); }
-        catch (error) { options.onError(error); }
+        catch (error) { options.onError(error); unfinished = true; }
       }
     }
+    failedPasses = unfinished ? failedPasses + 1 : 0;
   }
 
   function schedule() {
-    if (!active || timer !== undefined) return;
-    timer = setTimeout(() => { timer = undefined; void tick(); }, options.pollMs ?? 2000);
+    if (!active) return;
+    const delay = failedPasses === 0
+      ? baseDelay
+      : Math.min(60_000, baseDelay * 2 ** Math.min(failedPasses, 5));
+    timer = setTimeout(() => { timer = undefined; void tick(); }, delay);
   }
 
   function tick(): Promise<void> {
     if (!active) return Promise.resolve();
     if (running) return running;
-    running = transfer().catch(options.onError).finally(() => {
+    running = transfer().catch((error) => { failedPasses += 1; options.onError(error); }).finally(() => {
       running = null;
+      // Recompute the wait from the pass that just finished: an explicit tick
+      // that repaired (or discovered) an asset must not inherit a stale
+      // backed-off timer.
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
       schedule();
     });
     return running;

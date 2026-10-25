@@ -372,3 +372,49 @@ it('rejects permanent disposal of a visible board and aborts deletion if its rev
   expect(await f.repo.journal.pendingEdits.toArray()).toEqual(before);
   expect(await f.repo.journal.receipts.where('destination').equals(`local-pending-discard:${f.board.id}`).toArray()).toEqual([]);
 });
+
+// A signed "independent" board pulled with collaboration sharing off never
+// consults the Drive ACL for roles — but if the board is Drive-shared (its
+// usual origin), a collaborator whose Drive permission is editor/viewer must
+// not destroy the shared content on delete. The repository re-checks via
+// `reverifySharedDeletionRole`; unverifiable verdicts keep the grant's say.
+async function sharedSetup(reverify: (projectId: string) => Promise<'owner' | 'editor' | 'viewer' | null>) {
+  const name = `signedleave${crypto.randomUUID()}`;
+  const events: string[] = [];
+  const repo = await createRxRepository({ name, reverifySharedDeletionRole: reverify,
+    events: { projectDeleting: async () => { events.push('deleting'); }, projectDeleted: async () => { events.push('deleted'); }, projectHidden: async () => { events.push('hidden'); } } });
+  repos.push(repo);
+  const board = await repo.createProject('Signed but Drive-shared', 'project');
+  const card = await repo.addItem({ projectId: board.id, content: 'Shared content' });
+  const key = await generateDeviceKey();
+  const manifest = { protocol: 2 as const, boardId: board.id, authorityKeyId: key.keyId, driveProjectFileId: '', driveFolderId: '',
+    epoch: 1, issuedAt: Date.now() - 1000, expiresAt: Date.now() + 300000,
+    devices: [{ deviceKeyId: key.keyId, publicKey: key.publicJwk, role: 'owner' as 'owner' | 'editor' | 'viewer' }] };
+  const security = { boardId: board.id, manifest, signer: { deviceKeyId: key.keyId, privateJwk: key.privateJwk }, ownSessionId: 'test', manifestHistory: new Map([[1, manifest]]) };
+  const guard = await installLiveBoardMutations({ projectId: board.id, cards: repo.db.cards, projects: repo.db.projects, security, attestExisting: true });
+  return { board, card, events, guard, repo };
+}
+
+it('hides instead of deleting when the Drive ACL reports a non-owner for a signed board', async () => {
+  const f = await sharedSetup(async () => 'editor');
+  await f.repo.deleteProject(f.board.id);
+  expect(f.events).toEqual(['hidden']);
+  expect((await f.repo.db.cards.findOne(f.card.id).exec())?.deletedAt).toBeFalsy();
+  expect(await f.repo.isDeletedProject(f.board.id)).toBe(true);
+  await f.guard.uninstall();
+});
+
+it('keeps the verified grant verdict when the Drive recheck fails, and honours owner/not-shared', async () => {
+  const denied = await sharedSetup(async () => { throw new Error('Drive unreachable'); });
+  await denied.repo.deleteProject(denied.board.id);
+  expect(denied.events).toEqual(['deleting', 'deleted']);
+  await denied.guard.uninstall();
+  const sharedOwner = await sharedSetup(async () => 'owner');
+  await sharedOwner.repo.deleteProject(sharedOwner.board.id);
+  expect(sharedOwner.events).toEqual(['deleting', 'deleted']);
+  await sharedOwner.guard.uninstall();
+  const privateBoard = await sharedSetup(async () => null);
+  await privateBoard.repo.deleteProject(privateBoard.board.id);
+  expect(privateBoard.events).toEqual(['deleting', 'deleted']);
+  await privateBoard.guard.uninstall();
+});

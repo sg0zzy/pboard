@@ -66,6 +66,8 @@ export type PboardWebRTCConnectionOptions = {
     repository: RxRepository; security: CollaborationSecurityOptions; beforeReceive?: () => Promise<void>;
     /** Tracks live sessions so attachment recovery can request missing bytes from peers. */
     registry?: PeerHistorySessionRegistry;
+    /** Writer-only buffer content-key provisioning over the authenticated history channel. */
+    keyExchange?: { load(boardId: string): Promise<{ material: string; keyId: string } | undefined>; store(boardId: string, value: { material: string; keyId: string }): Promise<void> };
   };
   /**
    * Protocol-2 authentication. When set, a peer signals only through signed,

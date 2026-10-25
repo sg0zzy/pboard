@@ -77,4 +77,50 @@ describe("incoming board invitations", () => {
       await expect(recipient.renameProject(viewer.id, "Forbidden")).rejects.toThrow("view-only");
     } finally { await owner.db.close(); await recipient.db.close(); }
   });
+
+  it("imports a hidden board once discovery reports the owner re-invited", async () => {
+    const owner = await open();
+    const recipient = await open();
+    try {
+      const board = await owner.createProject("Re-invited");
+      const snapshot = await owner.exportProject(board.id);
+      const permissions = {
+        discoverSharedProjects: vi.fn(async () => [{ projectId: board.id, name: board.id, fileId: board.id }]),
+        readSharedSnapshot: vi.fn(async () => serializeProjectSnapshot(snapshot.project, snapshot.items)),
+        myRole: vi.fn(async () => "editor" as const)
+      };
+      let hidden = true;
+      const isReshared = vi.fn(async () => true);
+      const onReshared = vi.fn(async () => { hidden = false; });
+      const discover = createSharedBoardDiscovery({ connected: async () => true, permissions,
+        getRepository: async () => recipient, isDeleted: async () => hidden, isReshared, onReshared });
+      await discover();
+      expect(isReshared).toHaveBeenCalledWith(board.id);
+      expect(onReshared).toHaveBeenCalledWith(board.id);
+      expect((await recipient.listProjects()).map((project) => project.name)).toEqual(["Re-invited"]);
+      // A second pass is a no-op: the board is visible and no longer deleted.
+      await discover();
+      expect(permissions.readSharedSnapshot).toHaveBeenCalledTimes(1);
+      expect((await recipient.listProjects())).toHaveLength(1);
+    } finally { await owner.db.close(); await recipient.db.close(); }
+  });
+
+  it("leaves hidden boards untouched when no re-share evidence exists", async () => {
+    const owner = await open();
+    const recipient = await open();
+    try {
+      const board = await owner.createProject("Stale share");
+      const permissions = {
+        discoverSharedProjects: vi.fn(async () => [{ projectId: board.id, name: board.id, fileId: board.id }]),
+        readSharedSnapshot: vi.fn(async () => { throw new Error("must not read"); }),
+        myRole: vi.fn(async () => "editor" as const)
+      };
+      const onReshared = vi.fn(async () => { throw new Error("must not restore"); });
+      const discover = createSharedBoardDiscovery({ connected: async () => true, permissions,
+        getRepository: async () => recipient, isDeleted: async () => true, onReshared });
+      await discover();
+      expect(onReshared).not.toHaveBeenCalled();
+      expect(permissions.readSharedSnapshot).not.toHaveBeenCalled();
+    } finally { await owner.db.close(); await recipient.db.close(); }
+  });
 });

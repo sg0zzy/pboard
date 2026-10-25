@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { browser } from "../src/platform/browser";
-import { googleDrive, driveSyncState } from "../src/sync/browser";
+import { drivePermissions, googleDrive, driveSyncState } from "../src/sync/browser";
 import { DRIVE_PROJECT_STATE_PREFIX } from "../src/sync/state";
 import {
   DRIVE_RECONCILE_MESSAGE,
@@ -44,12 +44,14 @@ vi.mock("../src/sync/browser", () => ({
     getConnectionState: vi.fn(),
   },
   driveSyncState: { get: vi.fn(async () => ({ dirty: false, status: "synced" })) },
+  drivePermissions: { invalidateSharedDiscovery: vi.fn() },
 }));
 
 const browserMock = vi.mocked(browser);
 const reconcileAll = vi.mocked(googleDrive.reconcileAll);
 const syncProject = vi.mocked(googleDrive.syncProject);
 const getConnectionState = vi.mocked(googleDrive.getConnectionState);
+const invalidateSharedDiscovery = vi.mocked(drivePermissions.invalidateSharedDiscovery);
 const alarmsCreate = vi.mocked(browserMock.alarms.create);
 const storageAddListener = vi.mocked(browserMock.storage.onChanged.addListener);
 const alarmAddListener = vi.mocked(browserMock.alarms.onAlarm.addListener);
@@ -111,6 +113,9 @@ describe("handleDriveSyncMessage", () => {
     const result = await handleDriveSyncMessage({ type: DRIVE_RECONCILE_MESSAGE });
     expect(result).toEqual({ ok: true, result: reconcileResult });
     expect(reconcileAll).toHaveBeenCalledTimes(1);
+    // An explicit reconcile must not serve the cached shared-board listing.
+    expect(invalidateSharedDiscovery).toHaveBeenCalledTimes(1);
+    expect(invalidateSharedDiscovery.mock.invocationCallOrder[0]).toBeLessThan(reconcileAll.mock.invocationCallOrder[0]);
   });
 
   it("surfaces an Error from reconcileAll as the reason", async () => {

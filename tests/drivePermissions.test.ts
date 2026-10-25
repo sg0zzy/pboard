@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createDrivePermissionService,
   createDrivePermissionTransport,
+  type DriveFileRef,
   type DrivePermission,
   type DrivePermissionTransport,
   type DriveSharedProjectRecord,
@@ -108,6 +109,7 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
   let seq = 0;
   const nextId = (prefix: string) => `${prefix}${++seq}`;
   let identity: { email: string } | null = initial.identity === null ? null : { email: initial.identity ?? "me@example.com" };
+  const sharedWithMe: DriveFileRef[] = [];
 
   function permissionsFor(fileId: string): DrivePermission[] {
     return state.permissions.get(fileId) ?? [];
@@ -160,13 +162,15 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
     getFileParents: async (fileId) => state.folders.get(fileId)?.parents ?? state.files.get(fileId)?.parents ?? [],
     listFilesByName: async (name, mimeType) =>
       [...state.files.values()].filter((f) => f.name === name && f.mimeType === mimeType).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType })),
+    listSharedWithMe: async () => sharedWithMe,
     listPermissions: async (fileId) => permissionsFor(fileId).map((p) => ({ ...p })),
-    createPermission: async (fileId, role, email) => {
+    createPermission: async (fileId, role, email, createdTime?: string) => {
       const permission: DrivePermission = {
         id: nextId("perm"),
         type: "user",
         role: role === "editor" ? "writer" : "reader",
-        emailAddress: email
+        emailAddress: email,
+        ...(createdTime ? { createdTime } : {})
       };
       const list = permissionsFor(fileId);
       list.push(permission);
@@ -182,7 +186,7 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
       state.permissions.set(fileId, permissionsFor(fileId).filter((p) => p.id !== permissionId));
     }
   };
-  return { transport, state, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
+  return { transport, state, sharedWithMe, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
 }
 
 // In-memory fake of the local shared-layout cache (browser.storage.local in the app).
@@ -397,6 +401,15 @@ describe("createDrivePermissionService", () => {
     }
   });
 
+  it("re-listes shared projects immediately after the discovery cache is invalidated", async () => {
+    const { service } = makeService();
+    await service.discoverSharedProjects();
+    await service.ensureSharedProject("fresh");
+    expect((await service.discoverSharedProjects()).map((d) => d.projectId)).toEqual([]); // TTL cache
+    service.invalidateSharedDiscovery();
+    expect((await service.discoverSharedProjects()).map((d) => d.projectId)).toEqual(["fresh"]);
+  });
+
   it("resolves a collaborator's layout by discovery when the local cache is empty", async () => {
     const { service, fake, store } = makeService({ identity: "owner@example.com" });
     const folderId = await service.ensureSharedProject("proj1");
@@ -421,5 +434,101 @@ describe("createDrivePermissionService", () => {
     const projFolderId = [...fake.state.folders.values()].find((f) => f.name === "proj1")!.id;
     const realtimeFolders = [...fake.state.folders.values()].filter((f) => f.name === "realtime" && f.parents.includes(projFolderId));
     expect(realtimeFolders).toHaveLength(1);
+  });
+
+  it("revokes the caller's own collaborator and realtime permission on self-removal", async () => {
+    const { service, fake, store } = makeService();
+    await service.ensureSharedProject("proj1");
+    await service.invite("proj1", "edit@example.com", "editor");
+    const folderId = store.records.get("proj1")!.folderId!;
+    fake.state.permissions.get(folderId)!.push({ id: "perm-owner", type: "user", role: "owner", emailAddress: "me@example.com" });
+    const realtimeId = store.records.get("proj1")!.realtimeFolderId!;
+    expect(fake.state.permissions.get(realtimeId)!.some((p) => p.emailAddress === "edit@example.com")).toBe(true);
+    fake.setIdentity("edit@example.com");
+    await service.removeSelfFromProject("proj1");
+    const folderPermissions = fake.state.permissions.get(folderId)!;
+    expect(folderPermissions.some((p) => p.emailAddress === "edit@example.com")).toBe(false);
+    expect(folderPermissions.some((p) => p.role === "owner")).toBe(true);
+    expect(fake.state.permissions.get(realtimeId)!.some((p) => p.emailAddress === "edit@example.com")).toBe(false);
+  });
+
+  it("never revokes the owner's permission via self-removal", async () => {
+    const { service, fake, store } = makeService();
+    await service.ensureSharedProject("proj1");
+    await service.invite("proj1", "edit@example.com", "editor");
+    const folderId = store.records.get("proj1")!.folderId!;
+    fake.state.permissions.get(folderId)!.push({ id: "perm-owner", type: "user", role: "owner", emailAddress: "me@example.com" });
+    await service.removeSelfFromProject("proj1");
+    const folderPermissions = fake.state.permissions.get(folderId)!;
+    expect(folderPermissions.filter((p) => p.role === "owner")).toHaveLength(1);
+    expect(folderPermissions.some((p) => p.emailAddress === "edit@example.com")).toBe(true);
+  });
+
+  it("resolves quietly when the board was never Drive-shared", async () => {
+    const { service } = makeService();
+    await expect(service.removeSelfFromProject("private-board")).resolves.toBeUndefined();
+  });
+
+  it("resolves quietly when the caller's permission was already revoked", async () => {
+    const { service, fake } = makeService();
+    await service.ensureSharedProject("proj1");
+    fake.setIdentity("stranger@example.com");
+    await expect(service.removeSelfFromProject("proj1")).resolves.toBeUndefined();
+  });
+
+  it("re-discovers boards from the shared-with-me shelf while name search lags, including directly shared markers", async () => {
+    const fake = makeFakeTransport();
+    const store = makeFakeStore();
+    const service = createDrivePermissionService({ transport: fake.transport, sharedProjects: store,
+      readSnapshot: async (projectId) => JSON.stringify({ projectId }) });
+    const folderA = await service.ensureSharedProject("laggy");
+    const folderB = await service.ensureSharedProject("legacy");
+    const markerA = [...fake.state.files.values()].find((f) => f.name === "project.json" && f.parents.includes(folderA))!;
+    const markerB = [...fake.state.files.values()].find((f) => f.name === "project.json" && f.parents.includes(folderB))!;
+    store.records.delete("laggy");
+    store.records.delete("legacy");
+    // The grant happened but Drive's name-search index has not caught up.
+    fake.transport.listFilesByName = async () => [];
+    fake.sharedWithMe.push({ id: folderA, name: "laggy", mimeType: "application/vnd.google-apps.folder" });
+    fake.sharedWithMe.push({ id: markerB.id, name: "project.json", mimeType: "application/json" });
+
+    const discovered = await service.discoverSharedProjects();
+
+    expect(discovered.map((d) => d.projectId).sort()).toEqual(["laggy", "legacy"]);
+    expect(discovered.find((d) => d.projectId === "laggy")!.fileId).toBe(markerA.id);
+    expect(discovered.find((d) => d.projectId === "legacy")!.fileId).toBe(markerB.id);
+    expect(store.records.get("laggy")).toMatchObject({ folderId: folderA, projectFileId: markerA.id });
+  });
+
+  it("keeps name-search results when the shared-with-me shelf request fails", async () => {
+    const fake = makeFakeTransport();
+    const store = makeFakeStore();
+    const service = createDrivePermissionService({ transport: fake.transport, sharedProjects: store,
+      readSnapshot: async (projectId) => JSON.stringify({ projectId }) });
+    await service.ensureSharedProject("indexed");
+    fake.transport.listSharedWithMe = async () => { throw new Error("shelf unavailable"); };
+    expect((await service.discoverSharedProjects()).map((d) => d.projectId)).toEqual(["indexed"]);
+  });
+
+  it("ranks only collaborator grants created clearly after the removal above the deletion marker", async () => {
+    const { service, fake, store } = makeService({ identity: "collab@example.com" });
+    const folderId = await service.ensureSharedProject("proj1");
+    fake.state.permissions.set(folderId, [{ id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
+    const granted = Date.parse("2026-01-02T00:00:00Z");
+    const grant = (createdTime?: string) => {
+      fake.state.permissions.set(folderId, [
+        { id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" },
+        { id: "perm-mine", type: "user", role: "reader", emailAddress: "collab@example.com", ...(createdTime ? { createdTime } : {}) }
+      ]);
+    };
+    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // no collaborator row yet
+    grant();
+    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // legacy rows carry no createdTime
+    grant(new Date(granted).toISOString());
+    expect(await service.wasReinvitedSince("proj1", granted - 120_000)).toBe(true);
+    expect(await service.wasReinvitedSince("proj1", granted - 30_000)).toBe(false); // clock-skew margin
+    expect(await service.wasReinvitedSince("proj1", granted + 120_000)).toBe(false); // removal came after the grant
+    expect(store.records.get("proj1")!.folderId).toBe(folderId);
+    expect(await service.wasReinvitedSince("never-shared", 0)).toBe(false);
   });
 });

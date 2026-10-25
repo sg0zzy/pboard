@@ -17,7 +17,7 @@
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
     "test:ui:perf": "node experiments/collaboration/ui-perf.mjs",
     "test:recovery": "node scripts/recovery/run.mjs",
-    "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
+    "test:buffer": "cargo build --manifest-path services/pboard-signaling/Cargo.toml --bin pboard-signaling && node services/pboard-signaling/buffer-probe.mjs",    "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
     "demo:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs --interactive",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",

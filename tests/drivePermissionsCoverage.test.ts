@@ -88,6 +88,7 @@ function makeTransport(opts: {
       }
       return opts.listFilesByNameResult ?? [];
     }),
+    listSharedWithMe: vi.fn(async () => [] as any[]),
     listPermissions: vi.fn(async (fileId: string) => opts.listPermissions?.(fileId) ?? []),
     createPermission: vi
       .fn(async (fileId: string, role: PboardCollaboratorRole, email: string): Promise<DrivePermission> => ({

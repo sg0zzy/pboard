@@ -35,6 +35,14 @@ it('the explicit Sync now action enrolls only the selected board before uploadin
   expect(m.authorize).toHaveBeenCalledWith('board'); expect(m.sync).toHaveBeenCalledWith('board');
   expect(m.authorize.mock.invocationCallOrder[0]).toBeLessThan(m.sync.mock.invocationCallOrder[0]);
 });
+
+it('the explicit Sync now action also reconciles so newly shared boards surface at once', async () => {
+  m.connected = true; await render(); await click('button[aria-label="Sync current project to Google Drive now"]');
+  expect(m.sync).toHaveBeenCalledWith('board');
+  expect(m.reconcile).toHaveBeenCalledTimes(1);
+  expect(m.sync.mock.invocationCallOrder[0]).toBeLessThan(m.reconcile.mock.invocationCallOrder[0]);
+});
+
 it.each(['synced', 'syncing'])('allows an explicit sync despite cached %s state', async status => {
   m.connected = true; m.dirty = false; m.status = status;
   await render();

@@ -44,9 +44,9 @@ type Dependencies = {
   history?: PrivateDriveHistory;
   /**
    * Whether a never-before-persisted local board may receive private persistence
-   * under the currently connected account. Background reconciliation defaults to
-   * false (M07: an unbound board is never uploaded into another account
-   * automatically); a disclosed connect-time enrollment allows it.
+   * under the currently connected account. The runtime's policy is "a connected
+   * Drive is consent"; leaving this unset falls back to explicit-context-only
+   * enrollment, which keeps background reconciliation passive.
    */
   allowBinding?: (projectId: string, context: "reconcile" | "explicit") => Promise<boolean>;
 };
@@ -59,7 +59,7 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
   const syncInFlight = new Map<string, Promise<ProjectSyncResult>>();
   const manualInFlight = new Map<string, Promise<ProjectSyncResult>>();
   let reconciliationInFlight: Promise<DriveReconcileResult> | null = null;
-  /** A locally-created board with no durable account binding never auto-enrolls (M07). */
+  /** Enrollment policy is injected (`allowBinding`); the runtime treats a connected Drive as consent. */
   const mayUpload = async (projectId: string, context: "reconcile" | "explicit"): Promise<boolean> => {
     if (!history || !await history.available()) return true;
     if (await history.boundAccountFor(projectId)) return true;
@@ -395,9 +395,8 @@ export function createGoogleDriveProvider({ auth, transport, snapshots, syncStat
           // archive. Its local guard prevents materialization and snapshot upload.
           if (await isSharedProject(boardId)) continue;
           const existed = localByProject.has(boardId);
-          // M07: a locally created board with no durable account binding is never
-          // uploaded into a different account; it is enrolled only through a
-          // disclosed connect action (allowBinding).
+          // A locally created board with no durable account binding is enrolled
+          // only per the injected allowBinding policy (connected Drive = consent).
           if (existed && !remoteByProject.has(boardId) && !await mayUpload(boardId, "reconcile")) continue;
           const state = await syncState.get(boardId);
           const legacy = remoteEntries.filter(entry => entry.snapshot.project.id === boardId).map(entry => entry.snapshot);

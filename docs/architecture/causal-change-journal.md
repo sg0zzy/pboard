@@ -20,7 +20,13 @@ The wrapper on the actual projects/cards storage instance runs inside subsequent
 installed collaboration verification guards. Failed authorization cannot create
 journal entries. Local command writes are explicitly distinguished from snapshot
 imports and replication storage contexts. Observing a replacement is **not** proof
-that its author observed the previous local version.
+that its author observed the previous local version. Snapshot/bootstrap imports
+(untrusted-import context: Drive pulls, bootstraps, board files) write **no**
+journal records at all — they are replicated state, not authored changes, and
+each pull would otherwise add an unanchored observation root that reconciles as
+an unrelated-history conflict against the previous pull. The first local edit
+after an import anchors on the imported bytes as its baseline; verified history
+arrives only through the authenticated history exchange.
 
 Writes first commit a prepared journal record, then write the RxDB document, then
 commit the journal outcome before acknowledging the save. These are separate
@@ -46,6 +52,19 @@ collection/document binding, parent IDs, ancestry certainty and exact applicatio
 value. RxDB `_rev`, `_meta` and `_attachments` are excluded; `_sec` and tombstones
 are preserved. Parentage comes from an exact known previous value, not its clock.
 Ambiguous matches and first edits of legacy data retain an unknown baseline.
+An entry proved by this board's own authority counts as exact evidence for its
+own bytes even when the chain above it lacks a portable anchor (a board that
+was attested from unsigned history), so continued signed edits do not fork onto
+duplicate baseline roots. A removal re-signs and re-stamps its document in
+place; it anchors on the unique committed entry matching the document content
+after ignoring `_sec` and `updatedAt`.
+A local write also matches a `prepared` entry whose bytes are the current
+document: that entry came from an interrupted write whose document persisted
+while its journal finish never ran, so anchoring on it (and committing it)
+prevents a spurious baseline fork. At reconciliation time, heads descending
+only from synthetic `baseline` roots are inert snapshots, never authored
+branches: a lone authored chain beside such heads resolves to the newest
+state instead of a conflict.
 Existing records are captured lazily when first edited; there is no destructive
 startup rewrite or automatic signature attestation. Legacy imports retain unknown
 ancestry. Existing signed operation IDs/signatures remain unchanged inside `_sec`.
@@ -83,6 +102,23 @@ than maintained in a second mutable conflict table.
 - A resolution is another authorized descendant referencing all resolved heads.
   A partial resolution cannot erase unseen branches; concurrent incompatible
   resolutions become another conflict. Job 5 implements local signing and review UI.
+- Unowned roots (2026-10-24/25): reconciliation classifies parentless,
+  unknown-ancestry, unproven entries with origin `observed` (pre-fix pull
+  journaling, pre-signature replication) or `baseline` (private-backup
+  `capture`) as residue — they assert no authorship. If every head is
+  residue, the newest is the document's state; if exactly one head carries
+  a verified author proof and every other head is residue, the author chain
+  IS the document (kind current/deleted), with the residue retained but
+  inert. No journal entry is written and no resolution fork is created, so
+  the author's next entry — including a delete — chains cleanly and the
+  second same-account browser applies it as an ordinary update instead of
+  raising a "Conflict requires resolution" panel. Any local, linked, or
+  additional proven dissent keeps full conflict reporting.
+- Capture never forks (2026-10-25): `privateRecovery.capture` seeds baseline
+  roots only for documents with no committed journal history at all. Writing
+  a fresh root for an already-journaled document whose bytes drifted (seal
+  re-stamping, untrusted snapshot updates) forked the author's own chain on
+  every backup and surfaced the fork on every collaborator.
 
 Merge previews are explicitly unsigned, never submitted to RxDB replication and
 never represented as an original author's signed document. All source signatures

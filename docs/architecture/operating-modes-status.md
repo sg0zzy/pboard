@@ -8,14 +8,27 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 Implemented so far, without changing existing defaults or removing the legacy
 path:
 
-- **Durable account-binding gate (M05/M07).** After successful Google login,
-  the disclosed connect action records a verified account hash and the current
-  visible board IDs. Background enrollment requires that exact scope; old
-  timestamp-only consent is ignored. Explicit sidebar Sync now may enroll the
-  selected board; Android Connect/Sync now reviews the visible board set. A
-  later account or newly created standalone board does not inherit the old
-  disclosure. Established board bindings remain unchanged and block another
-  account. Local data is retained on every denied/failed operation.
+- **Account binding and enrollment (M05/M07, policy updated 2026-10).** A
+  connected Google Drive *is* the consent: every local board auto-enrolls for
+  private persistence under the connected account — no per-board prompt — and
+  connecting immediately reconciles so a fresh profile of the same account
+  restores its boards unattended. The earlier per-board disclosure
+  (`authorizePrivatePersistence`) still records its account-scoped receipt but
+  is no longer required to upload. Established board bindings stay with their
+  original account. Consequence of the 2026-10 decision: a board that was
+  created under account A and never uploaded can be enrolled by a later-
+  connected account B on the same device. Local data is retained on every
+  denied/failed operation.
+- **Unified Sync v2 storage and automatic legacy migration (2026-10-24).**
+  Under the websocket provider every board — private or shared — persists to
+  `My Drive/pboard/<boardId>/board.json.gz` (+ `attachments/`); AppData plays
+  no role in normal v2 persistence. The legacy migration runs automatically
+  on reconcile without prompting (connect is consent): AppData copies and
+  legacy shared `Pboard/` folders relocate after a read-back verification,
+  sources delete only after the 90-day window, shared ACLs are copied before
+  the flip. Account ordering preferences intentionally remain AppData-backed
+  account metadata. The `drive` OAuth scope is unchanged. See
+  [`docs/collaboration.md`](../collaboration.md) "Sync v2 components".
 - **Contract status resolver (S01).** `src/sync/boardStatus.ts` derives the four
   contract labels with the approved precedence (Local only → Conflict requires
   resolution → Synchronization pending → Synced), including the no-Synced rule

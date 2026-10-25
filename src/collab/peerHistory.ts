@@ -24,7 +24,7 @@ const MAX_IMAGE_JSON = Math.ceil(MAX_IMAGE_FILE_BYTES * 4 / 3) + 2048;
 const clean = ({ version, id, boardId, collection, documentId, parents, ancestry, value }: Change): Change => ({ version, id, boardId, collection, documentId, parents, ancestry, value });
 type Record = { change: Change; proof?: JournalProof; admission?: HistoryAdmission };
 type Frame = { kind: typeof KIND; version: 1; op: string; id: string; [key: string]: unknown };
-export type PeerHistorySession = { receive(frame: unknown): Promise<void>; flush(): Promise<void>; requestImages(ids: string[]): Promise<void>; close(): void };
+export type PeerHistorySession = { receive(frame: unknown): Promise<void>; flush(): Promise<void>; requestImages(ids: string[]): Promise<void>; requestContentKey(): Promise<boolean>; close(): void };
 export const isHistoryFrame = (value: unknown): boolean => !!value && typeof value === "object" && "kind" in value && value.kind === KIND;
 const hashIds = (value: unknown): string[] => {
   if (!Array.isArray(value) || value.length > 16 || value.some(id => typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id)) || new Set(value).size !== value.length) throw new Error("Invalid history identity list");
@@ -36,6 +36,8 @@ export function createPeerHistorySession(options: {
   repository: RxRepository; security: CollaborationSecurityOptions; context: VerifiedSessionContext;
   send(frame: unknown): void | Promise<void>; active(): boolean; onError(error: Error): void;
   beforeReceive?(): Promise<void>;
+  /** Buffer content keys travel only writer-to-writer on this authenticated channel. */
+  keyExchange?: { load(boardId: string): Promise<{ material: string; keyId: string } | undefined>; store(boardId: string, value: { material: string; keyId: string }): Promise<void> };
 }): PeerHistorySession {
   const { repository: rx, security, context } = options;
   let closed = false, supported = false, announced = false;
@@ -229,11 +231,18 @@ export function createPeerHistorySession(options: {
     if (closed || !supported) return; // Explicit capability absence retains the existing RxDB path.
     // A running scan may have read before this caller's commit. Wait for it,
     // then establish a fresh barrier before releasing ordinary RxDB messages.
+    // A rejection that races close() is a benign session end: close rejects
+    // outstanding acknowledgements while callers in the RxDB send path have
+    // no meaning for them anymore, and un-retaining the rejection here is
+    // what surfaces as an unhandled rejection at teardown.
+    const settle = async (work: Promise<void>) => {
+      try { await work; } catch (error) { if (!closed) throw error; }
+    };
     const previous = running;
-    if (previous) await previous;
+    if (previous) await settle(previous);
     if (closed) return;
     if (!running) running = exchange().finally(() => { running = null; });
-    await running;
+    await settle(running);
   }
   function wake() {
     if (closed || scheduled) return;
@@ -249,7 +258,7 @@ export function createPeerHistorySession(options: {
     if (++rate.count > 200) throw new Error("History message rate exceeded");
     const frame = raw as Frame;
     if (!frame || frame.kind !== KIND || frame.version !== 1 || typeof frame.id !== "string" || frame.id.length > 100) throw new Error("Invalid history frame");
-    const allowed: { [op: string]: string[] } = { hello: [], chunk: ["index", "total", "data"], offer: ["ids"], wanted: ["ids"], put: ["records"], ack: ["ids"], "image-want": ["ids"], "image-put": ["imageId", "image"], "image-part": ["imageId", "index", "total", "data"], "image-ack": ["ids"], "image-done": ["ids"] };
+    const allowed: { [op: string]: string[] } = { hello: [], chunk: ["index", "total", "data"], offer: ["ids"], wanted: ["ids"], put: ["records"], ack: ["ids"], "image-want": ["ids"], "image-put": ["imageId", "image"], "image-part": ["imageId", "index", "total", "data"], "image-ack": ["ids"], "image-done": ["ids"], "key-want": [], "key-put": ["material", "keyId"] };
     if (!Object.hasOwn(allowed, frame.op) || Object.keys(frame).some(key => !["kind", "version", "op", "id", ...allowed[frame.op]].includes(key))) throw new Error("Unknown history operation or field");
     if (frame.op === "chunk") {
       if (!Number.isSafeInteger(frame.index) || !Number.isSafeInteger(frame.total) || Number(frame.total) < 2 || Number(frame.total) > 64
@@ -279,6 +288,28 @@ export function createPeerHistorySession(options: {
       const waiting = pending.get(frame.id);
       if (!waiting) throw new Error("Unsolicited history response");
       pending.delete(frame.id); clearTimeout(waiting.timer); waiting.resolve(frame); return;
+    }
+    if (frame.op === "key-want") {
+      // Serving a content key requires: board grant present, this device holds
+      // one, and the requesting peer is itself owner/editor on the manifest.
+      if (!options.keyExchange || context.collection !== "cards" || (context.remoteRole !== "owner" && context.remoteRole !== "editor")) return;
+      const entry = await options.keyExchange.load(context.boardId);
+      if (entry) await send({ kind: KIND, version: 1, op: "key-put", id: frame.id, material: entry.material, keyId: entry.keyId });
+      return;
+    }
+    if (frame.op === "key-put") {
+      const waiting = pending.get(frame.id);
+      if (!waiting) throw new Error("Unsolicited content-key response");
+      pending.delete(frame.id);
+      clearTimeout(waiting.timer);
+      const material = String(frame.material ?? ""), keyId = String(frame.keyId ?? "");
+      if (!/^[0-9a-f]{16}$/.test(keyId) || !/^[A-Za-z0-9_-]{43}$/.test(material)) {
+        waiting.reject(new Error("Invalid content-key response"));
+        return;
+      }
+      if (options.keyExchange && context.remoteRole !== "viewer") await options.keyExchange.store(context.boardId, { material, keyId });
+      waiting.resolve(frame);
+      return;
     }
     if (frame.op === "image-want") {
       authorize();
@@ -382,8 +413,24 @@ export function createPeerHistorySession(options: {
     }
     throw new Error("Unknown history operation");
   }
+  async function requestContentKey(): Promise<boolean> {
+    authorize();
+    if (!options.keyExchange || context.collection !== "cards") return false;
+    const ownRole = security.manifest.devices.find(device => device.deviceKeyId === context.ownDeviceKeyId)?.role;
+    if (ownRole !== "owner" && ownRole !== "editor") return false;
+    if (await options.keyExchange.load(context.boardId)) return true;
+    try {
+      const frame = await request("key-want", {});
+      const material = String(frame.material ?? ""), keyId = String(frame.keyId ?? "");
+      if (!/^[0-9a-f]{16}$/.test(keyId) || !/^[A-Za-z0-9_-]{43}$/.test(material)) throw new Error("Invalid content-key response");
+      await options.keyExchange.store(context.boardId, { material, keyId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
   void send({ kind: KIND, version: 1, op: "hello", id: crypto.randomUUID() }).catch(fail);
-  return { receive, flush, requestImages, close() {
+  return { receive, flush, requestImages, requestContentKey, close() {
     if (closed) return; closed = true; unsubscribe(); clearTimeout(capabilityTimer); clearTimeout(scheduled); clearTimeout(assemblyTimer); clearTimeout(imageTimer); negotiate(); assembly = null; imageAssembly = null; offered.clear(); requestedImages.clear(); verifiedRecords.clear();
     for (const waiting of pending.values()) { clearTimeout(waiting.timer); waiting.reject(new Error("History session closed before acknowledgement")); }
     pending.clear();

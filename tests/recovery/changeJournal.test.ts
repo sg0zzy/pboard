@@ -62,10 +62,12 @@ it('does not journal security-rejected remote writes or fabricate ancestry for i
   expect(await repo.journal.entries.count()).toBe(count);
   await guard.uninstall();
   const snapshot = await repo.exportProject(board.id);
+  const beforeImport = await repo.journal.entries.count();
   await repo.importProject(snapshot!.project, snapshot!.items);
-  const observed = (await repo.journal.entries.toArray()).filter(c => c.origin === 'observed');
-  expect(observed.length).toBeGreaterThan(0);
-  expect(observed.every(c => c.ancestry === 'unknown' && c.parents.length === 0)).toBe(true);
+  // Snapshot imports are state, not authored changes: they never enter the
+  // journal, so repeated pulls cannot pile up unanchored observation roots.
+  expect(await repo.journal.entries.count()).toBe(beforeImport);
+  expect((await repo.journal.entries.toArray()).filter(c => c.origin === 'observed')).toEqual([]);
 });
 
 it('fails the save before touching documents when journal preparation fails', async () => {

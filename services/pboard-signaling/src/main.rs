@@ -80,6 +80,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     app = app.with_identity_enrollment(identity);
+    if let Ok(directory) = std::env::var("PBOARD_SIGNALING_BUFFER_DIR") {
+        std::fs::create_dir_all(&directory)?;
+        app = app.with_op_buffer(std::path::Path::new(&directory))?;
+    }
     app.validate_service_policy()?;
     match action.as_deref() {
         Some("--check-config") => return Ok(()),

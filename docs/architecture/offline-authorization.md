@@ -64,8 +64,13 @@ retained; the next edit requires explicit review rather than selecting by clock.
 `exportPendingWork(boardId)` exports all retained versions, including hidden-board
 work. An explicit private/collaborative copy still uses new board/card identities.
 
-`admitPendingWork`, called when an editor/owner manager starts with current guards,
-requires the same original device and authority. It creates a new signed operation
+`admitPendingWork`, called when an editor/owner manager starts with current guards
+and automatically when a pending-edit journal change arrives while this context
+holds the board's live editor role (the extension worker's context-menu pins carry
+no live authority, so their drafts are admitted by the open sidebar without the
+manual "Verify board access" step), requires the same original device and authority.
+One admission pass runs per board at a time; concurrent callers wait and re-check,
+so overlapping passes can never double-project. It creates a new signed operation
 under current authorization and an author proof, referencing the saved base rather
 than the latest remote document. The journal and existing guarded materializer
 reconcile it. A concurrent remote head remains a conflict. A stable operation ID

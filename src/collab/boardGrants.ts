@@ -215,7 +215,17 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
       else await publish(bundle);
     } else {
       const scope = toBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(["pboard-board-grants-v1", pin, board])))));
-      const received = await requestHttp(bundle.endpoint, `/grants/${scope}`);
+      let received: Awaited<ReturnType<typeof requestHttp>>;
+      try { received = await requestHttp(bundle.endpoint, `/grants/${scope}`); }
+      // The service answers 404 when a grant is not currently published:
+      // grants live only while the authority browser renews them, so a board
+      // its owner has not opened recently is absent from the service cache.
+      // That is the expired-grant state, not an unavailable service.
+      catch (error) {
+        if (error instanceof Error && error.message.includes('(HTTP 404)'))
+          throw new Error("Board grant expired. The original authority browser must be online to renew it.");
+        throw error;
+      }
       if (!received || received.version !== 1) throw new Error("Board authority metadata unavailable or unsupported");
       next = { ...bundle, authority: received.authority, history: received.history.map(entry => ({ payload: parseStrictJson(new TextDecoder().decode(fromBase64Url(entry.payload))) as unknown as SignedManifest["payload"], signature: entry.signature })) };
     }

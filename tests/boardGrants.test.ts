@@ -76,6 +76,19 @@ it("rejects expired/forged requests, authority replacement and history forks, an
   await owner.service.revoke("board", req.deviceKeyId);
   await expect(joining.service.poll("board")).rejects.toThrow("no owner-approved");
 });
+it("reports the expired-grant state when the service no longer publishes the board", async () => {
+  const f = fixture(), owner = f.client(), joining = f.client();
+  await owner.service.configure(settings); await joining.service.configure(settings);
+  const invitation = await owner.service.initialize("board");
+  const req = await joining.service.deviceRequest(JSON.stringify(invitation));
+  await joining.service.trust(JSON.stringify(await owner.service.approve(JSON.stringify(req), req.deviceKeyId, "editor")), req.authorityKeyId);
+  expect(await joining.service.security("board")).not.toBeNull();
+  // The authority browser went offline; the service cache expired the grant.
+  // A joiner holding the grant record must be told to wake the authority, not
+  // that the service itself is broken.
+  f.network.delete("current");
+  await expect(joining.service.security("board", true)).rejects.toThrow("Board grant expired. The original authority browser must be online to renew it.");
+});
 it("renews from persisted owner history after an interruption without discarding old signed epochs", async () => {
   const f = fixture(), owner = f.client(); await owner.service.configure(settings);
   const first = await owner.service.initialize("board");
@@ -190,5 +203,5 @@ it("persists verified downgrades/removal before rejecting admission and never tr
   expect(observed.at(-1)).toMatchObject({ role: 'revoked', authorityKeyId: request.authorityKeyId, deviceKeyId: request.deviceKeyId });
   await expect(peer.service.security('board')).rejects.toThrow('no owner-approved');
   const count = observed.length; f.network.delete('current');
-  await expect(peer.service.poll('board')).rejects.toThrow('unavailable'); expect(observed).toHaveLength(count);
+  await expect(peer.service.poll('board')).rejects.toThrow('Board grant expired'); expect(observed).toHaveLength(count);
 });

@@ -271,6 +271,18 @@ export type PboardDriveSignalingOptions = {
   store: PboardDriveSignalStore;
   /** Poll cadence; drives both presence and signal delivery latency. Default 2000ms. */
   pollMs?: number;
+  /**
+   * Poll cadence once the room has had no live peer, no delivered signal and
+   * no outbound signal for `idleSlowMs`. An empty room polled at the full rate
+   * costs a steady stream of Drive round trips forever; backing off to this
+   * interval keeps the presence heartbeat well inside `presenceTtlMs` so a
+   * joining peer is still discovered, at the cost of at most one slow poll of
+   * connect latency in each direction. Default 15000ms, never below `pollMs`
+   * and never at or above a quarter of the presence TTL.
+   */
+  maxPollMs?: number;
+  /** How long a room stays at the fast cadence after its last activity. Default `presenceTtlMs`. */
+  idleSlowMs?: number;
   /** A peer file not rewritten within this window is considered gone. Default 60000ms. */
   presenceTtlMs?: number;
   /** A signal older than this is dropped from the outbox. Default 240000ms. */
@@ -306,6 +318,12 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   const pollMs = options.pollMs ?? 2000;
   const presenceTtlMs = options.presenceTtlMs ?? 60_000;
   const signalTtlMs = options.signalTtlMs ?? 240_000;
+  // The slow cadence must still rewrite our presence often enough for peers
+  // to see it: keep it strictly inside a quarter of the presence TTL.
+  const maxPollMs = Math.max(pollMs, options.maxPollMs ?? 15_000, presenceTtlMs / 4);
+  const idleSlowMs = options.idleSlowMs ?? presenceTtlMs;
+  /** When the room last saw a live peer, delivered a signal, or sent one. */
+  let lastActivityAt = store.now();
   const me = store.peerId;
   const security = options.security ?? null;
   const replay: ReplayCache = security ? createReplayCache() : { accepted: new Map() };
@@ -329,13 +347,17 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
 
   function schedulePoll() {
     if (!started || timer !== null) return;
+    // An empty room is polled at the slow cadence: two idle browsers still
+    // find each other (each presence stays fresh within its TTL), only the
+    // connect latency grows to at most one slow poll per side.
+    const idle = store.now() - lastActivityAt >= idleSlowMs;
     timer = setTimeout(() => {
       timer = null;
       void tick().catch((error) => {
         if (onError) onError(error);
         else console.error("Pboard live collaboration signaling failed", error);
       });
-    }, pollMs);
+    }, idle ? maxPollMs : pollMs);
   }
   // Outbound signals already handed to onSignal, keyed by sender peer id.
   const delivered = new Map<string, Set<string>>();
@@ -375,13 +397,14 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       if (!started) return;
       for (const [peerId, record] of Object.entries(all)) {
         if (peerId === me || !record || now - record.updatedAt >= presenceTtlMs) continue;
-        if (record.security?.presence) onPresence?.(peerId, record.security);
+        if (record.security?.presence) { onPresence?.(peerId, record.security); lastActivityAt = now; }
         const seen = delivered.get(peerId) ?? new Set<string>();
         // Bound per-remote-session pending work before verification (flood guard).
         const incoming = record.outbox.filter((s) => s.toPeerId === me && now - (s.sentAt ?? record.updatedAt) < signalTtlMs).slice(0, MAX_PENDING_SIGNALS_PER_SESSION);
         for (const signal of incoming) {
-          if (seen.has(signal.id)) continue;
+          if (seen.has(signal.id)) { lastActivityAt = now; continue; }
           seen.add(signal.id);
+          lastActivityAt = now;
           if (security && signal.security) {
             try {
               const verifiedSignal: unknown = await verifySignedSignal(
@@ -409,7 +432,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
         }
         delivered.set(peerId, seen);
       }
-      await refreshRoster(now, all);
+      if ((await refreshRoster(now, all)).length) lastActivityAt = now;
     } finally {
       polling = false;
       schedulePoll();
@@ -421,6 +444,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
     async join(rosterHandler) {
       onRoster = rosterHandler;
       started = true;
+      lastActivityAt = store.now();
       try { await tick(); }
       catch (error) {
         // Keep the session identity usable while the scheduled poll retries.
@@ -433,6 +457,11 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
     sendSignal(to, signal) { return writeExclusive(async () => {
       if (!started) return;
       const now = store.now();
+      lastActivityAt = now;
+      // A room idling on the slow cadence must not delay the presence and
+      // outbox writes that carry this signal: re-arm the next poll at the
+      // fast cadence immediately.
+      if (timer !== null) { clearTimeout(timer); timer = null; schedulePoll(); }
       let securityEntry: { manifest: BoardPermissionManifest; signedSignal: SignedSignal } | undefined;
       if (security) {
         const signedEnvelope = await buildSignedSignal(

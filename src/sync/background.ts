@@ -1,5 +1,5 @@
 import { browser } from "../platform/browser";
-import { googleDrive, driveSyncState } from "./browser";
+import { drivePermissions, googleDrive, driveSyncState } from "./browser";
 import { isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
 import { recoveryDelayMs } from "./recoveryScheduler";
@@ -110,6 +110,8 @@ function recoveryAttempts(): RecoveryAttempts {
 
 export function handleDriveSyncMessage(message: unknown): Promise<unknown> | undefined {
   if (isDriveReconcileMessage(message)) {
+    // An explicit user action must not serve the 60-second discovery cache.
+    drivePermissions.invalidateSharedDiscovery();
     return googleDrive.reconcileAll()
       .then((result) => ({ ok: true, result }))
       .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive reconciliation failed" }));

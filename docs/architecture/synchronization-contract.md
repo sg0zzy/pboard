@@ -23,7 +23,13 @@ tested compatibility transition; their data and trust cannot simply be removed.
   prerequisites for an otherwise permitted local save.
 - Standalone and Connected are the only user-facing operating modes. A temporary
   outage is a degraded Connected state, not an automatic switch to Standalone.
-- Drive persists each account's private copy in its own `appDataFolder`.
+- Sync v2 (websocket provider) persists every board — private or shared — in
+  the user-visible unified store `My Drive/pboard/<boardId>/board.json.gz`
+  with `attachments/`; a private board is a folder without extra ACLs and
+  sharing changes ACLs only, never storage location. The legacy Drive-provider
+  mode keeps its per-account `appDataFolder` copies until the automatic
+  verified migration relocates them; websocket persistence never writes
+  AppData, touching it only for the once-per-session read-only legacy probe.
   Collaborators never read or modify another account's private Drive files.
   WebSocket carries bounded authenticated signaling/authorization metadata;
   WebRTC carries authorized peer replication, including attachments when added.
@@ -50,9 +56,9 @@ tested compatibility transition; their data and trust cannot simply be removed.
 | M02 | Successful Google connection with required platform permissions | Enter Connected automatically. Enable private persistence and authorized peer collaboration independently. No transport selector or manual board-authority initialization is required for eligible local boards. |
 | M03 | Google connection fails or is cancelled | Remain in the previous mode. Existing local data and pending work remain identical. No partial login may enable unauthorized remote access. |
 | M04 | Browser denies rendezvous host permission | Google-connected private Drive persistence may operate. Collaboration remains unavailable and pending with an actionable detail. Permission denial never triggers another signaling provider or another hostname. |
-| M05 | Login with previously unbound local boards | The Connect action must disclose that these boards will receive private persistence under this account. Eligible unsigned local boards may be enrolled automatically. Previously bound boards, pins and signed provenance cannot be reassigned. |
+| M05 | Login with previously unbound local boards | Connecting Google Drive is the consent (policy updated 2026-10): eligible unsigned local boards enroll automatically with no per-board prompt, and the connect action reconciles immediately so an already-synced account's boards appear unattended. Previously bound boards, pins and signed provenance cannot be reassigned. |
 | M06 | Explicit logout | Enter Standalone, stop future remote work, close sessions and cancel retries. Preserve local content, pending work, account bindings and device/authority keys. Recheck account/mode generation before applying late responses; a raced remote write is reconciled on the next login. |
-| M07 | Switch from account A to account B | Retain A's local boards and drafts with their original bindings. Do not upload them to B or reinterpret B as their owner. Account preferences and background jobs remain isolated. A deliberate private copy has new identities and preserves its source. |
+| M07 | Switch from account A to account B | Retain A's *bound* local boards and drafts with their original bindings; never reinterpret B as their owner. An unbound board's first connected account enrolls it — deliberately accepted in the 2026-10 policy so same-account profiles sync without prompts (see operating-modes-status). Account preferences and background jobs remain isolated. A deliberate private copy has new identities and preserves its source. |
 | M08 | Restart or resume with an existing account connection | Restore Connected intent, pending work and trust; refresh credentials and authorization as needed. Do not start duplicate pools, jobs or device enrollments. Expired credentials leave local work available. |
 
 Connected is a global operating mode; synchronization status is per board. A board
@@ -64,7 +70,7 @@ the last known restriction on an existing shared board.
 
 | ID | Scenario | Required outcome and test assertion |
 | --- | --- | --- |
-| PR01 | A user's original device is permanently unavailable; a fresh device has only Google login | Restore that account's permitted private boards and attachment bytes from its own appDataFolder, without a peer, rendezvous server, original profile or copied device key. Other accounts' files remain inaccessible. |
+| PR01 | A user's original device is permanently unavailable; a fresh device has only Google login | Restore that account's permitted private boards and attachment bytes from its own cloud copies — the `pboard` board folders under Sync v2, its appDataFolder under the legacy mode — without a peer, rendezvous server, original profile or copied device key. Other accounts' files remain inaccessible. |
 | PR02 | Recovered private data includes a previously signed shared-board copy | Preserve original data/signatures. Google login and snapshot restore do not mint, replace or imply ownership of shared-board authority. Fresh collaboration requires a valid existing-authority grant or reviewed delegation/recovery. |
 
 At approval the user additionally prioritized a minimal authorization design,
