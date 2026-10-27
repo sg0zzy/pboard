@@ -18,8 +18,9 @@ import { ConflictResolutionControls } from "./components/ConflictResolutionContr
 import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
-import { CloseIcon, CopyIcon, DebugIcon, DownloadIcon, EditIcon, NewProjectIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
+import { CloseIcon, CopyIcon, DebugIcon, DownloadIcon, EditIcon, NewProjectIcon, PeopleIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
 import { CaptureToolbar } from "./components/CaptureToolbar";
+import { IdleActivityPanel } from "./components/IdleActivityPanel";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
@@ -43,6 +44,7 @@ import { collaborationCounters } from "../collab/counters";
 
 const STATUS_MOVE_DELAY_MS = 800;
 const DEBUG_SECTION_STORAGE_KEY = "pboardDebugSection";
+const LIVE_COLLABORATION_STORAGE_KEY = "pboardLiveCollaboration";
 
 export function App() {
   // The recurring-work counters, so a sustained CPU load can be attributed to a
@@ -67,6 +69,8 @@ export function App() {
   const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
   const [debugSection, setDebugSection] = useState(import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket");
+  const [collabEnabled, setCollabEnabled] = useState(true);
+  const [collabPrefLoaded, setCollabPrefLoaded] = useState(false);
   const [notice, setNotice] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
@@ -132,6 +136,10 @@ export function App() {
     void browser.storage.local.get(DEBUG_SECTION_STORAGE_KEY).then((result: Record<string, unknown>) => {
       if (typeof result[DEBUG_SECTION_STORAGE_KEY] === "boolean") setDebugSection(result[DEBUG_SECTION_STORAGE_KEY] as boolean);
     });
+    void browser.storage.local.get(LIVE_COLLABORATION_STORAGE_KEY).then((result: Record<string, unknown>) => {
+      if (typeof result[LIVE_COLLABORATION_STORAGE_KEY] === "boolean") setCollabEnabled(result[LIVE_COLLABORATION_STORAGE_KEY] as boolean);
+      setCollabPrefLoaded(true);
+    });
     void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result: Record<string, unknown>) => {
       const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
       if (cardId) void consumePinnedCardFocus(cardId);
@@ -145,6 +153,9 @@ export function App() {
       }
       if (area === "local" && typeof changes[DEBUG_SECTION_STORAGE_KEY]?.newValue === "boolean") {
         setDebugSection(changes[DEBUG_SECTION_STORAGE_KEY].newValue as boolean);
+      }
+      if (area === "local" && typeof changes[LIVE_COLLABORATION_STORAGE_KEY]?.newValue === "boolean") {
+        setCollabEnabled(changes[LIVE_COLLABORATION_STORAGE_KEY].newValue as boolean);
       }
       if (area === "local" && changes[PINNED_CARD_FOCUS_KEY]) {
         const cardId = changes[PINNED_CARD_FOCUS_KEY].newValue as string | null | undefined;
@@ -205,6 +216,9 @@ export function App() {
   useEffect(() => {
     collaborationCounters.countEffect("collaboration");
     const projectId = currentProject?.id;
+    if (!collabPrefLoaded) return;
+    void collaborationManager.setEnabled(collabEnabled).catch(console.error);
+    if (!collabEnabled) { setLiveStatus("Live collaboration: switched off for testing."); return; }
     if (!projectId) { void collaborationManager.stop().catch(console.error); return; }
     let active = true;
     const updateStatus = () => {
@@ -248,7 +262,7 @@ export function App() {
       // teardown would otherwise delay the new board until the old transports
       // had closed. The unmount effect below stops the session for good.
     };
-  }, [currentProject?.id, collaborationRevision]);
+  }, [currentProject?.id, collaborationRevision, collabEnabled, collabPrefLoaded]);
 
   // Closing the sidebar ends live collaboration for the browser. A board switch
   // does not reach this effect, so it keeps the old board's channels open until
@@ -876,6 +890,7 @@ export function App() {
           <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
           <ShareControls projectId={currentProject?.id ?? null} permissions={sharePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
           {debugSection && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
+          {debugSection && <IdleActivityPanel />}
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
           {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
             <button
@@ -890,6 +905,20 @@ export function App() {
                 void browser.storage.local.set({ [DEBUG_SECTION_STORAGE_KEY]: next });
               }}
             ><DebugIcon /></button>
+          )}
+          {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
+            <button
+              type="button"
+              className="scale-button"
+              aria-label="Toggle live collaboration"
+              title={collabEnabled ? "Live collaboration is on. Click to switch it off for testing." : "Live collaboration is switched off. Click to switch it back on."}
+              aria-pressed={collabEnabled}
+              onClick={() => {
+                const next = !collabEnabled;
+                setCollabEnabled(next);
+                void browser.storage.local.set({ [LIVE_COLLABORATION_STORAGE_KEY]: next });
+              }}
+            ><PeopleIcon /></button>
           )}
           <div className="font-scale-controls" aria-label="Board font size">
             <button

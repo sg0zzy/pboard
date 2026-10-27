@@ -115,6 +115,7 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
     return state.permissions.get(fileId) ?? [];
   }
 
+  const restricted: string[] = [];
   const transport: DrivePermissionTransport = {
     currentIdentity: async () => identity,
     findSharedRoot: async () => {
@@ -182,11 +183,12 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
       permission.role = role === "editor" ? "writer" : "reader";
       return { ...permission };
     },
+    restrictWriterSharing: async (fileId) => { restricted.push(fileId); },
     deletePermission: async (fileId, permissionId) => {
       state.permissions.set(fileId, permissionsFor(fileId).filter((p) => p.id !== permissionId));
     }
   };
-  return { transport, state, sharedWithMe, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
+  return { transport, state, sharedWithMe, restricted, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
 }
 
 // In-memory fake of the local shared-layout cache (browser.storage.local in the app).
@@ -530,5 +532,30 @@ describe("createDrivePermissionService", () => {
     expect(await service.wasReinvitedSince("proj1", granted + 120_000)).toBe(false); // removal came after the grant
     expect(store.records.get("proj1")!.folderId).toBe(folderId);
     expect(await service.wasReinvitedSince("never-shared", 0)).toBe(false);
+  });
+});
+
+describe("writersCanShare restriction transport (D2)", () => {
+  const auth = (): GoogleAuthProvider => ({
+    connect: async () => {}, disconnect: async () => {},
+    getConnectionState: async () => "connected",
+    isConfigured: () => true,
+    getAccessToken: vi.fn(async () => "drive-token")
+  });
+
+  it("issues a metadata PATCH setting writersCanShare false", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ id: "f 1", writersCanShare: false })));
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+    await transport.restrictWriterSharing("f 1");
+    const [url, init] = fetcher.mock.calls[0];
+    expect(String(url)).toBe("https://www.googleapis.com/drive/v3/files/f%201?fields=id%2CwritersCanShare");
+    expect(init?.method).toBe("PATCH");
+    expect(init?.body).toBe('{"writersCanShare":false}');
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json");
+  });
+
+  it("rejects when Drive refuses the restriction so callers can degrade", async () => {
+    const transport = createDrivePermissionTransport(auth(), async () => new Response(JSON.stringify({ error: { message: "sharedDrive" } }), { status: 400 }));
+    await expect(transport.restrictWriterSharing("f")).rejects.toThrow("400");
   });
 });

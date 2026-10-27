@@ -32,6 +32,10 @@ export type CollaborationCounters = {
   initialisations: Record<string, number>;
   /** Wall-clock durations of the recurring operations, by name. */
   timings: Record<string, { runs: number; lastMs: number; totalMs: number }>;
+  /** Aggregated subsystem activity, by event name (idle-work attribution). */
+  events: Record<string, number>;
+  /** Live gauges: subscriptions, sockets, sessions that are currently open. */
+  active: Record<string, number>;
 };
 
 const counters: CollaborationCounters = {
@@ -46,7 +50,9 @@ const counters: CollaborationCounters = {
   effects: {},
   emissions: {},
   initialisations: {},
-  timings: {}
+  timings: {},
+  events: {},
+  active: {}
 };
 
 /**
@@ -78,7 +84,9 @@ export const collaborationCounters = {
       effects: { ...counters.effects },
       emissions: { ...counters.emissions },
       initialisations: { ...counters.initialisations },
-      timings: Object.fromEntries(Object.entries(counters.timings).map(([name, entry]) => [name, { ...entry }]))
+      timings: Object.fromEntries(Object.entries(counters.timings).map(([name, entry]) => [name, { ...entry }])),
+      events: { ...counters.events },
+      active: { ...counters.active }
     };
   },
   /** Reset every counter. */
@@ -95,10 +103,21 @@ export const collaborationCounters = {
     counters.emissions = {};
     counters.initialisations = {};
     counters.timings = {};
+    counters.events = {};
+    counters.active = {};
   },
   countDriveRequest(purpose: keyof CollaborationCounters["driveRequests"]): void {
     if (!enabled()) return;
     counters.driveRequests[purpose] += 1;
+  },
+  countEvent(name: string, by = 1): void {
+    if (!enabled()) return;
+    counters.events[name] = (counters.events[name] ?? 0) + by;
+  },
+  /** Set a live gauge (open subscriptions, sockets, sessions) to `value`. */
+  setActive(name: string, value: number): void {
+    if (!enabled()) return;
+    counters.active[name] = value;
   },
   countBackgroundSync(outcome: "attempts" | "settled" | "unsettled" | "failed" | "scheduled"): void {
     if (!enabled()) return;

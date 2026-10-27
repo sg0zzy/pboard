@@ -1,5 +1,6 @@
 import { portableJournalChanges, type JournalProof, type HistoryAdmission } from "../collab/security/journalProof";
 import { canonicalize, type Json } from "../collab/security/canonical";
+import { collaborationCounters } from "../collab/counters";
 
 export type PublicGrant = { id: string; boardId: string; authority: import('../collab/security/keys').DevicePublicKey; manifest: import('../collab/security/manifest').SignedManifest };
 export type DocumentValue = Record<string, Json>;
@@ -27,6 +28,8 @@ export type OfflinePermission = { id: string; role: "owner" | "editor" | "viewer
 export type PendingEdit = { id: string; boardId: string; base: Change; value: DocumentValue; deviceKeyId: string; authorityKeyId: string; admittedChangeId?: string; projected?: boolean; creation?: boolean; parents?: string[]; supersedes?: string[] };
 type Receipt = { id: string; changeId: string; destination: string };
 export type BoardErasure = Receipt & { boardId: string; accountId: string | null; imageIds: string[]; cardIds: string[]; cloudPending: boolean; localPurged?: boolean };
+/** Device-local audit trail row for Drive-verified authority re-keys (D1/D4). */
+export type AuthorityTransitionRow = { id: string; boardId: string; record: Record<string, unknown>; storedAt: number };
 
 /** Strip only RxDB implementation fields. Signed provenance is immutable data. */
 export function documentValue(document: Record<string, unknown>): DocumentValue {
@@ -79,6 +82,8 @@ export class ChangeJournal {
   /** Device-local verification evidence; never accepted from backup or peers. */
   readonly publicGrants = new JournalTable<PublicGrant>(this, "publicGrants");
   readonly admissions = new JournalTable<{ id: string; boardId: string; authorityKeyId: string; epoch: number }>(this, "admissions");
+  /** Device-local audit trail of Drive-verified authority re-keys. */
+  readonly authorityTransitions = new JournalTable<AuthorityTransitionRow>(this, "authorityTransitions");
   private listeners = new Set<(tables: string[]) => void>();
   private changeListeners = new Set<(tables: string[]) => void>();
   /**
@@ -93,7 +98,7 @@ export class ChangeJournal {
   constructor(name: string) { this.name = `${name}-change-journal-v1`; }
   async open(): Promise<void> {
     this.database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(this.name, 4);
+      const request = indexedDB.open(this.name, 6);
       request.onupgradeneeded = () => {
         if (!request.result.objectStoreNames.contains("entries")) {
         const entries = request.result.createObjectStore("entries", { keyPath: "id" });
@@ -106,6 +111,8 @@ export class ChangeJournal {
           request.result.createObjectStore("drafts", { keyPath: "id" }).createIndex("target", "target");
         }
         if (!request.result.objectStoreNames.contains("publicGrants")) request.result.createObjectStore("publicGrants", { keyPath: "id" }).createIndex("boardId", "boardId");
+        if (!request.result.objectStoreNames.contains("boardFlags")) request.result.createObjectStore("boardFlags");
+        if (!request.result.objectStoreNames.contains("authorityTransitions")) request.result.createObjectStore("authorityTransitions", { keyPath: "id" }).createIndex("boardId", "boardId");
         for (const name of ["permissions", "pendingEdits", "admissions"]) {
           if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, { keyPath: "id" });
         }
@@ -114,7 +121,7 @@ export class ChangeJournal {
       request.onerror = () => reject(request.error);
     });
   }
-  close(): void { this.channel?.close(); this.channel = null; this.listeners.clear(); this.changeListeners.clear(); this.database?.close(); this.database = undefined; }
+  close(): void { this.channel?.close(); this.channel = null; this.listeners.clear(); this.changeListeners.clear(); this.signedHistory.clear(); this.database?.close(); this.database = undefined; }
   subscribe(listener: (tables: string[]) => void): () => void {
     this.listeners.add(listener);
     if (!this.channel && typeof BroadcastChannel !== "undefined") {
@@ -124,9 +131,15 @@ export class ChangeJournal {
       // another context. A message without table names means "everything
       // changed", which is what an older peer sends.
       this.channel.onmessage = (event: MessageEvent) => {
+        collaborationCounters.countEvent("journal.remote");
         const tables = Array.isArray(event.data?.tables)
           ? (event.data.tables as string[]).filter((table) => typeof table === "string")
           : [];
+          // A signed entry committed in another context raises the monotonic
+          // bit there; drop this context's negative answers so the next read
+          // re-reads the flag instead of trusting a stale scan.
+          if (!tables.length || tables.includes("entries")) for (const [board, bit] of [...this.signedHistory])
+            void bit.then((signed) => { if (!signed && this.signedHistory.get(board) === bit) this.signedHistory.delete(board); });
         for (const next of this.listeners) next(tables);
       };
     }
@@ -155,6 +168,7 @@ export class ChangeJournal {
     if (!tables.length || tables.includes("receipts")) this.erasureCache = null;
     if (!tables.length || tables.includes("entries")) this.committedCache = null;
     for (const listener of this.changeListeners) listener(tables);
+    collaborationCounters.countEvent("journal.notify");
     for (const listener of this.listeners) listener(tables);
     const sender = this.channel ?? (typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(`pboard:journal:${this.name}`));
     // The table names travel with the message. A reader in another context
@@ -173,7 +187,7 @@ export class ChangeJournal {
   }
   async write(name: string, operation: (store: IDBObjectStore) => void): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const transaction = this.database!.transaction(name === 'receipts' ? [name] : [name, 'receipts'], "readwrite", { durability: "strict" });
+      const transaction = this.database!.transaction(name === 'receipts' ? [name] : name === 'entries' ? [name, 'receipts', 'boardFlags'] : [name, 'receipts'], "readwrite", { durability: "strict" });
       transaction.oncomplete = () => {
         resolve();
         // A receipts write can add or update a board-erasure marker, so the
@@ -182,12 +196,20 @@ export class ChangeJournal {
         if (["entries", "pendingEdits", "permissions"].includes(name)) this.notify([name]);
       };
       transaction.onerror = transaction.onabort = () => reject(transaction.error ?? new Error("Journal transaction aborted"));
+      const signedHistory = this.signedHistory;
       const run = (erased: Set<string>) => {
         const store = transaction.objectStore(name);
         const guarded = new Proxy(store, { get(target, key) {
           if (key === 'put' || key === 'add') return (value: any, id?: IDBValidKey) => {
             const boardId = name === 'permissions' ? value.id : name === 'drafts' ? JSON.parse(value.target)[0] : value.boardId;
             if (erased.has(boardId)) throw new Error('This board was permanently deleted');
+            if (name === 'entries' && value.value?._sec && value.state === 'committed') {
+              // Persist the monotonic signed-history bit inside the transaction
+              // that commits the entry, so authorization checks answer from one
+              // record instead of scanning the whole journal on every write.
+              transaction.objectStore('boardFlags').put(true, value.boardId);
+              signedHistory.set(value.boardId, Promise.resolve(true));
+            }
             return id === undefined ? target[key](value) : target[key](value, id);
           };
           const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
@@ -433,6 +455,30 @@ export class ChangeJournal {
       return value;
     });
     return this.committedLoad;
+  }
+  /**
+   * Whether this board's committed journal history holds signed entries.
+   * A board never loses its signed history, so the bit is monotonic: the
+   * write guard raises it in the transaction that commits a signed entry,
+   * and only the bootstrap scan below may persist a negative answer. The
+   * per-write authorization checks answer from this one record instead of
+   * reading the whole change log, which made every card edit expensive
+   * once a profile had months of journal.
+   */
+  private signedHistory = new Map<string, Promise<boolean>>();
+  hasSignedHistory(boardId: string): Promise<boolean> {
+    const cached = this.signedHistory.get(boardId);
+    if (cached) return cached;
+    const pending = (async () => {
+      const flag = await this.read("boardFlags", (store) => store.get(boardId) as IDBRequest<boolean | undefined>);
+      if (flag !== undefined) return flag;
+      const entries = await this.read("entries", (store) => store.index("boardId").getAll(boardId) as IDBRequest<JournalEntry[]>);
+      const signed = entries.some((entry) => entry.state === "committed" && !!entry.value._sec);
+      await this.write("boardFlags", (store) => { store.put(signed, boardId); });
+      return signed;
+    })();
+    this.signedHistory.set(boardId, pending);
+    return pending;
   }
   async beginBoardErasure(boardId: string, accountId: string | null, imageIds: string[], cardIds: string[]) {
     if (await this.boardErasure(boardId)) return;

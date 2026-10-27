@@ -98,6 +98,8 @@ export async function openDevice(cloud: DriveFixture, account = 'account-a') {
   let publishedGrant: unknown;
   const grants = createBoardGrantService({ storage,
     getKey: async scope => { if (destroyed) throw new Error('Original keys unavailable'); if (!keys.has(scope)) keys.set(scope, await generateDeviceKey()); return keys.get(scope)!; },
+    peekKey: async purpose => keys.get(purpose) ?? null,
+    publicGrantHistory: async board => (await (await getRepo()).journal.publicGrants.where('boardId').equals(board).toArray()).map(g => g.manifest),
     fetcher: async (input, init) => {
       const path = new URL(String(input)).pathname;
       if (path === '/grants/challenge') return new Response(JSON.stringify({ version: 2, challenge: 'a'.repeat(43) }));
@@ -108,6 +110,7 @@ export async function openDevice(cloud: DriveFixture, account = 'account-a') {
   });
   return {
     storage, state, auth, snapshots, grants, provider: providerFor(account), providerFor,
+    setPublished: (bundle: unknown) => { publishedGrant = bundle ? structuredClone(bundle) : undefined; },
     get repo() { if (destroyed) throw new Error('Original device permanently unavailable'); return repo; },
     async restart() { await repo.db.close(); repo = await open(); },
     async destroy() { if (destroyed) return; await repo.db.remove(); keys.clear(); destroyed = true; connected = false; }

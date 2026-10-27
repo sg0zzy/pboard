@@ -39,6 +39,7 @@ function makeService(overrides: Partial<DrivePermissionService> = {}): Handles {
     projectFileId: vi.fn(async () => "p1"),
     realtimeFolderId: vi.fn(async () => "r1"),
     discoverSharedProjects: vi.fn(async () => []),
+    verifyDriveOwnership: vi.fn(async () => { throw new Error("Drive ownership verification is not exercised here"); }),
     ...overrides
   };
   return { service, invite, updateRole, removeCollaborator };

@@ -9,8 +9,8 @@ import { collaborationDiagnostic } from "./diagnostics";
 // The package root requires Node globals and stream APIs. Use the bundled
 // browser entry, as RxDB's own WebRTC handler does, in extension contexts.
 // The transport is loaded on demand: it is only needed once a peer actually
-// connects, and it is the heaviest dependency of the extension.
 import type SimplePeer from "simple-peer";
+import { selectedPairCode } from "./security/ice";
 import { Subject } from "rxjs";
 import { newRxError } from "rxdb";
 import type { RxError, RxTypeError } from "rxdb";
@@ -38,6 +38,8 @@ import { manifestHash, manifestIsCurrent, AUTH_TIMEOUT_MS } from "./security/man
  * a polyfill is wrapped by `createSimplePeerWrtc` and injected here.
  */
 export type PboardWrtc = SimplePeerWrtc;
+/** Diagnostic codes for `iceStateChange`; only these numbers are ever logged. */
+const ICE_STATE_CODES: Record<string, number> = { new: 1, checking: 2, connected: 3, completed: 4, failed: 5, disconnected: 6, closed: 7 };
 
 /** A live simple-peer connection; `id` is the remote peer's signaling id. */
 export type PboardPeer = InstanceType<typeof SimplePeer> & { id: string };
@@ -247,6 +249,7 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
       peer.id = remotePeerId;
       peers.set(remotePeerId, peer);
       collaborationDiagnostic("webrtc.negotiating", { peer: remotePeerId, room: security?.collection });
+      const startedAt = Date.now();
       const state: HandshakeState = { initiator: remotePeerId > ownPeerId, jsepState: "new" };
       handshake.set(remotePeerId, state);
       // This connection attempt gets a fresh session id; old buffered signals
@@ -294,17 +297,27 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
         // as a collaboration failure. Other OperationErrors remain visible.
         if (!/User-Initiated Abort.*reason=Close called/i.test(String(error))) {
           error$.next(newRxError("RC_WEBRTC_PEER", { errorText: String(error) }));
+          // Simple-peer tags ICE failures with stable codes; log only the class.
+          const code = (error as { code?: unknown }).code;
+          collaborationDiagnostic("webrtc.error", { peer: remotePeerId, room: security?.collection,
+            code: code === "ERR_ICE_CONNECTION_FAILURE" ? 1 : code === "ERR_ICE_CONNECTION_CLOSED" ? 2 : code === "ERR_PC_NEGOTIATION_FAILURE" ? 3 : -1 });
         }
         peer.destroy();
         if (!disconnected) { disconnected = true; disconnect$.next(peer); }
       });
       peer.on("connect", () => {
         if (closed || peers.get(remotePeerId) !== peer) return;
-        collaborationDiagnostic("webrtc.datachannel_connected", { peer: remotePeerId, room: security?.collection });
+        collaborationDiagnostic("webrtc.datachannel_connected", { peer: remotePeerId, room: security?.collection, count: Date.now() - startedAt });
+        void describeSelectedPair(peer, remotePeerId, 0);
         state.transportConnected = true;
         resolveTransportReady();
         if (security) beginMutualProof(peer, remotePeerId);
         else connect$.next(peer);
+      });
+      peer.on("iceStateChange", (state: string) => {
+        if (closed || peers.get(remotePeerId) !== peer) return;
+        collaborationDiagnostic("webrtc.ice_state", { peer: remotePeerId, room: security?.collection,
+          code: ICE_STATE_CODES[state] ?? -1 });
       });
       peer.on("close", () => {
         collaborationDiagnostic("webrtc.closed", { peer: remotePeerId, room: security?.collection });
@@ -351,6 +364,21 @@ export function createPboardWebRTCConnectionHandler(options: PboardWebRTCConnect
           peer.signal(signal as Parameters<PboardPeer["signal"]>[0]);
         }
       }
+    }
+    /** Records the selected ICE pair *type* (never addresses) once the browser
+     * has chosen it; retries briefly because selection can lag the `connect`
+     * event, and stays silent when the stats provider is unavailable. */
+    async function describeSelectedPair(peer: PboardPeer, remotePeerId: string, attempt: number) {
+      try {
+        const pc = (peer as unknown as { _pc?: { getStats?: () => Promise<Map<string, Record<string, unknown>>> } })._pc;
+        const report = await pc?.getStats?.();
+        const code = report ? selectedPairCode(report) : 0;
+        if (code) { collaborationDiagnostic("webrtc.candidate_pair", { peer: remotePeerId, room: security?.collection, code }); return; }
+        if (attempt >= 2) return;
+      } catch { return; }
+      // Bounded to ≤3 attempts ~1 s apart; a closed handler is a no-op, so the
+      // trailing timer needs no registration (it cannot outlive usefulness).
+      setTimeout(() => { if (!closed && peers.get(remotePeerId) === peer) void describeSelectedPair(peer, remotePeerId, attempt + 1); }, 1000);
     }
 
     /** Complete admission: store the verified context, then emit connect$. */

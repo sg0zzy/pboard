@@ -6,6 +6,7 @@ import { type BoardItem, type BoardItemStatus, type BoardTemplate } from "../../
 import type { StoredBlob } from "../../storage/blobStore";
 import { stepCardType, stepStatus } from "../cardCycle";
 import { cardTextForClipboard } from "../cardText";
+import { acquireImageUrl, peekImageUrl, releaseImageUrl } from "../imageUrlCache";
 import { toSafeWebHref } from "../linkify";
 import { MarkdownContent, MarkdownInline, setTaskCheckedAtLine } from "../markdown";
 import { crossedPointerDragThreshold, pointerDropPosition } from "../pointerDrag";
@@ -123,30 +124,35 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
   useEffect(() => {
     if (!item.imageId) { setBlobImageUrl(null); setImageMissing(false); return; }
     if (!getImage) { setImageMissing(true); return; }
+    const imageId = item.imageId;
     let active = true;
-    let objectUrl: string | null = null;
+    let held = false;
     let unsubscribe: (() => void) | undefined;
     let revision = 0;
     setBlobImageUrl(null);
     setImageMissing(false);
     const reload = () => {
       const request = ++revision;
-      void getImage(item.imageId!).then((entry) => {
+      void getImage(imageId).then((entry) => {
         if (!active || request !== revision) return;
-        if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
-        if (!entry) { setBlobImageUrl(null); setImageMissing(true); return; }
-        objectUrl = URL.createObjectURL(entry.blob);
+        if (!entry) {
+          if (held) { releaseImageUrl(imageId); held = false; }
+          setBlobImageUrl(null); setImageMissing(true); return;
+        }
+        const url = acquireImageUrl(imageId, entry.blob);
+        if (held) releaseImageUrl(imageId); else held = true;
         setImageMissing(false);
-        setBlobImageUrl(objectUrl);
+        setBlobImageUrl(url);
       }).catch(() => { if (active && request === revision) setImageMissing(true); });
     };
-    reload();
-    if (subscribeImage) void subscribeImage(item.imageId, reload).then((stop) => {
+    const cached = peekImageUrl(imageId);
+    if (cached) { held = true; setBlobImageUrl(cached); } else reload();
+    if (subscribeImage) void subscribeImage(imageId, reload).then((stop) => {
       if (!active) { stop(); return; }
       unsubscribe = stop;
-      reload(); // Cover an arrival while the subscription was being opened.
+      if (!held) reload(); // Cover an arrival while the subscription was being opened.
     }).catch(() => { if (active) setImageMissing(true); });
-    return () => { active = false; unsubscribe?.(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+    return () => { active = false; unsubscribe?.(); if (held) releaseImageUrl(imageId); };
   }, [item.imageId, getImage, subscribeImage]);
 
   useEffect(() => {

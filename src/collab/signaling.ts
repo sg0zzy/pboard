@@ -17,6 +17,7 @@
  *   - `createDriveSignaling`        — Drive-hosted ephemeral records (Phase 2).
  */
 import { validateWebSocketEndpoint } from "./security/endpoint";
+import { collaborationCounters } from "./counters";
 import { manifestHash, type BoardPermissionManifest } from "./security/manifest";
 import {
   buildSignedSignal, verifySignedSignal,
@@ -353,6 +354,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
     const idle = store.now() - lastActivityAt >= idleSlowMs;
     timer = setTimeout(() => {
       timer = null;
+      collaborationCounters.countEvent("driveSignaling.tick");
       void tick().catch((error) => {
         if (onError) onError(error);
         else console.error("Pboard live collaboration signaling failed", error);

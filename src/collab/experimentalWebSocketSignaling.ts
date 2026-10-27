@@ -6,6 +6,7 @@ import { parseStrictJson } from "./security/canonical";
 import { validateWebSocketEndpoint } from "./security/endpoint";
 import { prepareRelayAdmission, type RelayAuthorization } from "./security/relayAdmission";
 import { collaborationDiagnostic } from "./diagnostics";
+import { collaborationCounters } from "./counters";
 
 export type ServiceAdmissionRequest = { challenge: string; session: string; room: string; key: StoredDeviceKey };
 
@@ -118,7 +119,7 @@ export function createExperimentalWebSocketSignaling(options: {
             }
             joined = true; attempts = 0; clearTimeout(deadline);
             debug("relay.joined", { count: peers.size });
-            heartbeat = setInterval(() => { if (joined && socket?.readyState === Socket.OPEN) send({ type: "ping" }); }, 15_000);
+            heartbeat = setInterval(() => { if (joined && socket?.readyState === Socket.OPEN) { collaborationCounters.countEvent("relay.ping"); send({ type: "ping" }); } }, 15_000);
             resolveJoin?.({ peerId: ownId, peers: [...peers.keys()] }); roster(); for (const id of peers.keys()) publishTo(id); break;
           case "peer_joined":
             if (joined && typeof message.peerId === "string" && typeof message.session === "string" && message.peerId !== ownId) {
@@ -164,6 +165,7 @@ export function createExperimentalWebSocketSignaling(options: {
       if (!stopped) {
         const delay = Math.min(30_000, 500 * 2 ** Math.min(attempts++, 6)) * (0.75 + Math.random() * 0.5);
         debug("relay.reconnect_scheduled", { count: Math.round(delay) });
+        collaborationCounters.countEvent("relay.reconnect");
         retry = setTimeout(() => { void connect().catch(fail); }, delay);
       }
     };

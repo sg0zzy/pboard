@@ -15,6 +15,7 @@ import {
   type DriveSharedProjectStore,
   type PboardCollaboratorRole,
 } from "../src/sync/drivePermissions";
+import { sha256Hex } from "../src/collab/security/authorityTransition";
 
 // ---------------------------------------------------------------------------
 // Test doubles
@@ -104,6 +105,7 @@ function makeTransport(opts: {
         role: role === "editor" ? "writer" : "reader",
       })),
     deletePermission: vi.fn().mockResolvedValue(undefined),
+    restrictWriterSharing: vi.fn().mockResolvedValue(undefined),
   } satisfies DrivePermissionTransport;
 }
 
@@ -573,5 +575,60 @@ describe("myRole", () => {
         id === "proj" ? [userPerm("o", "owner", "other@example.com", "Other")] : [],
     });
     expect(await service.myRole("p1")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Drive-verified ownership (D1/D4) and the writersCanShare restriction (D2).
+
+describe("verifyDriveOwnership", () => {
+  const layout = { folderId: "f", projectFileId: "p", realtimeFolderId: "r" };
+
+  it("proves ownership only from a live ACL read and binds digests to it", async () => {
+    const { service, transport } = makeService({
+      layout, identity: { email: "Owner@Example.com" },
+      listPermissions: () => [{ id: "o", type: "user", role: "owner", emailAddress: "owner@example.com" }],
+    });
+    const proof = await service.verifyDriveOwnership("p1");
+    expect(proof.folderFileId).toBe("f");
+    expect(proof.ownerEmailHash).toBe(await sha256Hex("owner@example.com"));
+    expect(proof.ownerEmailHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(proof.aclDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(transport.listPermissions).toHaveBeenCalledWith("f");
+  });
+
+  it("rejects verified non-owners instead of resolving a falsy proof", async () => {
+    const { service } = makeService({
+      layout, identity: { email: "me@example.com" },
+      listPermissions: () => [
+        { id: "o", type: "user", role: "owner", emailAddress: "them@example.com" },
+        { id: "w", type: "user", role: "writer", emailAddress: "me@example.com" },
+      ],
+    });
+    await expect(service.verifyDriveOwnership("p1")).rejects.toThrow(/does not report this account as the board folder owner/);
+  });
+
+  it("postpones on unavailable accounts and transport failures (unverified, not denied)", async () => {
+    const signedOut = makeService({ layout, identity: null });
+    await expect(signedOut.service.verifyDriveOwnership("p1")).rejects.toThrow(/unavailable/i);
+    const broken = makeService({ layout });
+    broken.transport.listPermissions.mockRejectedValue(new Error("Drive 503"));
+    await expect(broken.service.verifyDriveOwnership("p1")).rejects.toThrow("Drive 503");
+    const unshared = makeService({ identity: { email: "me@example.com" } });
+    await expect(unshared.service.verifyDriveOwnership("p1")).rejects.toThrow(/not shared through Google Drive/);
+  });
+});
+
+describe("writersCanShare application (D2)", () => {
+  it("restricts a newly created folder and project.json", async () => {
+    const { service, transport } = makeService();
+    await service.ensureSharedProject("p1");
+    expect(transport.restrictWriterSharing.mock.calls.map(([id]) => id)).toEqual(["p1", "project.json@p1"]);
+  });
+
+  it("never breaks sharing when the restriction is unsupported", async () => {
+    const { service, transport } = makeService();
+    transport.restrictWriterSharing.mockRejectedValue(new Error("shared drive item"));
+    await expect(service.ensureSharedProject("p1")).resolves.toBe("p1");
   });
 });

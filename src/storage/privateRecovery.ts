@@ -1,3 +1,4 @@
+import { collaborationCounters } from "../collab/counters";
 import { canonicalize } from "../collab/security/canonical";
 import { withUntrustedImport } from "../collab/security/liveMutations";
 import { isTypeSupported } from "../templates/boardTemplates";
@@ -62,13 +63,14 @@ export function createPrivateRecovery(options: {
     return changes;
   }
   async function apply(boardId: string, canApply: () => Promise<boolean>) {
-    return options.locked(async () => {
+    return collaborationCounters.timed("privateRecovery.apply", () => options.locked(async () => {
       if (!await canApply()) return;
       let entries = (await journal.entries.where("boardId").equals(boardId).toArray()).filter(e => e.state === "committed");
       const signedBoard = entries.some(e => e.value._sec);
       const groups = new Map<string, Change[]>();
       for (const entry of entries) { const id = scope(entry), group = groups.get(id); if (group) group.push(entry); else groups.set(id, [entry]); }
       const ordered = [...groups.values()].sort((a, b) => a[0].collection === b[0].collection ? a[0].documentId.localeCompare(b[0].documentId) : a[0].collection === "projects" ? -1 : 1);
+      let wrote = false;
       for (const changes of ordered) {
         if (!await canApply()) return;
         let result = reconcile(changes);
@@ -103,14 +105,15 @@ export function createPrivateRecovery(options: {
           if (!project) continue;
           if (!isTypeSupported(project.template, chosen.value.type as never)) throw new Error("Private history contains a card incompatible with the current template. Retained versions require review.");
         }
-        await withUntrustedImport([collection], () => withJournalMaterialization(collection, chosen.value,
+        wrote = true; await withUntrustedImport([collection], () => withJournalMaterialization(collection, chosen.value,
           () => (collection as typeof db.cards).upsert(chosen.value as never)));
       }
+      collaborationCounters.countEvent(wrote ? "privateRecovery.changed" : "privateRecovery.noop");
       // Selection is device-local. Do not import any account/authority settings.
       if (!(await db.settings.findOne("currentProjectId").exec())?.value && await db.projects.findOne(boardId).exec()) {
         await db.settings.upsert({ id: "currentProjectId", value: boardId });
       }
-    });
+    }));
   }
   return { capture, legacyChanges, apply };
 }

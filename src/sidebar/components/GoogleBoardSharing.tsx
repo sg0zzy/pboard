@@ -1,5 +1,6 @@
 import { IDENTITY_REFRESH_MS } from '../../collab/googleIdentitySharing';
 import { useEffect, useRef, useState } from 'react';
+import { BoardExistingSignedDataError } from "../../collab/authorityErrors";
 import { boardCollaboration, collaborationManager } from '../../sync/browser';
 import { repository } from '../../storage/browser';
 
@@ -17,6 +18,7 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
   const [hasAuthority, setHasAuthority] = useState(false);
   useEffect(() => {
     let active = true, running = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
     async function sync() {
       if (running) return; running = true;
       try {
@@ -37,11 +39,21 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
         const list = projectId ? await boardCollaboration.identitySharing.collaborators(projectId) : [];
         const owns = projectId ? await boardCollaboration.ownsAuthority(projectId) : false;
         if (active) { setMembers(list); setHasAuthority(owns); }
-      } catch (error) { if (active) { setBoards([]); setSyncError(error instanceof Error ? error.message : 'Account sharing unavailable'); } }
+      } catch (error) {
+        if (active) {
+          setBoards([]);
+          setSyncError(error instanceof Error ? error.message : 'Account sharing unavailable');
+          // A deterministic authority block does not clear by polling it; stop
+          // the refresh loop and keep showing the diagnostic. Opening the
+          // panel again, switching boards, or an explicit pairing retry
+          // re-runs the effect.
+          if (error instanceof BoardExistingSignedDataError) { clearInterval(timer); timer = undefined; window.removeEventListener('focus', refresh); }
+        }
+      }
       finally { running = false; }
     }
     const refresh = () => void sync();
-    refresh(); const timer = setInterval(refresh, IDENTITY_REFRESH_MS);
+    refresh(); timer = setInterval(refresh, IDENTITY_REFRESH_MS);
     window.addEventListener('focus', refresh);
     return () => { active = false; clearInterval(timer); window.removeEventListener('focus', refresh); };
   }, [projectId]);

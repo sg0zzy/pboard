@@ -1,4 +1,5 @@
 import { importLocalBoard, type ImportedCard } from './importBoard';
+import { collaborationCounters } from "../collab/counters";
 import { createRepository, STORAGE_KEY } from "./repository";
 import { browser } from "../platform/browser";
 import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount, leaveSharedBoard } from "../sync/browser";
@@ -182,7 +183,8 @@ export const repository = {
     let active = true, generation = 0;
     const refresh = () => {
       const current = ++generation;
-      void rx.listConflicts().then(records => { if (active && current === generation) listener(records); })
+      collaborationCounters.countEvent("conflicts.scan");
+      void collaborationCounters.timed("listConflicts", () => rx.listConflicts()).then(records => { if (active && current === generation) listener(records); })
         .catch(error => { if (active && current === generation) onError(error); });
     };
     let scheduled: ReturnType<typeof setTimeout> | undefined;
@@ -190,8 +192,9 @@ export const repository = {
       clearTimeout(scheduled); scheduled = setTimeout(refresh, 125);
     });
     const timer = setInterval(refresh, 10_000); // Access/grant expiry can change without a document write.
+    collaborationCounters.setActive("conflicts.subscription", 1);
     refresh();
-    return () => { active = false; clearTimeout(scheduled); clearInterval(timer); unsubscribe(); };
+    return () => { active = false; clearTimeout(scheduled); clearInterval(timer); unsubscribe(); collaborationCounters.setActive("conflicts.subscription", 0); };
   },
   listProjects: async (): Promise<Project[]> => {
     const rx = await selectedRxRepository();

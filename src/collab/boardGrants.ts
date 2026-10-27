@@ -1,4 +1,5 @@
 import { sealAuthorityRecovery, openAuthorityRecovery } from "./security/authorityRecovery";
+import { collaborationCounters } from "./counters";
 /** Owner-approved board grants. This path never reads Google identity or ACLs. */
 import type { KeyValueStorage } from "../storage/repository";
 import type { CollaborationSecurityOptions } from "./manager";
@@ -6,10 +7,12 @@ import { ensureDeviceKey, loadPurposeKey, saveRecoveredPurposeKey, importSigning
 import { canonicalBytes, fromBase64Url, parseStrictJson, signedBytes, toBase64Url, type Json } from "./security/canonical";
 import { acceptManifest, manifestHash, signManifest, verifyManifest, type SignedManifest, type ManifestDevice, type ManifestRole } from "./security/manifest";
 import { storageManifestEpochs } from "./security/enrollment";
+import { AUTHORITY_TRANSITION_FORMAT, OWNERSHIP_PROOF_FRESHNESS_MS, TRANSITION_MIN_CLIENT_VERSION, signTransition, type AuthorityTransitionRecord, type DriveOwnershipProof } from "./security/authorityTransition";
 import { prepareRelayAdmission } from "./security/relayAdmission";
 import { validateWebSocketEndpoint } from "./security/endpoint";
 import { collaborationDiagnostic } from "./diagnostics";
 import { createBoardPairing } from "./boardPairing";
+import { withStorageLock } from "../storage/lock";
 
 export const COLLABORATION_SETTINGS = "pboardCollaborationSettings";
 const GRANTS = "pboardBoardGrants";
@@ -17,7 +20,11 @@ const MAX_BUNDLE = 4 * 1024 * 1024;
 export const DEFAULT_RENDEZVOUS = "wss://pboard.cecosl.ovh/ws";
 export type CollaborationSettings = { provider: "drive" | "websocket"; url: string };
 export type BoardGrantBundle = { format: "pboard-board-grants-v1"; endpoint: string; authority: DevicePublicKey; history: SignedManifest[] };
-type RecordEntry = { bundle: BoardGrantBundle; bootstrap: boolean; blockedDevices?: string[] };
+type RecordEntry = { bundle: BoardGrantBundle; bootstrap: boolean; blockedDevices?: string[];
+  /** Set only by a Drive-ownership-verified re-key; never overwrites an older record. */
+  transition?: AuthorityTransitionRecord;
+  /** Authority fingerprints this record succeeded, kept for audit. */
+  superseded?: { previousAuthorityKeyId: string | null; note: string }[] };
 export type BoardDeviceRequest = { format: "pboard-board-device-v1"; boardId: string; authorityKeyId: string; publicKey: DevicePublicKey; deviceKeyId: string; expiresAt: number; nonce: string; signature: string };
 const validId = (value: string) => /^[A-Za-z0-9_-]{1,200}$/.test(value);
 const encode = (value: unknown) => value as Json;
@@ -33,13 +40,18 @@ export function rendezvousOrigin(endpoint: string) {
 }
 const proofBytes = (request: Omit<BoardDeviceRequest, "signature">) => signedBytes("pboard-board-device-v1", encode(request));
 
-export function createBoardGrantService(options: { storage: KeyValueStorage; fetcher?: typeof fetch; getKey?: typeof ensureDeviceKey; canAccessEndpoint?: (origin: string) => Promise<boolean>; recoveryKeys?: { load: typeof loadPurposeKey; save: typeof saveRecoveredPurposeKey }; recoveryHistory?: (board: string) => Promise<SignedManifest[]>; validateRecoveryData?: (board: string, bundle: BoardGrantBundle) => Promise<void>; onAuthorization?: (board: string, permission: import("../storage/changeJournal").OfflinePermission) => Promise<void> }) {
+export function createBoardGrantService(options: { storage: KeyValueStorage; fetcher?: typeof fetch; getKey?: typeof ensureDeviceKey; peekKey?: (purpose: string) => Promise<import("./security/keys").StoredDeviceKey | null>; canAccessEndpoint?: (origin: string) => Promise<boolean>; recoveryKeys?: { load: typeof loadPurposeKey; save: typeof saveRecoveredPurposeKey }; recoveryHistory?: (board: string) => Promise<SignedManifest[]>; publicGrantHistory?: (board: string) => Promise<SignedManifest[]>; validateRecoveryData?: (board: string, bundle: BoardGrantBundle) => Promise<void>; onAuthorization?: (board: string, permission: import("../storage/changeJournal").OfflinePermission, authorityReplacementAuthorized?: boolean) => Promise<void>; onTransition?: (board: string, record: AuthorityTransitionRecord) => Promise<void> }) {
   const fetcher = options.fetcher ?? fetch;
   const key = options.getKey ?? ensureDeviceKey;
+  const peekKey = options.peekKey ?? loadPurposeKey;
   const recoveryKeys = options.recoveryKeys ?? { load: loadPurposeKey, save: saveRecoveredPurposeKey };
   async function authorityKey(board: string, pin?: string) {
-    pin ??= (await record(board))?.bundle.history.at(-1)?.payload.authorityKeyId;
+    const entry = await record(board);
+    pin ??= entry?.bundle.history.at(-1)?.payload.authorityKeyId;
     if (pin) { const recovered = await recoveryKeys.load(`recovered-board-authority:${board}:${pin}`); if (recovered) return recovered; }
+    // A re-keyed record signs with its own fresh root; the legacy standalone
+    // root is never used again (and never deleted) once a transition exists.
+    if (entry?.transition) { const rekeyed = await peekKey(`rekeyed-board-authority:${board}`); if (rekeyed) return rekeyed; }
     return key(`standalone-board-authority:${board}`);
   }
   const epochs = storageManifestEpochs(options.storage);
@@ -60,7 +72,15 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
   }
   async function records() { return ((await options.storage.get(GRANTS))[GRANTS] ?? {}) as Record<string, RecordEntry>; }
   async function record(id: string) { return (await records())[id] ?? null; }
-  async function save(id: string, value: RecordEntry) { await options.storage.set({ [GRANTS]: { ...await records(), [id]: value } }); }
+  // The whole map is re-read under a cross-context lock: the sidebar and the
+  // background worker each save records for other boards, and an unguarded
+  // read-modify-write silently clobbers the other context's grant records —
+  // one way a board loses its authority while keeping its signed history.
+  async function save(id: string, value: RecordEntry) {
+    await withStorageLock(options.storage, GRANTS, async () => {
+      await options.storage.set({ [GRANTS]: { ...await records(), [id]: value } });
+    });
+  }
   async function checkEndpoint(endpoint: string) {
     validateRendezvous(endpoint);
     if (options.canAccessEndpoint && !await options.canAccessEndpoint(rendezvousOrigin(endpoint))) throw new Error("Allow access to this rendezvous service using Enable WebSocket collaboration");
@@ -84,7 +104,7 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     const bytes = new Uint8Array(length); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
     return parseStrictJson(new TextDecoder().decode(bytes), MAX_BUNDLE) as unknown as { version: number; authority: DevicePublicKey; history: { payload: string; signature: string }[] };
   }
-  async function verified(bundle: BoardGrantBundle, pin: string, previous?: BoardGrantBundle) {
+  async function verified(bundle: BoardGrantBundle, pin: string, previous?: BoardGrantBundle, authorizeReplacement = false) {
     if (bundle.format !== "pboard-board-grants-v1" || Object.keys(bundle.authority).sort().join(",") !== "crv,kty,x,y" || await publicKeyFingerprint(bundle.authority) !== pin || !bundle.history.length || bundle.history.length > 4096 || JSON.stringify(bundle).length > MAX_BUNDLE) throw new Error("Invalid board grant or authority fingerprint");
     validateRendezvous(bundle.endpoint);
     const history = new Map<number, Awaited<ReturnType<typeof verifyManifest>>>();
@@ -103,11 +123,12 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     await acceptManifest({ ...current.payload, boardId: `board-grant:${pin}:${board}` }, epochs, Date.now());
     cache.delete(board);
     const role = current.payload.devices.find(d => d.deviceKeyId === own.keyId)?.role;
-    await options.onAuthorization?.(board, { id: board, role: role ?? "revoked", deviceKeyId: own.keyId, authorityKeyId: pin });
+    await options.onAuthorization?.(board, { id: board, role: role ?? "revoked", deviceKeyId: own.keyId, authorityKeyId: pin }, authorizeReplacement);
     if (!role) throw new Error("This device has no owner-approved board grant");
     return { board, history, own, current };
   }
   async function publish(bundle: BoardGrantBundle) {
+    collaborationCounters.countEvent("grant.publish");
     const own = await key(`board-device:${bundle.history.at(-1)!.payload.boardId}`);
     const topic = `pboard-collab-${bundle.history.at(-1)!.payload.boardId}-cards`;
     const admission = await prepareRelayAdmission(topic, { authority: bundle.authority, manifest: bundle.history.at(-1)! }, own.keyId);
@@ -161,6 +182,45 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     if (!validId(board)) throw new Error("Select a local board first");
     const previous = await record(board); const own = await key(`board-device:${board}`);
     return write(board, previous?.bundle.history.at(-1)!.payload.devices ?? [{ deviceKeyId: own.keyId, publicKey: own.publicJwk, role: "owner" }], previous ?? undefined);
+  });
+  // Drive-verified authority re-key (Phase 2): establishes a NEW authority on a
+  // device that holds no grant record, only when the caller just completed a
+  // fresh authenticated Drive ACL read proving this account owns the board
+  // folder. Refuses whenever this device already pins an authority (restore or
+  // renew own those cases; an existing record is never silently replaced) —
+  // historical chains and their key slots are never modified or deleted. The
+  // new root lives in its own purpose slot so the legacy root stays intact.
+  const reestablishAuthority = (board: string, proof: DriveOwnershipProof) => exclusive(async () => {
+    if (!validId(board)) throw new Error("Select a local board first");
+    const now = Date.now();
+    if (!proof || typeof proof.folderFileId !== "string" || !proof.folderFileId || typeof proof.ownerEmailHash !== "string" || !proof.ownerEmailHash || typeof proof.aclDigest !== "string" || !proof.aclDigest
+      || !Number.isSafeInteger(proof.verifiedAt) || now - proof.verifiedAt > OWNERSHIP_PROOF_FRESHNESS_MS || proof.verifiedAt - now > OWNERSHIP_PROOF_FRESHNESS_MS)
+      throw new Error("A fresh live Drive ownership proof is required; cached metadata cannot authorize a re-key");
+    if (await record(board)) throw new Error("This device already pins a board authority; re-establishment never replaces it — restore or renew instead");
+    const retained = await peekKey(`standalone-board-authority:${board}`);
+    const authority = await key(`rekeyed-board-authority:${board}`);
+    const own = await key(`board-device:${board}`);
+    const manifest = await signManifest({ protocol: 2, boardId: board, driveProjectFileId: "", driveFolderId: "", authorityKeyId: authority.keyId,
+      epoch: 1, issuedAt: now, expiresAt: now + 300_000, devices: [{ deviceKeyId: own.keyId, publicKey: own.publicJwk, role: "owner" }] }, authority);
+    const bundle: BoardGrantBundle = { format: "pboard-board-grants-v1", endpoint: (await settings()).url, authority: authority.publicJwk, history: [manifest] };
+    // Self-verification pins the fresh epoch scope; conflicting signed chains
+    // under any pre-existing pin are rejected by that pin's own epoch floor.
+    // A Drive-verified transition explicitly authorizes replacing the locally
+    // cached permission row; other verified() callers keep the guard.
+    await verified(bundle, authority.keyId, undefined, true);
+    const transition = await signTransition({ format: AUTHORITY_TRANSITION_FORMAT, boardId: board,
+      previousAuthorityKeyId: retained?.keyId ?? null, previousAuthorityPublicKey: retained?.publicJwk ?? null,
+      newAuthorityKeyId: authority.keyId, newAuthorityPublicKey: authority.publicJwk,
+      driveFolderFileId: proof.folderFileId, driveOwnerEmailHash: proof.ownerEmailHash, aclDigest: proof.aclDigest,
+      minClientVersion: TRANSITION_MIN_CLIENT_VERSION, issuedAt: now }, authority.privateJwk);
+    // Persist first; a publish error cannot discard the re-key. Publication then
+    // retries through ordinary renew/security refresh, so it is best-effort here.
+    await save(board, { bundle, bootstrap: true, transition, ...(retained ? { superseded: [{ previousAuthorityKeyId: retained.keyId, note: "authority re-established after verified Drive ownership" }] } : {}) });
+    await options.onTransition?.(board, transition);
+    try { await publish(bundle); } catch { collaborationDiagnostic("board_grant.rekey_publish_deferred", { count: 1 }); }
+    cache.delete(board);
+    collaborationCounters.countEvent("grant.rekeyed");
+    return transition;
   });
   async function deviceRequest(raw: string): Promise<BoardDeviceRequest> {
     const invitation = parseStrictJson(raw, MAX_BUNDLE) as unknown as BoardGrantBundle;
@@ -238,10 +298,64 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     if (!polledManifests.has(board)) polledManifests.set(board, manifestHash(result.manifest));
     collaborationDiagnostic("board_grant.verified", { count: result.manifest.devices.length }); return result;
   });
+  /**
+   * Restores a lost local grant record from the original cryptographic
+   * evidence only, so a legitimate authority device is never asked to
+   * re-initialize (and never replaces) its own authority. Requires that this
+   * device still holds the board's root authority key and an enrolled device
+   * key, that the service copy verifies against that exact root, and that
+   * adopting its head manifest never rolls back a locally pinned epoch.
+   * An expired head is acceptable: the owner renews it on the next security
+   * pass, continuing the same signed chain. Any failure leaves no trace.
+   */
+  const restoreAuthorityRecord = (board: string) => exclusive(async (): Promise<boolean> => {
+    try {
+      if (!validId(board) || await record(board)) return false;
+      const root = await peekKey(`standalone-board-authority:${board}`);
+      const own = await peekKey(`board-device:${board}`);
+      if (!root || !own) return false;
+      const pin = root.keyId;
+      const endpoint = (await settings()).url;
+      const candidates: { authority: DevicePublicKey; history: SignedManifest[] }[] = [];
+      try {
+        const scope = toBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(["pboard-board-grants-v1", pin, board])))));
+        const received = await requestHttp(endpoint, `/grants/${scope}`);
+        if (received && received.version === 1 && Array.isArray(received.history) && received.history.length && received.history.length <= 4096
+          && await publicKeyFingerprint(received.authority) === pin)
+          candidates.push({ authority: received.authority,
+            history: received.history.map(entry => ({ payload: parseStrictJson(new TextDecoder().decode(fromBase64Url(entry.payload))) as unknown as SignedManifest["payload"], signature: entry.signature })) });
+      } catch { /* service unreachable or malformed: only the verified local copy can restore */ }
+      // The journal keeps every manifest this device verified at guard install
+      // (publicGrants). A locally retained chain restores without relying on
+      // the disposable service cache; it still verifies against the retained
+      // root and may not roll back a pinned epoch.
+      const local = await options.publicGrantHistory?.(board) ?? [];
+      if (local.length) candidates.push({ authority: root.publicJwk, history: [...local].sort((a, b) => a.payload.epoch - b.payload.epoch) });
+      for (const candidate of candidates) {
+        let last = 0, ok = true;
+        for (const signed of candidate.history) {
+          let head: Awaited<ReturnType<typeof verifyManifest>>;
+          try { head = await verifyManifest(signed, candidate.authority, pin); } catch { ok = false; break; }
+          if (head.boardId !== board || head.driveProjectFileId !== "" || head.driveFolderId !== "" || head.epoch <= last) { ok = false; break; }
+          last = head.epoch;
+        }
+        if (!ok || !candidate.history.length) continue;
+        const tail = candidate.history.at(-1)!.payload;
+        if (tail.devices.find(d => d.role === "owner")?.deviceKeyId !== own.keyId) continue;
+        try { await acceptManifest({ ...tail, boardId: `board-grant:${pin}:${board}` }, epochs, Date.now()); } catch { continue; }
+        await save(board, { bundle: { format: "pboard-board-grants-v1", endpoint, authority: candidate.authority, history: candidate.history }, bootstrap: true });
+        cache.delete(board);
+        collaborationDiagnostic("board_grant.restored", { count: tail.epoch });
+        return true;
+      }
+      return false;
+    } catch { return false; }
+  });
   async function role(board: string) { const context = await security(board); return context?.manifest.devices.find(d => d.deviceKeyId === context.signer.deviceKeyId)?.role ?? null; }
   async function poll(board: string) {
     const old = polledManifests.get(board);
-    const next = await security(board, true);
+    collaborationCounters.countEvent("grant.poll");
+    const next = await collaborationCounters.timed("grant.security", () => security(board, true));
     if (!next) return false;
     const hash = manifestHash(next.manifest);
     polledManifests.set(board, hash);
@@ -333,6 +447,8 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     await publish(bundle); cache.delete(payload.boardId); return payload.boardId;
   });
   return { settings, configure, initialize, deviceRequest, approve, trust, revoke, security, role, poll, pairing, inspectRecovery, restoreAuthority,
+    reestablishAuthority,
+    authorityTransitioned: async (board: string) => Boolean((await record(board))?.transition),
     async exportAuthorityRecovery(board: string, passphrase: string) {
       const saved = await record(board); if (!saved) throw new Error('No board authority to back up');
       const root = await authorityKey(board), pin = await publicKeyFingerprint(saved.bundle.authority);
@@ -358,6 +474,7 @@ export function createBoardGrantService(options: { storage: KeyValueStorage; fet
     }),
     async localBundle(board: string) { return (await record(board))?.bundle ?? null; },
     async ownsAuthority(board: string) { const value = await record(board); return Boolean(value && await publicKeyFingerprint(value.bundle.authority) === (await authorityKey(board)).keyId && value.bundle.history.at(-1)!.payload.devices.find(d => d.role === "owner")?.deviceKeyId === (await key(`board-device:${board}`)).keyId); },
+    restoreAuthorityRecord,
     async automaticDeviceAllowed(board: string, device: string) { return !(await record(board))?.blockedDevices?.includes(device); },
     async exportBundle(board: string) { const value = await record(board); if (!value) throw new Error("Initialize this board's authority first"); return value.bundle; },
     markBootstrapped: (board: string) => exclusive(async () => { const value = await record(board); if (value?.bootstrap) await save(board, { ...value, bootstrap: false }); }),

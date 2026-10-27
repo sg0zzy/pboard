@@ -2,7 +2,10 @@ import { createGoogleIdentitySharing } from "../collab/googleIdentitySharing";
 import { createCollaborativeCopy } from "../collab/collaborativeCopy";
 import { identifyLegacyBoard, legacyTransitionFor, transitionLegacyBoard } from "../collab/legacyTransition";
 import { COLLABORATION_SETTINGS, createBoardGrantService, type CollaborationSettings } from "../collab/boardGrants";
+import { BoardExistingSignedDataError } from "../collab/authorityErrors";
 import { createDeviceEnrollment, storageManifestEpochs } from "../collab/security/enrollment";
+import { loadIceServers } from "../collab/security/ice";
+import { classifyBoardAuthority } from "../collab/authorityDiagnostics";
 import { collaborationDiagnostic } from "../collab/diagnostics";
 import { collaborationCounters } from "../collab/counters";
 import { createGoogleBrokerEnrollment, googleBrokerEnabled } from "../collab/googleBrokerEnrollment";
@@ -69,6 +72,11 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     async recoveryHistory(board) {
       const rx = await getRepository(); return rx ? (await rx.journal.publicGrants.where('boardId').equals(board).toArray()).map(g => g.manifest) : [];
     },
+    // Locally retained grant chain (verified at each guard install): lets an
+    // authority device rebuild a lost grant record without the service cache.
+    async publicGrantHistory(board) {
+      const rx = await getRepository(); return rx ? (await rx.journal.publicGrants.where('boardId').equals(board).toArray()).map(g => g.manifest) : [];
+    },
     async validateRecoveryData(board, bundle) {
       const rx = await getRepository(); if (!rx) throw new Error('Recovery data storage is unavailable');
       const history = new Map(bundle.history.map(e => [e.payload.epoch, e.payload]));
@@ -78,12 +86,22 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         await verifyMutation(entry.value, { boardId: board, collection: entry.collection, manifest, now: () => p.issuedAt }, createMutationReplayCache());
       }
     },
-    async onAuthorization(board, permission) {
+    async onAuthorization(board, permission, authorityReplacementAuthorized) {
       const rx = await getRepository();
       if (!rx) throw new Error("Cannot persist verified board permission");
       const previous = await rx.journal.permissions.get(board);
-      if (previous?.authorityKeyId && previous.authorityKeyId !== permission.authorityKeyId) throw new Error("Board authority replacement is forbidden");
+      // Replacement is allowed only when the grant service is installing a
+      // Drive-verified authority transition (re-key); every other caller keeps
+      // the original pin.
+      if (previous?.authorityKeyId && previous.authorityKeyId !== permission.authorityKeyId && !authorityReplacementAuthorized)
+        throw new Error("Board authority replacement is forbidden");
       await rx.journal.permissions.put(permission);
+    },
+    async onTransition(board, record) {
+      const rx = await getRepository();
+      if (!rx) throw new Error("Cannot persist board authority transition");
+      await rx.journal.authorityTransitions.put({ id: `${board}:${record.newAuthorityKeyId}`, boardId: board, record: record as unknown as Record<string, unknown>, storedAt: Date.now() });
+      collaborationDiagnostic("board_grant.rekeyed", { count: 1 });
     } });
   const identitySharing = createGoogleIdentitySharing({ storage, auth: googleAuth, grants: boardCollaboration, fetcher, canAccessEndpoint: hasSignalingHostPermission,
     async canInitialize(board) {
@@ -95,7 +113,35 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       const project = await rx.db.projects.findOne(board).exec();
       const cards = await rx.db.cards.find({ selector: { projectId: board } }).exec();
       const history = await rx.journal.entries.where("boardId").equals(board).toArray();
-      if (project?.toJSON()._sec || cards.some(c => c.toJSON()._sec) || history.some(change => change.value._sec)) throw new Error("This board has existing signed collaboration data. Keep its original authority; automatic initialization cannot replace it.");
+      if (project?.toJSON()._sec || cards.some(c => c.toJSON()._sec) || history.some(change => change.value._sec)) {
+        // A board this device signed itself must never face a re-initialization
+        // attempt: restore the lost grant record from the retained authority
+        // keys first. Success means there is nothing to initialize.
+        if (await boardCollaboration.restoreAuthorityRecord(board)) {
+          collaborationDiagnostic("board_authority.restored", { room: "lost grant record adopted by its own authority device" });
+          return false;
+        }
+        // Drive-verified owner re-key (D1/D4): live authenticated ownership of
+        // the board folder is the only oracle; a refused or postponed re-key
+        // falls through to the existing block below — now stating its reason.
+        const rekey = await tryDriveRekey(board);
+        if (rekey.done) return false;
+        // Record which authority situation this is (never key material) so the
+        // block can be supported with a precise recovery path.
+        const diagnosis = await classifyBoardAuthority({
+          boardId: board, storage,
+          hasSignedHistory: history.some(change => change.value._sec),
+          hasDocumentSignature: !!project?.toJSON()._sec || cards.some(c => c.toJSON()._sec)
+        });
+        collaborationDiagnostic("board_authority.blocked", { room: diagnosis.state });
+        throw new BoardExistingSignedDataError("This board has existing signed collaboration data. Keep its original authority; automatic initialization cannot replace it."
+          + (diagnosis.state === "authority-metadata-missing"
+            ? " This device still holds the board's authority key but lost its grant record: open the board on this device while the grant service still caches its history, or import the sealed authority recovery file; the signed history itself stays intact."
+            : diagnosis.state === "authority-foreign"
+              ? " The board's authority lives on the device that signed it: open the board there so its grant can renew, import its sealed recovery file, or pair this device; local content stays readable and exportable."
+              : "")
+          + (rekey.reason ? ` Automatic Drive-ownership re-key was refused: ${rekey.reason}` : ""));
+      }
       return true;
     },
     async canReceive(board, owner, email) {
@@ -541,8 +587,53 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     };
   }
 
+  // D1/D4: re-establishing a lost board authority requires a live authenticated
+  // Drive ACL read proving this account owns the board folder. Every failure —
+  // Drive unavailable (postponement), unshared board, verified non-owner, or an
+  // existing grant record on this device — refuses without touching local data,
+  // leaving the ordinary block (or offline editing) exactly as before.
+  async function tryDriveRekey(board: string): Promise<{ done: boolean; reason?: string }> {
+    // Read the provider fresh instead of the lazily cached flag: the sharing
+    // UI can reach this path before the manager's role refresh has run.
+    if ((await boardCollaboration.settings()).provider !== "websocket") return { done: false };
+    if (!await driveConnected()) return { done: false, reason: "Google Drive is not connected; re-keying postponed" };
+    try {
+      await boardCollaboration.reestablishAuthority(board, await drivePermissions.verifyDriveOwnership(board));
+      collaborationDiagnostic("board_authority.rekeyed", { room: "owner re-established via live Drive ACL" });
+      return { done: true };
+    } catch (error) {
+      const reason = String((error as Error)?.message ?? error).slice(0, 160);
+      collaborationDiagnostic("board_authority.rekey_refused", { room: reason });
+      return { done: false, reason };
+    }
+  }
+  // Explicit user-triggered re-key (the auditable D1 act): unlike the automatic
+  // decision-tree attempt, real errors propagate so the UI can show the reason.
+  async function reestablishAuthorityFromDrive(board: string) {
+    if ((await boardCollaboration.settings()).provider !== "websocket") throw new Error("Enable WebSocket collaboration before re-establishing a board authority");
+    if (!await driveConnected()) throw new Error("Connect Google Drive before re-establishing a board authority");
+    const transition = await boardCollaboration.reestablishAuthority(board, await drivePermissions.verifyDriveOwnership(board));
+    collaborationDiagnostic("board_authority.rekeyed", { room: "explicit Drive ownership re-key" });
+    return transition;
+  }
+
   async function boardSecurityFor(projectId: string): Promise<CollaborationSecurityOptions | null> {
-    if (independentCollaboration()) return boardCollaboration.security(projectId);
+    if (independentCollaboration()) {
+      // Independent mode never reaches the identity-driven auto-init path, so
+      // a lost grant record on a board this device signed must be restored
+      // here too, otherwise editing stays blocked with no initialization ever
+      // attempted. Gated on the persistent signed-history flag: one cheap
+      // lookup, no extra network for ordinary unsigned boards.
+      if (!await boardCollaboration.localBundle(projectId)) {
+        const rx = await getRepository();
+        if (rx && await rx.journal.hasSignedHistory(projectId) && await boardCollaboration.restoreAuthorityRecord(projectId))
+          collaborationDiagnostic("board_authority.restored", { room: "lost grant record adopted by its own authority device" });
+        // Restore failed or is impossible: a Drive-verified owner may still
+        // re-establish authority (D1/D4); refusals keep the ordinary block.
+        else if (rx && await rx.getProject(projectId)) await tryDriveRekey(projectId);
+      }
+      return boardCollaboration.security(projectId);
+    }
     if (!await driveConnected()) return null;
     if (legacyBroker()) {
       const role = await drivePermissions.myRole(projectId);
@@ -779,6 +870,8 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   });
 
   const googleBroker = createGoogleBrokerEnrollment({ storage, getAccessToken: () => googleAuth.getAccessToken(), fetcher, canAccessEndpoint: hasSignalingHostPermission });
+  let iceConfiguration: Promise<RTCConfiguration | null> | null = null;
+  const getIceConfiguration = () => (iceConfiguration ??= loadIceServers(storage).then(iceServers => ({ iceServers })));
   const collaborationManager: CollaborationManager = createCollaborationManager({
     getAccountId: async () => independentCollaboration() ? null : connectedAccountId(),
     // Private preference sync verifies and selects its own account. Board pool
@@ -806,6 +899,9 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     signalingFor: (topic, security) => selectRuntimeSignaling(topic, () => driveSignalingFor(topic), security, signalingSettings, identitySharing.admitService),
     onHistoryReceived: (projectId) => driveSyncState.markDirty(projectId),
     boardSecurity: boardSecurityFor,
+    // Explicit ICE endpoints (pinned defaults + optional operator additions);
+    // resolved once per runtime; the loader already degrades to defaults.
+    getIceConfiguration,
     accountSecurity: accountSecurityFor,
     securityChanged: async (projectId) => independentCollaboration() ? boardCollaboration.poll(projectId) : legacyBroker() ? googleBroker.poll(projectId, await connectedAccountId()) : false,
     installMutationGuard: (projectId, security) => installBoardMutationGuard(projectId, security, true),
@@ -917,7 +1013,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       await runtime?.stop();
     }
   };
-  return { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, bufferRealtime, experimentalEnrollment, renewBoardAuthorization, boardCollaboration: { ...boardCollaboration, identitySharing,
+  return { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, reestablishAuthorityFromDrive, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, bufferRealtime, experimentalEnrollment, renewBoardAuthorization, boardCollaboration: { ...boardCollaboration, identitySharing,
     async createCopy(projectId: string) { const rx = await getRepository(); if (!rx) throw new Error("Local RxDB is unavailable"); return createCollaborativeCopy(rx, projectId); },
     async identifyLegacyBoard(projectId: string) {
       if (!await legacyDriveTrust(projectId)) throw new Error("No legacy shared-board trust record for this board");

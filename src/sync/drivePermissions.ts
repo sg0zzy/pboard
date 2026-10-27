@@ -3,6 +3,7 @@ import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, 
 import type { PboardDriveSignalRecord, PboardDriveSignalStore } from "../collab/signaling";
 import { collaborationCounters } from "../collab/counters";
 import type { BoardImage } from "../types";
+import { aclDigest, sha256Hex, type DriveOwnershipProof } from "../collab/security/authorityTransition";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -66,6 +67,13 @@ export interface DrivePermissionTransport {
    */
   listSharedWithMe(): Promise<DriveFileRef[]>;
   listPermissions(fileId: string): Promise<DrivePermission[]>;
+  /**
+   * PATCH `writersCanShare=false` so only the owner may change sharing on a
+   * My Drive item (D2). Shared-drive items reject this property; callers
+   * treat failure as non-fatal. Caveats: Drive cannot restrict a writer
+   * from sharing child items that writer itself creates inside the folder.
+   */
+  restrictWriterSharing(fileId: string): Promise<void>;
   createPermission(fileId: string, role: PboardCollaboratorRole, email: string): Promise<DrivePermission>;
   updatePermission(fileId: string, permissionId: string, role: PboardCollaboratorRole): Promise<DrivePermission>;
   deletePermission(fileId: string, permissionId: string): Promise<void>;
@@ -244,6 +252,12 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
       const body = await response.json() as { permissions?: DrivePermission[] };
       return body.permissions ?? [];
     },
+    async restrictWriterSharing(fileId) {
+      // Metadata PATCH on the standard API host; a non-ok response rejects.
+      await authorizedFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=id%2CwritersCanShare`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ writersCanShare: false })
+      });
+    },
     async createPermission(fileId, role, email) {
       const response = await authorizedFetch(
         `${DRIVE_API}/files/${encodeURIComponent(fileId)}/permissions?fields=id,type,role,emailAddress,displayName`,
@@ -320,6 +334,12 @@ export interface DrivePermissionService {
   invalidateSharedDiscovery(): void;
   /** The caller's role for the shared project; null when not shared or no permission. */
   myRole(projectId: string): Promise<PboardRole | null>;
+  /**
+   * Fresh live Drive ACL read proving this account owns the board folder
+   * (authority re-key authorization). Throws when unverified or not owner —
+   * never resolves from cached metadata.
+   */
+  verifyDriveOwnership(projectId: string): Promise<DriveOwnershipProof>;
   /**
    * Self-removal for a non-owner's board "delete": revoke the caller's own
    * collaborator and realtime permission so the owner's share list reflects
@@ -450,14 +470,14 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     let folderId = cached.folderId;
     if (!folderId) {
       let folder = await transport.findFile(projectId, rootId);
-      if (!folder) folder = await transport.createFolder(projectId, rootId);
+      if (!folder) { folder = await transport.createFolder(projectId, rootId); await restrictWriterSharingBestEffort(folder.id); }
       folderId = folder.id;
     }
     let projectFileId = cached.projectFileId;
     if (!projectFileId) {
       const existing = await transport.findFile(PROJECT_FILE_NAME, folderId);
       if (existing) projectFileId = existing.id;
-      else projectFileId = (await transport.createJsonFile(PROJECT_FILE_NAME, folderId, await options.readSnapshot(projectId))).id;
+      else { projectFileId = (await transport.createJsonFile(PROJECT_FILE_NAME, folderId, await options.readSnapshot(projectId))).id; await restrictWriterSharingBestEffort(projectFileId); }
     }
     let realtimeFolderId = cached.realtimeFolderId;
     if (!realtimeFolderId) {
@@ -491,6 +511,29 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email);
     if (!mine) return null;
     return mine.role === "writer" ? "editor" : "viewer";
+  }
+  // D2: folder sharing stays owner-only on My Drive. Unsupported on shared
+  // drives (writersCanShare is fixed true there) and never worth breaking a
+  // share for, so failure only counts an event.
+  async function restrictWriterSharingBestEffort(fileId: string): Promise<void> {
+    try { await transport.restrictWriterSharing(fileId); }
+    catch { collaborationCounters.countEvent("drive.share_restriction_failed"); }
+  }
+
+  // Fresh authenticated ownership read for authority re-key (D1/D4): resolves
+  // nothing from cache. Resolves ONLY when the live ACL proves this account
+  // owns the board folder; every other outcome (not shared, signed out, API
+  // failure, verified non-owner) throws so callers postpone rather than trust.
+  async function verifyDriveOwnership(projectId: string): Promise<DriveOwnershipProof> {
+    const layout = await resolveLayout(projectId);
+    if (!layout.folderId) throw new Error("This board is not shared through Google Drive; Drive ownership cannot be verified");
+    const identity = await transport.currentIdentity();
+    if (!identity) throw new Error("Google account unavailable; Drive ownership is unverified");
+    const permissions = await transport.listPermissions(layout.folderId);
+    const email = identity.email.trim().toLowerCase();
+    if (!permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email))
+      throw new Error("Google Drive does not report this account as the board folder owner; re-keying is refused");
+    return { folderFileId: layout.folderId, ownerEmailHash: await sha256Hex(email), aclDigest: await aclDigest(permissions), verifiedAt: Date.now() };
   }
 
   async function listCollaborators(projectId: string): Promise<Collaborator[]> {
@@ -632,6 +675,7 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     discoverSharedProjects,
     invalidateSharedDiscovery,
     myRole,
+    verifyDriveOwnership,
     listCollaborators,
     invite,
     updateRole,

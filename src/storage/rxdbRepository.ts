@@ -286,7 +286,7 @@ export async function createRxRepository(options: {
     if (observed === 'revoked' || permission?.role === "revoked") throw new Error("Board editing permission was removed; pending work remains available for export");
     if (observed === "viewer" || liveBoardRole(cards, projectId) === "viewer" || (permission?.role ?? options.mutatorRole) === "viewer") throw new Error("You have view-only access to this shared project");
     const signed = permission?.authorityKeyId || (await projects.findOne(projectId).exec())?._sec
-      || (await journal.committedEntries()).some(e => e.boardId === projectId && !!e.value._sec)
+      || (await journal.hasSignedHistory(projectId))
       || (await pendingEdits()).some(e => e.boardId === projectId);
     if (signed && !liveBoardRole(cards, projectId) && !(allowPending && permission?.deviceKeyId && permission.role !== "viewer")) {
       throw new Error("Current board authorization is required; cached content remains readable and exportable");

@@ -10,6 +10,7 @@ import { manifestHash, type SignedManifest } from './security/manifest';
 import { storageManifestEpochs } from './security/enrollment';
 import { collaborationDiagnostic } from './diagnostics';
 import { identityRejection, IdentityServiceError } from './identityErrors';
+import { collaborationCounters } from './counters';
 
 type Role = 'editor' | 'viewer';
 export type EmailPolicy = { version: 1; boardId: string; authority: DevicePublicKey; ownerEmail: string; members: { email: string; role: Role }[]; issuedAt: number; expiresAt: number };
@@ -95,7 +96,10 @@ export function createGoogleIdentitySharing(options: {
     const ownerPolicy = (await local())[policy.boardId];
     if (ownerPolicy && await options.grants.ownsAuthority(policy.boardId) && (policy.ownerEmail !== ownerPolicy.ownerEmail || policy.issuedAt < ownerPolicy.revision || JSON.stringify(policy.members) !== JSON.stringify(ownerPolicy.members))) throw new Error('Stale sharing policy rejected; open this board in its original authority browser to republish current invitations');
     const previous = await options.grants.localBundle(policy.boardId);
-    if (previous && await publicKeyFingerprint(previous.authority) !== await publicKeyFingerprint(policy.authority)) throw new Error('Existing board authority differs from the directory; automatic replacement is forbidden');
+    // A Drive-verified authority transition replaces the local authority on
+    // purpose; the stale directory policy (signed by the old authority) is
+    // then republished from the new chain instead of blocking sync.
+    if (previous && await publicKeyFingerprint(previous.authority) !== await publicKeyFingerprint(policy.authority) && !await options.grants.authorityTransitioned(policy.boardId)) throw new Error('Existing board authority differs from the directory; automatic replacement is forbidden');
     return policy;
   }
   async function readBundle(policy: EmailPolicy): Promise<BoardGrantBundle> {
@@ -111,6 +115,7 @@ export function createGoogleIdentitySharing(options: {
   async function syncWork(selected?: string, force = false) {
     if ((await options.grants.settings()).provider !== 'websocket' || await options.auth.getConnectionState() !== 'connected') { last = null; requests.clear(); publications.clear(); trusted.clear(); return { email: '', boards: [] as Entry[], ready: [] as string[], issues: [] as CapacityIssue[] }; }
     if (!force && last && last.selected === selected && Date.now() - last.at < IDENTITY_REFRESH_MS - 1000) return { ...last.reply, ready: last.ready, issues: last.issues };
+    collaborationCounters.countEvent("identity.sync.full");
     let reply = await exchange({ type: 'sync', publication: null });
     for (const board of trusted.keys()) if (!reply.boards.some(entry => entry.publication.policy.boardId === board)) trusted.delete(board);
     for (const [board, request] of requests) {
@@ -234,7 +239,7 @@ export function createGoogleIdentitySharing(options: {
   }
   return {
     admitService,
-    sync: (selected?: string, force = false) => exclusive(() => syncWork(selected, force)),
+    sync: (selected?: string, force = false) => exclusive(() => collaborationCounters.timed("identity.sync", () => syncWork(selected, force))),
     invite: (board: string, email: string, role: Role) => exclusive(() => change(board, email, role)),
     remove: (board: string, email: string) => exclusive(() => change(board, email, null)),
     async collaborators(board: string) { const value = (await local())[board] ?? last?.reply.boards.find(e => e.publication.policy.boardId === board)?.publication.policy; return value ? [{ email: value.ownerEmail, role: 'owner' as const }, ...value.members] : []; },
