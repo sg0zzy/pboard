@@ -345,6 +345,59 @@ compliance.
   inputs. This is an inspection concern, not a reproduced failure in this
   audit; capture provenance/config from the same snapshot before claiming
   concurrent-edit coverage for those fields (ARTIFACTS/L13).
+- Operation-protocol audit gaps (2026-10-28, read-only pass plus the focused
+  operation tests). No narrow-screen overflow menu component exists: the header at
+  `src/sidebar/App.tsx:890-933` relies on flex-wrap, so the "owner maintenance
+  popover on narrow screens" wording at `docs/architecture/drive-operation-sync.md:47`
+  describes an unbuilt component; the WebRTC toggle is gated on
+  `VITE_PBOARD_SIGNALING_PROVIDER === "websocket"` (`:897-904`) while the persisted
+  live toggle (`:46`, `:911-926`) is always rendered, which matches `:216` but not
+  `:47`. No code was changed for these items.
+- Performance instrumentation is not exercised on the operation path:
+  `src/collab/counters.ts` offers `countRender` (`:145`), `countEffect` (`:149`),
+  `countEmission` (`:153`), `countInitialisation` (`:157`), `time` (`:162`),
+  `timed` (`:171`), `withDrivePurpose` (`:182`) and `instrumentFetcher` (`:193`,
+  which returns the fetcher unchanged when `DIAGNOSTICS` is off), and the only
+  operation-layer call site found is `src/sidebar/components/Card.tsx:94`. No test
+  exercises counters and no test asserts a performance threshold;
+  `tests/operations/performance.test.ts` prints measurements with no bound, so the
+  acceptance threshold stays unenforced. Adaptive polling bounds themselves are
+  covered (`src/sync/operations/session.ts:18-19,33-35,94,146-152,156-161`).
+- No application undo/redo command stack exists in `src`. Every undo/redo/rollback
+  match is a comment or recovery semantics: `src/sync/attachmentGc.ts:11`,
+  `src/storage/boardErasure.ts:6`, `src/collab/security/checkpoint.ts:107,135`,
+  `src/security/mutation.ts:159`, `src/webrtcHandler.ts:111,133,140`;
+  `tests/recovery/attachmentGc.test.ts:31` is a GC grace window and
+  `tests/recovery/causalReconciliation.test.ts:114` uses "undone" for a replay
+conflict. The absence statement at `docs/architecture/drive-operation-sync.md:48` is
+accurate, and the Escape clause at `:49` is backed by the form handlers at
+`src/sidebar/components/Card.tsx:350` and `src/sidebar/App.tsx:419,955,1185`; the
+capture selection overlay has its own handler at
+`src/background/regionCapture.ts:139`.
+- Presence and cursor shapes are absent at the operation layer by design:
+  `src/sync/operations/realtime.ts:42-43` accepts only `have` and `operations`; live
+  cursors and ephemeral drag remain in `src/collab/signaling.ts` and
+  `src/webrtcHandler.ts`.
+- The AppData boundary holds for the operation protocol
+  (`src/sync/operations/driveStore.ts:12-14`) but not as a blanket claim. Legacy
+  writers remain: `src/sync/driveTransport.ts` defaults to AppData when no regular
+  parent is supplied (`:31`) and writes there (`:114`), and `src/sync/runtime.ts`
+  still constructs legacy transports without a regular parent at `:176,184,839,1034`
+  (account preferences also live in AppData by product decision, `:247`). The design
+  doc is now scoped to the operation protocol; retargeting those writers is a
+  storage-owner decision under the privacy/trust boundaries, not part of this audit.
+- Measured limits now reproduce from permanent tests:
+  `tests/operations/performance.test.ts`, `tests/operations/wireVolume.test.ts` and
+  `tests/operations/wholeBoardComparison.test.ts`. On one workload (1,000 card
+  creates, then 50 edits each followed by a forced sync) the incremental path measured
+  511 B payload per edit against about 10,392 B whole-board upload per sync, and
+  4.9 ms against 14.7 ms median edit-plus-sync latency, but it issued more Drive
+  requests per edit (8.3 against 7.0 per whole-board sync). Latency is run-dependent;
+  byte counts are not. Incremental retained state grows with history: 1,001 receipts
+  produced a 1,199,052 B checkpoint against 530,923 B board state. The per-connection
+  inbound buffer bound (16,777,216 B) is derived from `realtime.ts:33,36`, not
+  observed. Live Google accounts, real ACL propagation, physical Android devices and
+  native Firefox collaborative sessions remain unexercised.
 
 ### Validation executed for this audit
 
@@ -371,6 +424,20 @@ were not rebuilt, pruned or modified. Full package compilation, signing and
 live remote acceptance were not repeated; historical build evidence below
 must not be mistaken for a build of this audited commit. No commits, tags,
 pushes, workflow dispatches, publication or credential changes were performed.
+
+Operation-protocol verification for this audit (2026-10-28). The serialized suite
+(`npm test -- --maxWorkers=1`) passed 178 files / 1,196 tests in 309 s, including the 29
+realtime tests and the three permanent measurement files. Two parallel runs failed three
+pre-existing files only under worker load — `tests/googleIdentitySharing.test.ts:63` (5000
+ms timeout), `tests/recovery/imageSyncBackoff.test.ts:107` (`expected 6 to be 7`) and
+`tests/collab/liveDeleteConflict.test.ts:115` (`waitUntil: condition not met within
+timeout`, 15613 ms) — and each passes in isolation; none of them was modified.
+`tests/operations/wholeBoardComparison.test.ts` timed out in the first parallel run at the
+default 5000 ms and now carries an explicit 30000 ms timeout. Byte counts are stable across
+runs; latency is not. The serialized run measured 10.1 ms median incremental edit-plus-sync
+(583 ms on the first edit) against 26.8 ms median whole-board, and the microbenchmark
+recorded 178.9 ms elapsed / 181.1 ms CPU, 6.84 ms / 8.41 ms incremental and 75.5 ms
+snapshot generation. `npx tsc --noEmit` reported nothing.
 
 
 Adoption date: 2026-10-16. Central origin: https://github.com/sg0zzy/dev-standards. Edition **1.0.0**, commit **`e3111c4e9dc652f833a5f2ba5232c292646e7969`**. No central tags existed; Git resolved main to this SHA. Browser access returned 404, but authenticated Git retrieval succeeded. The pinned checkout and SHA-256 inventory of all 21 files were verified locally. No policy was reconstructed from memory.
@@ -1574,3 +1641,280 @@ includes an explicit selected-board sync after a Drive outage, signed-history
 recovery and permanent-erasure protection. Google HTTP is simulated; no live user
 Google account or server was modified. The broader acceptance gate is unchanged;
 no OAuth, schema, version, deployment, commit, tag or release changes were made.
+
+### Drive operation synchronization foundation — 28 October 2026
+
+The exact adopted standards commit and 21 digests were reverified against a separate
+local pinned checkout. See [the assessment and acceptance gaps](docs/architecture/drive-operation-sync.md)
+for the additive journal schema 7, deterministic operation engine, durable outbox,
+regular-Drive immutable storage/session prototype and conservative retention planner.
+The new stores participate in existing local permanent-erasure guards and cleanup.
+The current production sync/authority paths remain active; migration, RxDB projection,
+peer admission and maintenance UI are unfinished. Existing architecture/security
+and release-readiness gaps remain open. No live user Drive data, ACL, credentials,
+version, standards pin, commits, tags, pushes or deployment were changed.
+
+### Drive-first operation runtime and migration — 28 October 2026
+
+Continued the authorized branch implementation after the protocol foundation.
+The default browser/Android runtime now uses the existing WAL/RxDB with semantic
+operations, a durable outbox, immutable regular-Drive segments, optional native
+WebRTC, owner snapshots and confirmed conservative gardening. Journal schema 10
+is additive; no prior history or keys were deleted. Legacy snapshot file IDs and
+ACLs are preserved with a verified Drive content restriction before adoption.
+Editors can bootstrap operation history without an online owner; fresh viewers
+can read unmigrated legacy content. Offline legacy forks and pending drafts retain
+review/export recovery paths. Account preferences/private erasure markers write
+regular Drive storage; AppData is only a legacy read/recovery source.
+
+Exact central pin e3111c4e9dc652f833a5f2ba5232c292646e7969 and all 21 digests
+reverified using scripts/verify-standards.py and /tmp/pboard-standards-pinned.
+See [architecture, migration, retention and validation details](docs/architecture/drive-operation-sync.md).
+No version/standards pin change, commit, tag, push, remote workflow, live Google
+write/ACL/deletion, signaling deployment or credential change was performed.
+Local disposable test databases and simulated Drive files exercise deletion only.
+Existing release readiness/protection/certificate and live-account/device evidence
+gaps remain separate from this feature implementation.
+
+Feature validation: full serial root run passed 175 files / 1,162 tests. The
+focused operation suite passed 76 tests; Android passed 15 files / 98 tests.
+Both typechecks and managed Firefox/Chromium builds/package verification passed;
+Firefox lint reported zero errors/notices/warnings. Final board-scoped operation
+notifications were rechecked with the operation suite and seven storage/journal
+tests. Native Chromium verified real IndexedDB recovery, native chunked
+DataChannels/reconnect/revocation, and responsive toolbar/preference behavior.
+For 1,000 cards and 50 edits, recorded local median was approximately 9 ms,
+with one Drive segment and no Drive calls during the edit loop. Drive HTTP is
+simulated; live Google/physical-device validation and bounded receipt-history
+pruning remain documented limitations. The default parallel legacy WebRTC suite
+showed timing failures; the complete serialized run passed.
+
+### Request-cost accounting, hang root causes and guard evidence — 29 October 2026
+
+The central pin was verified against a checkout we own rather than the cached one.
+`dev-standards.lock.json` records commit `e3111c4e9dc652f833a5f2ba5232c292646e7969`,
+edition `1.0.0` and 21 file digests (`origin` is `null`); the cached central checkout
+HEAD is `21e78eee013a58455b275fd339df97b40533c186`, which is not the pin, so a clone
+was detached to the pinned commit and `scripts/verify-standards.py` reported
+`Verified edition 1.0.0, commit e3111c4…, 21 files`. The pin itself was not changed.
+
+Quota accounting defect: `DRIVE_DEFAULT_COST_PER_MINUTE` was `10_000`, an unverified
+value about 3% of the documented per-user-per-project budget. Google documents
+1,000,000 request-cost units per minute per project and 325,000 per user per project
+(https://developers.google.com/workspace/drive/api/guides/limits, last updated 2026-09-11);
+a browser client is bounded by the per-user figure, so the constant now carries
+325,000. Per-method pricing is 5 (read), 100 (list), 200 (download), 50 (edit) and 5
+(other); `driveRequestCost` is a pre-flight projection, and a reported
+`X-Drive-Request-Cost` header is the accounting truth — an absent header is not zero
+cost, and `observe()` corrects only a charge that `acquire()` booked (`pendingCharge`).
+
+Measured deferral boundaries for the simulated inventory burst (`pageSize=200`,
+projection 204 units per request, which exceeds the documented 100 for a list): at the
+corrected budget, 0 deferrals for the first 3,248 requests (charged 324,800) and the
+first deferral on request 3,249 for the full remaining window; at the previous
+`10_000` the burst deferred on request 99 and the recorded run produced 48 deferrals,
+the first at request 399 (charged 9,998, wait 56,560 ms). The whole-board half needed
+359 requests / 980 projected units and deferred 359 times under the old budget. A
+deferral is decided on the projection, so a request the projection prices above the
+budget can be deferred even though Google would have served it; the throttle defers
+only — it never refuses, never adds a request and never hides a 403.
+
+Message defect fixed in `driveQuotaError`: it previously asserted a `projected cost N >
+limit M` inequality that could be false when a real Google 403 arrived inside the local
+window; the clause now states only the relation that holds (`projected cost …` when the
+projection genuinely crosses, otherwise `charged N of limit M`). Quota classification
+runs before any role/scope mapping, so `insufficientPermissions` cannot appear in the
+quota message; permission denials come from `assertRole`. `driveSecondDelayMs` takes the
+upper bound of a `second delays (N-M seconds)` body but clamps to 30 s, so a `(30-90)`
+body yields `retry after 30000ms`; `Retry-After` clamps separately at 10 s. A prior
+documentation claim that `secondDelay` priced 10,000 ms was false and was replaced.
+
+Hang root causes, both fixed without raising timeouts:
+- `tests/operations/service.test.ts` hung on the unverified default budget, not on a
+  stranded storage-write-queue promise; the quota deferral awaited a full window under
+  `10_000`. With the corrected default the file passes 13/13 in 1.45 s at default
+  timeouts.
+- `locked()` was a strict single-exclusion FIFO queue, so a nested acquisition from
+  inside a held section chained onto its own still-pending previous operation and
+  awaited a chain that could only resolve after itself — a self-deadlock. Possession is
+  now proven by the section symbol the running section hands out (`createReentrantLock`
+  in `src/storage/lock.ts`, additive exports only; `withStorageLock` and `fallbackLock`
+  unchanged), and callers that cannot prove possession stay independent FIFO callers.
+  `AsyncLocalStorage` was rejected as it is Node-only and would break mutual exclusion
+  for unrelated callers. Evidence before the change: 2 failed / 7 passed; after: 9/9 in
+  `tests/lockReentrancy.test.ts`. Removing the possession proof reproduces the hang
+  (6 failed / 3 passed, 10,061 ms, `Test timed out in 5000ms`).
+
+Change journal guard evidence: `prepare()` previously accepted a claim on an
+already-superseded recorded entry, so the write became an anonymous fork that surfaced
+only at confirm; intake silently dropped entries after a board was retired mid-flight.
+Prepare now refuses a claimed recorded head (`Change must anchor on the recorded change
+journal head`) before anything is written, and `accept(entries, refuseRetired)` refuses
+retired boards inside the same strict transaction that reads the erasure markers —
+never from a request event handler, where fake-indexeddb swallows listener throws into
+an `AggregateError`. Two failing tests became 18/18 (487 ms) in
+`tests/recovery/causalReconciliation.test.ts`; the confirm gate stays green 5/5 in 1.05 s
+with its message pin intact (`STALE` is the contract).
+
+Share dialog projection contract: `tests/driveProjectionContract.test.ts` is 3/3 green,
+and every fix was in the test — the projection itself was already compliant. The parser
+split only on commas, so an unclosed group segment lost its last character and produced
+`Invalid field selection i`; the path filter `endsWith("/permissions")` missed
+`permissions.update`'s `/files/<id>/permissions/<id>`; and the request count was a magic
+number that ignored `invite`'s `ensureSharedProject` fetch. Drive `Permission` has no
+`createdTime` field and `id` is opaque, verified at the source revision: the recorded
+field projection stays `nextPageToken,permissions(id,type,role,emailAddress,displayName)`
+and re-invitation is decided by grant identity, not by a timestamp that does not exist.
+
+`canDraft` was examined and is not a defect. There is no `boardRole` helper or numeric
+role mapping in `src` (`grep 'role > 1'`, `boardRole\(` → no matches), and
+`liveBoardRole` is manifest-derived, not card-count dependent
+(`src/collab/security/liveMutations.ts:25-27`, `:182-183`). `canDraft`
+(`src/storage/rxdbRepository.ts:1120`) reports the pending-only mode — an authority key
+with no current live entitlement — which matches its consumers in
+`src/storage/conflictResolution.ts:44-49` and `:92`, where a pending board skips the
+live-variant verification that a live-authority board requires. `Card not found` is
+thrown by missing or soft-deleted card documents (`src/storage/repository.ts:213, 266,
+296`; `src/storage/rxdbRepository.ts:835, 880, 899, 951`) and is independent of
+`canDraft`. No permanent test covers `canDraft`.
+
+Per-file evidence at default timeouts, no wall-clock sleeps in permanent tests:
+`tests/driveQuota.test.ts` 15/15 (451 ms), `tests/collab/counters.test.ts` 8/8,
+`tests/operations/session.test.ts` 14/14 (550 ms), `tests/operations/wholeBoardComparison.test.ts`
+unchanged and green, `tests/drivePermissions.test.ts` and
+`tests/driveFieldCostModel.test.ts` green, root `tsc --noEmit` clean. Throwaway probes
+were deleted after their observations were recorded; message-text pins were dropped
+where the message is not the contract, and no test timeout was raised.
+
+Open gaps that block release readiness are unchanged: commit history, certificate
+identity and repository protections. No commit, tag, push, remote workflow run,
+publication, deployment, credential change or standards-pin change was performed. Drive
+HTTP remains simulated; live Google account, ACL, physical-device and bounded
+receipt-history validation are still documented limitations.
+
+### Peer-history anchoring, write-queue settle and the image cadence — 30 October 2026
+
+**Finding:** the remaining failures were expectations and test synchronisation, not source
+behaviour; the head-anchor rule was re-confirmed as intended and was not changed.
+
+`tests/recovery/peerHistory.test.ts` built its causal descendant from a `RxDocument` handle
+captured before the ancestor write, so the second write's `previous` byte-matched a
+superseded journal entry — exactly the anonymous fork the rule refuses. Observed directly:
+that write is refused inside `prepare()` before `original.call`, so the RxDB conflict
+handler never runs (RxDB `COL20`, `writeError.status` 422, `context`
+`"incremental-write"`, empty `validationErrors`, the write row's `previous` still the
+`Initial` entry whose recorded change has a child), and the peer stays `kind="current"` on
+the ancestor head. The same content written from a document re-read after the ancestor
+write is accepted, produces one head whose parent is the ancestor, and the conflict handler
+selects the past-clock descendant. The assertion is only satisfiable through a proven single
+head: `causalWinner` (`src/storage/rxdbRepository.ts:135-149`) consults `reconcile` only for
+a single-head graph and otherwise falls back to `lastWriteWins` on `max(updatedAt,
+deletedAt)`, which would have kept the 2099 ancestor. The test now builds the descendant
+through the path `prepare` allows, asserts the single-head condition and keeps the
+behavioural half; `src/storage/resolutionOrigin.ts` returns `undefined` for a document with
+no registered intent, so that test's ancestry comes only from the byte-matched `previous`
+(`comparable()` strips `_sec` only, so `updatedAt` is part of the identity). Green 35/35 in
+2.68 s.
+
+`tests/journalWriteQueue.test.ts` asserted a cause identity across two batches, which the
+wrapper does not guarantee: `installJournalStorage` turns one thrown or ambiguous failure
+into one `JournalWriteFailure` per input row and returns `{ error, success: [] }`, and its
+shared failure object is proven per batch only. That cross-batch claim was removed; the
+per-batch settle behaviour is still asserted. Two test-only typecheck defects were fixed:
+the repository options object has no `journal` field (the repository builds
+`new ChangeJournal(db.name)`, installs it and exposes it on the api), and
+`BulkWriteRow.previous` is `undefined` for inserts, so it needs `RxDocumentData<...>`.
+Green 3/3 in 854 ms.
+
+`tests/driveFieldCostModel.test.ts:46` pinned the unverified `10000` default; it now pins
+the documented per-user-per-project figure (`325_000` in `src/sync/driveQuota.ts`, mirrored
+in `experiments/collaboration/driveFieldCostModel.mjs:21`). Green 13/13 in 311 ms.
+
+`tests/recovery/imageSyncBackoff.test.ts` failed only inside the full run — 1 failed of 2 in
+two consecutive full runs (1257 passed) while the same file passed alone. Cause:
+`notifyCards()` fires `void tick()` and the next delay is armed in the pass's `.finally()`
+when that pass settles, so advancing the fake clock past a still-pending pass (WebCrypto
+hashing and asset verification resolve on the real event loop) put the clock beyond the
+point where the base cadence was armed. The test now awaits that same pass — `sync.tick()`
+returns the running promise, so it adds no probe — before moving the clock. No source
+change, no wall-clock sleep, no timeout raise; the file is 2/2.
+
+Validation: root `node_modules/.bin/tsc` exits 0, and `node_modules/.bin/vitest run` is green
+across 185 files / 1258 tests in 78 s at default timeouts. The suite prints `Switched to a
+new branch 'feature'` / `Switched to branch 'main'` from a test that runs git inside its own
+temporary repository; `git branch --show-current` stayed `feature/drive-first-collaboration`
+and this work changed no branch or worktree. Throwaway probes were deleted after their
+observations were recorded, no message-text pin was added, and `node_modules` was not
+patched. The standards pin (commit `e3111c4e9dc652f833a5f2ba5232c292646e7969`, edition
+`1.0.0`, 21 files in `dev-standards.lock.json`) was verified twice against a checkout we
+own; central access remains unreachable, so no compliance claim is made and no
+policy-dependent release or deletion operation was performed. Open gaps that block release
+readiness are unchanged: commit history, certificate identity and repository protections.
+
+### Operation-protocol coverage audit — 30 October 2026
+
+**Finding:** the delegated coverage audit needed correction: the protocol is implemented,
+the realtime transport is directly tested, and two statements over-claimed. Those two
+statements were corrected; the remaining gaps are stated here, not closed.
+
+Scaffold check: `grep -c -E "TODO|FIXME|stub|placeholder|not implemented" -r
+src/sync/operations` returns 0 for each of the fifteen files, so nothing is scaffolded.
+The audit's claim that `src/sync/operations/realtime.ts` has no direct test is false:
+`tests/operations/realtime.test.ts` is 493 lines with 49 `it(` blocks in two describes
+(`realtime transport frame rules` at `:134`, `realtime transport permission gates` at
+`:210`) covering in-order frame reassembly, frame-budget refusal, buffer-limit
+stop/resume, out-of-order index refusal, the sixteen-concurrent-buffer cap, the 1–128
+window, oversized text, foreign protocol refusal and batches above 128 entries.
+
+Undo remains absent by design, not a defect: no command stack exists in `src` or
+`apps/android/src`; the only `undo` hits are prose or comments
+(`src/sync/attachmentGc.ts:11`, `src/collab/security/mutation.ts:159`) and two deletion
+confirmations (`src/sidebar/components/ConflictResolutionControls.tsx:60`,
+`src/sidebar/components/PendingWorkControls.tsx:55`). `SPECIFICATION.md:211` requires
+trash undo only as a status change, which a normal card update already satisfies, and
+`docs/architecture/drive-operation-sync.md:49-51` records both the absence and the rule
+that a future command undo must emit conditional property changes and never restore a
+board. Implementing a command stack is new scope, not a regression fix.
+
+Two wording defects corrected in this pass:
+
+- `docs/architecture/drive-operation-sync.md` said the persisted live toggle was visible
+  only with a WebSocket build flag. `src/sidebar/App.tsx` renders the `webrtc-toggle`
+  button unconditionally and persists it under `LIVE_COLLABORATION_STORAGE_KEY`;
+  `VITE_PBOARD_SIGNALING_PROVIDER === "websocket"` gates only the debug-section button
+  (`:70`, `:897`). That bullet now states the present behaviour, and the coverage bullet
+  names the realtime frame-rule tests while noting that toolbar overflow is asserted by
+  the post-build Chromium smoke, because vitest has no layout engine. The file is untracked
+  content from this worktree, so the correction is ours rather than a historical record.
+- `tests/operations/driveStore.test.ts:11` read as a store-wide "no PATCH" claim that
+  `src/sync/operations/driveStore.ts:148` (`protectLegacy` PATCHes `contentRestrictions`)
+  and `:179` (`trash` PATCHes `trashed: true`) contradict; its assertion covers only that
+  test's requests (`:16`), so the title is now scoped to them. `appDataFolder` has no
+  occurrence in `driveStore.ts` and still appears in the legacy paths
+  (`src/sync/driveTransport.ts:82,97,128`, `src/sync/privateMigration.ts:5`,
+  `src/sync/runtime.ts:442,573`), consistent with the storage layout in
+  `docs/architecture/drive-operation-sync.md:31,168-169`.
+
+Open gaps, unchanged by this pass: `tests/operations/performance.test.ts` asserts
+correctness only (`:34-35`) and prints its benchmark (`:36`); no performance threshold is
+asserted anywhere and there is no baseline against the real pre-protocol runtime, so the
+performance claim rests on harness output. `experiments/collaboration/ui-perf.mjs` counts
+reads, writes and refreshes without measuring frame or paint latency, and narrow-screen
+overflow is asserted only by `experiments/collaboration/toolbar-smoke.mjs:57-68`.
+
+Validation: `npm run typecheck` exits 0, and `node_modules/.bin/vitest run` is green at
+default timeouts (185 files, 1259 tests). The Android gate was exercised: `npm run
+typecheck` exits 0 and `npm test` passes 15 files / 98 tests in 2.17 s. `npm run build:all`
+and `npm run verify:build all` passed. `node experiments/collaboration/toolbar-smoke.mjs`
+passed at 240, 320, 480 and 800 px with no overflow, one toggle and the preference
+surviving reload; `node experiments/collaboration/webrtc-browser-smoke.mjs` passed with two
+isolated Chromium profiles (board switch in 7 ms, the gate dropped a replayed answer,
+replication converged without snapshot resurrection); `node
+experiments/collaboration/ui-perf.mjs` reported add 11.2 ms, edit 7.4 ms, history 6.4 ms,
+340 journal writes and 553 reads. Only the changed file was re-run after the title change:
+`tests/operations/driveStore.test.ts` 6/6 in 190 ms. No compliance claim is made: the
+standards pin (`e3111c4e9dc652f833a5f2ba5232c292646e7969`, edition `1.0.0`, 21 files in
+`dev-standards.lock.json`) was not re-verified in this pass and central access remains
+unreachable. Release readiness stays blocked on owner-owned commit history, certificate
+identity and repository protections; Drive HTTP remains simulated, and nothing was
+committed, tagged or published.

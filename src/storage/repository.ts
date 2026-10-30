@@ -1,6 +1,6 @@
 import { boardTemplates, isTypeSupported } from "../templates/boardTemplates";
 import { normalizeCardDisplayMode } from "../cardDisplayModes";
-import { withStorageLock } from "./lock";
+import { createReentrantLock, withStorageLock, type LockAcquire, type LockedOperation } from "./lock";
 import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
 
 export const STORAGE_KEY = "projectBoardState";
@@ -30,8 +30,10 @@ const now = () => new Date().toISOString();
 const newId = () => crypto.randomUUID();
 
 export function createRepository(storage: KeyValueStorage, events: RepositoryEvents = {}) {
-  function withLock<T>(operation: () => Promise<T>): Promise<T> {
-    return withStorageLock(storage, STORAGE_KEY, operation);
+  const acquire: LockAcquire = <T>(operation: () => Promise<T>): Promise<T> => withStorageLock(storage, STORAGE_KEY, operation);
+  const reentrant = createReentrantLock(acquire);
+  function withLock<T>(operation: LockedOperation<T>): Promise<T> {
+    return reentrant.run(operation);
   }
 
   async function load(): Promise<AppState> {
@@ -328,8 +330,9 @@ export function createRepository(storage: KeyValueStorage, events: RepositoryEve
       await changed(projectId);
     });
   }
-
-  return { load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems };
+  // The lock is published because a callback that runs inside a critical section can
+  // only re-acquire it through the acquirer that section hands it.
+  return { withLock, load, createProject, selectProject, reorderProjects, renameProject, deleteProject, changeProjectTemplate, addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems };
 }
 
 function normalizeOrder(state: AppState, projectId: string) {

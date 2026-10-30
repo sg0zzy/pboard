@@ -13,6 +13,7 @@ export type DriveProjectSyncState = {
   changeToken?: number;
   status: DriveProjectSyncStatus;
   dirtyAt?: string;
+  firstDirtyAt?: string;
   lastSyncedAt?: string;
   lastSyncedRevision?: number;
   remoteFileId?: string;
@@ -95,6 +96,7 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         dirty: true,
         changeToken: (current.changeToken ?? 0) + 1,
         status: "pending",
+        firstDirtyAt: current.dirty ? current.firstDirtyAt ?? current.dirtyAt ?? new Date().toISOString() : new Date().toISOString(),
         dirtyAt: new Date().toISOString(),
         error: undefined
       });
@@ -117,6 +119,7 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
         projectId,
         dirty: changedDuringSync,
         status: changedDuringSync ? "pending" : "synced",
+        firstDirtyAt: changedDuringSync ? current.firstDirtyAt : undefined,
         lastSyncedAt: new Date().toISOString(),
         lastSyncedRevision: revision,
         remoteFileId,

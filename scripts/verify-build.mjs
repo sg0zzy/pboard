@@ -32,7 +32,12 @@ function verifyBackgroundStartup(source, kind) {
     identity: {},
     menus: { removeAll: async () => {}, create() {}, onClicked: event("menu") },
     commands: { onCommand: event("command") },
-    alarms: { onAlarm: event("alarm") }
+    alarms: {
+      onAlarm: event("alarm"),
+      get: async () => undefined,
+      create: async () => {},
+      clear: async () => true
+    }
   };
   // Evaluate the production bundle without Node's global/process/Buffer.
   // Merely checking that files exist misses browser-incompatible imports.

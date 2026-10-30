@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => {
 });
 vi.mock('../../../src/sync/runtime', () => ({
   createDriveRuntime: () => ({
-    googleDrive: { reconcileAll: mocks.reconcile },
+    googleDrive: { reconcileAll: mocks.reconcile, syncProject: vi.fn(async () => "pulled") },
     authorizePrivatePersistence: vi.fn(async () => {}),
     collaborationManager: { start: mocks.start, stop: mocks.stop, refreshRole: mocks.refresh, state: () => mocks.live },
     driveSyncState: { markDirty: mocks.dirty, get: async () => ({ remoteFileId: 'backup' }) },
@@ -19,7 +19,7 @@ vi.mock('../../../src/sync/runtime', () => ({
 import { createAndroidSync, type AndroidSync } from '../src/sync/service';
 let service: AndroidSync;
 let connected: boolean;
-const repository = { setMutatorRole: vi.fn() } as unknown as RxRepository;
+const repository = { setMutatorRole: vi.fn(), listProjects: vi.fn(async () => []) } as unknown as RxRepository;
 beforeEach(() => {
   vi.useFakeTimers(); vi.clearAllMocks(); localStorage.clear(); connected = true;
   mocks.live.role = 'editor'; mocks.live.error = null;
@@ -40,6 +40,8 @@ describe('Android foreground sync lifecycle', () => {
     expect(mocks.reconcile).toHaveBeenCalledTimes(1); expect(mocks.start).toHaveBeenCalledWith('board');
     await service.events.projectChanged?.('board'); await service.events.projectChanged?.('board');
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(mocks.reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(12 * 60_000);
     expect(mocks.reconcile).toHaveBeenCalledTimes(2); expect(mocks.start).toHaveBeenCalledTimes(1);
     expect(mocks.refresh).toHaveBeenCalled();
     await service.setForeground(false);
@@ -50,7 +52,7 @@ describe('Android foreground sync lifecycle', () => {
     await service.initialize(); mocks.reconcile.mockRejectedValueOnce(new Error('Network unavailable'));
     await service.setForeground(true);
     expect(service.state().error).toBe('Network unavailable');
-    await vi.advanceTimersByTimeAsync(25_000);
+    await vi.advanceTimersByTimeAsync(24 * 60_000);
     expect(mocks.reconcile).toHaveBeenCalledTimes(2);
     expect(service.state().error).toBe(''); expect(service.state().lastSynced).not.toBe('');
   });

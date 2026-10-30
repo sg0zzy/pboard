@@ -60,6 +60,7 @@ vi.mock("../src/sync/client", () => ({
 }));
 
 vi.mock("../src/sync/browser", () => ({
+  operationService: { subscribeRole: async () => () => {}, role: async () => "viewer" },
   boardCollaboration: { settings: async () => ({ provider: "drive", url: "wss://pboard.cecosl.ovh/ws" }) },
   collaborationManager: {
     state: () => ({ ready: false, role: "private", connectedPeers: [], error: null }),

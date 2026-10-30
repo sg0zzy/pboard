@@ -1,5 +1,9 @@
 # Two operating modes and automatic recovery: behavior contract
 
+> Superseded for synchronization/authorization by the user’s 28 October 2026
+> [Drive-first operation contract](drive-operation-sync.md). Retained as historical
+> context; its independent board-grant authority is not active in the default runtime.
+
 Status: **approved architectural baseline**, 19 October 2026. Job 1 of the implementation
 sequence agreed in this conversation. This document specifies target behavior and
 test outcomes; it does not describe completed functionality. The user approved

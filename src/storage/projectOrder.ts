@@ -57,6 +57,14 @@ function restoreTime(preference: ProjectOrderPreference, projectId: string): num
   return saved ? Date.parse(saved) : Number.NEGATIVE_INFINITY;
 }
 
+/** When a board left this account's list. Re-share detection needs the moment,
+ * not only the flag: a later restore event outranks the deletion marker. */
+export function projectDeletionTime(preference: ProjectOrderPreference, projectId: string): number | null {
+  const deleted = deletionTime(preference, projectId);
+  if (!Number.isFinite(deleted)) return null;
+  return restoreTime(preference, projectId) > deleted ? null : deleted;
+}
+
 /**
  * Deletion markers merge across devices. Each side states its deletion fact; a
  * project stays deleted when EITHER side deleted it later than the last known

@@ -14,7 +14,7 @@ const open = async () => {
 };
 
 // The collaboration setting is the mode switch: `websocket` is Sync v2.
-const runtimeFor = (storage: MemoryStorage, rx: RxRepository, stub: DriveStub, onReconciled?: () => Promise<void>) => createDriveRuntime({
+const runtimeFor = (storage: MemoryStorage, rx: RxRepository, stub: DriveStub, onReconciled?: () => Promise<void>) => createDriveRuntime({ operationSync: false,
   storage, getRepository: async () => rx,
   auth: {
     getAccessToken: async () => 'token', getConnectionState: async () => 'connected' as const,

@@ -4,8 +4,8 @@
 import type { KeyValueStorage } from '../storage/repository';
 import type { GoogleAuthProvider } from '../sync/googleAuth';
 import { createBoardGrantService, rendezvousOrigin, validateRendezvous, type BoardGrantBundle, type BoardDeviceRequest } from './boardGrants';
-import { ensureDeviceKey, importSigningKey, publicKeyFingerprint, signBytes, verifyBytes, type DevicePublicKey } from './security/keys';
-import { canonicalBytes, fromBase64Url, parseStrictJson, toBase64Url, type Json } from './security/canonical';
+import { ensureDeviceKey, importSigningKey, importVerifyingKey, signBytes, type DevicePublicKey } from './security/keys';
+import { canonicalBytes, canonicalize, fromBase64Url, parseStrictJson, SIGNATURE_ALGORITHM, toBase64Url, type Json } from './security/canonical';
 import { manifestHash, type SignedManifest } from './security/manifest';
 import { storageManifestEpochs } from './security/enrollment';
 import { collaborationDiagnostic } from './diagnostics';
@@ -38,14 +38,65 @@ export function createGoogleIdentitySharing(options: {
   // head signature: an altered history prefix must still be rejected.
   const trusted = new Map<string, { digest: string; device: string }>();
   const epochs = storageManifestEpochs(options.storage);
+  // Canonical text is produced on every call; only the SHA-256 over it is memoized.
+  // Verification outcomes and imported verifying keys are pure in their inputs, so a
+  // repeated sync reuses them. The caps keep a long-lived sidebar from growing the
+  // memos with every republished policy.
+  const MAX_MEMO_ENTRIES = 128;
+  const canonicalDigests = new Map<string, string>();
+  async function fingerprint(publicJwk: DevicePublicKey): Promise<string> {
+    const canonical = canonicalize(publicJwk as unknown as Json);
+    const known = canonicalDigests.get(canonical);
+    if (known !== undefined) return known;
+    const digest = toBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))));
+    if (canonicalDigests.size >= MAX_MEMO_ENTRIES) canonicalDigests.clear();
+    canonicalDigests.set(canonical, digest);
+    return digest;
+  }
+  const verifiedPolicies = new Map<string, boolean>();
+  const verifyingKeys = new Map<string, Promise<CryptoKey | null>>();
+  async function verifyCanonical(canonical: string, signature: string, publicJwk: DevicePublicKey): Promise<boolean> {
+    // The authority part of the memo key is the JWK curve and point; the canonical
+    // policy text already embeds the authority, so a replayed signature against a
+    // different authority can never hit an entry created for a valid one.
+    const authority = `${publicJwk.crv}:${publicJwk.x}:${publicJwk.y}`, memoKey = `${canonical}\u0000${signature}\u0000${authority}`;
+    const known = verifiedPolicies.get(memoKey);
+    if (known !== undefined) return known;
+    if (verifiedPolicies.size >= MAX_MEMO_ENTRIES) verifiedPolicies.clear();
+    if (!/^[A-Za-z0-9_-]{86}$/.test(signature)) return false; // 64 bytes => 86 base64url chars
+    let raw: Uint8Array;
+    try { raw = fromBase64Url(signature); } catch { return false; }
+    if (raw.length !== 64) return false;
+    let cachedKey = verifyingKeys.get(authority);
+    if (cachedKey === undefined) {
+      if (verifyingKeys.size >= MAX_MEMO_ENTRIES) verifyingKeys.clear();
+      cachedKey = importVerifyingKey(publicJwk).catch(() => null); verifyingKeys.set(authority, cachedKey);
+    }
+    const verifyingKey = await cachedKey;
+    if (!verifyingKey) return false; // Malformed JWK coordinates or unsupported key: fail closed.
+    let verified: boolean;
+    try { verified = await crypto.subtle.verify(SIGNATURE_ALGORITHM, verifyingKey, raw as BufferSource, new TextEncoder().encode(canonical) as BufferSource); } catch { return false; }
+    verifiedPolicies.set(memoKey, verified);
+    return verified;
+  }
   async function bundleDigest(bundle: BoardGrantBundle) {
     const bytes = new Uint8Array(canonicalBytes(json(bundle)));
     return toBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
   }
   let last: { at: number; selected?: string; reply: Reply; ready: string[]; issues: CapacityIssue[] } | null = null;
   const exclusive = <T>(work: () => Promise<T>) => { const result = chain.then(work, work); chain = result.catch(() => {}); return result; };
-  const local = async () => ((await options.storage.get(STORE))[STORE] ?? {}) as Record<string, Local>;
-  async function save(board: string, value: Local) { await options.storage.set({ [STORE]: { ...await local(), [board]: value } }); }
+  // Reads are shared inside one work unit instead of per entry. Every write still
+  // reaches storage and updates the cached view, so a sync never judges membership
+  // from a snapshot taken before its own writes; a grant write appends signed
+  // history, so the cached row for that board is dropped.
+  let localView: Record<string, Local> | null = null;
+  const bundleView = new Map<string, BoardGrantBundle | null>();
+  async function local() { return localView ??= ((await options.storage.get(STORE))[STORE] ?? {}) as Record<string, Local>; }
+  async function grantBundle(board: string) {
+    if (!bundleView.has(board)) bundleView.set(board, await options.grants.localBundle(board));
+    return bundleView.get(board) ?? null;
+  }
+  async function save(board: string, value: Local) { const view = await local(); await options.storage.set({ [STORE]: { ...view, [board]: value } }); view[board] = value; }
   async function http(path: string, body?: unknown, token?: string, limit = 1024 * 1024) {
     const setting = await options.grants.settings();
     if (setting.provider !== 'websocket') throw new Error('WebSocket collaboration is not enabled');
@@ -78,7 +129,7 @@ export function createGoogleIdentitySharing(options: {
     return reply;
   }
   async function publication(board: string, email: string, members?: Local['members']): Promise<Publication> {
-    const bundle = await options.grants.localBundle(board);
+    const bundle = await grantBundle(board);
     if (!bundle || !await options.grants.ownsAuthority(board)) throw new Error('Only the original authority browser can manage email sharing');
     const previous = (await local())[board];
     if (previous && previous.ownerEmail !== email) throw new Error('This board belongs to a different Google account. Its authority will not be reassigned.');
@@ -92,27 +143,28 @@ export function createGoogleIdentitySharing(options: {
     if (policy.version !== 1 || !/^[A-Za-z0-9_-]{1,200}$/.test(policy.boardId) || policy.expiresAt <= Date.now() || policy.issuedAt > Date.now() + 30_000 || policy.expiresAt - policy.issuedAt > 600_000
       || !Array.isArray(policy.members) || policy.members.length > 16 || !Array.isArray(entry.pending) || entry.pending.length > 16
       || (policy.ownerEmail !== email && !policy.members.some(m => m.email === email && ['editor','viewer'].includes(m.role)))
-      || !await verifyBytes(policy.authority, signature, canonicalBytes(json(['pboard-identity-policy-v1', policy])))) throw new Error('Invalid or unauthorized board identity policy');
+      || !await verifyCanonical(canonicalize(json(['pboard-identity-policy-v1', policy])), signature, policy.authority)) throw new Error('Invalid or unauthorized board identity policy');
     const ownerPolicy = (await local())[policy.boardId];
     if (ownerPolicy && await options.grants.ownsAuthority(policy.boardId) && (policy.ownerEmail !== ownerPolicy.ownerEmail || policy.issuedAt < ownerPolicy.revision || JSON.stringify(policy.members) !== JSON.stringify(ownerPolicy.members))) throw new Error('Stale sharing policy rejected; open this board in its original authority browser to republish current invitations');
-    const previous = await options.grants.localBundle(policy.boardId);
+    const previous = await grantBundle(policy.boardId);
     // A Drive-verified authority transition replaces the local authority on
     // purpose; the stale directory policy (signed by the old authority) is
     // then republished from the new chain instead of blocking sync.
-    if (previous && await publicKeyFingerprint(previous.authority) !== await publicKeyFingerprint(policy.authority) && !await options.grants.authorityTransitioned(policy.boardId)) throw new Error('Existing board authority differs from the directory; automatic replacement is forbidden');
+    if (previous && await fingerprint(previous.authority) !== await fingerprint(policy.authority) && !await options.grants.authorityTransitioned(policy.boardId)) throw new Error('Existing board authority differs from the directory; automatic replacement is forbidden');
     return policy;
   }
   async function readBundle(policy: EmailPolicy): Promise<BoardGrantBundle> {
-    const pin = await publicKeyFingerprint(policy.authority);
+    const pin = await fingerprint(policy.authority);
     const scope = toBase64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(['pboard-board-grants-v1', pin, policy.boardId])))));
     const received = await http(`/grants/${scope}`, undefined, undefined, 4 * 1024 * 1024) as { version: number; authority: DevicePublicKey; history: { payload: string; signature: string }[] };
-    if (received.version !== 1 || !Array.isArray(received.history) || await publicKeyFingerprint(received.authority) !== pin) throw new Error('Missing signed board manifest');
+    if (received.version !== 1 || !Array.isArray(received.history) || await fingerprint(received.authority) !== pin) throw new Error('Missing signed board manifest');
     const last = received.history.at(-1);
     if (!last || (parseStrictJson(new TextDecoder().decode(fromBase64Url(last.payload))) as unknown as SignedManifest['payload']).boardId !== policy.boardId) throw new Error('Board identity differs from its grant');
     return { format: 'pboard-board-grants-v1', endpoint: (await options.grants.settings()).url, authority: received.authority,
       history: received.history.map(s => ({ payload: parseStrictJson(new TextDecoder().decode(fromBase64Url(s.payload))) as unknown as SignedManifest['payload'], signature: s.signature })) };
   }
   async function syncWork(selected?: string, force = false) {
+    localView = null; bundleView.clear();
     if ((await options.grants.settings()).provider !== 'websocket' || await options.auth.getConnectionState() !== 'connected') { last = null; requests.clear(); publications.clear(); trusted.clear(); return { email: '', boards: [] as Entry[], ready: [] as string[], issues: [] as CapacityIssue[] }; }
     if (!force && last && last.selected === selected && Date.now() - last.at < IDENTITY_REFRESH_MS - 1000) return { ...last.reply, ready: last.ready, issues: last.issues };
     collaborationCounters.countEvent("identity.sync.full");
@@ -124,7 +176,7 @@ export function createGoogleIdentitySharing(options: {
     // A signed directory entry for this account takes precedence over creating a
     // new authority, including on a device restored from its private Drive backup.
     const selectedEntry = reply.boards.find(e => e.publication.policy.boardId === selected);
-    if (selected && !await options.grants.localBundle(selected) && !selectedEntry && await options.canInitialize(selected)) await options.grants.initialize(selected);
+    if (selected && !await grantBundle(selected) && !selectedEntry && await options.canInitialize(selected)) { await options.grants.initialize(selected); bundleView.delete(selected); }
     // Validate advertised policies before republishing anything; a replay or
     // authority mismatch must never be hidden by an automatic renewal.
     for (const entry of reply.boards) await check(entry, reply.email);
@@ -133,8 +185,15 @@ export function createGoogleIdentitySharing(options: {
     const owned = new Set([...Object.entries(policies).filter(([, p]) => p.ownerEmail === reply.email).map(([board]) => board), ...(selected ? [selected] : [])]);
     for (const board of owned) {
       if (!await options.grants.ownsAuthority(board) || !await options.canReceive(board, reply.email, reply.email)) continue;
-      await options.grants.security(board); // renew every owned board, not only the selected one
-      const advertised = reply.boards.find(e => e.publication.policy.boardId === board)?.publication.policy;
+      const entry = reply.boards.find(e => e.publication.policy.boardId === board);
+      const bundle = await grantBundle(board);
+      // Merely visiting a private board must not enroll it forever. Keep
+      // unattended invitations, pending enrollment and already paired devices
+      // alive, but let inactive single-device private entries expire/evict.
+      if (board !== selected && !policies[board]?.members.length
+        && !entry?.pending.length && (bundle?.history.at(-1)?.payload.devices.length ?? 0) <= 1) continue;
+      await options.grants.security(board); bundleView.delete(board);
+      const advertised = entry?.publication.policy;
       if (!advertised || advertised.expiresAt - Date.now() < 120_000) {
         const deferred = publications.get(board);
         if (!force && !advertised && deferred?.email === reply.email && deferred.retryAt > Date.now()) {
@@ -156,15 +215,15 @@ export function createGoogleIdentitySharing(options: {
     for (const entry of reply.boards) {
       const policy = await check(entry, reply.email);
       if (!await options.canReceive(policy.boardId, policy.ownerEmail, reply.email)) continue;
-      const pin = await publicKeyFingerprint(policy.authority);
+      const pin = await fingerprint(policy.authority);
       if (await options.grants.ownsAuthority(policy.boardId)) {
         const own = await key(`board-device:${policy.boardId}`);
         const bindings = (await local())[policy.boardId];
         for (const pending of entry.pending) {
           const role: Role | undefined = pending.email === policy.ownerEmail ? 'editor' : policy.members.find(m => m.email === pending.email)?.role;
           if (!role || pending.request.authorityKeyId !== pin || pending.request.boardId !== policy.boardId || pending.request.deviceKeyId === own.keyId || !await options.grants.automaticDeviceAllowed(policy.boardId, pending.request.deviceKeyId)) continue;
-          const current = (await options.grants.localBundle(policy.boardId))!.history.at(-1)!.payload.devices.find(d => d.deviceKeyId === pending.request.deviceKeyId);
-          if (!current || current.role !== role) await options.grants.approve(JSON.stringify(pending.request), pending.request.deviceKeyId, role);
+          const current = (await grantBundle(policy.boardId))!.history.at(-1)!.payload.devices.find(d => d.deviceKeyId === pending.request.deviceKeyId);
+          if (!current || current.role !== role) { await options.grants.approve(JSON.stringify(pending.request), pending.request.deviceKeyId, role); bundleView.delete(policy.boardId); }
           if (bindings) bindings.devices[pending.request.deviceKeyId] = pending.email;
         }
         if (bindings) await save(policy.boardId, bindings);
@@ -188,7 +247,7 @@ export function createGoogleIdentitySharing(options: {
         } else {
           requests.delete(policy.boardId);
           const digest = await bundleDigest(bundle), cached = trusted.get(policy.boardId);
-          const current = await options.grants.localBundle(policy.boardId);
+          const current = await grantBundle(policy.boardId);
           const head = bundle.history.at(-1)!.payload;
           const scoped = { ...head, boardId: `board-grant:${pin}:${policy.boardId}` };
           const accepted = await epochs.read(scoped.boardId);
@@ -200,7 +259,7 @@ export function createGoogleIdentitySharing(options: {
             || !accepted || accepted.epoch !== head.epoch || accepted.hash !== manifestHash(scoped) || accepted.expiresAt !== head.expiresAt
             || await bundleDigest(current) !== digest) {
             trusted.delete(policy.boardId);
-            await options.grants.trust(JSON.stringify(bundle), pin);
+            await options.grants.trust(JSON.stringify(bundle), pin); bundleView.delete(policy.boardId);
             trusted.set(policy.boardId, { digest, device: own.keyId });
           }
           ready.push(policy.boardId);
@@ -212,6 +271,7 @@ export function createGoogleIdentitySharing(options: {
     return { ...reply, ready, issues };
   }
   async function change(board: string, email: string, role: Role | null) {
+    localView = null; bundleView.clear();
     email = normalizedEmail(email);
     if (!/^[\x21-\x7e]+@[^\s@]+$/.test(email) || email.length > 254) throw new Error('Enter a valid email address');
     const reply = await exchange({ type: 'sync', publication: null });
@@ -223,7 +283,7 @@ export function createGoogleIdentitySharing(options: {
     // Failure stops the action; it never leaves an advertised removal with an
     // unchanged active manifest. Existing downloaded data cannot be erased.
     const updates = Object.fromEntries(Object.entries(existing.devices).filter(([, account]) => account === email).map(([id]) => [id, role]));
-    if (Object.keys(updates).length) await options.grants.updateAuthorizedDevices(board, updates);
+    if (Object.keys(updates).length) { await options.grants.updateAuthorizedDevices(board, updates); bundleView.delete(board); }
     await exchange({ type: 'sync', publication: await publication(board, reply.email, members) });
     last = null;
   }

@@ -85,7 +85,7 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
       void requestDriveReconciliation();
       if (selectedProject.current !== projectId) return;
       if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
-      else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Drive sync complete.');
+      else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Sync OK');
       await refresh();
     } catch (error) { if (selectedProject.current === projectId) setLocalError(error instanceof Error ? error.message : "Google Drive sync failed"); }
     finally { syncing.current.delete(projectId); setSyncingProjects(new Set(syncing.current)); }

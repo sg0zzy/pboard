@@ -65,7 +65,7 @@ function runtimeWithStorage(storage: {
     clientId: "id", identity: { getRedirectURL: () => "", launchWebAuthFlow: async () => undefined },
     storage, now: () => Date.now()
   });
-  return createDriveRuntime({ auth, storage, getRepository: async () => null, hasSignalingHostPermission: async () => false });
+  return createDriveRuntime({ operationSync: false, auth, storage, getRepository: async () => null, hasSignalingHostPermission: async () => false });
 }
 
 it("does not rewrite a shared-project layout that did not change", async () => {

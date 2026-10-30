@@ -24,7 +24,7 @@ function makeStorage() {
   return { data, get: async (key: string) => ({ [key]: structuredClone(data.get(key)) }), set: async (patch: Record<string, unknown>) => { for (const [key, value] of Object.entries(patch)) data.set(key, structuredClone(value)); } };
 }
 
-function makeFetcher(acl: unknown[]) {
+function makeFetcher(acl: unknown[], layout: 'legacy' | 'unified' | 'missing' | 'unavailable' = 'legacy') {
   let published: unknown;
   const fetcher = vi.fn<typeof fetch>(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -40,6 +40,15 @@ function makeFetcher(acl: unknown[]) {
     if (url.pathname === '/drive/v3/files/folder1') return json({ id: 'folder1', name: BOARD, mimeType: 'application/vnd.google-apps.folder' });
     if (url.pathname === '/drive/v3/files') {
       const query = url.searchParams.get('q') ?? '';
+      if (layout === 'unavailable') return new Response('{}', { status: 403 });
+      if (layout === 'unified') {
+        const folderMime = 'application/vnd.google-apps.folder';
+        if (query.includes("name = 'pboard'")) return json({ files: [{ id: 'root-v2', name: 'pboard', mimeType: folderMime, parents: ['actual-root'] }] });
+        if (query.includes(`name = '${BOARD}'`)) return json({ files: [{ id: 'folder-v2', name: BOARD, mimeType: folderMime, parents: ['root-v2'] }] });
+        if (query.includes("name = 'board.json.gz'")) return json({ files: [{ id: 'snapshot-v2', name: 'board.json.gz', parents: ['folder-v2'] }] });
+        return json({ files: [] });
+      }
+      if (layout === 'missing') return json({ files: [] });
       if (query.includes('sharedWithMe')) return json({ files: [] });
       if (query.includes("'project.json'")) return json({ files: [{ id: 'pj', name: 'project.json', mimeType: 'application/json' }] });
       return json({ files: [] });
@@ -77,12 +86,12 @@ const auth: GoogleAuthProvider = {
   isConfigured: () => true, getAccessToken: async () => 'drive-token'
 };
 
-function setup(acl: unknown[]) {
+function setup(acl: unknown[], layout: 'legacy' | 'unified' | 'missing' | 'unavailable' = 'legacy') {
   const storage = makeStorage();
-  const drive = makeFetcher(acl);
+  const drive = makeFetcher(acl, layout);
   const { rx, transitions, permissions } = makeRepository();
-  const runtime = createDriveRuntime({ auth, storage, getRepository: async () => rx, fetcher: drive.fetcher, hasSignalingHostPermission: async () => true });
-  return { storage, runtime, transitions, permissions, get published() { return drive.published; } };
+  const runtime = createDriveRuntime({ operationSync: false, auth, storage, getRepository: async () => rx, fetcher: drive.fetcher, hasSignalingHostPermission: async () => true });
+  return { storage, runtime, transitions, permissions, fetcher: drive.fetcher, get published() { return drive.published; } };
 }
 
 it('unblocks a Drive-owned board with lost authority when the sharing view asks for the role', async () => {
@@ -112,3 +121,37 @@ it('keeps the block for a verified non-owner and states the re-key refusal reaso
   expect(a.storage.data.get('pboardBoardGrants')).toBeUndefined();
   expect(a.transitions).toHaveLength(0);
 });
+
+it('recovers the owner authority from the unified folder without legacy project.json or sharing metadata', async () => {
+  const a = setup([{ id: 'owner', type: 'user', role: 'owner', emailAddress: EMAIL }], 'unified');
+  expect(await a.runtime.sharePermissions.myRole(BOARD)).toBe('owner');
+  expect(a.transitions).toHaveLength(1);
+  expect(a.transitions[0]!.record.driveFolderFileId).toBe('folder-v2');
+  expect(a.published).toBeTruthy();
+  const calls = vi.mocked(a.fetcher).mock.calls;
+  expect(calls.some(([input]) => String(input).includes('/folder-v2/permissions'))).toBe(true);
+  expect(calls.filter(([input]) => String(input).includes('googleapis.com')).every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
+});
+
+it('refuses unified-folder re-key for a writer even with a stale legacy owned-folder record', async () => {
+  const a = setup([
+    { id: 'owner', type: 'user', role: 'owner', emailAddress: 'them@example.com' },
+    { id: 'writer', type: 'user', role: 'writer', emailAddress: EMAIL }
+  ], 'unified');
+  a.storage.data.set('pboardDriveSharedProjects', { [BOARD]: { folderId: 'legacy-owned', projectFileId: 'old-project' } });
+  // Exercise the explicit recovery entry point: legacy trust also blocks auto-init.
+  await expect(a.runtime.reestablishAuthorityFromDrive(BOARD)).rejects.toThrow(/does not report this account as the board folder owner/);
+  expect(a.storage.data.get('pboardBoardGrants')).toBeUndefined();
+  expect(a.transitions).toHaveLength(0);
+});
+
+for (const layout of ['missing', 'unavailable'] as const) {
+  it(`keeps signed data blocked when Drive discovery is ${layout}, without creating a proof folder`, async () => {
+    const a = setup([{ id: 'owner', type: 'user', role: 'owner', emailAddress: EMAIL }], layout);
+    await expect(a.runtime.sharePermissions.myRole(BOARD)).rejects.toBeInstanceOf(BoardExistingSignedDataError);
+    expect(a.storage.data.get('pboardBoardGrants')).toBeUndefined();
+    expect(a.transitions).toHaveLength(0);
+    expect(a.published).toBeUndefined();
+    expect(vi.mocked(a.fetcher).mock.calls.filter(([input]) => String(input).includes('googleapis.com')).every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
+  });
+}

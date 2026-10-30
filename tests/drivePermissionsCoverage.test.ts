@@ -615,7 +615,7 @@ describe("verifyDriveOwnership", () => {
     broken.transport.listPermissions.mockRejectedValue(new Error("Drive 503"));
     await expect(broken.service.verifyDriveOwnership("p1")).rejects.toThrow("Drive 503");
     const unshared = makeService({ identity: { email: "me@example.com" } });
-    await expect(unshared.service.verifyDriveOwnership("p1")).rejects.toThrow(/not shared through Google Drive/);
+    await expect(unshared.service.verifyDriveOwnership("p1")).rejects.toThrow(/No existing Drive board folder was found/);
   });
 });
 

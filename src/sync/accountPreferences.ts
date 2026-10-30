@@ -5,6 +5,7 @@ import type { DriveTransport } from "./driveTransport";
 /** Durable, account-private order; live WebRTC replication remains available. */
 export function createAccountPreferenceSync(options: {
   transport: DriveTransport;
+  legacySource?: DriveTransport;
   getAccountId: () => Promise<string | null>;
   getRepository: () => Promise<Pick<RxRepository, "getProjectOrder" | "applyProjectOrder" | "setProjectOrderAccount" | "listProjects" | "db"> | null>;
 }) {
@@ -23,6 +24,10 @@ export function createAccountPreferenceSync(options: {
     }
     let file = await options.transport.findProjectFile(account);
     let saved: string | null = null;
+    if (!file && options.legacySource) {
+      const legacy = await options.legacySource.findProjectFile(account);
+      if (legacy) await rx.applyProjectOrder(account, parseProjectOrder(await options.legacySource.download(legacy.id)));
+    }
     if (file) {
       const remote = parseProjectOrder(await options.transport.download(file.id));
       await rx.applyProjectOrder(account, remote);

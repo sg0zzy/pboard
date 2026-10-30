@@ -165,13 +165,12 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
       [...state.files.values()].filter((f) => f.name === name && f.mimeType === mimeType).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType })),
     listSharedWithMe: async () => sharedWithMe,
     listPermissions: async (fileId) => permissionsFor(fileId).map((p) => ({ ...p })),
-    createPermission: async (fileId, role, email, createdTime?: string) => {
+    createPermission: async (fileId, role, email) => {
       const permission: DrivePermission = {
         id: nextId("perm"),
         type: "user",
         role: role === "editor" ? "writer" : "reader",
-        emailAddress: email,
-        ...(createdTime ? { createdTime } : {})
+        emailAddress: email
       };
       const list = permissionsFor(fileId);
       list.push(permission);
@@ -512,26 +511,31 @@ describe("createDrivePermissionService", () => {
     expect((await service.discoverSharedProjects()).map((d) => d.projectId)).toEqual(["indexed"]);
   });
 
-  it("ranks only collaborator grants created clearly after the removal above the deletion marker", async () => {
+  it("restores a left board only when the caller's own grant id changed after a recorded removal", async () => {
     const { service, fake, store } = makeService({ identity: "collab@example.com" });
     const folderId = await service.ensureSharedProject("proj1");
-    fake.state.permissions.set(folderId, [{ id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
-    const granted = Date.parse("2026-01-02T00:00:00Z");
-    const grant = (createdTime?: string) => {
-      fake.state.permissions.set(folderId, [
-        { id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" },
-        { id: "perm-mine", type: "user", role: "reader", emailAddress: "collab@example.com", ...(createdTime ? { createdTime } : {}) }
-      ]);
-    };
-    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // no collaborator row yet
-    grant();
-    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // legacy rows carry no createdTime
-    grant(new Date(granted).toISOString());
-    expect(await service.wasReinvitedSince("proj1", granted - 120_000)).toBe(true);
-    expect(await service.wasReinvitedSince("proj1", granted - 30_000)).toBe(false); // clock-skew margin
-    expect(await service.wasReinvitedSince("proj1", granted + 120_000)).toBe(false); // removal came after the grant
+    const grant = (id: string) => fake.state.permissions.set(folderId, [
+      { id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" },
+      { id, type: "user", role: "reader", emailAddress: "collab@example.com" }
+    ]);
+    // The first observation of a grant has nothing to order it against, so it
+    // only records the baseline: a grant that predates the leave cannot be
+    // mistaken for a re-invitation.
+    grant("perm-1");
+    expect(await service.wasReinvitedSince("proj1")).toBe(false);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false); // same grant, never revoked
+    // A different id for the same grantee means the old grant was revoked and
+    // re-issued, which is the only ordering signal Drive exposes.
+    grant("perm-2");
+    expect(await service.wasReinvitedSince("proj1")).toBe(true);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false); // baseline advanced
+    // The leave itself is the baseline, so the owner's next grant is a new one.
+    await service.removeSelfFromProject("proj1");
+    grant("perm-3");
+    expect(await service.wasReinvitedSince("proj1")).toBe(true);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false);
     expect(store.records.get("proj1")!.folderId).toBe(folderId);
-    expect(await service.wasReinvitedSince("never-shared", 0)).toBe(false);
+    expect(await service.wasReinvitedSince("never-shared")).toBe(false);
   });
 });
 

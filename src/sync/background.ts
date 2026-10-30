@@ -2,10 +2,9 @@ import { browser } from "../platform/browser";
 import { drivePermissions, googleDrive, driveSyncState } from "./browser";
 import { isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
-import { recoveryDelayMs } from "./recoveryScheduler";
+import { dirtyFlushAt, drivePollDelay } from "./syncPolicy";
 import { collaborationCounters } from "../collab/counters";
 
-const IDLE_SYNC_DELAY_MS = 25_000;
 const ALARM_PREFIX = "pboard-drive-sync:";
 
 export function registerDriveBackgroundSync() {
@@ -29,16 +28,21 @@ export function registerDriveBackgroundSync() {
    * which is why the sync itself is not delayed by reading the attempt count.
    */
   const retrying = new Set<string>();
-  const schedule = async (projectId: string, delayMs = IDLE_SYNC_DELAY_MS) => {
-    if (await googleDrive.getConnectionState() !== "connected" && !(await driveSyncState.get(projectId)).permanentDeletion) return;
+  const schedule = async (projectId: string, delayMs?: number) => {
+    const state = await driveSyncState.get(projectId);
+    if (await googleDrive.getConnectionState() !== "connected" && !state.permanentDeletion) return;
     scheduled.add(projectId);
-    await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: Date.now() + delayMs });
+    await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: delayMs === undefined ? Math.max(Date.now(), dirtyFlushAt(state)) : Date.now() + delayMs });
   };
   browser.storage.onChanged.addListener((changes: Record<string, { newValue?: unknown }>, area: string) => {
     if (area !== "local") return;
     for (const [key, change] of Object.entries(changes)) {
       if (!key.startsWith(DRIVE_PROJECT_STATE_PREFIX)) continue;
       const next = change.newValue as DriveProjectSyncState | undefined;
+      if (next && !next.dirty) {
+        scheduled.delete(next.projectId);
+        void browser.alarms.clear?.(`${ALARM_PREFIX}${next.projectId}`);
+      }
       if (!next?.dirty || next.status !== "pending") continue;
       // A board that is already scheduled must not get another one: the sync
       // that is already pending is the one that will pick this change up.
@@ -72,24 +76,39 @@ export function registerDriveBackgroundSync() {
           const attempt = await attempts.get(projectId);
           await attempts.set(projectId, attempt + 1);
           collaborationCounters.countBackgroundSync("unsettled");
-          await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+          await schedule(projectId, drivePollDelay(attempt));
           return;
         }
         await attempts.clear(projectId);
         retrying.delete(projectId);
         collaborationCounters.countBackgroundSync("settled");
         collaborationCounters.setRetryingBoards(retrying.size);
-      } catch {
+      } catch (error) {
         // Bounded exponential backoff; the durable attempt count survives restart.
         const attempt = await attempts.get(projectId);
         await attempts.set(projectId, attempt + 1);
         collaborationCounters.countBackgroundSync("failed");
-        await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+        const cooldown = error instanceof Error && 'waitMs' in error ? Number(error.waitMs) || 0 : 0;
+        await schedule(projectId, Math.max(drivePollDelay(attempt), cooldown));
       }
     })();
   });
 
   void googleDrive.reconcileAll().catch(() => undefined);
+  // Alarms may be lost on browser restart. Restore their absolute deadlines
+  // from durable dirty state, including while no sidebar is open.
+  void browser.storage.local.get(null).then((saved: Record<string, unknown>) => {
+    for (const [key, value] of Object.entries(saved)) {
+      const state = value as DriveProjectSyncState | undefined;
+      if (key.startsWith(DRIVE_PROJECT_STATE_PREFIX) && state?.dirty && !scheduled.has(state.projectId)) {
+        void (async () => {
+          if (await browser.alarms.get?.(`${ALARM_PREFIX}${state.projectId}`)) { scheduled.add(state.projectId); return; }
+          const attempt = await attempts.get(state.projectId);
+          await schedule(state.projectId, attempt ? drivePollDelay(attempt) : undefined);
+        })();
+      }
+    }
+  });
 }
 
 type RecoveryAttempts = { get(projectId: string): Promise<number>; set(projectId: string, attempt: number): Promise<void>; clear(projectId: string): Promise<void> };

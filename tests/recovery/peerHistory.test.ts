@@ -9,6 +9,8 @@ import { verifyJournalChange } from '../../src/collab/security/journalProof';
 import { makeChange, type Change } from '../../src/storage/changeJournal';
 import type { CollaborationSecurityOptions } from '../../src/collab/manager';
 import type { VerifiedSessionContext } from '../../src/collab/security/session';
+import type { WithDeleted } from 'rxdb';
+import type { CardRecord } from '../../src/storage/rxdbSchemas';
 const repos: RxRepository[] = [], sessions: PeerHistorySession[] = [];
 afterEach(async () => { vi.useRealTimers(); sessions.splice(0).forEach(s => s.close()); for (const r of repos.splice(0)) await r.db.close(); });
 async function fixture() {
@@ -253,15 +255,23 @@ it('keeps pre-enrollment private content local while publishing later authentica
 });
 it('uses proven causal descendants over reversed document clocks in the existing RxDB conflict handler', async () => {
   const f = await fixture(), card = await f.a.addItem({ projectId: f.board.id, content: 'Initial' });
-  const doc = (await f.a.db.cards.findOne(card.id).exec())!;
-  await doc.incrementalModify(value => ({ ...value, content: 'Future-clock ancestor', updatedAt: '2099-01-01T00:00:00.000Z' }));
+  const ancestorHandle = (await f.a.db.cards.findOne(card.id).exec())!;
+  await ancestorHandle.incrementalModify(value => ({ ...value, content: 'Future-clock ancestor', updatedAt: '2099-01-01T00:00:00.000Z' }));
   const ancestor = (await f.a.reconciliation.inspect({ boardId: f.board.id, collection: 'cards', documentId: card.id })).variants[0];
   const wire = link(f); await wire.sync();
-  await doc.incrementalModify(value => ({ ...value, content: 'Past-clock descendant', updatedAt: '2001-01-01T00:00:00.000Z' }));
+  // Anchoring requires a write whose previous is the recorded head; a stale handle is refused as an anonymous fork.
+  const descendantHandle = (await f.a.db.cards.findOne(card.id).exec())!;
+  await descendantHandle.incrementalModify(value => ({ ...value, content: 'Past-clock descendant', updatedAt: '2001-01-01T00:00:00.000Z' }));
   await wire.sync();
   expect((await f.b.getCard(card.id))?.content).toBe('Past-clock descendant');
-  const descendant = (await f.b.reconciliation.inspect({ boardId: f.board.id, collection: 'cards', documentId: card.id })).variants[0];
-  const winner = await f.b.db.cards.conflictHandler.resolve({ realMasterState: ancestor.value as any, newDocumentState: descendant.value as any }, 'peer-history-clock');
+  const atB = await f.b.reconciliation.inspect({ boardId: f.board.id, collection: 'cards', documentId: card.id });
+  expect(atB.kind).toBe('current');
+  const descendant = atB.variants[0];
+  expect(atB.heads).toEqual([descendant.id]);
+  expect(descendant.parents).toEqual([ancestor.id]);
+  // Change.value is the untyped journal document; the handler input is the typed card row.
+  const master = ancestor.value as WithDeleted<CardRecord>, next = descendant.value as WithDeleted<CardRecord>;
+  const winner = await f.b.db.cards.conflictHandler.resolve({ realMasterState: master, newDocumentState: next }, 'peer-history-clock');
   expect(winner.content).toBe('Past-clock descendant');
 });
 

@@ -6,6 +6,13 @@ import { createRxRepository } from "../src/storage/rxdbRepository";
 import { serializeProjectSnapshot } from "../src/sync/snapshot";
 import type { BoardItem, Project } from "../src/types";
 
+// These fixtures cover the retained legacy discovery path; the operation runtime
+// has dedicated migration/Drive-only integration coverage.
+vi.mock('../src/sync/runtime', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/sync/runtime')>();
+  return { ...actual, createDriveRuntime: (options: Parameters<typeof actual.createDriveRuntime>[0]) => actual.createDriveRuntime({ ...options, operationSync: false }) };
+});
+
 // Stub the extension `browser` API so the real src/sync/browser can be imported
 // without a Chromium/extension context. vi.mock is hoisted above the static
 // import of src/sync/browser below, so the stub is in place when that module

@@ -101,7 +101,9 @@ describe("missing shared image retry backoff", () => {
       // probed again on a base cadence, not on the old deep backoff.
       imageIds.push(second);
       stub.notifyCards(); // card change → immediate probe of the new asset
-      await vi.advanceTimersByTimeAsync(0);
+      // The listener pass is fire-and-forget and its next delay is armed when it
+      // settles; await that same pass so the cadence is armed before the clock moves.
+      await sync.tick();
       expect(reads).toBe(beforeLate + 2);
       await vi.advanceTimersByTimeAsync(2_500); // base(1s)+backoff(2s) probe arrives...
       expect(reads).toBe(beforeLate + 3); // ...while a stale 16s backoff would be silent

@@ -65,6 +65,14 @@ prevents a spurious baseline fork. At reconciliation time, heads descending
 only from synthetic `baseline` roots are inert snapshots, never authored
 branches: a lone authored chain beside such heads resolves to the newest
 state instead of a conflict.
+
+A prepare that names a specific recorded entry as its parent is refused when that entry is no
+longer the head this journal recorded for the document, because another recorded entry has
+already superseded it. The refusal lands at prepare time, before the entry is constructed or
+written, so the recorded head stays intact and nothing is left pending: a queued or stale-UI
+write cannot become an anonymous fork that only surfaces as a conflict at confirm time.
+Content that more than one recorded candidate could explain is not a claim on a specific
+entry, so the unknown baseline root above is never refused.
 Existing records are captured lazily when first edited; there is no destructive
 startup rewrite or automatic signature attestation. Legacy imports retain unknown
 ancestry. Existing signed operation IDs/signatures remain unchanged inside `_sec`.
@@ -129,6 +137,11 @@ The bounded `receive(changes, verify)` entry point checks content identity, scop
 parents and document binding, requires an explicit verifier even on replay, and
 atomically retains a verified batch. Cross-board references are rejected even
 when the child arrives before its parent. There is no permissive verifier default.
+Reconciliation intake refuses a batch whose board was retired while the batch was in flight,
+never appending to a retired journal and never reading one as live history; the refusal is
+decided from the erasure markers read inside the same strict transaction that would write the
+entries, and a refused batch strands nothing pending. Other callers that tolerate a
+partially-applied batch keep the silent per-entry drop.
 It is not connected to legacy transport payloads in these jobs: current protocol-2
 mutation signatures authenticate document data, **not the new journal parentage**.
 Job 7 adds detached author proofs and a separate bounded peer intake path that
@@ -144,11 +157,12 @@ npm run test:recovery -- --browser
 npm run typecheck
 ```
 
-The 22 new tests cover actual RxDB writes, restart, scoped acknowledgements,
+The 24 new tests cover actual RxDB writes, restart, scoped acknowledgements,
 preparation failure, commit/ack interruption, uncertain recovery, signed baseline
 preservation, rejected writes, image retention, causal ordering, equivalent and
 independent changes, persistent text conflicts, structural edits, missing parents,
-tombstones, resolutions, replay, invalid identities and cross-board references.
+tombstones, resolutions, replay, invalid identities, cross-board references, a prepare that
+claims a superseded parent, and a batch whose board was retired while it was in flight.
 IndexedDB unit tests use fake-indexeddb; native browser recovery is separate.
 
 The existing native WebRTC regression exposed responses finishing after a peer

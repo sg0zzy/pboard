@@ -6,11 +6,23 @@
  * a hot path, and the collection itself is disabled outside a development
  * build, so the production cost is a single boolean check per call site.
  */
+import { driveCostResource, driveRequestCost, type DriveCostResource } from "../sync/driveQuota";
 
 /** The counters a development build exposes. */
 export type CollaborationCounters = {
   /** Drive requests issued, by purpose. */
   driveRequests: { sync: number; reconcile: number; discovery: number; identity: number; other: number };
+  /** Drive request cost, by resource. `byResource` holds the authoritative number:
+   *  Google's reported `X-Drive-Request-Cost` when the response carried it, otherwise
+   *  the projection, which is the local model (`projected`) and not a measurement.
+   */
+  driveCost: {
+    requests: number;
+    projected: number;
+    reported: number;
+    reportedRequests: number;
+    byResource: Partial<Record<DriveCostResource, number>>;
+  };
   /** Background sync attempts, and how they ended. */
   backgroundSync: { attempts: number; settled: number; unsettled: number; failed: number; scheduled: number };
   /** The boards the background worker is currently retrying. */
@@ -40,6 +52,7 @@ export type CollaborationCounters = {
 
 const counters: CollaborationCounters = {
   driveRequests: { sync: 0, reconcile: 0, discovery: 0, identity: 0, other: 0 },
+  driveCost: { requests: 0, projected: 0, reported: 0, reportedRequests: 0, byResource: {} },
   backgroundSync: { attempts: 0, settled: 0, unsettled: 0, failed: 0, scheduled: 0 },
   retryingBoards: 0,
   sharedDiscovery: { listings: 0, cached: 0 },
@@ -74,6 +87,7 @@ export const collaborationCounters = {
   snapshot(): CollaborationCounters {
     return {
       driveRequests: { ...counters.driveRequests },
+      driveCost: { ...counters.driveCost, byResource: { ...counters.driveCost.byResource } },
       backgroundSync: { ...counters.backgroundSync },
       retryingBoards: counters.retryingBoards,
       sharedDiscovery: { ...counters.sharedDiscovery },
@@ -92,6 +106,7 @@ export const collaborationCounters = {
   /** Reset every counter. */
   clear(): void {
     counters.driveRequests = { sync: 0, reconcile: 0, discovery: 0, identity: 0, other: 0 };
+    counters.driveCost = { requests: 0, projected: 0, reported: 0, reportedRequests: 0, byResource: {} };
     counters.backgroundSync = { attempts: 0, settled: 0, unsettled: 0, failed: 0, scheduled: 0 };
     counters.retryingBoards = 0;
     counters.sharedDiscovery = { listings: 0, cached: 0 };
@@ -109,6 +124,20 @@ export const collaborationCounters = {
   countDriveRequest(purpose: keyof CollaborationCounters["driveRequests"]): void {
     if (!enabled()) return;
     counters.driveRequests[purpose] += 1;
+  },
+  /** Price one Drive request; Google's reported cost outranks the local projection. */
+  countDriveCost(resource: DriveCostResource, projected: number, reported?: number): void {
+    if (!enabled()) return;
+    const cost = counters.driveCost;
+    cost.requests += 1;
+    cost.projected += projected;
+    if (reported === undefined || !Number.isFinite(reported)) {
+      cost.byResource[resource] = (cost.byResource[resource] ?? 0) + projected;
+      return;
+    }
+    cost.reported += reported;
+    cost.reportedRequests += 1;
+    cost.byResource[resource] = (cost.byResource[resource] ?? 0) + reported;
   },
   countEvent(name: string, by = 1): void {
     if (!enabled()) return;
@@ -192,16 +221,28 @@ export const collaborationCounters = {
    */
   instrumentFetcher(fetcher: typeof fetch): typeof fetch {
     if (!DIAGNOSTICS) return fetcher;
-    return (input, init) => {
+    return async (input, init) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input instanceof Request ? input.url : "";
-      const purpose: DrivePurpose = /drive\/v3\/about|\/oauth2\/v1\/userinfo|oauth2\.googleapis\.com\/(token|revoke)/.test(url)
+      const purpose: DrivePurpose = /drive\/v3\/about|\/oauth2\/v1\/userinfo|oauth2\.googleapis.com\/(token|revoke)/.test(url)
         ? "identity"
         : drivePurpose ?? "other";
       counters.driveRequests[purpose] += 1;
-      return fetcher(input, init);
+      const response = await fetcher(input, init);
+      // Only Drive endpoints are priced, and the header number outranks the model.
+      if (url.includes("/drive/v3/")) {
+        const header = response.headers?.get("X-Drive-Request-Cost");
+        const reported = header ? Number(header) : undefined;
+        collaborationCounters.countDriveCost(driveCostResource(url), driveRequestCost(url), reported);
+      }
+      return response;
     };
   }
 };
+
+/** The counters API this module publishes: the shape consumers and the background
+ *  global see. Named here so callers import a contract instead of projecting the
+ *  implementation value's type. */
+export type CollaborationCountersApi = typeof collaborationCounters;
 
 type DrivePurpose = keyof CollaborationCounters["driveRequests"];
 let drivePurpose: DrivePurpose | null = null;
@@ -211,7 +252,7 @@ declare global {
    * The recurring work counters, exposed on the background page's global in a
    * development build so a developer can read them from the console.
    */
-  var pboardCounters: typeof collaborationCounters | undefined;
+  var pboardCounters: CollaborationCountersApi | undefined;
   /** Set by the build when the counters are collected. */
   var __PBOARD_DIAGNOSTICS__: boolean;
 }

@@ -18,7 +18,7 @@ async function setup() {
   const repo = { installBoardSecurity: vi.fn(async () => ({ projectId: 'board', uninstall: vi.fn(async () => {}) })),
     admitPendingWork: vi.fn(async (_board: string) => {}) };
   const data: Record<string, unknown> = {};
-  const runtime = createDriveRuntime({ auth: { getAccessToken: async () => { throw new Error('No account connected'); }, getConnectionState: async () => 'disconnected',
+  const runtime = createDriveRuntime({ operationSync: false, auth: { getAccessToken: async () => { throw new Error('No account connected'); }, getConnectionState: async () => 'disconnected',
     isConfigured: () => true, connect: async () => {}, disconnect: async () => {} },
     storage: { get: async key => ({ [key]: data[key] }), set: async values => { Object.assign(data, values); } },
     getRepository: async () => repo as unknown as RxRepository,

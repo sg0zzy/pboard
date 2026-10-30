@@ -41,7 +41,12 @@ Google identity. Policies last at most ten minutes. Scope is the existing
 root-fingerprint + board ID hash. Within a retained scope, owner changes, older
 issue times and same-time conflicting policies are rejected. No namespace can
 replace another root's grant. Expired directory tombstones are retained another
-390 seconds to reject immediate rollback; the directory is disposable, so
+390 seconds to reject immediate rollback. At capacity, a new valid publication
+may replace only the same authenticated owner's oldest owner-only entry that
+has never carried invitations or device requests in this directory lifetime.
+Collaboration entries retain their rollback floor even after invitations or
+requests are removed; other owners' entries are never displaced. The 16-entry
+per-owner and 64-entry global bounds remain unchanged. The directory is disposable, so
 clients preserve their authority pin and membership history across restarts.
 The original root browser also persists its policy revision and email membership
 and refuses replayed/removed invitations before approving pending devices, even
@@ -64,7 +69,7 @@ TLS service, verify the entire signed history and require their own key in the
 current manifest. Existing pins cannot be replaced. Manual pairing remains an
 alternative with independently compared fingerprints/codes.
 
-Fixed directory caps: 64 retained scopes, 8 per verified owner, 16 invited emails
+Fixed directory caps: 64 retained scopes, 16 per verified owner, 16 invited emails
 and 16 pending device requests per scope; 128 pending challenges. These bounds
 are additional to the configurable global HTTP/auth/room/traffic quotas. Only
 public authorization metadata is held in memory; there is no content mailbox,

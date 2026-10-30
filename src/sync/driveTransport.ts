@@ -1,5 +1,7 @@
 import type { GoogleAuthProvider } from "./googleAuth";
 import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { driveBoundedRetryDelayMs } from "./driveRetry";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -28,35 +30,48 @@ type GoogleDriveErrorResponse = {
 
 const escapeDriveQuery = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 
-export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, filePrefix = "project-"): DriveTransport {
+export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, filePrefix = "project-", regularParent?: () => Promise<string>, quota: DriveQuotaThrottle = defaultDriveQuotaThrottle()): DriveTransport {
   const projectFileName = (projectId: string) => `${filePrefix}${projectId.replace(/[^a-zA-Z0-9_-]/g, "_")}.pboard`;
-  async function requestError(response: Response): Promise<Error> {
-    let detail = "";
+  async function errorDetail(response: Response): Promise<string> {
     try {
       const body = await response.json() as GoogleDriveErrorResponse;
       const reason = body.error?.errors?.find((entry) => entry.reason)?.reason;
-      detail = [reason, body.error?.status, body.error?.message].filter(Boolean).join(": ");
+      return [reason, body.error?.status, body.error?.message].filter(Boolean).join(": ");
     } catch {
       // Some intermediary failures return a non-JSON response.
+      return "";
     }
+  }
+
+  async function requestError(response: Response): Promise<Error> {
+    const detail = await errorDetail(response);
+    // Quota denial stays distinguishable from permission denial.
+    if (isDriveQuotaFailure(detail)) return driveQuotaError(response.status, detail, quota);
     return new Error(`Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
 
-  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0): Promise<Response> {
+  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0, spentMs = 0): Promise<Response> {
     const token = await auth.getAccessToken(!retry);
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
+    const cost = driveRequestCost(input);
+    // Respect projected budget deferrals and real Google quota cooldowns.
+    await quota.acquire(cost, init.signal);
     // Account signaling/preferences and snapshots must observe writes made
     // by another browser, including when the URL is unchanged between polls.
     const response = await fetcher(input, { ...init, headers,
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
-    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt);
+    quota.observe(cost, response.headers);
+    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt, spentMs);
+    if (response.status === 429 && isDriveQuotaFailure(await errorDetail(response.clone()))) throw await requestError(response);
     // A transient Google-side failure (internalError, rate limit) usually
-    // clears on a replay; only one-shot methods are replayed.
+    // clears on a replay; only one-shot methods are replayed. A quota denial is
+    // not replayed blindly.
     if (!response.ok && DRIVE_TRANSIENT_STATUSES[response.status] && attempt + 1 < DRIVE_TRANSIENT_ATTEMPTS &&
         isDriveReplayableMethod(init.method)) {
-      await new Promise<void>((resolve) => { setTimeout(resolve, driveRetryDelayMs(attempt, response.headers.get("Retry-After"))); });
-      return authorizedFetch(input, init, retry, attempt + 1);
+      const delay = driveBoundedRetryDelayMs(attempt, response.headers.get("Retry-After"), spentMs, await errorDetail(response));
+      await new Promise<void>((resolve) => { setTimeout(resolve, delay); });
+      return authorizedFetch(input, init, retry, attempt + 1, spentMs + delay);
     }
     if (!response.ok) throw await requestError(response);
     return response;
@@ -65,8 +80,8 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
   async function findProjectFile(projectId: string): Promise<DriveAppDataFile | null> {
     const name = projectFileName(projectId);
     const params = new URLSearchParams({
-      spaces: "appDataFolder",
-      q: `name = '${escapeDriveQuery(name)}' and trashed = false`,
+      spaces: regularParent ? "drive" : "appDataFolder",
+      q: `name = '${escapeDriveQuery(name)}' and trashed = false${regularParent ? ` and '${escapeDriveQuery(await regularParent())}' in parents` : ''}`,
       fields: "files(id,name,modifiedTime)",
       pageSize: "2"
     });
@@ -80,8 +95,8 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     let pageToken: string | undefined;
     do {
       const params = new URLSearchParams({
-        spaces: "appDataFolder",
-        q: `name contains '${escapeDriveQuery(filePrefix)}' and trashed = false`,
+        spaces: regularParent ? "drive" : "appDataFolder",
+        q: `name contains '${escapeDriveQuery(filePrefix)}' and trashed = false${regularParent ? ` and '${escapeDriveQuery(await regularParent())}' in parents` : ''}`,
         fields: "nextPageToken,files(id,name,modifiedTime)",
         pageSize: "100"
       });
@@ -111,7 +126,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     const boundary = `pboard_${crypto.randomUUID().replaceAll("-", "")}`;
     const metadata = JSON.stringify({
       name: projectFileName(projectId),
-      parents: ["appDataFolder"],
+      parents: [regularParent ? await regularParent() : "appDataFolder"],
       mimeType: "application/json"
     });
     const body = [

@@ -16,6 +16,8 @@ const equalHeads = (a: string[], b: string[]) => a.length === b.length && [...a]
 
 export function createConflictResolution(options: {
   journal: ChangeJournal;
+  excludedBoards?: () => ReadonlySet<string>;
+  ignoreBoard?: (boardId: string) => boolean;
   collections: Collections;
   canDraft?(boardId: string): Promise<boolean>;
   assertCanMutate(boardId: string): void | Promise<void>;
@@ -58,7 +60,8 @@ export function createConflictResolution(options: {
   }
   async function listConflicts(): Promise<ConflictRecord[]> {
     const erased = new Set((await journal.boardErasures()).map(entry => entry.boardId));
-    const entries = (await journal.committedEntries()).filter(e => !erased.has(e.boardId));
+    const excluded = options.excludedBoards?.();
+    const entries = (await (excluded?.size ? journal.committedEntriesExcept(excluded) : journal.committedEntries())).filter(e => !erased.has(e.boardId) && !options.ignoreBoard?.(e.boardId));
     const groups = new Map<string, typeof entries>();
     const signedBoards = new Set(entries.filter(e => e.value._sec).map(e => e.boardId));
     // "No handle" boards: anything the current account list cannot show gets a

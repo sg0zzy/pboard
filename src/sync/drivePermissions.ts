@@ -1,5 +1,6 @@
 import type { GoogleAuthProvider } from "./googleAuth";
-import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
+import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveBoundedRetryDelayMs, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
 import type { PboardDriveSignalRecord, PboardDriveSignalStore } from "../collab/signaling";
 import { collaborationCounters } from "../collab/counters";
 import type { BoardImage } from "../types";
@@ -19,8 +20,6 @@ export type DrivePermission = {
   role: "reader" | "writer" | "owner" | "fileOrganizer";
   emailAddress?: string;
   displayName?: string;
-  /** Server-set grant time (ISO), requested so re-invitations outrank old deletions. */
-  createdTime?: string;
 };
 
 export type DriveFileRef = { id: string; name: string; mimeType: string; modifiedTime?: string; parents?: string[] };
@@ -92,47 +91,78 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 const driveRole = (role: PboardCollaboratorRole): "reader" | "writer" => (role === "editor" ? "writer" : "reader");
 const escapeDriveQuery = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 
-export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch): DrivePermissionTransport {
-  async function requestError(response: Response): Promise<Error> {
-    let detail = "";
+export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, quota: DriveQuotaThrottle = defaultDriveQuotaThrottle()): DrivePermissionTransport {
+  async function errorDetail(response: Response): Promise<string> {
     try {
       const body = await response.json() as GoogleDriveErrorResponse;
       const reason = body.error?.errors?.find((entry) => entry.reason)?.reason;
-      detail = [reason, body.error?.status, body.error?.message].filter(Boolean).join(": ");
+      return [reason, body.error?.status, body.error?.message].filter(Boolean).join(": ");
     } catch {
       // Non-JSON intermediary failures.
+      return "";
     }
+  }
+
+  async function requestError(response: Response): Promise<Error> {
+    let detail = await errorDetail(response);
     if (response.status === 403 && /insufficientScopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes/i.test(detail)) {
       detail += "; reconnect Google Drive and allow project sharing access";
     }
+    // A quota denial is not a permission denial: the caller must still see the
+    // quota, so this branch runs before the generic failure message.
+    if (isDriveQuotaFailure(detail)) return driveQuotaError(response.status, detail, quota);
     return new Error(`Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
 
-  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0): Promise<Response> {
+  async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0, spentMs = 0): Promise<Response> {
     const token = await auth.getAccessToken(!retry);
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
+    const cost = driveRequestCost(input);
+    // Defer projected overshoots; a real Google quota denial blocks requests
+    // through the context's shared cooldown before they reach the network.
+    await quota.acquire(cost, init.signal);
     // Presence, offers and answers change at the same URLs. A cached empty
     // file search or older peer record can prevent two browsers rendezvousing.
     const response = await fetcher(input, { ...init, headers,
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
-    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt);
+    quota.observe(cost, response.headers);
+    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt, spentMs);
+    if (response.status === 429 && isDriveQuotaFailure(await errorDetail(response.clone()))) throw await requestError(response);
     // A transient Google-side failure (internalError, rate limit) usually
-    // clears on a replay; only one-shot methods are replayed.
+    // clears on a replay; only one-shot methods are replayed. A quota denial is
+    // not replayed blindly — the throttle owns the cooldown and the error
+    // reaches the caller.
     if (!response.ok && DRIVE_TRANSIENT_STATUSES[response.status] && attempt + 1 < DRIVE_TRANSIENT_ATTEMPTS &&
         isDriveReplayableMethod(init.method)) {
-      await new Promise<void>((resolve) => { setTimeout(resolve, driveRetryDelayMs(attempt, response.headers.get("Retry-After"))); });
-      return authorizedFetch(input, init, retry, attempt + 1);
+      const delay = driveBoundedRetryDelayMs(attempt, response.headers.get("Retry-After"), spentMs, await errorDetail(response));
+      await new Promise<void>((resolve) => { setTimeout(resolve, delay); });
+      return authorizedFetch(input, init, retry, attempt + 1, spentMs + delay);
     }
     if (!response.ok) throw await requestError(response);
     return response;
   }
-
+  /**
+   * A listing request is priced by the page size it asks for, so the funnels ask
+   * for a small page and follow the continuation token. `nextPageToken` must be in
+   * the projection or the loop cannot see that more results exist.
+   */
+  const LIST_PAGE_SIZE = "20";
+  async function listFilesPage(params: URLSearchParams): Promise<DriveFileRef[]> {
+    const files: DriveFileRef[] = [];
+    for (;;) {
+      const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
+      const body = await response.json() as { files?: DriveFileRef[]; nextPageToken?: string };
+      files.push(...(body.files ?? []));
+      if (!body.nextPageToken) return files;
+      params.set("pageToken", body.nextPageToken);
+    }
+  }
   async function findFile(name: string, parentId: string): Promise<DriveFileRef | null> {
     const params = new URLSearchParams({
       spaces: "drive",
       q: `name = '${escapeDriveQuery(name)}' and '${escapeDriveQuery(parentId)}' in parents and trashed = false`,
-      fields: "files(id,name,mimeType,modifiedTime)",
+      fields: "files(id,name,mimeType,modifiedTime,parents)",
       pageSize: "2"
     });
     const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
@@ -195,16 +225,13 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
       const response = await authorizedFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,modifiedTime,parents`);
       return await response.json() as DriveFileRef;
     },
-    async listFiles(parentId) {
-      const params = new URLSearchParams({
+    async listFiles(parentId: string) {
+      return listFilesPage(new URLSearchParams({
         spaces: "drive",
         q: `'${encodeURIComponent(parentId)}' in parents and trashed = false`,
-        fields: "files(id,name,mimeType,modifiedTime)",
-        pageSize: "100"
-      });
-      const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
-      const body = await response.json() as { files?: DriveFileRef[] };
-      return body.files ?? [];
+        fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)",
+        pageSize: LIST_PAGE_SIZE
+      }));
     },
     async deleteFile(fileId) {
       try {
@@ -223,34 +250,32 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
         return [];
       }
     },
-    async listFilesByName(name, mimeType) {
-      const params = new URLSearchParams({
+    async listFilesByName(name: string, mimeType: string) {
+      return listFilesPage(new URLSearchParams({
         spaces: "drive",
         q: `name = '${escapeDriveQuery(name)}' and mimeType = '${escapeDriveQuery(mimeType)}' and trashed = false`,
-        fields: "files(id,name,mimeType,modifiedTime)",
-        pageSize: "100"
-      });
-      const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
-      const body = await response.json() as { files?: DriveFileRef[] };
-      return body.files ?? [];
+        fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)",
+        pageSize: LIST_PAGE_SIZE
+      }));
     },
     async listSharedWithMe() {
-      const params = new URLSearchParams({
+      return listFilesPage(new URLSearchParams({
         spaces: "drive",
         q: "sharedWithMe = true and trashed = false",
-        fields: "files(id,name,mimeType,modifiedTime)",
-        pageSize: "100"
-      });
-      const response = await authorizedFetch(`${DRIVE_API}/files?${params}`);
-      const body = await response.json() as { files?: DriveFileRef[] };
-      return body.files ?? [];
+        fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)",
+        pageSize: LIST_PAGE_SIZE
+      }));
     },
-    async listPermissions(fileId) {
-      const response = await authorizedFetch(
-        `${DRIVE_API}/files/${encodeURIComponent(fileId)}/permissions?fields=permissions(id,type,role,emailAddress,displayName,createdTime)&pageSize=100`
-      );
-      const body = await response.json() as { permissions?: DrivePermission[] };
-      return body.permissions ?? [];
+    async listPermissions(fileId: string) {
+      const permissions: DrivePermission[] = [];
+      const params = new URLSearchParams({ fields: "nextPageToken,permissions(id,type,role,emailAddress,displayName)", pageSize: LIST_PAGE_SIZE });
+      for (;;) {
+        const response = await authorizedFetch(`${DRIVE_API}/files/${encodeURIComponent(fileId)}/permissions?${params}`);
+        const body = await response.json() as { permissions?: DrivePermission[]; nextPageToken?: string };
+        permissions.push(...(body.permissions ?? []));
+        if (!body.nextPageToken) return permissions;
+        params.set("pageToken", body.nextPageToken);
+      }
     },
     async restrictWriterSharing(fileId) {
       // Metadata PATCH on the standard API host; a non-ok response rejects.
@@ -293,6 +318,14 @@ export type DriveSharedProjectRecord = {
   folderId: string | null;
   projectFileId: string | null;
   realtimeFolderId: string | null;
+  /**
+   * Baseline for re-invitation detection: the id this account's own
+   * collaborator permission had at the previous observation. Null means the
+   * account held no grant at that observation. Drive's Permission
+   * representation carries no creation time, so this is the only ordering
+   * signal available; it is the sole field here beyond the layout ids.
+   */
+  observedGrantId?: string | null;
 };
 export interface DriveSharedProjectStore {
   get(projectId: string): Promise<DriveSharedProjectRecord>;
@@ -301,8 +334,12 @@ export interface DriveSharedProjectStore {
 }
 
 export interface DrivePermissionServiceOptions {
+  prepareOperationBoard?: (projectId: string) => Promise<void>;
+  isOperationBoard?: (projectId: string) => Promise<boolean>;
   transport: DrivePermissionTransport;
   sharedProjects: DriveSharedProjectStore;
+  /** Read-only current-layout lookup, supplied for Sync v2 authority recovery. */
+  findOwnershipFolder?: (projectId: string) => Promise<string | null>;
   /** Reads the current local snapshot (project + hydrated items) for a project. */
   readSnapshot: (projectId: string) => Promise<string>;
 }
@@ -349,11 +386,13 @@ export interface DrivePermissionService {
    */
   removeSelfFromProject(projectId: string): Promise<void>;
   /**
-   * True when the caller's own collaborator permission on this board was
-   * granted strictly after `sinceMs` (plus a clock-skew margin): the owner
-   * re-invited after the local removal, so a deletion marker must yield.
+   * True when this account's collaborator grant on the board differs from the
+   * grant id recorded at the previous observation: the original grant was
+   * revoked and a new one issued after the removal, so the deletion marker
+   * must yield. A board whose grant was never observed before the removal has
+   * no baseline; the first observation records it and reports false.
    */
-  wasReinvitedSince(projectId: string, sinceMs: number): Promise<boolean>;
+  wasReinvitedSince(projectId: string): Promise<boolean>;
   listCollaborators(projectId: string): Promise<Collaborator[]>;
   invite(projectId: string, email: string, role: PboardCollaboratorRole): Promise<void>;
   updateRole(projectId: string, email: string, role: PboardCollaboratorRole): Promise<void>;
@@ -406,7 +445,7 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     const byProject = new Map<string, DiscoveredSharedProject[]>();
     const note = async (projectId: string, file: DriveFileRef, knownFolderId?: string) => {
       const cached = await sharedProjects.get(projectId);
-      const folderId = knownFolderId ?? (await transport.getFileParents(file.id))[0];
+      const folderId = knownFolderId ?? file.parents?.[0] ?? (await transport.getFileParents(file.id))[0];
       if (cached.folderId !== folderId || cached.projectFileId !== file.id) {
         await sharedProjects.set(projectId, { ...(folderId ? { folderId } : {}), projectFileId: file.id });
       }
@@ -414,12 +453,16 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
       byProject.get(projectId)!.push({ projectId, name: projectId, fileId: file.id });
     };
     for (const file of files) {
-      const folderId = (await transport.getFileParents(file.id))[0];
-      if (!folderId) continue;
-      const folder = await transport.getFile(folderId);
-      if (folder.mimeType !== FOLDER_MIME) continue;
-      // The folder is named after the projectId (see ensureSharedProject).
-      await note(folder.name, file, folderId);
+      try {
+        const folderId = file.parents?.[0] ?? (await transport.getFileParents(file.id))[0];
+        if (!folderId) continue;
+        const folder = await transport.getFile(folderId);
+        if (folder.mimeType !== FOLDER_MIME) continue;
+        // A name search may still contain a child of a trashed/revoked folder.
+        await note(folder.name, file, folderId);
+      } catch (error) {
+        if (!/\((403|404)\)/.test(String(error))) throw error;
+      }
     }
     // Drive name search can lag real permission changes by minutes, which
     // looks like "the invitation never arrived" even after a browser
@@ -434,7 +477,7 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
           if (marker && !seen.has(marker.id)) { seen.add(marker.id); await note(shared.name, marker); }
         } else if (shared.name === PROJECT_FILE_NAME && shared.mimeType === JSON_MIME && !seen.has(shared.id)) {
           seen.add(shared.id);
-          const parentId = (await transport.getFileParents(shared.id))[0];
+          const parentId = shared.parents?.[0] ?? (await transport.getFileParents(shared.id))[0];
           if (parentId) {
             const parent = await transport.getFile(parentId);
             if (parent.mimeType === FOLDER_MIME) await note(parent.name, shared);
@@ -459,12 +502,16 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     if (cached.folderId && cached.projectFileId) return cached;
     const match = (await discoverSharedProjects()).find((entry) => entry.projectId === projectId);
     if (!match) return { folderId: cached.folderId, projectFileId: cached.projectFileId, realtimeFolderId: cached.realtimeFolderId };
-    const folderId = (await transport.getFileParents(match.fileId))[0] ?? null;
+    // Discovery already persisted the parent it read from the listing projection;
+    // the parent read is a fallback for a cache that was written without it.
+    const written = await sharedProjects.get(projectId);
+    const folderId = written.folderId ?? (await transport.getFileParents(match.fileId))[0] ?? null;
     if (folderId) await sharedProjects.set(projectId, { folderId, projectFileId: match.fileId });
     return { folderId, projectFileId: match.fileId, realtimeFolderId: cached.realtimeFolderId };
   }
 
   async function ensureSharedProject(projectId: string): Promise<string> {
+    await options.prepareOperationBoard?.(projectId);
     const cached = await sharedProjects.get(projectId);
     const rootId = await ensureSharedRoot();
     let folderId = cached.folderId;
@@ -509,6 +556,11 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     const email = identity.email.trim().toLowerCase();
     if (permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email)) return "owner";
     const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email);
+    // First observation of this account's grant establishes the baseline the
+    // next read compares against, so a board left on another device can still
+    // be recognized as re-invited.
+    if (mine && (await sharedProjects.get(projectId)).observedGrantId === undefined)
+      await sharedProjects.set(projectId, { observedGrantId: mine.id });
     if (!mine) return null;
     return mine.role === "writer" ? "editor" : "viewer";
   }
@@ -524,16 +576,20 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
   // nothing from cache. Resolves ONLY when the live ACL proves this account
   // owns the board folder; every other outcome (not shared, signed out, API
   // failure, verified non-owner) throws so callers postpone rather than trust.
+  // Sync v2 supplies its existing canonical folder; private boards need no
+  // collaborator ACL or legacy project.json to establish their owner's proof.
   async function verifyDriveOwnership(projectId: string): Promise<DriveOwnershipProof> {
-    const layout = await resolveLayout(projectId);
-    if (!layout.folderId) throw new Error("This board is not shared through Google Drive; Drive ownership cannot be verified");
+    // Prefer the canonical v2 board over a retained legacy sharing record.
+    // Lookup must never create an empty owned folder as proof of ownership.
+    const folderId = await options.findOwnershipFolder?.(projectId) ?? (await resolveLayout(projectId)).folderId;
+    if (!folderId) throw new Error("No existing Drive board folder was found; Drive ownership cannot be verified");
     const identity = await transport.currentIdentity();
     if (!identity) throw new Error("Google account unavailable; Drive ownership is unverified");
-    const permissions = await transport.listPermissions(layout.folderId);
+    const permissions = await transport.listPermissions(folderId);
     const email = identity.email.trim().toLowerCase();
     if (!permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email))
       throw new Error("Google Drive does not report this account as the board folder owner; re-keying is refused");
-    return { folderFileId: layout.folderId, ownerEmailHash: await sha256Hex(email), aclDigest: await aclDigest(permissions), verifiedAt: Date.now() };
+    return { folderFileId: folderId, ownerEmailHash: await sha256Hex(email), aclDigest: await aclDigest(permissions), verifiedAt: Date.now() };
   }
 
   async function listCollaborators(projectId: string): Promise<Collaborator[]> {
@@ -582,7 +638,7 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) throw new Error("Enter a valid email address");
     await ensureSharedProject(projectId);
     const layout = await resolveLayout(projectId);
-    await transport.uploadJsonFile(layout.projectFileId!, await options.readSnapshot(projectId));
+    if (!await options.isOperationBoard?.(projectId)) await transport.uploadJsonFile(layout.projectFileId!, await options.readSnapshot(projectId));
     await transport.createPermission(layout.folderId ?? "", role, normalized);
     await grantRealtimeAccess(projectId, normalized);
   }
@@ -610,21 +666,32 @@ export function createDrivePermissionService(options: DrivePermissionServiceOpti
     if (permissions.some((p) => p.role === "owner" && p.emailAddress?.trim().toLowerCase() === email)) return;
     const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email);
     if (mine) await transport.deletePermission(layout.folderId, mine.id);
+    // The leave itself is the baseline: a different grant id at the next
+    // observation means the owner re-invited. Recorded as null here, including
+    // when the permission was already gone before the leave.
+    await sharedProjects.set(projectId, { observedGrantId: null });
     await revokeRealtimeAccess(projectId, email);
   }
 
-  async function wasReinvitedSince(projectId: string, sinceMs: number): Promise<boolean> {
+  async function wasReinvitedSince(projectId: string): Promise<boolean> {
     const layout = await resolveLayout(projectId);
     if (!layout.folderId) return false;
     const identity = await transport.currentIdentity();
     if (!identity?.email) return false;
     const email = identity.email.trim().toLowerCase();
-    const mine = (await transport.listPermissions(layout.folderId))
-      .find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email && p.role !== "owner");
-    // A minute of skew tolerance between Drive's server clock and local
-    // preference timestamps; without a recorded grant time nothing outranks
-    // the deletion.
-    return !!mine?.createdTime && Date.parse(mine.createdTime) > sinceMs + 60_000;
+    const permissions = await transport.listPermissions(layout.folderId);
+    const mine = permissions.find((p) => p.type === "user" && p.emailAddress?.trim().toLowerCase() === email && p.role !== "owner");
+    const recorded = (await sharedProjects.get(projectId)).observedGrantId;
+    if (recorded === undefined) {
+      // No prior observation: a single grant cannot be ordered against a
+      // removal that happened while this account was not reading the board.
+      await sharedProjects.set(projectId, { observedGrantId: mine?.id ?? null });
+      return false;
+    }
+    if (!mine) return false;
+    if (mine.id === recorded) return false;
+    await sharedProjects.set(projectId, { observedGrantId: mine.id });
+    return true;
   }
 
   async function findCollaborator(projectId: string, email: string): Promise<{ folderId: string; permission: DrivePermission }> {

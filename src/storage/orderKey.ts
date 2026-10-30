@@ -13,7 +13,7 @@ export function initialOrderKeys(count: number): string[] {
 }
 
 export function compareOrdered<T extends { id: string; orderKey: string }>(a: T, b: T): number {
-  return a.orderKey < b.orderKey ? -1 : a.orderKey > b.orderKey ? 1 : a.id.localeCompare(b.id);
+  return a.orderKey < b.orderKey ? -1 : a.orderKey > b.orderKey ? 1 : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 }
 
 /** Explicit maintenance operation, never run implicitly during an ordinary move. */

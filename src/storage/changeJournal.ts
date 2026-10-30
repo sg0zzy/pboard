@@ -2,6 +2,8 @@ import { portableJournalChanges, type JournalProof, type HistoryAdmission } from
 import { canonicalize, type Json } from "../collab/security/canonical";
 import { collaborationCounters } from "../collab/counters";
 
+const PERMANENTLY_DELETED = 'This board was permanently deleted';
+
 export type PublicGrant = { id: string; boardId: string; authority: import('../collab/security/keys').DevicePublicKey; manifest: import('../collab/security/manifest').SignedManifest };
 export type DocumentValue = Record<string, Json>;
 export type Change = {
@@ -48,6 +50,32 @@ export async function makeChange(input: Omit<Change, "version" | "id">): Promise
 }
 export function scope(change: Pick<Change, "boardId" | "collection" | "documentId">): string {
   return JSON.stringify([change.boardId, change.collection, change.documentId]);
+}
+
+/** Pending-review checkpoint and operation rows the confirmation guard reads. */
+export type PendingReviewRecord = { boardId: string; operationId: string; reviewedIds: string[] };
+export type OperationRecord = { id: string; boardId: string; sourceId?: string };
+
+/** Current heads: the edits nothing else supersedes and that no delivery has admitted. */
+export function pendingHeads(edits: PendingEdit[]): PendingEdit[] {
+  const superseded = new Set(edits.flatMap(e => e.supersedes ?? []));
+  return edits.filter(e => !e.admittedChangeId && !superseded.has(e.id));
+}
+/** Drafts a pending review already adopted as an operation. Adoption only shows in the pending
+ *  list for a bound board, so a checkpoint from an unbound board never excuses a head. */
+export function adoptedPendingIds(reviews: PendingReviewRecord[], operations: OperationRecord[], boundBoards: Set<string>): Set<string> {
+  const adopted = new Set<string>();
+  for (const review of reviews) {
+    if (!boundBoards.has(review.boardId)) continue;
+    const operation = operations.find(row => row.id === review.operationId);
+    if (operation?.boardId === review.boardId && operation.sourceId?.startsWith('pending:')) for (const id of review.reviewedIds) adopted.add(id);
+  }
+  return adopted;
+}
+/** The retained work a caller can confirm: heads minus what a pending review already adopted. */
+export function confirmableIds(edits: PendingEdit[], reviews: PendingReviewRecord[], operations: OperationRecord[], boundBoards: Set<string>): string[] {
+  const adopted = adoptedPendingIds(reviews, operations, boundBoards);
+  return pendingHeads(edits).filter(edit => !adopted.has(edit.id)).map(edit => edit.id).sort();
 }
 
 /** Small IndexedDB facade; no second Dexie runtime beside RxDB's pinned adapter. */
@@ -98,8 +126,22 @@ export class ChangeJournal {
   constructor(name: string) { this.name = `${name}-change-journal-v1`; }
   async open(): Promise<void> {
     this.database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(this.name, 6);
+      const request = indexedDB.open(this.name, 10);
       request.onupgradeneeded = () => {
+        // Transport-independent operation WAL shares the existing journal DB.
+        for (const name of ["operations", "operationStreams", "operationOutbox", "operationSegments", "operationCheckpoints"]) {
+          if (!request.result.objectStoreNames.contains(name)) {
+            const store = request.result.createObjectStore(name, { keyPath: "id" });
+            store.createIndex("boardId", "boardId");
+            if (["operationOutbox", "operationSegments"].includes(name)) store.createIndex("pendingBoard", "pendingBoard");
+          }
+        }
+        const operationMetadata = request.transaction!.objectStore('operationCheckpoints');
+        if (!operationMetadata.indexNames.contains('kind')) operationMetadata.createIndex('kind', 'kind');
+        if (!operationMetadata.indexNames.contains('kindBoard')) operationMetadata.createIndex('kindBoard', ['kind', 'boardId']);
+        const operationRows = request.transaction!.objectStore('operations');
+        if (!operationRows.indexNames.contains('sourceId')) operationRows.createIndex('sourceId', 'sourceId', { unique: true });
+        if (!operationRows.indexNames.contains('stream')) operationRows.createIndex('stream', ['boardId', 'operation.actorId', 'operation.seq']);
         if (!request.result.objectStoreNames.contains("entries")) {
         const entries = request.result.createObjectStore("entries", { keyPath: "id" });
         entries.createIndex("boardId", "boardId"); entries.createIndex("state", "state");
@@ -116,6 +158,8 @@ export class ChangeJournal {
         for (const name of ["permissions", "pendingEdits", "admissions"]) {
           if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name, { keyPath: "id" });
         }
+        const sources = request.transaction!.objectStore('entries');
+        if (!sources.indexNames.contains('localBoard')) sources.createIndex('localBoard', ['boardId', 'state', 'origin']);
       };
       request.onsuccess = () => { request.result.onversionchange = () => request.result.close(); resolve(request.result); };
       request.onerror = () => reject(request.error);
@@ -177,6 +221,24 @@ export class ChangeJournal {
     sender?.postMessage({ tables });
     if (sender !== this.channel) sender?.close();
   }
+  /** One strict transaction for operation identity, WAL and publication intent.
+   * The callback must enqueue IDB requests synchronously; never await network or
+   * WebCrypto while an IndexedDB transaction is active. */
+  operationTransaction<T>(boardId: string, names: string[], run: (transaction: IDBTransaction, result: (value: T) => void) => void, notifications?: string[]): Promise<T> {
+    const allowed = new Set(["operations", "operationStreams", "operationOutbox", "operationSegments", "operationCheckpoints", "entries"]);
+    if (!names.length || names.some(name => !allowed.has(name))) return Promise.reject(new Error("Invalid operation transaction"));
+    return new Promise<T>((resolve, reject) => {
+      const tx = this.database!.transaction([...names, "receipts"], "readwrite", { durability: "strict" });
+      let value: T;
+      tx.oncomplete = () => { this.notify([...(notifications ?? names), `operation-board:${boardId}`]); resolve(value); };
+      tx.onerror = tx.onabort = () => reject(tx.error ?? new Error("Operation transaction aborted"));
+      const marker = tx.objectStore('receipts').get(JSON.stringify([boardId, 'local-board-erasure']));
+      marker.onsuccess = () => {
+        if (marker.result) { tx.abort(); return; }
+        try { run(tx, result => { value = result; }); } catch (error) { tx.abort(); reject(error); }
+      };
+    });
+  }
   async read<T>(name: string, operation: (store: IDBObjectStore) => IDBRequest<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const transaction = this.database!.transaction(name, "readonly");
@@ -185,9 +247,9 @@ export class ChangeJournal {
       transaction.onerror = transaction.onabort = () => reject(transaction.error ?? new Error("Journal transaction aborted"));
     });
   }
-  async write(name: string, operation: (store: IDBObjectStore) => void): Promise<void> {
+  async write(name: string, operation: (store: IDBObjectStore, erasedBoards: Set<string>) => void): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const transaction = this.database!.transaction(name === 'receipts' ? [name] : name === 'entries' ? [name, 'receipts', 'boardFlags'] : [name, 'receipts'], "readwrite", { durability: "strict" });
+      const transaction = this.database!.transaction(name === 'receipts' ? [name] : name === 'entries' ? [name, 'receipts', 'boardFlags', 'operationCheckpoints'] : [name, 'receipts'], "readwrite", { durability: "strict" });
       transaction.oncomplete = () => {
         resolve();
         // A receipts write can add or update a board-erasure marker, so the
@@ -202,7 +264,12 @@ export class ChangeJournal {
         const guarded = new Proxy(store, { get(target, key) {
           if (key === 'put' || key === 'add') return (value: any, id?: IDBValidKey) => {
             const boardId = name === 'permissions' ? value.id : name === 'drafts' ? JSON.parse(value.target)[0] : value.boardId;
-            if (erased.has(boardId)) throw new Error('This board was permanently deleted');
+            if (erased.has(boardId)) throw new Error(PERMANENTLY_DELETED);
+            if (name === 'entries' && value.state === 'committed' && value.origin === 'local') {
+              const metadata = transaction.objectStore('operationCheckpoints');
+              const binding = metadata.get(`binding:${boardId}`);
+              binding.onsuccess = () => { if (binding.result?.pendingIndexed) metadata.put({ id: `source-pending:${value.id}`, kind: 'operation-source-pending', boardId, entryId: value.id }); };
+            }
             if (name === 'entries' && value.value?._sec && value.state === 'committed') {
               // Persist the monotonic signed-history bit inside the transaction
               // that commits the entry, so authorization checks answer from one
@@ -214,7 +281,7 @@ export class ChangeJournal {
           };
           const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value;
         } });
-        try { operation(guarded); } catch (error) { transaction.abort(); reject(error); }
+        try { operation(guarded, erased); } catch (error) { transaction.abort(); reject(error); }
       };
       if (name === 'receipts') run(new Set());
       else {
@@ -235,6 +302,16 @@ export class ChangeJournal {
       if (exact) return exact;
     }
     const portable = authenticated ? portableJournalChanges(candidates) : new Set<string>();
+    const recorded = candidates.filter(c => c.boardId === boardId && (c.state === "committed" || c.state === "prepared"));
+    const claims = new Set<JournalEntry>();
+    // Prepare states its ancestry claim in two forms: an explicit resolution set, or the
+    // single recorded entry it matched from the stored bytes. Either claim must be the head
+    // this journal recorded for this document; a claim on an entry this journal already
+    // superseded is the anonymous fork that would only surface as a conflict at confirm
+    // time, so it is refused here, before the entry is constructed or written, leaving the
+    // recorded head intact and nothing stranded. Unattributable content is not a claim on a
+    // specific entry, so it still synthesizes the honest unknown baseline root.
+    if (resolution) for (const claim of resolution) { const found = recorded.find(c => c.id === claim); if (found) claims.add(found); }
     let parent: JournalEntry | undefined;
     if (local && previous && !resolution) {
       // RxDB's storage wrapper generates revisions after our WAL boundary.
@@ -277,6 +354,9 @@ export class ChangeJournal {
           state: "committed", origin: "baseline" };
       }
     }
+    if (parent) claims.add(parent);
+    for (const claim of claims) if (recorded.some(c => c !== claim && c.parents.includes(claim.id))) throw new Error("Change must anchor on the recorded change journal head");
+
     const entry: JournalEntry = { ...await makeChange({ ...common, parents: resolution ?? (parent ? [parent.id] : []),
       ancestry: resolution || local && (!previous || parent) ? "known" : "unknown", value: documentValue(document) }),
       state: "prepared", origin: local ? "local" : "observed" };
@@ -315,11 +395,17 @@ export class ChangeJournal {
       };
     });
   }
-  /** Atomic batch admission, including references arriving before their parent. */
-  async accept(entries: JournalEntry[]): Promise<void> {
-    const erased = new Set((await this.boardErasures()).map(entry => entry.boardId));
-    entries = entries.filter(entry => !erased.has(entry.boardId));
-    await this.write("entries", store => {
+  /** Atomic batch admission, including references arriving before their parent. Callers
+   * that tolerate a partially-applied batch drop retired-board entries from the shared
+   * marker copy; reconciliation intake asks for refusal instead, so the decision is made
+   * from the markers read inside this same strict transaction. */
+  async accept(entries: JournalEntry[], refuseRetired = false): Promise<void> {
+    if (!refuseRetired) {
+      const erased = new Set((await this.boardErasures()).map(entry => entry.boardId));
+      entries = entries.filter(entry => !erased.has(entry.boardId));
+    }
+    await this.write("entries", (store, erasedBoards) => {
+      if (refuseRetired && entries.some(entry => erasedBoards.has(entry.boardId))) throw new Error(PERMANENTLY_DELETED);
       const request = store.getAll();
       request.onsuccess = () => {
         const existing = request.result as JournalEntry[];
@@ -366,16 +452,15 @@ export class ChangeJournal {
   /** Explicit local disposal. Receipt markers never leave this device. */
   async discardPendingWork(boardId: string, reviewedIds: string[], erasure?: { accountId: string | null; imageIds: string[]; cardIds: string[] }): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-      const tx = this.database!.transaction(['pendingEdits', 'receipts'], 'readwrite', { durability: 'strict' });
+      const tx = this.database!.transaction(['pendingEdits', 'receipts', 'operationCheckpoints', 'operations'], 'readwrite', { durability: 'strict' });
       let failure: Error | undefined;
       tx.oncomplete = () => { resolve(); this.notify(["pendingEdits", "receipts"]); };
       tx.onerror = tx.onabort = () => reject(failure ?? tx.error ?? new Error('Retained work could not be deleted'));
-      const store = tx.objectStore('pendingEdits'), request = store.getAll();
-      request.onsuccess = () => {
-        const edits = (request.result as PendingEdit[]).filter(edit => edit.boardId === boardId);
-        const superseded = new Set(edits.flatMap(edit => edit.supersedes ?? []));
-        const heads = edits.filter(edit => !edit.admittedChangeId && !superseded.has(edit.id)).map(edit => edit.id).sort();
-        if (canonicalize(heads) !== canonicalize([...new Set(reviewedIds)].sort()) || reviewedIds.length !== heads.length) {
+      const store = tx.objectStore('pendingEdits'), checkpoints = tx.objectStore('operationCheckpoints'), operationRows: OperationRecord[] = [], bound = new Set<string>();
+      const confirm = (edits: PendingEdit[], reviews: PendingReviewRecord[]) => {
+        const expected = confirmableIds(edits, reviews, operationRows, bound);
+        const confirmed = new Set(reviewedIds);
+        if (confirmed.size !== expected.length || confirmed.size !== reviewedIds.length || canonicalize([...confirmed].sort()) !== canonicalize(expected)) {
           failure = new Error('Retained work changed. Review it again before deleting.'); tx.abort(); return;
         }
         if (erasure) tx.objectStore('receipts').put({ id: JSON.stringify([boardId, 'local-board-erasure']), changeId: boardId,
@@ -385,6 +470,24 @@ export class ChangeJournal {
           tx.objectStore('receipts').put({ id: JSON.stringify([edit.id, destination]), changeId: edit.id, destination });
           store.delete(edit.id);
         }
+      };
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const edits = (request.result as PendingEdit[]).filter(edit => edit.boardId === boardId);
+        const reviews = checkpoints.index('kindBoard').getAll(['operation-pending-review', boardId]);
+        const binding = checkpoints.index('kindBoard').get(['operation-binding', boardId]);
+        let outstanding = 2;
+        const settle = () => { if (!outstanding) confirm(edits, reviews.result as PendingReviewRecord[]); };
+        binding.onsuccess = () => { if (binding.result) bound.add(boardId); outstanding--; settle(); };
+        reviews.onsuccess = () => {
+          for (const review of reviews.result as PendingReviewRecord[]) {
+            outstanding++;
+            const operation = tx.objectStore('operations').get(review.operationId);
+            const done = () => { if (operation.result) operationRows.push(operation.result as OperationRecord); outstanding--; settle(); };
+            operation.onsuccess = done; operation.onerror = done;
+          }
+          outstanding--; settle();
+        };
       };
     });
   }
@@ -456,6 +559,20 @@ export class ChangeJournal {
     });
     return this.committedLoad;
   }
+  async localSourceIds(boardId: string): Promise<string[]> {
+    return (await this.read<IDBValidKey[]>('entries', store => store.index('localBoard').getAllKeys([boardId, 'committed', 'local']))).map(String);
+  }
+  /** Enumerate board keys first so operation boards never load/reconcile their
+   * legacy document histories just to refresh the old conflict panel. */
+  async committedEntriesExcept(excluded: ReadonlySet<string>): Promise<JournalEntry[]> {
+    const boards = await new Promise<string[]>((resolve, reject) => {
+      const tx = this.database!.transaction('entries', 'readonly'), ids: string[] = [];
+      const cursor = tx.objectStore('entries').index('boardId').openKeyCursor(null, 'nextunique');
+      cursor.onsuccess = () => { if (cursor.result) { const id = String(cursor.result.key); if (!excluded.has(id)) ids.push(id); cursor.result.continue(); } };
+      tx.oncomplete = () => resolve(ids); tx.onerror = tx.onabort = () => reject(tx.error);
+    });
+    return (await Promise.all(boards.map(id => this.entries.where('boardId').equals(id).toArray()))).flat().filter(entry => entry.state === 'committed');
+  }
   /**
    * Whether this board's committed journal history holds signed entries.
    * A board never loses its signed history, so the bit is monotonic: the
@@ -487,17 +604,17 @@ export class ChangeJournal {
     this.notify(["receipts"]);
   }
   async purgeBoardHistory(boardId: string) {
-    const names = ['entries', 'pendingEdits', 'drafts', 'permissions', 'publicGrants', 'admissions'];
+    const names = ['entries', 'pendingEdits', 'drafts', 'permissions', 'publicGrants', 'admissions', 'operations', 'operationStreams', 'operationOutbox', 'operationSegments', 'operationCheckpoints'];
     await new Promise<void>((resolve, reject) => {
       const tx = this.database!.transaction([...names, 'receipts'], 'readwrite', { durability: 'strict' });
-      tx.oncomplete = () => { resolve(); this.notify(["entries", "pendingEdits", "receipts"]); };
+      tx.oncomplete = () => { resolve(); this.notify(["entries", "pendingEdits", "receipts", "operationBindings"]); };
       tx.onabort = tx.onerror = () => reject(tx.error ?? new Error('Board erasure remains pending'));
       const removedIds = new Set<string>(); let remaining = names.length;
       const cleanupReceipts = () => {
         const request = tx.objectStore('receipts').openCursor();
         request.onsuccess = () => {
           const cursor = request.result; if (!cursor) return;
-          if (cursor.value.destination !== 'local-board-erasure' && (removedIds.has(cursor.value.changeId) || cursor.value.destination === `local-pending-discard:${boardId}`)) cursor.delete();
+          if (cursor.value.destination !== 'local-board-erasure' && (removedIds.has(cursor.value.changeId) || cursor.value.destination === `local-pending-discard:${boardId}` || cursor.value.destination === `operation-download:${boardId}` || cursor.value.destination === `operation-source-covered:${boardId}`)) cursor.delete();
           cursor.continue();
         };
       };

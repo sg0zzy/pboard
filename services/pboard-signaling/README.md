@@ -63,6 +63,22 @@ private Drive backup/recovery behavior remains separate. Legacy signed/Drive-tru
 boards refuse automatic authority migration; use their original provider or the
 explicit collaborative-copy operation, which preserves the original.
 
+Directory lifecycle: selecting a private board publishes discovery for that
+board, but inactive single-device private boards are no longer renewed merely
+because they were visited. Invitations, pending device requests and paired-device
+grants continue to renew while the authority browser is online. At the existing
+16-entry owner / 64-entry global capacity, the server may replace the requesting
+owner's oldest entry that has never held invitations or device requests during
+its lifetime. It never evicts another owner's entry or a collaboration entry,
+including the retained policy floor after an invitation/request is removed.
+When all eligible slots are protected, the ordinary capacity warning still
+applies. Replacement removes only disposable discovery metadata; signed device
+grants, board authority and Drive content remain intact. Both the client update
+and the server update are needed to fix rapid private-board switching without
+continually republishing retired entries. The OVH activation and rollback record
+is below under “Directory lifecycle activation — 27 October 2026”. There is no
+new environment setting or quota increase.
+
 Reproduce the new native Chromium tests (Google HTTP simulated, real WebRTC/RxDB):
 
 ```sh
@@ -1065,3 +1081,57 @@ public health/WSS admission, anonymous join rejection and isolated benchmark
 cleanup were verified. No real Google/browser end-to-end load or long soak was
 run for this change. Reload the updated extension build for the client optimization;
 the server configuration changes are already active. No tag or release was made.
+
+
+### Directory lifecycle activation — 27 October 2026
+
+The owner's explicit “yes go on with the deploy” authorized updating only the
+Pboard signaling executable on `cecosl` / `pboard.cecosl.ovh`. Activation completed
+at **2026-10-27T22:42:33.162134+00:00**. The existing 16-entry owner and 64-entry global
+directory bounds remain unchanged. At capacity, an owner-only entry with no
+collaboration history may give its slot to that same owner's new publication.
+Invitations, pending/previous device requests and their retained rollback floors
+are protected; no other owner's entry is displaced. The client update also stops
+renewing inactive single-device private boards.
+
+An isolated capture of Cargo.toml, Cargo.lock and every service Rust source file
+was compiled with `cargo build --release --locked --no-default-features`; no test
+feature was enabled. The candidate matched the previously tested release binary.
+Pre-activation validation passed as `pboard-signaling` using the existing running
+service's environment, handled privately without logging or exporting credentials.
+Only the executable was atomically replaced and only this service was restarted.
+Private configuration/key files, systemd configuration and HAProxy configuration
+were checked unchanged. No credentials, DNS, proxy/TLS settings, operator grants
+or persisted enrollment state were intentionally changed.
+
+Current deployed executable SHA-256 (supersedes earlier active-binary references):
+`6f8750c0b6a51df35a26a1648803b89767a93598782d8ab85ac1966fdb3295a5`.
+
+Rollback executable:
+`/var/backups/pboard-signaling/20261027T224230Z-directory-lifecycle/pboard-signaling.previous`
+(previous SHA-256 `1c1035b491c61e3e87bffca205eecd4b4959a5665ab992c50b6ebf774acd46ea`).
+Restore it through a temporary executable in `/opt/pboard-signaling/`, atomically
+rename it to `pboard-signaling`, then restart only `pboard-signaling.service`.
+A root-only deployment receipt and previous service-unit copy are in the same
+backup directory; the unit itself was not changed.
+
+Protected local artifact:
+`/home/ste2/code/pboard/local_artifacts/0.11.0-local.73596711722953071200236920574428785766/pboard-signaling-linux-x86_64`.
+Its adjacent `build-info.json` contains the input inventory/digests, compiler and
+lock identities, empty feature set and checksum; `deployment.json` records activation.
+Source inventory SHA-256: `557870719fb3d3c780219d09d00e0cf6fbc6031980ac29fbee5346beda7ba2fa`.
+
+Validation: 53 Rust tests, 52 focused client tests, TypeScript checking, Clippy
+across all Rust targets, and managed Firefox/Chromium builds/package verification
+passed before activation. Public HTTPS health and identity challenge returned 200;
+WSS advertised required Google service admission, rejected anonymous join, and
+rejected missing/forged service receipts. The running process checksum matched
+the candidate. Real Google enrollment and live user-board switching were not
+exercised; the 40-private-board regression uses local fixtures. The updated native
+quota harness was syntax-checked but not run.
+
+Reload the rebuilt extension in each browser profile to apply the client renewal
+change; current unpacked builds are `dist/manifest.json` and
+`dist/chromium/manifest.json`. Active clients reconnect and republish protected
+invitations after the restart. No application version bump, commit, tag, push or
+product release was performed.

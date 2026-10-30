@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { DriveFixture, openDevice, sampleImage, type RecoveryDevice } from './harness';
 import { generateDeviceKey } from '../../src/collab/security/keys';
 import { installLiveBoardMutations } from '../../src/collab/security/liveMutations';
+import { pendingHeads } from '../../src/storage/changeJournal';
 
 const devices: RecoveryDevice[] = [];
 const EXPIRED = 'Current board authorization is required';
@@ -82,7 +83,6 @@ it('retains supersession evidence after admission so an old draft cannot become 
   const drafts = (await fresh.repo.journal.pendingEdits.toArray()).filter(edit => edit.base.documentId === f.card.id);
   expect(drafts.map(edit => edit.id).sort()).toEqual([earlier.id, later.id].sort());
   expect(drafts.every(edit => !edit.admittedChangeId && !edit.projected)).toBe(true);
-  const { pendingHeads } = await import('../../src/storage/pendingWork');
   expect(pendingHeads(drafts).map(edit => edit.value.content)).toEqual(['Later reviewed draft']);
   await expect(fresh.repo.admitPendingWork(f.board.id)).rejects.toThrow(EXPIRED);
 });

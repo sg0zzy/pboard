@@ -50,7 +50,7 @@ it.each(['synced', 'syncing'])('allows an explicit sync despite cached %s state'
   expect(button.disabled).toBe(false);
   await click('.drive-sync-button');
   expect(m.sync).toHaveBeenCalledWith('board');
-  expect(host.textContent).toContain('Drive sync complete');
+  expect(host.textContent).toContain('Sync OK');
 });
 it('shows immediate progress while authorization is pending and prevents duplicate clicks', async () => {
   m.connected = true;
@@ -98,7 +98,7 @@ it('keeps each board sync running across switches and does not let another board
   expect(disabled()).toBe(true); expect(host.textContent).toContain('Syncing…');
   expect(host.textContent).not.toContain('Board A failed');
   await act(async () => { completeB({ ok: true }); });
-  expect(disabled()).toBe(false); expect(host.textContent).toContain('Drive sync complete');
+  expect(disabled()).toBe(false); expect(host.textContent).toContain('Sync OK');
   await select('board'); expect(disabled()).toBe(false);
 });
 

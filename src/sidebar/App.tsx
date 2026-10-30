@@ -1,4 +1,4 @@
-import { ExperimentalEnrollment } from "./components/ExperimentalEnrollment";
+import { BoardMaintenanceControls } from './components/BoardMaintenanceControls';
 import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
@@ -35,7 +35,6 @@ import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capt
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
 import { collaborationManager, drivePermissions, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
-import { BoardCollaborationControls } from "./components/BoardCollaborationControls";
 import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
@@ -70,6 +69,7 @@ export function App() {
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
   const [debugSection, setDebugSection] = useState(import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket");
   const [collabEnabled, setCollabEnabled] = useState(true);
+  const [rtcIndicator, setRtcIndicator] = useState('connecting');
   const [collabPrefLoaded, setCollabPrefLoaded] = useState(false);
   const [notice, setNotice] = useState("");
   const [downloading, setDownloading] = useState(false);
@@ -114,8 +114,6 @@ export function App() {
   const itemsRef = useRef<BoardItem[]>([]);
   const fingerprintTimer = useRef<number | null>(null);
   const fingerprintRevision = useRef(0);
-  const visibilitySyncTimer = useRef<number | null>(null);
-  const currentProjectIdRef = useRef<string | null>(null);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -183,22 +181,10 @@ export function App() {
         setNotice(discoveryNotice);
       }
     }); };
-    // A new collaboration revision means the Drive state changed, so the
-    // boards are discovered again. The interval and the event listeners stay
-    // in place: rebuilding them on every revision would drop and re-arm the
-    // 30-second timer each time the collaboration state changed.
+    // Startup/account changes restore remote boards. The background account
+    // alarm owns recurring discovery; focus and visibility do not flush edits.
     discover();
-    const timer = window.setInterval(discover, 30_000);
-    const onVisible = () => { if (document.visibilityState === "visible") discover(); };
-    window.addEventListener("focus", discover);
-    window.addEventListener("online", discover);
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      active = false; window.clearInterval(timer);
-      window.removeEventListener("focus", discover);
-      window.removeEventListener("online", discover);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
+    return () => { active = false; };
   }, [collaborationRevision]);
 
   useEffect(() => {
@@ -218,12 +204,14 @@ export function App() {
     const projectId = currentProject?.id;
     if (!collabPrefLoaded) return;
     void collaborationManager.setEnabled(collabEnabled).catch(console.error);
-    if (!collabEnabled) { setLiveStatus("Live collaboration: switched off for testing."); return; }
+    if (!collabEnabled) setLiveStatus("WebRTC is disabled. Google Drive synchronization remains available.");
     if (!projectId) { void collaborationManager.stop().catch(console.error); return; }
     let active = true;
     const updateStatus = () => {
       if (!active) return;
       const state = collaborationManager.state();
+      setRtcIndicator(state.error ? 'error' : !state.ready ? 'connecting' : state.connectedPeers.length ? 'connected' : 'enabled');
+      if (!collabEnabled) { setLiveStatus("WebRTC is disabled. Google Drive synchronization remains available."); return; }
       setLiveStatus(state.error ? `Live collaboration: ${state.error}`
         : !state.ready ? "Checking live collaboration…"
         : state.role === "private" ? "Live collaboration is not enabled for this project."
@@ -319,41 +307,6 @@ export function App() {
   const rejectedItems = items.filter((item) => item.status === "rejected");
   const doneItems = items.filter((item) => item.status === "done");
   const trashItems = items.filter((item) => item.status === "trash");
-
-  useEffect(() => {
-    currentProjectIdRef.current = currentProject?.id ?? null;
-  }, [currentProject?.id]);
-
-  useEffect(() => {
-    const cancel = () => {
-      if (visibilitySyncTimer.current !== null) window.clearTimeout(visibilitySyncTimer.current);
-      visibilitySyncTimer.current = null;
-    };
-    const schedule = () => {
-      cancel();
-      visibilitySyncTimer.current = window.setTimeout(() => {
-        visibilitySyncTimer.current = null;
-        const projectId = currentProjectIdRef.current;
-        if (projectId) void requestProjectSync(projectId);
-      }, 3000);
-    };
-    const onVisibility = () => document.visibilityState === "hidden" ? schedule() : cancel();
-    const onPageHide = () => {
-      const projectId = currentProjectIdRef.current;
-      if (projectId) void requestProjectSync(projectId);
-    };
-    window.addEventListener("blur", schedule);
-    window.addEventListener("focus", cancel);
-    window.addEventListener("pagehide", onPageHide);
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      cancel();
-      window.removeEventListener("blur", schedule);
-      window.removeEventListener("focus", cancel);
-      window.removeEventListener("pagehide", onPageHide);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, []);
 
   useEffect(() => {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
@@ -889,9 +842,9 @@ export function App() {
         <div className="app-title-row">
           <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
           <ShareControls projectId={currentProject?.id ?? null} permissions={sharePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
-          {debugSection && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
           {debugSection && <IdleActivityPanel />}
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
+          {currentProject && <BoardMaintenanceControls key={currentProject.id} projectId={currentProject.id} revision={collaborationRevision} />}
           {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
             <button
               type="button"
@@ -906,20 +859,22 @@ export function App() {
               }}
             ><DebugIcon /></button>
           )}
-          {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
-            <button
-              type="button"
-              className="scale-button"
-              aria-label="Toggle live collaboration"
-              title={collabEnabled ? "Live collaboration is on. Click to switch it off for testing." : "Live collaboration is switched off. Click to switch it back on."}
-              aria-pressed={collabEnabled}
-              onClick={() => {
-                const next = !collabEnabled;
-                setCollabEnabled(next);
-                void browser.storage.local.set({ [LIVE_COLLABORATION_STORAGE_KEY]: next });
-              }}
-            ><PeopleIcon /></button>
-          )}
+          <button
+            type="button"
+            className="scale-button webrtc-toggle"
+            aria-label="Toggle WebRTC collaboration"
+            data-state={collabEnabled ? rtcIndicator : "disabled"}
+            aria-description={liveStatus}
+            title={collabEnabled ? `${liveStatus} Disable WebRTC. Google Drive synchronization remains available.` : "WebRTC is disabled. Enable realtime collaboration."}
+            aria-pressed={collabEnabled}
+            disabled={!collabPrefLoaded}
+            onClick={() => {
+              const next = !collabEnabled;
+              setCollabEnabled(next);
+              void browser.storage.local.set({ [LIVE_COLLABORATION_STORAGE_KEY]: next })
+                .catch(() => setNotice("WebRTC preference could not be saved. Try again."));
+            }}
+          ><PeopleIcon /></button>
           <div className="font-scale-controls" aria-label="Board font size">
             <button
               className="scale-button"
@@ -1048,7 +1003,6 @@ export function App() {
           </form>
         )}
       </header>
-      <BoardCollaborationControls projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />
 
       {!currentProject ? (
         <section className="empty-state">

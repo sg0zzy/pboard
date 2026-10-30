@@ -1,3 +1,9 @@
+import { createDriveChanges } from './operations/changes';
+import { DriveQuotaExceededError } from './driveQuota';
+import { dirtyFlushAt } from './syncPolicy';
+import { validId } from './operations/protocol';
+import { createOperationRealtime } from './operations/realtime';
+import { createOperationService } from './operations/service';
 import { createGoogleIdentitySharing } from "../collab/googleIdentitySharing";
 import { createCollaborativeCopy } from "../collab/collaborativeCopy";
 import { identifyLegacyBoard, legacyTransitionFor, transitionLegacyBoard } from "../collab/legacyTransition";
@@ -52,7 +58,9 @@ import { verifyMutation, createMutationReplayCache, type MutationGuardInstall } 
 import type { CollaborationSecurityOptions } from "../collab/manager";
 
 /** Platform-independent Drive and WebRTC wiring shared by browser and Android. */
-export function createDriveRuntime({ auth: googleAuth, storage, getRepository, fetcher: rawFetcher = fetch, hasSignalingHostPermission, onReconciled }: {
+export function createDriveRuntime({ auth: googleAuth, storage, getRepository, fetcher: rawFetcher = fetch, hasSignalingHostPermission, onReconciled, operationSync = true }: {
+  /** Legacy protocol is retained only for compatibility tests/recovery tooling. */
+  operationSync?: boolean;
   auth: GoogleAuthProvider; storage: KeyValueStorage; getRepository: () => Promise<RxRepository | null>; fetcher?: typeof fetch;
   hasSignalingHostPermission?: (origin: string) => Promise<boolean>; onReconciled?: () => Promise<void>;
 }) {
@@ -220,12 +228,13 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       await driveProvider.connect();
       void googleDrive.reconcileAll().catch(() => undefined);
     },
-    syncProject: async (projectId, options) => await v2Mode()
+    syncProject: async (projectId, options) => operationSync ? syncOperations(projectId, options?.force ?? false) : await v2Mode()
       ? boardSyncV2.syncProject(projectId, options)
       : collaborationCounters.enabled
         ? collaborationCounters.withDrivePurpose("sync", () => collaborationCounters.timed("sync:project", () => driveProvider.syncProject(projectId, options)))
         : driveProvider.syncProject(projectId, options),
     reconcileAll: async () => {
+      if (operationSync) return reconcileOperations();
       const finish = async <T>(result: T): Promise<T> => {
         // Opportunistic maintenance after every reconcile round (pending
         // board-leave ACL removals); never fails or delays the reconcile.
@@ -249,9 +258,12 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         ? collaborationCounters.withDrivePurpose("reconcile", () => collaborationCounters.timed("reconcile", () => driveProvider.reconcileAll()))
         : driveProvider.reconcileAll()));
     },
-    deleteProject: async (projectId) => await v2Mode() ? boardSyncV2.deleteProject(projectId) : driveProvider.deleteProject(projectId),
-    pullProject: async (projectId) => await v2Mode() ? boardSyncV2.pullProject(projectId) : driveProvider.pullProject(projectId),
-    pushProject: async (projectId) => await v2Mode() ? boardSyncV2.pushProject(projectId) : driveProvider.pushProject(projectId)
+    deleteProject: async (projectId) => operationSync ? (async () => {
+      if (!await driveConnected()) return 'pending' as const;
+      try { await operationService.flushRemoval(projectId); await driveTombstones.clear(projectId); return 'deleted' as const; } catch { return 'pending' as const; }
+    })() : await v2Mode() ? boardSyncV2.deleteProject(projectId) : driveProvider.deleteProject(projectId),
+    pullProject: async (projectId) => operationSync ? pullOperations(projectId) : await v2Mode() ? boardSyncV2.pullProject(projectId) : driveProvider.pullProject(projectId),
+    pushProject: async (projectId) => operationSync ? (await syncOperations(projectId, true), { id: (await operationService.layout(projectId)).folderId, name: 'operations' }) : await v2Mode() ? boardSyncV2.pushProject(projectId) : driveProvider.pushProject(projectId)
   };
 
   const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
@@ -272,6 +284,11 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   const legacyHistoryTransport = createDriveTransport(googleAuth, fetcher, "history-");
   const legacyPermissionTransport = createDrivePermissionTransport(googleAuth, fetcher);
   const legacyMigrationDeps: LegacyMigrationDeps = {
+    skipBoard: operationSync ? async boardId => {
+      const rx = await getRepository(); if (rx?.operationSource.bindings.has(boardId)) return true;
+      const folder = (await sharedProjects.get(boardId)).folderId ?? await boardStore.existingBoardFolder(boardId);
+      return folder ? (await legacyPermissionTransport.listFiles(folder)).some(file => file.name.startsWith('migration-')) : false;
+    } : undefined,
     store: boardStore,
     listAppDataBoards: () => driveTransport.listProjectFiles(),
     listAppDataHistory: async (projectId) => (await legacyHistoryTransport.listProjectFiles())
@@ -309,7 +326,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     legacyPassRun ??= (async () => {
       const result = await migrateLegacyBoards(legacyMigrationDeps);
       for (const state of Object.values(await readMigrationRecords())) {
-        if (cleanupDue(state, Date.now())) await cleanupLegacySource(legacyMigrationDeps, state.projectId).catch(() => undefined);
+        if (!operationSync && cleanupDue(state, Date.now())) await cleanupLegacySource(legacyMigrationDeps, state.projectId).catch(() => undefined);
       }
       return result;
     })().catch(error => { legacyPassRun = null; throw error; });
@@ -331,7 +348,10 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         return {
           folderId: record?.folderId ?? null,
           projectFileId: record?.projectFileId ?? null,
-          realtimeFolderId: record?.realtimeFolderId ?? null
+          realtimeFolderId: record?.realtimeFolderId ?? null,
+          // Stays undefined while nothing has been observed: the sharing service
+          // must tell "no baseline yet" from "observed with no grant".
+          observedGrantId: record?.observedGrantId
         };
       },
       async set(projectId, patch) {
@@ -346,7 +366,8 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         // an identical value as well, so the write must be skipped here.
         if (next.folderId === existing.folderId &&
             next.projectFileId === existing.projectFileId &&
-            next.realtimeFolderId === existing.realtimeFolderId) return;
+            next.realtimeFolderId === existing.realtimeFolderId &&
+            next.observedGrantId === existing.observedGrantId) return;
         all[projectId] = next;
         await writeAll(all);
       },
@@ -364,6 +385,9 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   const drivePermissions = createDrivePermissionService({
     transport: createDrivePermissionTransport(googleAuth, fetcher),
     sharedProjects,
+    findOwnershipFolder: async (projectId) => await v2Mode() ? boardStore.existingBoardFolder(projectId) : null,
+    prepareOperationBoard: operationSync ? async projectId => { await operationService.open(projectId); } : undefined,
+    isOperationBoard: async projectId => Boolean((await getRepository())?.operationSource.bindings.has(projectId)),
     readSnapshot: async (projectId) => {
       const rx = await getRepository();
       if (!rx) throw new Error("Sharing requires the RxDB storage backend");
@@ -391,9 +415,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       const leaves = ((await storage.get(PENDING_BOARD_LEAVES_KEY))[PENDING_BOARD_LEAVES_KEY] ?? {}) as Record<string, true>;
       if (leaves[projectId]) return false;
       try {
-        const rx = await getRepository();
-        const since = await rx?.projectDeletionTime(projectId);
-        return since !== null && since !== undefined && await drivePermissions.wasReinvitedSince(projectId, since);
+        return await drivePermissions.wasReinvitedSince(projectId);
       } catch {
         return false;
       }
@@ -727,6 +749,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
    * unverifiable manifest leaves everything retained.
    */
   async function renewBoardAuthorization(projectId: string): Promise<{ role: string }> {
+    if (operationSync) return { role: await operationService.role(projectId) };
     const active = activeGuards.get(projectId);
     if (active?.managed) {
       // The manager owns its transports and guard. Let it refresh/restart them
@@ -816,7 +839,8 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   }
 
   const syncAccountPreferences = createAccountPreferenceSync({
-    transport: createDriveTransport(googleAuth, fetcher, "account-preferences-"),
+    transport: createDriveTransport(googleAuth, fetcher, "account-preferences-", operationSync ? () => boardStore.rootFolder() : undefined),
+    legacySource: operationSync ? createDriveTransport(googleAuth, fetcher, 'account-preferences-') : undefined,
     getAccountId: connectedAccountId,
     getRepository: () => getRepository()
   });
@@ -872,7 +896,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   const googleBroker = createGoogleBrokerEnrollment({ storage, getAccessToken: () => googleAuth.getAccessToken(), fetcher, canAccessEndpoint: hasSignalingHostPermission });
   let iceConfiguration: Promise<RTCConfiguration | null> | null = null;
   const getIceConfiguration = () => (iceConfiguration ??= loadIceServers(storage).then(iceServers => ({ iceServers })));
-  const collaborationManager: CollaborationManager = createCollaborationManager({
+  const legacyCollaborationManager: CollaborationManager = createCollaborationManager({
     getAccountId: async () => independentCollaboration() ? null : connectedAccountId(),
     // Private preference sync verifies and selects its own account. Board pool
     // lifecycle must not clear it, nor add Google identity HTTP on every switch.
@@ -943,7 +967,211 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     getRepository: () => getRepository()
   });
 
-  const usesIdentitySharing = async () => (await boardCollaboration.settings()).provider === "websocket";
+  const operationChanges = createDriveChanges({ auth: googleAuth, fetcher, getRepository, getAccountId: connectedAccountId });
+  const operationService = createOperationService({ changes: operationChanges, auth: googleAuth, store: boardStore, fetcher, getRepository,
+    async recoverLegacyImage(boardId, imageId) {
+      const found = await boardStore.findAttachment(boardId, imageId);
+      if (found) { const bytes = await boardStore.downloadFile(found.id); if (bytes) return JSON.parse(new TextDecoder().decode(bytes)) as BoardImage; }
+      return drivePermissions.readSharedImage(boardId, imageId);
+    },
+    async freezeLegacyMirrors(boardId, drive) {
+      const privateCopy = await driveTransport.findProjectFile(boardId);
+      if (privateCopy) await drive.protectLegacy(privateCopy.id);
+      const unifiedCopy = await boardStore.snapshotFileId(boardId);
+      if (unifiedCopy) await drive.protectLegacy(unifiedCopy);
+    },
+    async realtime(boardId, session, drive) {
+      const transport = createDrivePermissionTransport(googleAuth, fetcher), peerId = crypto.randomUUID();
+      // Board viewers retain the existing separate signaling-folder permission.
+      const realtimeFolder = await drivePermissions.realtimeFolderId(boardId);
+      const topic = `pboard-operations-${boardId}`, prefix = `sig-${topic}-`;
+      const base = createDriveSignalStore({ transport, sharedProjects, projectId: boardId, peerId, topic, realtimeFolderId: async () => realtimeFolder });
+      const roles = new Map<string, { role: string | null; until: number }>();
+      async function peerRole(id: string) {
+        const cached = roles.get(id); if (cached && cached.until > Date.now()) return cached.role;
+        if (await drive.folderRole() === 'revoked') return null;
+        const files = (await transport.listFiles(realtimeFolder)).filter(file => file.name === `${prefix}${id}.json`);
+        if (files.length !== 1) return null;
+        const file = await drive.metadata(files[0].id);
+        if (!file.parents?.includes(realtimeFolder)) return null;
+        const permissions = await transport.listPermissions((await operationService.layout(boardId)).folderId);
+        const owner = file.owners?.[0]?.emailAddress?.trim().toLowerCase();
+        const role = file.ownedByMe ? await drive.folderRole() : permissions.find(permission => permission.type === 'user' && permission.emailAddress?.trim().toLowerCase() === owner)?.role ?? null;
+        roles.set(id, { role, until: Date.now() + 10000 }); return role;
+      }
+      const signaling = createDriveSignaling({ store: { ...base,
+        async listPeers() { const peers = await base.listPeers(); const result: typeof peers = {}; for (const [id, value] of Object.entries(peers)) if (await peerRole(id)) result[id] = value; return result; }
+      } });
+      return createOperationRealtime({ signaling, config: (await getIceConfiguration()) ?? undefined,
+        canRead: async id => !!await peerRole(id), canWrite: async id => ['owner', 'editor', 'writer'].includes(await peerRole(id) ?? ''),
+        receive: operations => session.receiveRealtime(operations), frontier: () => session.frontier(), recover: () => session.sync(false, false),
+        state: (peers, error) => { if (operationProject === boardId) operationState = { ...operationState, connectedPeers: peers, error: error ?? null }; }
+      });
+    },
+    sharedLayout: boardId => sharedProjects.get(boardId),
+    recordLayout: (boardId, folderId, projectFileId) => sharedProjects.set(boardId, { folderId, projectFileId }),
+    async stopLegacy(boardId) { await legacyCollaborationManager.stop(); await removeBoardMutationGuard(boardId); },
+    async onStatus(boardId, error) { if (error) await driveSyncState.markError(boardId, error); }
+  });
+  async function syncOperations(boardId: string, force: boolean): Promise<import('./googleDriveProvider').ProjectSyncResult> {
+    const rx = await getRepository();
+    if (!rx) throw new Error('Local storage is unavailable');
+    if (await rx.isDeletedProject(boardId)) return 'not-dirty';
+    const syncState = await driveSyncState.get(boardId);
+    const changeToken = syncState.changeToken ?? 0;
+    // Opening an unbound local board migrates/publishes a baseline. Defer that
+    // first publication too; importing a missing remote board remains immediate.
+    if (!force && !rx.operationSource.bindings.has(boardId) && await rx.getProject(boardId)
+      && syncState.dirty && dirtyFlushAt(syncState) > Date.now()) return 'not-dirty';
+    try {
+      const session = await operationService.open(boardId);
+      const publish = force || await session.flushDue();
+      await driveSyncState.markSyncing(boardId);
+      await operationService.sync(boardId, force, publish);
+      const project = await rx.getProject(boardId);
+      const pending = await rx.operationSource.local.pendingTiming(boardId);
+      if (pending) {
+        const latest = await driveSyncState.get(boardId);
+        await driveSyncState.set({ ...latest, dirty: true, status: 'pending',
+          firstDirtyAt: new Date(pending.oldest).toISOString(), dirtyAt: new Date(pending.latest).toISOString() });
+      }
+      else if (project) await driveSyncState.markSynced(boardId, project.revision, (await operationService.layout(boardId)).folderId, changeToken);
+      return 'pulled';
+    } catch (error) { await driveSyncState.markError(boardId, error instanceof Error ? error.message : 'Drive sync failed'); throw error; }
+  }
+  async function pullOperations(boardId: string) {
+    await syncOperations(boardId, true); const rx = await getRepository();
+    if (!rx || !await rx.getProject(boardId)) return null;
+    return { format: 'pboard-project' as const, version: 1 as const, exportedAt: new Date().toISOString(), ...await rx.exportProject(boardId) };
+  }
+  async function syncOperationErasures(rx: RxRepository) {
+    const account = await connectedAccountId(); if (!account) return;
+    const regular = createDriveTransport(googleAuth, fetcher, `erased-${account}-`, () => boardStore.rootFolder());
+    const legacy = createDriveTransport(googleAuth, fetcher, 'erased-');
+    const checkAccount = async () => { if (await connectedAccountId() !== account) throw new Error('Google account changed during erasure synchronization'); };
+    for (const transport of [regular, legacy]) for (const file of await transport.listProjectFiles()) {
+      const value = parseStrictJson(await transport.download(file.id), 1024 * 1024) as any;
+      if (value?.format !== 'pboard-board-erasure' || value.version !== 1 || !validId(value.boardId)
+        || file.name !== `${transport === regular ? `erased-${account}-` : 'erased-'}${value.boardId}.pboard`
+        || (transport === regular && value.accountId !== account)) throw new Error('Invalid account erasure marker');
+      await checkAccount(); await operationService.close(value.boardId); await rx.applyPrivateBoardErasure(value.boardId, account);
+    }
+    for (const marker of await rx.journal.boardErasures()) {
+      if (marker.accountId !== account || !marker.cloudPending) continue;
+      await operationService.close(marker.boardId); await operationChanges.forgetBoard(marker.boardId); await checkAccount();
+      let file = await regular.findProjectFile(marker.boardId);
+      if (!file) file = await regular.upload(marker.boardId, JSON.stringify({ format: 'pboard-board-erasure', version: 1, boardId: marker.boardId, accountId: account }));
+      const verified = parseStrictJson(await regular.download(file.id)) as any;
+      if (verified.boardId !== marker.boardId || verified.accountId !== account) throw new Error('Private erasure publication could not be verified');
+      await checkAccount();
+      // Confirmed deletion removes only this account's legacy private backups.
+      for (const transport of [driveTransport, legacyHistoryTransport, createDriveTransport(googleAuth, fetcher, 'image-')]) {
+        for (const candidate of await transport.listProjectFiles()) {
+          if (!(candidate.name === `project-${marker.boardId}.pboard` || candidate.name.startsWith(`history-${marker.boardId}_`) || candidate.name === `history-${marker.boardId}.pboard`)) continue;
+          const contents = parseStrictJson(await transport.download(candidate.id), 32 * 1024 * 1024) as any;
+          if (contents?.boardId !== marker.boardId && contents?.project?.id !== marker.boardId) continue;
+          await checkAccount(); await transport.delete(candidate.id);
+        }
+      }
+      const layout = await sharedProjects.get(marker.boardId);
+      if (layout.folderId) {
+        const folder = await legacyPermissionTransport.getFile(layout.folderId).catch(error => {
+          if (String(error).includes('404')) return null; throw error;
+        });
+        if (folder) {
+          const permissions = await legacyPermissionTransport.listPermissions(layout.folderId);
+          const email = (await connectedAccountEmail()).toLowerCase();
+          const onlyOwner = permissions.length === 1 && permissions[0].role === 'owner' && permissions[0].emailAddress?.toLowerCase() === email;
+          if (onlyOwner && folder.name === marker.boardId) { await checkAccount(); await boardStore.trashFile(layout.folderId); }
+        }
+      }
+      await rx.journal.receipts.update(marker.id, { cloudPending: false } as any);
+      await driveSyncState.forget(marker.boardId);
+    }
+  }
+  let reconcilingOperations: Promise<import('./googleDriveProvider').DriveReconcileResult> | undefined;
+  function reconcileOperations() {
+    if (reconcilingOperations) return reconcilingOperations;
+    reconcilingOperations = (async () => {
+      const result: import('./googleDriveProvider').DriveReconcileResult = { status: 'disconnected', imported: 0, pulled: 0, pushed: 0, deleted: 0 };
+      if (!await driveConnected()) return result;
+      // Read/migrate legacy sources, preserving all original files. New board
+      // persistence never runs the old AppData writer or leader/buffer runtime.
+      const rx = await getRepository(); if (!rx) return result;
+      const shared = await drivePermissions.discoverSharedProjects();
+      await syncOperationErasures(rx);
+      for (const tombstone of await driveTombstones.getAll()) await googleDrive.deleteProject(tombstone.projectId);
+      await runLegacyPass();
+      await syncAccountPreferences();
+      const ids = new Set([...(await rx.listProjects()).map(project => project.id), ...await boardStore.listBoards(), ...shared.map(project => project.projectId)]);
+      const errors: unknown[] = [];
+      for (const id of ids) {
+        if (await rx.isDeletedProject(id)) continue;
+        const existed = !!await rx.getProject(id);
+        try { await syncOperations(id, false); if (existed) result.pulled++; else result.imported++; }
+        catch (error) { if (error instanceof DriveQuotaExceededError) throw error; errors.push(error); }
+      }
+      void onReconciled?.().catch(() => undefined);
+      if (errors.length) throw new AggregateError(errors, errors[0] instanceof Error ? errors[0].message : 'Some boards could not synchronize');
+      result.status = 'reconciled'; return result;
+    })().finally(() => { reconcilingOperations = undefined; }); return reconcilingOperations;
+  }
+  // Preserve the platform lifecycle interface. No board authority, device grant,
+  // RxDB master/fork pool, server buffer or leader participates in operation sync.
+  let operationProject: string | null = null, realtimeEnabled = true;
+  let operationState: import('../collab/manager').CollaborationState = { sharedFileId: null, role: 'private', ready: false, connectedPeers: [], error: null };
+  let operationActivation = 0;
+  const collaborationManager: CollaborationManager = operationSync ? {
+    async start(boardId) {
+      const activation = ++operationActivation;
+      const previous = operationProject; operationProject = boardId;
+      if (previous && previous !== boardId) { operationService.active(previous)?.setPolling(false); await operationService.active(previous)?.setRealtime(false); }
+      if (activation !== operationActivation) return;
+      operationState = { sharedFileId: null, role: 'private', ready: false, connectedPeers: [], error: null };
+      if (!await driveConnected()) { operationService.active(boardId)?.setPolling(false); await operationService.active(boardId)?.setRealtime(false); return; }
+      if (activation !== operationActivation) return;
+      try {
+        const rx = await getRepository(), state = await driveSyncState.get(boardId);
+        if (rx && !rx.operationSource.bindings.has(boardId) && await rx.getProject(boardId)
+          && state.dirty && dirtyFlushAt(state) > Date.now()) return;
+        const session = await operationService.open(boardId);
+        if (activation !== operationActivation) return;
+        // Platform account polling covers inactive boards as well. Per-edit
+        // flush timers remain active independently of the selected board.
+        const role = await operationService.role(boardId);
+        if (activation !== operationActivation) return;
+        operationState = { sharedFileId: (await operationService.layout(boardId)).folderId, role: role === 'revoked' ? 'private' : role, ready: true, connectedPeers: [], error: null };
+        // Recover immediately on activation. Optional signaling failures never
+        // prevent Drive delivery or postpone it until the next polling timer.
+        void session.sync(false, false).catch(error => driveSyncState.markError(boardId, error instanceof Error ? error.message : 'Drive synchronization failed'));
+        try { await session.setRealtime(realtimeEnabled); }
+        catch (error) { if (activation === operationActivation) operationState = { ...operationState, error: error instanceof Error ? error.message : 'WebRTC unavailable' }; }
+        if (activation !== operationActivation && operationProject !== boardId) { session.setPolling(false); await session.setRealtime(false); }
+      } catch (error) { if (activation === operationActivation) operationState = { ...operationState, error: error instanceof Error ? error.message : 'Collaboration unavailable' }; throw error; }
+    },
+    async stop() { operationActivation++; const old = operationProject; operationProject = null; if (old) { operationService.active(old)?.setPolling(false); await operationService.active(old)?.setRealtime(false); } operationState = { ...operationState, sharedFileId: null, ready: false, connectedPeers: [] }; },
+    async setEnabled(enabled) { realtimeEnabled = enabled; if (operationProject) await operationService.active(operationProject)?.setRealtime(enabled); },
+    async refreshRole() {
+      const boardId = operationProject, activation = operationActivation;
+      if (!boardId || !await driveConnected() || activation !== operationActivation) return;
+      const rx = await getRepository(), state = await driveSyncState.get(boardId);
+      if (rx && !rx.operationSource.bindings.has(boardId) && await rx.getProject(boardId)
+        && state.dirty && dirtyFlushAt(state) > Date.now()) return;
+      const role = await operationService.role(boardId);
+      if (activation !== operationActivation) return;
+      operationState = { ...operationState, sharedFileId: (await operationService.layout(boardId)).folderId,
+        ready: role !== 'revoked', role: role === 'revoked' ? 'private' : role };
+      try {
+        await operationService.active(boardId)?.setRealtime(role !== 'revoked' && realtimeEnabled);
+        if (activation === operationActivation) operationState = { ...operationState, error: null };
+      } catch (error) {
+        if (activation === operationActivation) operationState = { ...operationState, error: error instanceof Error ? error.message : 'WebRTC unavailable' };
+        throw error;
+      }
+    },
+    state: () => ({ ...operationState }), requestContentKey: async () => false, ensureContentKey: async () => false
+  } : legacyCollaborationManager;
+  const usesIdentitySharing = async () => !operationSync && (await boardCollaboration.settings()).provider === "websocket";
   // Only the sharing UI dispatches here. Existing Drive persistence, discovery,
   // image transfer, deletion/ACL handling and default transport keep their service.
   const sharePermissions = {
@@ -975,6 +1203,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   const bufferRealtime = {
     active: () => [...bufferRuntimes.keys()],
     async start(boardId: string): Promise<boolean> {
+      if (operationSync) return false;
       if (bufferRuntimes.has(boardId)) return true;
       if (!(await driveConnected())) return false;
       const origin = await bufferHttpOrigin();
@@ -1013,7 +1242,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       await runtime?.stop();
     }
   };
-  return { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, reestablishAuthorityFromDrive, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, bufferRealtime, experimentalEnrollment, renewBoardAuthorization, boardCollaboration: { ...boardCollaboration, identitySharing,
+  return { operationService, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, reestablishAuthorityFromDrive, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, bufferRealtime, experimentalEnrollment, renewBoardAuthorization, boardCollaboration: { ...boardCollaboration, identitySharing,
     async createCopy(projectId: string) { const rx = await getRepository(); if (!rx) throw new Error("Local RxDB is unavailable"); return createCollaborativeCopy(rx, projectId); },
     async identifyLegacyBoard(projectId: string) {
       if (!await legacyDriveTrust(projectId)) throw new Error("No legacy shared-board trust record for this board");

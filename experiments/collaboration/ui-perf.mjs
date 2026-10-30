@@ -21,7 +21,10 @@ const server = createServer(async (request, response) => {
       return;
     }
     response.setHeader("Content-Type", "text/javascript");
-    response.end(await readFile(join(work, "bundle/probe.js")));
+    const bundle = join(work, 'bundle');
+    const requested = resolve(bundle, `.${new URL(request.url, 'http://localhost').pathname}`);
+    if (!requested.startsWith(`${bundle}/`)) { response.statusCode = 403; response.end(); return; }
+    response.end(await readFile(requested));
   } catch (error) {
     response.statusCode = 500;
     response.end(String(error));
@@ -70,7 +73,7 @@ try {
   await build({ configFile: false, root,
     build: {
       outDir: join(work, "bundle"), emptyOutDir: true, target: "esnext",
-      lib: { entry: join(root, "experiments/collaboration/ui-perf-probe.ts"), formats: ["es"], fileName: "probe" },
+      lib: { entry: process.argv[2] ? resolve(process.argv[2]) : join(root, "experiments/collaboration/ui-perf-probe.ts"), formats: ["es"], fileName: "probe" },
       rolldownOptions: { output: { codeSplitting: false } }
     }
   });
@@ -78,11 +81,13 @@ try {
   const origin = `http://127.0.0.1:${server.address().port}`;
   const page = await browser(origin);
   const deadline = Date.now() + 60_000;
+  let completed = false;
   while (Date.now() < deadline) {
     const result = await page("window.probe?.result ?? null");
-    if (result) { console.log(JSON.stringify(result, null, 2)); break; }
+    if (result) { if (result.error) throw new Error(result.error); console.log(JSON.stringify(result, null, 2)); completed = true; break; }
     await pause(200);
   }
+  if (!completed) throw new Error('Browser probe did not complete before the deadline');
 } finally {
   for (const socket of sockets) socket.close();
   await Promise.all(browsers.map(async (child) => {

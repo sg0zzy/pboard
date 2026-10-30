@@ -94,6 +94,9 @@ struct Pending {
 struct Entry {
     signed: SignedPolicy,
     pending: HashMap<String, Pending>,
+    // Preserve the policy rollback floor after invitations/requests are
+    // removed, until ordinary expiry cleans the entry.
+    has_collaboration: bool,
 }
 #[derive(Default)]
 pub(crate) struct Directory {
@@ -190,12 +193,38 @@ impl Directory {
                         .count()
                         >= MAX_BOARDS_PER_OWNER
                 {
-                    return Err("directory_capacity");
+                    // Directory slots are discovery metadata, not membership
+                    // grants. Reuse only this verified owner's oldest private
+                    // entry with no collaboration history. Never displace
+                    // another owner or discard a collaboration rollback floor.
+                    let retired = self
+                        .entries
+                        .iter()
+                        .filter(|(_, entry)| {
+                            entry.signed.policy.owner_email == email
+                                && !entry.has_collaboration
+                                && entry.signed.policy.members.is_empty()
+                                && entry.pending.is_empty()
+                        })
+                        .min_by(|(a_scope, a), (b_scope, b)| {
+                            a.signed
+                                .policy
+                                .issued_at
+                                .cmp(&b.signed.policy.issued_at)
+                                .then(a_scope.cmp(b_scope))
+                        })
+                        .map(|(scope, _)| scope.clone());
+                    let Some(retired) = retired else {
+                        return Err("directory_capacity");
+                    };
+                    self.entries.remove(&retired);
                 }
                 let entry = self.entries.entry(scope).or_insert_with(|| Entry {
                     signed: signed.clone(),
                     pending: HashMap::new(),
+                    has_collaboration: false,
                 });
+                entry.has_collaboration |= !p.members.is_empty();
                 entry.signed = signed;
                 entry
                     .pending
@@ -234,6 +263,7 @@ impl Directory {
                 } else if entry.pending.len() >= MAX_PENDING {
                     return Err("pending_capacity");
                 }
+                entry.has_collaboration = true;
                 entry.pending.insert(
                     request.device_key_id.clone(),
                     Pending {
@@ -568,6 +598,12 @@ mod tests {
             let mut signed = policy(&root, vec![]);
             signed.policy.board_id = format!("board-{owner}-{board}");
             signed.policy.owner_email = format!("owner{owner}@example.test");
+            // Explicit invitations occupy protected slots, unlike idle
+            // owner-only entries created just by visiting private boards.
+            signed.policy.members = vec![EmailRole {
+                email: "invited@example.test".into(),
+                role: "viewer".into(),
+            }];
             signed.signature = sign(
                 &root,
                 &encoded(json!(["pboard-identity-policy-v1", signed.policy])),
@@ -622,6 +658,261 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+    fn named_policy(key: &SigningKey, owner: &str, board: &str) -> SignedPolicy {
+        let mut signed = policy(key, vec![]);
+        signed.policy.owner_email = owner.into();
+        signed.policy.board_id = board.into();
+        signed.signature = sign(
+            key,
+            &encoded(json!(["pboard-identity-policy-v1", signed.policy])),
+        );
+        signed
+    }
+
+    #[test]
+    fn reclaimed_slots_never_discard_collaboration_policy_rollback_floors() {
+        for paired in [false, true] {
+            let root = SigningKey::random(&mut OsRng);
+            let mut directory = Directory::default();
+            let mut original = None;
+            for board in 0..MAX_BOARDS_PER_OWNER {
+                let name = if board == 0 {
+                    "board".into()
+                } else {
+                    format!("invited-{board}")
+                };
+                let mut signed = named_policy(&root, "owner@example.test", &name);
+                if !paired || board != 0 {
+                    signed.policy.members.push(EmailRole {
+                        email: "invited@example.test".into(),
+                        role: "viewer".into(),
+                    });
+                }
+                signed.signature = sign(
+                    &root,
+                    &encoded(json!(["pboard-identity-policy-v1", signed.policy])),
+                );
+                if board == 0 {
+                    original = Some(signed.clone());
+                }
+                directory
+                    .apply(
+                        "owner@example.test",
+                        Operation::Sync {
+                            publication: Some(signed),
+                        },
+                    )
+                    .unwrap();
+            }
+            let original = original.unwrap();
+            if paired {
+                directory
+                    .apply(
+                        "owner@example.test",
+                        Operation::Request {
+                            request: request(&root, &SigningKey::random(&mut OsRng)),
+                        },
+                    )
+                    .unwrap();
+                // Simulate expiry/removal of an already processed request.
+                let scope = crate::board_grants::scope(&public(&root).fingerprint(), "board");
+                directory.entries.get_mut(&scope).unwrap().pending.clear();
+            } else {
+                let mut revoked = original.clone();
+                revoked.policy.members.clear();
+                revoked.policy.issued_at += 1;
+                revoked.policy.expires_at += 1;
+                revoked.signature = sign(
+                    &root,
+                    &encoded(json!(["pboard-identity-policy-v1", revoked.policy])),
+                );
+                directory
+                    .apply(
+                        "owner@example.test",
+                        Operation::Sync {
+                            publication: Some(revoked),
+                        },
+                    )
+                    .unwrap();
+            }
+            let replacement = named_policy(&root, "owner@example.test", "new-board");
+            assert_eq!(
+                directory
+                    .apply(
+                        "owner@example.test",
+                        Operation::Sync {
+                            publication: Some(replacement)
+                        }
+                    )
+                    .unwrap_err(),
+                "directory_capacity"
+            );
+            assert_eq!(directory.entries.len(), MAX_BOARDS_PER_OWNER);
+            if !paired {
+                assert_eq!(
+                    directory
+                        .apply(
+                            "owner@example.test",
+                            Operation::Sync {
+                                publication: Some(original)
+                            }
+                        )
+                        .unwrap_err(),
+                    "policy_conflict"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotating_private_boards_reuses_only_the_owners_oldest_idle_slot() {
+        let root = SigningKey::random(&mut OsRng);
+        let mut directory = Directory::default();
+        let start = now_ms();
+        for board in 0..40 {
+            let mut signed = named_policy(&root, "owner@example.test", &format!("board-{board}"));
+            signed.policy.issued_at = start + board;
+            signed.policy.expires_at = start + board + 600_000;
+            signed.signature = sign(
+                &root,
+                &encoded(json!(["pboard-identity-policy-v1", signed.policy])),
+            );
+            directory
+                .apply(
+                    "owner@example.test",
+                    Operation::Sync {
+                        publication: Some(signed),
+                    },
+                )
+                .unwrap();
+            assert!(directory.entries.len() <= MAX_BOARDS_PER_OWNER);
+        }
+        let kept: std::collections::BTreeSet<_> = directory
+            .entries
+            .values()
+            .map(|entry| entry.signed.policy.board_id.as_str())
+            .collect();
+        let expected: std::collections::BTreeSet<_> =
+            (24..40).map(|board| format!("board-{board}")).collect();
+        assert_eq!(kept, expected.iter().map(String::as_str).collect());
+    }
+
+    #[test]
+    fn private_rotation_preserves_invitations_and_pending_pairing() {
+        let root = SigningKey::random(&mut OsRng);
+        let mut directory = Directory::default();
+        let paired = policy(&root, vec![]);
+        directory
+            .apply(
+                "owner@example.test",
+                Operation::Sync {
+                    publication: Some(paired),
+                },
+            )
+            .unwrap();
+        let device = SigningKey::random(&mut OsRng);
+        directory
+            .apply(
+                "owner@example.test",
+                Operation::Request {
+                    request: request(&root, &device),
+                },
+            )
+            .unwrap();
+        let mut invited = named_policy(&root, "owner@example.test", "invited-board");
+        invited.policy.members.push(EmailRole {
+            email: "invited@example.test".into(),
+            role: "editor".into(),
+        });
+        invited.signature = sign(
+            &root,
+            &encoded(json!(["pboard-identity-policy-v1", invited.policy])),
+        );
+        directory
+            .apply(
+                "owner@example.test",
+                Operation::Sync {
+                    publication: Some(invited),
+                },
+            )
+            .unwrap();
+        for board in 0..40 {
+            let signed = named_policy(&root, "owner@example.test", &format!("private-{board}"));
+            directory
+                .apply(
+                    "owner@example.test",
+                    Operation::Sync {
+                        publication: Some(signed),
+                    },
+                )
+                .unwrap();
+        }
+        let pending_scope = crate::board_grants::scope(&public(&root).fingerprint(), "board");
+        assert_eq!(directory.entries[&pending_scope].pending.len(), 1);
+        let result = directory
+            .apply(
+                "invited@example.test",
+                Operation::Sync { publication: None },
+            )
+            .unwrap();
+        assert_eq!(result["boards"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["boards"][0]["publication"]["policy"]["boardId"],
+            "invited-board"
+        );
+    }
+
+    #[test]
+    fn a_full_directory_never_evicts_another_owners_private_boards() {
+        let root = SigningKey::random(&mut OsRng);
+        let mut directory = Directory::default();
+        for owner in 0..4 {
+            let email = format!("owner{owner}@example.test");
+            for board in 0..MAX_BOARDS_PER_OWNER {
+                let signed = named_policy(&root, &email, &format!("board-{owner}-{board}"));
+                directory
+                    .apply(
+                        &email,
+                        Operation::Sync {
+                            publication: Some(signed),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(directory.entries.len(), MAX_BOARDS);
+        let before: std::collections::BTreeSet<_> = directory.entries.keys().cloned().collect();
+        let signed = named_policy(&root, "new-owner@example.test", "new-board");
+        assert_eq!(
+            directory
+                .apply(
+                    "new-owner@example.test",
+                    Operation::Sync {
+                        publication: Some(signed)
+                    }
+                )
+                .unwrap_err(),
+            "directory_capacity"
+        );
+        assert_eq!(
+            directory
+                .entries
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            before
+        );
+        let signed = named_policy(&root, "owner0@example.test", "replacement-board");
+        directory
+            .apply(
+                "owner0@example.test",
+                Operation::Sync {
+                    publication: Some(signed),
+                },
+            )
+            .unwrap();
+        assert_eq!(directory.entries.len(), MAX_BOARDS);
     }
     #[test]
     fn rejects_forged_expired_rollback_cross_board_requests_and_quota_floods() {

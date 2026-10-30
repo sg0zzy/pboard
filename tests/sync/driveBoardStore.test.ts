@@ -7,6 +7,65 @@ const store = (stub: DriveStub) => createDriveBoardStore({ auth, fetcher: stub.f
 const bytes = (text: string) => new TextEncoder().encode(text);
 
 describe('driveBoardStore', () => {
+  it('looks up recovery folders without creating data, and requires an existing snapshot', async () => {
+    const stub = new DriveStub();
+    const boards = store(stub);
+    expect(await boards.existingBoardFolder('board-r')).toBeNull();
+    expect(stub.files).toHaveLength(0);
+    const root = stub.addFolder('pboard', 'root');
+    const folder = stub.addFolder('board-r', root.id);
+    expect(await boards.existingBoardFolder('board-r')).toBeNull();
+    const snapshot = stub.addFile('board.json.gz', folder.id, 'existing snapshot');
+    const before = structuredClone(stub.files);
+    expect(await boards.existingBoardFolder('board-r')).toBe(folder.id);
+    expect(stub.files).toEqual(before);
+    // Recovery bypasses the ordinary folder/snapshot cache.
+    snapshot.trashed = true;
+    expect(await boards.existingBoardFolder('board-r')).toBeNull();
+  });
+
+  it('refuses ambiguous recovery folders without merging or trashing data', async () => {
+    const stub = new DriveStub();
+    const boards = store(stub);
+    for (let i = 0; i < 2; i++) {
+      const root = stub.addFolder('pboard', 'root');
+      const board = stub.addFolder('board-r', root.id);
+      stub.addFile('board.json.gz', board.id, `snapshot-${i}`);
+    }
+    const before = structuredClone(stub.files);
+    await expect(boards.existingBoardFolder('board-r')).rejects.toThrow(/Multiple Drive board folders/);
+    expect(stub.files).toEqual(before);
+  });
+
+  it('refuses duplicate snapshots without changing either copy', async () => {
+    const stub = new DriveStub();
+    const root = stub.addFolder('pboard', 'root');
+    const folder = stub.addFolder('board-r', root.id);
+    stub.addFile('board.json.gz', folder.id, 'one');
+    stub.addFile('board.json.gz', folder.id, 'two');
+    const before = structuredClone(stub.files);
+    await expect(store(stub).existingBoardFolder('board-r')).rejects.toThrow(/Multiple Drive board snapshots/);
+    expect(stub.files).toEqual(before);
+  });
+
+  it('checks subsequent listing pages before deciding a recovery folder is unique', async () => {
+    const stub = new DriveStub();
+    const root = stub.addFolder('pboard', 'root');
+    const one = stub.addFolder('board-r', root.id);
+    const two = stub.addFolder('board-r', root.id);
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.searchParams.get('q')?.includes("name = 'board-r'")) {
+        return new Response(JSON.stringify(url.searchParams.has('pageToken')
+          ? { files: [two] } : { files: [one], nextPageToken: 'next' }));
+      }
+      return stub.fetch(String(input), init);
+    });
+    const boards = createDriveBoardStore({ auth, fetcher });
+    await expect(boards.existingBoardFolder('board-r')).rejects.toThrow(/Multiple Drive board folders/);
+    expect(fetcher.mock.calls.some(([input]) => String(input).includes('pageToken=next'))).toBe(true);
+  });
+
   it('creates the pboard root and per-board folder exactly once', async () => {
     const stub = new DriveStub();
     const boards = store(stub);

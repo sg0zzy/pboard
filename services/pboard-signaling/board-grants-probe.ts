@@ -5,7 +5,7 @@ import { createRxRepository } from "../../src/storage/rxdbRepository";
 import { createIndexedDbBlobStore } from "../../src/storage/blobStore";
 import { makeChange } from "../../src/storage/changeJournal";
 import { verifyPendingAdmission } from "../../src/collab/security/journalProof";
-import { pendingHeads } from "../../src/storage/pendingWork";
+import { pendingHeads } from "../../src/storage/changeJournal";
 import { createElement } from "react";
 import { createRoot } from "react-dom/client";
 import { ConflictResolutionControls } from "../../src/sidebar/components/ConflictResolutionControls";

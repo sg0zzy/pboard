@@ -1,5 +1,5 @@
 import { hasJournalOrigin, proveJournalChange, certifyLocalHistory } from "../collab/security/journalProof";
-import type { RxCollection } from "rxdb";
+import type { RxCollection, RxStorageBulkWriteResponse, RxStorageWriteErrorValidation } from "rxdb";
 import { isUntrustedImport } from "../collab/security/liveMutations";
 import { ChangeJournal, documentValue, type Change, type JournalEntry } from "./changeJournal";
 import { canonicalize } from "../collab/security/canonical";
@@ -9,8 +9,17 @@ import { isJournalMaterialization } from "./journalMaterialization";
 // Explicit allowlist: replication/storage maintenance must never invent ancestry.
 const localContexts = new Set(["rx-collection-bulk-insert", "rx-collection-bulk-remove", "rx-document-save-data", "incremental-write"]);
 
+/** RxDB's per-row write error plus the journal cause the caller must reject with. */
+export type JournalWriteFailure<T> = RxStorageWriteErrorValidation<T> & { error: Error };
+
+/** A fully rejected batch. RxDB's published response has no success field (its
+ * write queue derives the written documents from the input rows minus the error
+ * ids), so the empty array here is this wrapper's explicit statement that the
+ * batch committed nothing. */
+export type JournalWriteResponse<T> = RxStorageBulkWriteResponse<T> & { success: T[] };
+
 /** Install before collaboration guards, so rejected remote writes never enter the WAL. */
-export function installJournalStorage<T>(collection: RxCollection<T>, name: Change["collection"], journal: ChangeJournal): void {
+export function installJournalStorage<T>(collection: RxCollection<T>, name: Change["collection"], journal: ChangeJournal, committed?: (entries: JournalEntry[]) => void | Promise<void>): void {
   const storage = collection.storageInstance;
   const original = storage.bulkWrite;
   storage.bulkWrite = async (rows, context) => {
@@ -46,14 +55,33 @@ export function installJournalStorage<T>(collection: RxCollection<T>, name: Chan
     }
     // A thrown/ambiguous storage error leaves prepared rows for startup recovery.
     const result = await original.call(storage, rows, context);
-    await journal.finish(entries, new Set(result.error.map(error => error.documentId)));
+    if (entries.length) {
+      await journal.finish(entries, new Set(result.error.map(error => error.documentId)));
+      const conversion = committed?.(entries);
+      if (conversion) await conversion;
+    }
     return result;
-    } catch {
-      // RxDB incremental queues expect per-row errors, not a rejected bulkWrite
-      // promise (which leaves their callers waiting indefinitely).
-      return { error: rows.map(row => ({ documentId: String((row.document as Record<string, unknown>).id),
-        writeRow: row, status: 422, isError: true, context, schema: collection.schema.jsonSchema, validationErrors: [],
-        error: new Error("Local change journal could not complete; write outcome requires recovery") })) } as Awaited<ReturnType<typeof original>>;
+    } catch (cause) {
+      // A rejected bulkWrite leaves RxDB's incremental write queue marked as
+      // running, so every later write on this collection waits forever; the
+      // queue settles a caller only from the response it hands back. Convert the
+      // failure into a complete response instead — documentId must be the primary
+      // key, because the queue resolves each error back to its caller by looking
+      // up that id in the batch it just ran — and keep the original cause on every
+      // row so the caller rejects with it.
+      const failure = cause instanceof Error ? cause : new Error("Local change journal could not complete; write outcome requires recovery");
+      const errors: JournalWriteFailure<T>[] = rows.map(row => ({
+        status: 422,
+        isError: true,
+        context,
+        schema: collection.schema.jsonSchema,
+        validationErrors: [],
+        error: failure,
+        documentId: String(row.document[collection.schema.primaryPath]),
+        writeRow: row
+      }));
+      const response: JournalWriteResponse<T> = { error: errors, success: [] };
+      return response;
     }
   };
 }

@@ -1,5 +1,11 @@
 # Pboard collaboration architecture
 
+> **Current default, 28 October 2026:** [Drive-first operation synchronization](architecture/drive-operation-sync.md)
+> replaces peer authority, device-grant gating and mutable board snapshots in the
+> normal browser/Android runtime. Drive ACLs authorize access; immutable operations
+> converge without WebRTC or an online owner. The sections below retain the prior
+> implementations and investigation history for compatibility/recovery context.
+
 Approved implementation target: [two operating modes, synchronization semantics and recovery
 acceptance scenarios](architecture/synchronization-contract.md). That contract is
 the approved baseline; its implementation is staged and the behavior described
@@ -36,7 +42,7 @@ Reviewed against the implementation on 12 October 2026. Google Drive provides pe
 
 `src/sync/browser.ts` constructs the permission service, shared snapshot sync, shared-board discovery, and collaboration manager. `src/sidebar/App.tsx` starts the manager for the current project and stops it on unmount. A project change starts the new board, which retires the previous board's session in the background; it does not stop first. Start, stop, and role refresh operations are serialized.
 
-The sidebar discovers shared boards on load, every 30 seconds, on focus, and after Drive/sharing changes; the Drive **Sync now** button additionally reconciles immediately with a fresh (uncached) listing, so a just-received invitation surfaces on click. Background reconciliation also runs discovery. Because Drive name search can lag a fresh grant by minutes, discovery additionally expands the shared-with-me shelf (board folders and directly shared `project.json` markers) as a best-effort supplement, so invitations surface without waiting for the index. Discovery skips existing local boards and isolates per-board failures, and rejects snapshots with a mismatched project ID. A locally removed (left) board normally stays hidden forever; it is restored only when the owner re-invited — the caller's own Drive collaborator permission was created after the removal (one minute of clock-skew tolerance) — and no leave revocation is still pending. Access is refreshed every 10 seconds while the board is open. Changes to the resolved role or shared file restart the pools.
+The sidebar discovers shared boards on load, every 30 seconds, on focus, and after Drive/sharing changes; the Drive **Sync now** button additionally reconciles immediately with a fresh (uncached) listing, so a just-received invitation surfaces on click. Background reconciliation also runs discovery. Because Drive name search can lag a fresh grant by minutes, discovery additionally expands the shared-with-me shelf (board folders and directly shared `project.json` markers) as a best-effort supplement, so invitations surface without waiting for the index. Discovery skips existing local boards and isolates per-board failures, and rejects snapshots with a mismatched project ID. A locally removed (left) board normally stays hidden forever; it is restored only when the owner re-invited and no leave revocation is still pending. Re-invitation is recognized by grant identity, not by time: the caller's own collaborator grant `id` must differ from the `id` recorded at the previous observation, or from the null baseline a leave recorded through this app sets, because Drive's `Permission` resource exposes no creation time and its `id` is opaque. The first observation of a grant can therefore never be ordered against an earlier removal: it records the baseline and reports no re-invitation, so a grant that predates the leave does not restore the board. Access is refreshed every 10 seconds while the board is open. Changes to the resolved role or shared file restart the pools.
 
 The Share dialog manages invitations, viewer/editor roles, and member removal. **Enable live collaboration** creates a shared layout without inviting another account, allowing two browsers on the same account to connect. The dialog shows waiting, connected-browser, and error messages.
 
@@ -158,6 +164,13 @@ and — since the idle-CPU investigation — the wall-clock `timings` of the
 recurring operations (`reconcile`, `sync:project`, `collab:refreshRole`,
 `collab:start`).
 
+The same build prices every Drive request it sends. `driveCost` records the projected
+cost, the cost Google reported through `X-Drive-Request-Cost`, how many responses
+carried that header, and the charged cost per resource. The reported number is
+authoritative and the projection is the local model, so a report can show where the
+two disagree. The discovery block also records cache hits and misses, which separates
+a layout that is being cached from one that re-lists on every pass.
+
 The Drive counter is wired into the fetcher every Drive provider uses:
 identity endpoints are classified by URL, everything else by the operation
 that issued it (`withDrivePurpose` marks `sync` and `reconcile` runs;
@@ -174,6 +187,7 @@ sidebar's console:
 
 ```js
 pboardCounters.snapshot()
+pboardCounters.snapshot().driveCost
 pboardCounters.clear()
 ```
 
@@ -184,6 +198,13 @@ that grows points at a board the worker cannot settle, a
 `sharedDiscovery.listings` count that grows points at a layout that is not
 being cached, and a `driveRequests.identity` count that grows by units of
 three per board sync points at the uncached account identity.
+
+Read the cost block as `pboardCounters.snapshot().driveCost`. A `byResource.list` that
+grows while the board is idle names the resource being over-priced, `reportedRequests`
+staying at 0 means every number in the report is model rather than measurement, and a
+reported cost above the projection names a request the model does not account for. The
+throttle that defers these requests never refuses one and never adds one, so a growing
+cost count is real traffic, not retry traffic.
 
 To take a 60-second idle report in Firefox: load a diagnostics build, open
 the sidebar on the board that shows the problem, in both the sidebar's and
@@ -627,6 +648,19 @@ send.
 
 ## Sync v2 components (unified storage wired; buffered realtime opt-in per board)
 
+Authority recovery in WebSocket mode looks up the existing canonical
+`pboard/<boardId>/board.json.gz` folder before consulting legacy `project.json`
+sharing records. A private board needs no collaborator ACL to qualify: a fresh
+Drive identity and folder-permissions read must prove that the connected account
+is its owner. Discovery never creates or merges folders, bypasses local folder
+caches, and refuses duplicate board folders or snapshots. Missing data and API
+failures leave recovery blocked. This avoids treating a board in the unified
+layout as “not shared” before checking its owner's permissions.
+
+Coverage: `tests/recovery/authorityRekeyRuntime.test.ts` exercises owner recovery,
+writer refusal, missing data and discovery failures;
+`tests/sync/driveBoardStore.test.ts` checks read-only discovery and ambiguity.
+
 The v2 redesign (local-first RxDB + user-visible Drive snapshots + server
 buffer + single-writer leader) was approved with these decisions: buffer
 encrypted by default, private-board history archives relocate to the visible
@@ -769,3 +803,12 @@ Verification: `tests/snapshotV2.test.ts`, `tests/bufferPump.test.ts`,
 `tests/collab/contentKeyExchange.test.ts` (live linked-peer key exchange),
 plus `npm run test:buffer` (21 live-server checks) and `cargo test --lib`
 (21 tests including the buffer/leader/API set) with `cargo clippy` clean.
+
+## Drive operation refactor checkpoint — 28 October 2026
+
+The [architecture assessment, operation protocol, recovery design, implementation
+status and validation record](architecture/drive-operation-sync.md) describe the
+new transport-independent protocol foundation. It is not yet the active board
+runtime. Existing authority/grant and snapshot paths described above still apply.
+The existing WebRTC toggle is now available in all builds, retains its local
+preference and closes the existing realtime manager without disabling Drive sync.

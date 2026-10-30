@@ -4,6 +4,7 @@ import { createAndroidGoogleAuth } from './auth';
 import { createSyncStorage } from './storage';
 import type { RepositoryEvents } from '../../../../src/storage/repository';
 import type { RxRepository } from '../storage/repository';
+import { dirtyFlushAt, drivePollDelay } from '../../../../src/sync/syncPolicy';
 
 export function createAndroidSync(getRepository: () => Promise<RxRepository>, auth = createAndroidGoogleAuth(createSyncStorage()), storage = createSyncStorage()) {
   const runtime = createDriveRuntime({ auth, storage, getRepository });
@@ -14,13 +15,27 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
   let running: Promise<void> | undefined;
   let disposed = false;
   let generation = 0;
+  let pollAttempt = 0;
+  const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const listeners = new Set<() => void>();
   let lastLiveError = '';
   let state = { connected: false, busy: false, resolving: false, error: '', role: 'private', peers: 0, lastSynced: '', projectId: null as string | null };
   const emit = (patch: Partial<typeof state>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
-  function schedule(delay = 25_000) {
+  function schedule(delay = drivePollDelay(pollAttempt)) {
     clearTimeout(timer);
     if (foreground && state.connected && !disposed) timer = setTimeout(() => { void sync(); }, delay);
+  }
+  function clearFlushTimers() { for (const timer of flushTimers.values()) clearTimeout(timer); flushTimers.clear(); }
+  async function scheduleBoard(id: string, afterAttempt = false) {
+    const saved = await runtime.driveSyncState.get(id);
+    clearTimeout(flushTimers.get(id)); flushTimers.delete(id);
+    if (!foreground || !state.connected || disposed || !saved.dirty) return;
+    const remaining = dirtyFlushAt(saved) - Date.now();
+    const delay = afterAttempt && remaining <= 0 ? drivePollDelay(pollAttempt) : Math.max(0, remaining);
+    flushTimers.set(id, setTimeout(() => { flushTimers.delete(id); void sync(); }, delay));
+  }
+  async function restoreFlushTimers(afterAttempt = false) {
+    for (const project of await (await getRepository()).listProjects()) await scheduleBoard(project.id, afterAttempt);
   }
   let liveQueue: Promise<void> = Promise.resolve();
   function restartLive(): Promise<void> {
@@ -60,32 +75,34 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
     liveQueue = operation.catch(() => undefined);
     return operation;
   }
-  async function sync() {
+  async function sync(force = false) {
     if (running) return running;
     if (!foreground || !state.connected || disposed) return;
     const current = generation;
     running = (async () => {
       emit({ busy: true, error: '' });
       try {
+        if (force && selected) await runtime.googleDrive.syncProject(selected, { force: true });
         await runtime.googleDrive.reconcileAll();
+        pollAttempt = 0;
         if (current !== generation || disposed || !state.connected || !foreground) return;
         // Refresh role/permission changes while the app remains open.
         await restartLive();
         emit({ lastSynced: new Date().toLocaleTimeString() });
-      } catch (error) { emit({ error: error instanceof Error ? error.message : String(error), resolving: false }); }
-      finally { emit({ busy: false }); running = undefined; schedule(); }
+      } catch (error) { pollAttempt = Math.min(pollAttempt + 1, 6); emit({ error: error instanceof Error ? error.message : String(error), resolving: false }); }
+      finally { emit({ busy: false }); running = undefined; schedule(); await restoreFlushTimers(true); }
     })();
     return running;
   }
   const events: RepositoryEvents = {
-    async projectChanged(id) { await runtime.driveSyncState.markDirty(id); schedule(2_000); },
+    async projectChanged(id) { await runtime.driveSyncState.markDirty(id); await scheduleBoard(id); },
     async projectDeleting(project) {
       const saved = await runtime.driveSyncState.get(project.id);
       await runtime.driveTombstones.add({ projectId: project.id, remoteFileId: saved.remoteFileId,
         deletedAt: new Date().toISOString(), projectUpdatedAt: project.updatedAt, revision: project.revision });
     },
-    projectHidden() { schedule(2_000); },
-    projectDeleted() { schedule(2_000); },
+    projectHidden() { schedule(); },
+    projectDeleted() { schedule(); },
   };
   return {
     ...runtime, auth, events,
@@ -101,7 +118,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       finally { emit({ busy: false }); }
     },
     async disconnect() {
-      ++generation; clearTimeout(timer);
+      ++generation; clearTimeout(timer); clearFlushTimers();
       const previousRole = state.role;
       emit({ connected: false, resolving: false, peers: 0, error: '' });
       // Finish any current backup before disconnect returns.
@@ -110,7 +127,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       await auth.disconnect();
       emit({ role: previousRole === 'viewer' ? 'viewer' : 'private' });
     },
-    sync,
+    sync: () => sync(true),
     async selectProject(id: string | null) {
       if (selected === id) return;
       selected = id; ++generation;
@@ -126,7 +143,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
     async setForeground(active: boolean) {
       foreground = active; ++generation;
       if (active) { try { await restartLive(); } catch { /* sync retries with a visible error */ } await sync(); }
-      else { clearTimeout(timer); await restartLive(); }
+      else { clearTimeout(timer); clearFlushTimers(); await restartLive(); }
     },
     pollLive() {
       const live = runtime.collaborationManager.state();
@@ -139,9 +156,9 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       await runtime.drivePermissions.invite(projectId, email, role);
       await runtime.driveSyncState.markDirty(projectId);
       await restartLive();
-      schedule(2_000);
+      await scheduleBoard(projectId);
     },
-    async dispose() { disposed = true; ++generation; foreground = false; clearTimeout(timer); await running; await restartLive(); listeners.clear(); },
+    async dispose() { disposed = true; ++generation; foreground = false; clearTimeout(timer); clearFlushTimers(); await running; await restartLive(); listeners.clear(); },
   };
 }
 export type AndroidSync = ReturnType<typeof createAndroidSync>;

@@ -17,6 +17,7 @@ type StubFile = {
   trashed: boolean;
   createdTime: string;
   modifiedTime: string;
+  contentRestrictions?: { readOnly: boolean; ownerRestricted: boolean; reason?: string }[];
 };
 
 export type StubPermission = { id: string; type: "user"; role: string; emailAddress: string };
@@ -37,6 +38,7 @@ const stamp = () => new Date(1_700_000_000_000 + clock++ * 1000).toISOString();
 export class DriveStub {
   files: StubFile[] = [];
   permissions = new Map<string, StubPermission[]>();
+  defaultPermissions: StubPermission[] = [];
   appDataCalls = 0;
   requests: string[] = [];
   /** Hook invoked before every request; may mutate `files` to race the code. */
@@ -68,17 +70,20 @@ export class DriveStub {
     const api = url.startsWith("https://www.googleapis.com/drive/v3/files");
     const params = new URL(url).searchParams;
     const pathParts = new URL(url).pathname.split("/");
+    if (method === 'GET' && url.includes('/drive/v3/about')) return json({ user: { emailAddress: 'owner@example.com', displayName: 'Owner' } });
+    if (method === 'GET' && url.includes('/files/generateIds')) return json({ ids: [`reserved-${this.next++}`] });
     if (upload && method === "GET") return json({ error: { status: "METHOD_NOT_ALLOWED", message: "Media downloads must use the v3 host" } }, 405);
     if (upload && method === "POST") {
       const text = typeof init.body === "string" ? init.body : "";
       const meta = /\{[\s\S]*?\}(?=\r\n--)/.exec(text)?.[0];
       if (!meta) return json({ error: { message: "multipart metadata missing" } }, 400);
-      const parsed = JSON.parse(meta) as { name?: string; parents?: string[] | string; mimeType?: string };
+      const parsed = JSON.parse(meta) as { id?: string; name?: string; parents?: string[] | string; mimeType?: string };
       const parents = (typeof parsed.parents === "string" ? JSON.parse(parsed.parents) as string[] : parsed.parents ?? []).map(alias);
       const parts = [...text.matchAll(/Content-Type: [^\r\n]+\r\n\r\n([\s\S]*?)(?=\r\n--)/g)].map(m => m[1]);
       const payload = parts.length > 1 ? parts[1] : "";
+      if (parsed.id && this.byId(parsed.id)) return json({ error: { message: 'exists' } }, 409);
       const file: StubFile = {
-        id: `file-${this.next++}`, name: parsed.name ?? "", parents,
+        id: parsed.id ?? `file-${this.next++}`, name: parsed.name ?? "", parents,
         mimeType: parsed.mimeType ?? "", bytes: new TextEncoder().encode(payload), version: 1, trashed: false, createdTime: stamp(), modifiedTime: stamp()
       };
       this.files.push(file);
@@ -92,6 +97,7 @@ export class DriveStub {
     if (upload && method === "PATCH") {
       const file = this.byId(decodeURIComponent(pathParts.at(-1)!));
       if (!file || file.trashed) return json({ error: { message: "missing" } }, 404);
+      if (file.contentRestrictions?.some(restriction => restriction.readOnly)) return json({ error: { message: 'read-only legacy file' } }, 403);
       const expected = headers.get("If-Match");
       if (expected !== null && expected !== String(file.version)) return json({ error: { message: "precondition failed" } }, 412);
       file.bytes = init.body instanceof Uint8Array ? init.body
@@ -100,13 +106,13 @@ export class DriveStub {
             : new Uint8Array();
       file.version += 1;
       file.modifiedTime = stamp();
-      return json({ id: file.id, version: String(file.version), md5Checksum: "md5" });
+      return json({ ...file, size: String(file.bytes.length), ownedByMe: true, owners: [{ emailAddress: 'owner@example.com' }], capabilities: { canAddChildren: true }, version: String(file.version), md5Checksum: "md5" });
     }
-    if (api && url.endsWith("/permissions") && method === "GET") {
+    if (api && new URL(url).pathname.endsWith("/permissions") && method === "GET") {
       const target = decodeURIComponent(pathParts.at(-2)!);
-      return json({ permissions: this.permissions.get(target) ?? [] });
+      return json({ permissions: this.permissions.get(target) ?? this.defaultPermissions });
     }
-    if (api && url.endsWith("/permissions") && method === "POST") {
+    if (api && new URL(url).pathname.endsWith("/permissions") && method === "POST") {
       const target = decodeURIComponent(pathParts.at(-2)!);
       const body = JSON.parse(String(init.body)) as { role: string; emailAddress: string };
       const permission: StubPermission = { id: `perm-${this.next++}`, type: "user", role: body.role, emailAddress: body.emailAddress };
@@ -118,7 +124,7 @@ export class DriveStub {
       if (id !== "files") {
         const file = this.byId(id);
         if (!file || file.trashed) return json({ error: { message: "missing" } }, 404);
-        return json({ id: file.id, version: String(file.version), md5Checksum: "md5" });
+        return json({ ...file, size: String(file.bytes.length), ownedByMe: true, owners: [{ emailAddress: 'owner@example.com' }], capabilities: { canAddChildren: true }, version: String(file.version), md5Checksum: "md5" });
       }
       const query = params.get("q") ?? "";
       const appData = params.get("spaces") === "appDataFolder";
@@ -132,7 +138,7 @@ export class DriveStub {
         && (nameEq === undefined || f.name === nameEq)
         && (nameIn === undefined || f.name.includes(nameIn))
         && (mimeType === undefined || f.mimeType === mimeType));
-      return json({ files: listed.map(f => ({ id: f.id, name: f.name, parents: f.parents, mimeType: f.mimeType, createdTime: f.createdTime, modifiedTime: f.modifiedTime })) });
+      return json({ files: listed.map(f => ({ id: f.id, name: f.name, parents: f.parents, mimeType: f.mimeType, createdTime: f.createdTime, modifiedTime: f.modifiedTime, size: String(f.bytes.length) })) });
     }
     if (api && method === "POST") {
       const parsed = JSON.parse(String(init.body)) as { name?: string; parents?: string[]; mimeType?: string };
@@ -147,7 +153,8 @@ export class DriveStub {
       const id = decodeURIComponent(pathParts.at(-1)!);
       const file = this.byId(id);
       if (!file) return json({ error: { message: "missing" } }, 404);
-      const patch = JSON.parse(String(init.body ?? "{}")) as { trashed?: boolean; name?: string };
+      const patch = JSON.parse(String(init.body ?? "{}")) as { trashed?: boolean; name?: string; contentRestrictions?: StubFile["contentRestrictions"] };
+      if (patch.contentRestrictions) file.contentRestrictions = patch.contentRestrictions;
       if (patch.trashed !== undefined) file.trashed = patch.trashed;
       if (patch.name !== undefined) file.name = patch.name;
       const addParents = params.get("addParents");

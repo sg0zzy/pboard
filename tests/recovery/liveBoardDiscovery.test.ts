@@ -13,7 +13,7 @@ async function open(cloud: DriveFixture, account = 'account-a') {
 }
 function discovery(device: RecoveryDevice) {
   const fetcher = vi.fn<typeof fetch>(async () => { throw new Error('No legacy Drive or rendezvous requests expected'); });
-  const runtime = createDriveRuntime({ auth: device.auth, storage: device.storage, getRepository: async () => device.repo, fetcher });
+  const runtime = createDriveRuntime({ operationSync: false, auth: device.auth, storage: device.storage, getRepository: async () => device.repo, fetcher });
   // Keep the real private-history provider and RxDB storage, replacing only
   // its HTTP boundary with the account-isolated synthetic Drive fixture.
   vi.spyOn(runtime.googleDrive, 'reconcileAll').mockImplementation(() => device.provider.reconcileAll());

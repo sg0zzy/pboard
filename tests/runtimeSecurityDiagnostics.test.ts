@@ -54,7 +54,7 @@ async function fixture() {
     return new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
   const repo = { setProjectOrderAccount: vi.fn(async () => {}), setMutatorRole: vi.fn() } as unknown as RxRepository;
-  const runtime = createDriveRuntime({ auth: { getAccessToken: async () => "fixture-token", getConnectionState: async () => "connected", isConfigured: () => true, connect: async () => {}, disconnect: async () => {} }, storage, fetcher, getRepository: async () => repo });
+  const runtime = createDriveRuntime({ operationSync: false, auth: { getAccessToken: async () => "fixture-token", getConnectionState: async () => "connected", isConfigured: () => true, connect: async () => {}, disconnect: async () => {} }, storage, fetcher, getRepository: async () => repo });
   async function blocked(message: RegExp) {
     try {
       await expect(runtime.collaborationManager.start(board)).rejects.toThrow(message);

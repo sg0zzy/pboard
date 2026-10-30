@@ -18,6 +18,7 @@ import { getToolbarPinContext, pinFromToolbar, type PinApi } from "./toolbarPins
 import { togglePboardSidebar } from "./sidebar";
 import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
+import { registerDriveAccountPolling } from '../sync/drivePolling';
 import { collaborationCounters } from "../collab/counters";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
@@ -29,6 +30,7 @@ const WEB_PAGES = ["http://*/*", "https://*/*"];
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();
 registerDriveBackgroundSync();
+registerDriveAccountPolling();
 
 /**
  * The recurring work counters, for a development build. A developer can read
