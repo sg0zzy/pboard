@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDrivePermissionService,
   createDrivePermissionTransport,
@@ -8,7 +8,14 @@ import {
   type DriveSharedProjectRecord,
   type DriveSharedProjectStore
 } from "../src/sync/drivePermissions";
+import { defaultDriveIdentityCache } from "../src/sync/driveIdentity";
 import type { GoogleAuthProvider } from "../src/sync/googleAuth";
+// Each case below stubs its own `about` endpoint. The account-identity cache
+// lives as long as a JS context — one extension worker or one sidebar page —
+// and a test process runs many fake contexts, so drop it between cases.
+
+beforeEach(() => defaultDriveIdentityCache().invalidate());
+
 
 describe("Drive account identity", () => {
   function auth(): GoogleAuthProvider {

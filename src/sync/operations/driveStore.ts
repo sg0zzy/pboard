@@ -5,6 +5,7 @@ import { parseStrictJson } from '../../collab/security/canonical';
 import type { GoogleAuthProvider } from '../googleAuth';
 import { canonical, digest, MAX_SEGMENT_BYTES, validateSegment, type Segment } from './protocol';
 import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from '../driveQuota';
+import { shareGet } from '../driveSharedRequest';
 
 const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
@@ -28,16 +29,21 @@ export function createOperationDriveStore(options: {
   async function call(url: string, init: RequestInit = {}) {
     const send = async (refresh = false) => {
       const headers = new Headers(init.headers);
-      headers.set('Authorization', `Bearer ${await options.auth.getAccessToken(refresh)}`);
-      const cost = driveRequestCost(url);
+      headers.set("Authorization", `Bearer ${await options.auth.getAccessToken(refresh)}`);
+      const cost = driveRequestCost(url, init.method ?? "GET");
       // Respect projected budget deferrals and real Google quota cooldowns.
       await quota.acquire(cost, init.signal);
       const response = await fetcher(url, { ...init, headers, cache: 'no-store' });
       quota.observe(cost, response.headers);
       return response;
     };
-    let response = await send();
-    if (response.status === 401) response = await send(true);
+    // Every board's inventory, metadata and segment reads run through here, and
+    // one reconcile round asks for the same immutable file from the inventory,
+    // the image sweep and the checkpoint read. Concurrent identical reads share
+    // one request; the refresh retry keeps its own key so it never awaits itself.
+    const key = `${url}|${init.method ?? 'GET'}`;
+    const response = await shareGet(init.method, key, () => send());
+    if (response.status === 401) return await shareGet(init.method, `${key}|renewed`, () => send(true));
     return response;
   }
   async function errorDetail(response: Response): Promise<string> {

@@ -245,7 +245,7 @@ export const repository = {
     await (await getRxRepository()).discardRemovedBoardWork(args[0], args[1], account ?? undefined);
     if ((await (await getRxRepository()).journal.boardErasure(args[0]))?.cloudPending) await driveSyncState.markDirty(args[0], true);
     else await driveSyncState.forget(args[0]);
-    void googleDrive.reconcileAll().catch(() => {}); // Durable erasure queue retries while offline.
+    void googleDrive.reconcileAll({ force: true }).catch(() => {}); // Durable erasure queue retries while offline.
   },
   permanentlyDeleteBoard: async (boardId: string) => {
     const rx = await getRxRepository();
@@ -254,7 +254,7 @@ export const repository = {
     await rx.permanentlyDeleteBoard(boardId, account ?? undefined);
     if ((await rx.journal.boardErasure(boardId))?.cloudPending) await driveSyncState.markDirty(boardId, true);
     else await driveSyncState.forget(boardId);
-    void googleDrive.reconcileAll().catch(() => {});
+    void googleDrive.reconcileAll({ force: true }).catch(() => {});
   },
   exportPendingWork: async (boardId: string) => (await getRxRepository()).exportPendingWork(boardId),
   putImage: async (image: BoardItem["image"]) => { if (!image) throw new Error("Image required"); return (await getRxRepository()).putImage(image); },

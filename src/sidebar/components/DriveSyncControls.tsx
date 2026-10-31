@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { browser } from "../../platform/browser";
-import { driveSyncState, googleAuth, googleDrive, authorizePrivatePersistence } from "../../sync/browser";
-import { requestDriveReconciliation, requestProjectSync } from "../../sync/client";
+import { clearDriveSyncError, driveSyncState, googleAuth, googleDrive, authorizePrivatePersistence } from "../../sync/browser";
+import { requestDriveErrorClear, requestDriveReconciliation, requestProjectSync } from "../../sync/client";
 import {
   DRIVE_AUTH_STORAGE_KEY,
   projectSyncStorageKey,
   type DriveProjectSyncState
 } from "../../sync/state";
-import { ChevronDownIcon, ChevronUpIcon, CloudIcon, SyncIcon } from "../components/icons";
+import { ChevronDownIcon, ChevronUpIcon, CloudIcon, CloseIcon, SyncIcon } from "../components/icons";
 
 type Props = { projectId: string | null; onConnectionChanged?: () => void };
 
@@ -91,6 +91,25 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
     finally { syncing.current.delete(projectId); setSyncingProjects(new Set(syncing.current)); }
   }
 
+  /**
+   * Dismiss the failure notice in both contexts that can hold one, without
+   * spending a Drive request. The board stays pending, so the next attempt is a
+   * real one and reports the failure again if Google still refuses — which is
+   * how a one-off rate window is told apart from a limit that is really spent.
+   */
+  async function clearError() {
+    if (!projectId) return;
+    setLocalError("");
+    setSyncFeedback("");
+    await clearDriveSyncError(projectId);
+    const result = await requestDriveErrorClear(projectId);
+    if (selectedProject.current !== projectId) return;
+    setSyncFeedback(result.ok
+      ? "Error cleared. The next sync asks Drive again and reports the failure if it happens again."
+      : result.reason || "The Drive error could not be cleared.");
+    await refresh();
+  }
+
   if (!connected) {
     const configured = googleAuth.isConfigured();
     return (
@@ -138,6 +157,14 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
         disabled={!projectId || syncBusy || authBusy}
         onClick={() => void syncNow()}
       ><SyncIcon /></button>
+      {(currentState?.error || localError) && <button
+        type="button"
+        className="drive-icon-button"
+        aria-label="Clear the Drive error message"
+        title="Clear this Drive error and stop holding the local retry delay, so the next sync is a real request. The board stays pending, so the message returns if Drive refuses again."
+        disabled={authBusy}
+        onClick={() => void clearError()}
+      ><CloseIcon /></button>}
       {(syncBusy || localError || syncFeedback) && <span className="drive-sync-feedback" role="status">{syncBusy ? 'Syncing…' : localError || syncFeedback}</span>}
       <span className="visually-hidden" role="status">{statusText}</span>
     </div>

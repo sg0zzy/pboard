@@ -83,7 +83,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       emit({ busy: true, error: '' });
       try {
         if (force && selected) await runtime.googleDrive.syncProject(selected, { force: true });
-        await runtime.googleDrive.reconcileAll();
+        await runtime.googleDrive.reconcileAll({ force: true });
         pollAttempt = 0;
         if (current !== generation || disposed || !state.connected || !foreground) return;
         // Refresh role/permission changes while the app remains open.

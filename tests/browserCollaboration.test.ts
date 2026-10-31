@@ -26,6 +26,10 @@ vi.mock("../src/platform/browser", () => {
       Object.assign(data, structuredClone(values));
       return Promise.resolve();
     },
+    remove: (key: string) => {
+      delete data[key];
+      return Promise.resolve();
+    },
   };
   return {
     browser: {
@@ -68,10 +72,16 @@ import {
   discoverSharedBoards,
   registerRxRepositoryResolver,
 } from "../src/sync/browser";
+import { DRIVE_LAST_RECONCILED_AT_KEY } from "../src/sync/runtime";
+import { browser } from "../src/platform/browser";
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.spyOn(googleAuth, "getConnectionState").mockResolvedValue("connected");
   vi.spyOn(drivePermissions, "myRole").mockResolvedValue("editor");
+  // The cases share one stubbed extension storage, and a completed reconcile
+  // round is what tells the next caller it need not repeat the sweep. Each case
+  // is its own browser session, so start it with no reconcile history.
+  await browser.storage.local.remove(DRIVE_LAST_RECONCILED_AT_KEY);
 });
 
 afterEach(() => {

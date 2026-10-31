@@ -1,6 +1,7 @@
 import { browser } from "../platform/browser";
 import { drivePermissions, googleDrive, driveSyncState } from "./browser";
-import { isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
+import { isDriveClearErrorMessage, isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
+import { clearDriveQuotaCooldown } from "./driveQuota";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
 import { dirtyFlushAt, drivePollDelay } from "./syncPolicy";
 import { collaborationCounters } from "../collab/counters";
@@ -94,7 +95,7 @@ export function registerDriveBackgroundSync() {
     })();
   });
 
-  void googleDrive.reconcileAll().catch(() => undefined);
+  void googleDrive.reconcileAll({ force: true }).catch(() => undefined);
   // Alarms may be lost on browser restart. Restore their absolute deadlines
   // from durable dirty state, including while no sidebar is open.
   void browser.storage.local.get(null).then((saved: Record<string, unknown>) => {
@@ -128,10 +129,20 @@ function recoveryAttempts(): RecoveryAttempts {
 }
 
 export function handleDriveSyncMessage(message: unknown): Promise<unknown> | undefined {
+  if (isDriveClearErrorMessage(message)) {
+    // The failed request and the quota denial it recorded live in this context,
+    // so this is where dismissing them has to happen. The charged unit window is
+    // not touched: the next attempt really goes to Drive, and a still-exhausted
+    // limit is reported again.
+    clearDriveQuotaCooldown();
+    return driveSyncState.clearError(message.projectId)
+      .then(() => ({ ok: true }))
+      .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive error could not be cleared" }));
+  }
   if (isDriveReconcileMessage(message)) {
     // An explicit user action must not serve the 60-second discovery cache.
     drivePermissions.invalidateSharedDiscovery();
-    return googleDrive.reconcileAll()
+    return googleDrive.reconcileAll({ force: true })
       .then((result) => ({ ok: true, result }))
       .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive reconciliation failed" }));
   }

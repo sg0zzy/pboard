@@ -78,3 +78,28 @@ it("compares two sync states by their stored fields", () => {
   expect(sameSyncState(left, { ...right, changeToken: 1 })).toBe(false);
   expect(sameSyncState(left, { ...right, status: "synced" })).toBe(false);
 });
+
+it("dismisses a stored failure without forgiving the pending change", async () => {
+  const { storage, counter } = memoryStorage();
+  const state = createDriveSyncStateStore(storage);
+
+  await state.markDirty("board");
+  await state.markError("board", "Google Drive request failed (403): rateLimitExceeded");
+  expect((await state.get("board")).status).toBe("error");
+
+  const writesBeforeClear = counter.writes;
+  await state.clearError("board");
+  const cleared = await state.get("board");
+  expect(cleared.error).toBeUndefined();
+  // The unsynchronized change survives, so the next attempt is a real Drive
+  // request that reports the failure again if it recurs.
+  expect(cleared.dirty).toBe(true);
+  expect(cleared.status).toBe("pending");
+  expect(counter.writes).toBe(writesBeforeClear + 1);
+
+  // Nothing left to dismiss: the worker watches these writes, and a write that
+  // changed nothing schedules a sync it was never asked for.
+  const writesAfterClear = counter.writes;
+  await state.clearError("board");
+  expect(counter.writes).toBe(writesAfterClear);
+});

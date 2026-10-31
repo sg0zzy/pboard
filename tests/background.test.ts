@@ -4,6 +4,7 @@ import { browser } from "../src/platform/browser";
 import { drivePermissions, googleDrive, driveSyncState } from "../src/sync/browser";
 import { DRIVE_PROJECT_STATE_PREFIX } from "../src/sync/state";
 import {
+  DRIVE_CLEAR_ERROR_MESSAGE,
   DRIVE_RECONCILE_MESSAGE,
   DRIVE_SYNC_MESSAGE,
 } from "../src/sync/messages";
@@ -43,7 +44,7 @@ vi.mock("../src/sync/browser", () => ({
     syncProject: vi.fn(),
     getConnectionState: vi.fn(),
   },
-  driveSyncState: { get: vi.fn(async () => ({ dirty: false, status: "synced" })) },
+  driveSyncState: { get: vi.fn(async () => ({ dirty: false, status: "synced" })), clearError: vi.fn(async () => undefined) },
   drivePermissions: { invalidateSharedDiscovery: vi.fn() },
 }));
 
@@ -52,6 +53,7 @@ const reconcileAll = vi.mocked(googleDrive.reconcileAll);
 const syncProject = vi.mocked(googleDrive.syncProject);
 const getConnectionState = vi.mocked(googleDrive.getConnectionState);
 const invalidateSharedDiscovery = vi.mocked(drivePermissions.invalidateSharedDiscovery);
+const clearSyncError = vi.mocked(driveSyncState.clearError);
 const alarmsCreate = vi.mocked(browserMock.alarms.create);
 const storageAddListener = vi.mocked(browserMock.storage.onChanged.addListener);
 const alarmAddListener = vi.mocked(browserMock.alarms.onAlarm.addListener);
@@ -176,6 +178,22 @@ describe("handleDriveSyncMessage", () => {
     const result = await handleDriveSyncMessage({ type: DRIVE_SYNC_MESSAGE, projectId: "" });
     expect(result).toBeUndefined();
     expect(syncProject).not.toHaveBeenCalled();
+  });
+
+  it("dismisses a stored Drive failure for one board", async () => {
+    expect(await handleDriveSyncMessage({ type: DRIVE_CLEAR_ERROR_MESSAGE, projectId: "p1" })).toEqual({ ok: true });
+    expect(clearSyncError).toHaveBeenCalledWith("p1");
+  });
+
+  it("refuses to dismiss a failure for an unnamed board", async () => {
+    expect(await handleDriveSyncMessage({ type: DRIVE_CLEAR_ERROR_MESSAGE })).toBeUndefined();
+    expect(clearSyncError).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed dismissal instead of claiming the error is gone", async () => {
+    clearSyncError.mockRejectedValueOnce(new Error("storage is full"));
+    expect(await handleDriveSyncMessage({ type: DRIVE_CLEAR_ERROR_MESSAGE, projectId: "p1" }))
+      .toEqual({ ok: false, reason: "storage is full" });
   });
 });
 

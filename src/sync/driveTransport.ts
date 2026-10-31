@@ -2,6 +2,7 @@ import type { GoogleAuthProvider } from "./googleAuth";
 import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
 import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
 import { driveBoundedRetryDelayMs } from "./driveRetry";
+import { shareGet } from "./driveSharedRequest";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -52,9 +53,18 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
 
   async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0, spentMs = 0): Promise<Response> {
     const token = await auth.getAccessToken(!retry);
+    // The erasure sweep, the preference round, the history archive and the
+    // legacy migration pass all list the same AppData prefix inside one
+    // startup tick. Identical concurrent reads share one request and one quota
+    // charge; a retry always uses its own key so it can never await itself.
+    const key = `${token}|${input} ${retry ? 1 : 0} ${attempt}`;
+    return await shareGet(init.method, key, () => send(input, init, token, retry, attempt, spentMs));
+  }
+
+  async function send(input: string, init: RequestInit, token: string, retry: boolean, attempt: number, spentMs: number): Promise<Response> {
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
-    const cost = driveRequestCost(input);
+    const cost = driveRequestCost(input, init.method ?? "GET");
     // Respect projected budget deferrals and real Google quota cooldowns.
     await quota.acquire(cost, init.signal);
     // Account signaling/preferences and snapshots must observe writes made

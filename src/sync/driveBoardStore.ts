@@ -18,6 +18,7 @@
 import { getSnapshotMeta, downloadSnapshotBytes, publishSnapshotConditional } from "./drivePublish";
 import type { GoogleAuthProvider } from "./googleAuth";
 import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { shareGet } from "./driveSharedRequest";
 
 export const BOARD_ROOT_NAME = "pboard";
 export const BOARD_SNAPSHOT_FILENAME = "board.json.gz";
@@ -73,7 +74,14 @@ export function createDriveBoardStore(options: {
   const pending = new Map<string, Promise<string>>();
 
   async function sendRaw(url: string, init: RequestInit = {}): Promise<Response> {
-    const cost = driveRequestCost(url);
+    // Board discovery, per-board inventory and the ownership probe can ask for
+    // the same folder listing inside one startup tick; concurrent identical
+    // reads share the request and its quota charge.
+    const bearer = new Headers(init.headers).get("authorization") ?? "";
+    return await shareGet(init.method, `${bearer}|${url}`, () => issue(url, init));
+  }
+  async function issue(url: string, init: RequestInit = {}): Promise<Response> {
+    const cost = driveRequestCost(url, init.method ?? "GET");
     // Respect projected budget deferrals and real Google quota cooldowns.
     await quota.acquire(cost, init.signal);
     const response = await fetchRaw(url, {

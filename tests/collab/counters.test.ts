@@ -4,6 +4,10 @@
  * is the only wiring point for `countDriveCost`, so every assertion drives the
  * service through an instrumented fake fetcher instead of counting directly. */
 import { afterEach, expect, it, vi } from "vitest";
+// Only the published per-method unit prices are needed at module scope; the
+// counters module itself stays lazily loaded below so the diagnostics boundary
+// is still exercised.
+import * as driveQuotaUnits from "../../src/sync/driveQuota";
 import type { GoogleAuthProvider } from "../../src/sync/googleAuth";
 import type { DriveSharedProjectRecord, DriveSharedProjectStore } from "../../src/sync/drivePermissions";
 import type { CollaborationCountersApi } from "../../src/collab/counters";
@@ -39,13 +43,16 @@ type Build = {
 };
 type FakeFile = { id: string; name: string; mimeType: string; parents: string[] };
 
-// Model cost of one pass over the seeded board set: name search 1 base + 3 top-level
-// entries (nextPageToken + the files group) + pageSize 20 = 24 ("search"); the
-// shared-with-me shelf sends the same projection, so it also prices 24; folder
-// lookup 1 + 5 fields = 6 ("get"), twice. Four priced requests, 60 projected.
-const NAME_SEARCH = 24;
-const SHELF_LIST = 24;
-const FILE_REF = 6;
+// Charged cost of one pass over the seeded board set. Google prices a list or a
+// search at a flat `DRIVE_UNIT_LIST` whatever the caller projects or the page size
+// asks for, and a single-resource read at `DRIVE_UNIT_READ`: the name search and
+// the shared-with-me shelf are lists; the two board-folder file references are
+// gets. Four priced requests, 210 units — the projection used to call the same
+// pass 60, which is why the local ledger never once looked close to Google's
+// 325,000 units/minute per-user budget.
+const NAME_SEARCH = driveQuotaUnits.DRIVE_UNIT_LIST;
+const SHELF_LIST = driveQuotaUnits.DRIVE_UNIT_LIST;
+const FILE_REF = driveQuotaUnits.DRIVE_UNIT_READ;
 const PASS_PROJECTED = NAME_SEARCH + SHELF_LIST + FILE_REF * 2;
 const PASS_BY_RESOURCE = { search: NAME_SEARCH + SHELF_LIST, get: FILE_REF * 2 };
 
@@ -175,18 +182,18 @@ it("misses, hits the real 60-second cache, then misses again after invalidation"
   expect(harness.calls).toHaveLength(12);
 });
 
-it("lets the reported cost outrank the projection, per resource", async () => {
+it("lets the reported cost outrank the URL estimate, per resource", async () => {
   const build = await loadBuild(true);
   const harness = makeHarness(build, { header: () => "7" });
   await harness.service.discoverSharedProjects();
-  // The local model is still recorded; `byResource` holds the charged number.
+  // The URL estimate is still recorded; `byResource` holds the charged number.
   expect(build.counters.snapshot().driveCost).toEqual({
     requests: 4, projected: PASS_PROJECTED, reported: 28, reportedRequests: 4,
     byResource: { search: 14, get: 14 }
   });
 });
 
-it("prices an absent header by the projection, not zero", async () => {
+it("prices an absent header by Google's documented per-method cost, not zero", async () => {
   const build = await loadBuild(true);
   const harness = makeHarness(build, { header: () => null });
   await harness.service.discoverSharedProjects();
@@ -200,13 +207,15 @@ it("prices each request separately, so a garbled header falls back without erasi
   const build = await loadBuild(true);
   const harness = makeHarness(build, { header: (url) => url.pathname.endsWith("/files") ? "not-a-cost" : "3" });
   await harness.service.discoverSharedProjects();
+  // The two listings carried a garbled header and fell back to Google's list
+  // price; the two file-reference gets each reported 3 units.
   expect(build.counters.snapshot().driveCost).toEqual({
     requests: 4, projected: PASS_PROJECTED, reported: 6, reportedRequests: 2,
-    byResource: { search: PASS_BY_RESOURCE.search, get: FILE_REF }
+    byResource: { search: PASS_BY_RESOURCE.search, get: 3 + 3 }
   });
 });
 
-it("falls back to the projection for a blank header instead of booking a reported zero", async () => {
+it("falls back to the documented per-method cost for a blank header instead of booking a reported zero", async () => {
   const build = await loadBuild(true);
   const harness = makeHarness(build, { header: () => "" });
   await harness.service.discoverSharedProjects();

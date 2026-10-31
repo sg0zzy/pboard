@@ -1,6 +1,8 @@
 import type { GoogleAuthProvider } from "./googleAuth";
 import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveBoundedRetryDelayMs, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
 import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { shareGet } from "./driveSharedRequest";
+import { defaultDriveIdentityCache, type DriveIdentityCache } from "./driveIdentity";
 import type { PboardDriveSignalRecord, PboardDriveSignalStore } from "../collab/signaling";
 import { collaborationCounters } from "../collab/counters";
 import type { BoardImage } from "../types";
@@ -91,7 +93,7 @@ const FOLDER_MIME = "application/vnd.google-apps.folder";
 const driveRole = (role: PboardCollaboratorRole): "reader" | "writer" => (role === "editor" ? "writer" : "reader");
 const escapeDriveQuery = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
 
-export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, quota: DriveQuotaThrottle = defaultDriveQuotaThrottle()): DrivePermissionTransport {
+export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher: typeof fetch = fetch, quota: DriveQuotaThrottle = defaultDriveQuotaThrottle(), identity: DriveIdentityCache = defaultDriveIdentityCache()): DrivePermissionTransport {
   async function errorDetail(response: Response): Promise<string> {
     try {
       const body = await response.json() as GoogleDriveErrorResponse;
@@ -116,9 +118,18 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
 
   async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0, spentMs = 0): Promise<Response> {
     const token = await auth.getAccessToken(!retry);
+    // One startup asks the same sharing search, the same realtime-folder
+    // lookup and the same ACL page from several subsystems in one tick; those
+    // reads now share a single request and a single quota charge. The identity
+    // lookup itself is cached by `driveIdentity`.
+    const key = `${token}|${input} ${retry ? 1 : 0} ${attempt}`;
+    return await shareGet(init.method, key, () => send(input, init, token, retry, attempt, spentMs));
+  }
+
+  async function send(input: string, init: RequestInit, token: string, retry: boolean, attempt: number, spentMs: number): Promise<Response> {
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
-    const cost = driveRequestCost(input);
+    const cost = driveRequestCost(input, init.method ?? "GET");
     // Defer projected overshoots; a real Google quota denial blocks requests
     // through the context's shared cooldown before they reach the network.
     await quota.acquire(cost, init.signal);
@@ -173,12 +184,18 @@ export function createDrivePermissionTransport(auth: GoogleAuthProvider, fetcher
   return {
     async currentIdentity() {
       // Drive's user resource is available with the scopes we already request;
-      // People API profile fields require separate authorization.
-      const response = await authorizedFetch(`${DRIVE_API}/about?fields=user(emailAddress,displayName)`);
-      const body = (await response.json()) as { user?: { emailAddress?: string; displayName?: string } };
-      const email = body.user?.emailAddress;
-      if (!email) return null;
-      return { email, name: body.user?.displayName };
+      // People API profile fields require separate authorization. The account
+      // behind an access token does not change while that token is valid, so
+      // concurrent and near-simultaneous callers share one lookup instead of
+      // each asking `about.get` (docs/collaboration.md).
+      const token = await auth.getAccessToken();
+      return await identity.resolve(token, async (bearer) => {
+        const response = await send(`${DRIVE_API}/about?fields=user(emailAddress,displayName)`, {}, bearer, true, 0, 0);
+        const body = (await response.json()) as { user?: { emailAddress?: string; displayName?: string } };
+        const email = body.user?.emailAddress;
+        if (!email) return null;
+        return { email, name: body.user?.displayName };
+      });
     },
     findSharedRoot: () => findFile(SHARED_ROOT_NAME, "root"),
     async createFolder(name, parentId) {

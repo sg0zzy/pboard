@@ -1,8 +1,11 @@
-// The Drive request-cost model, pinned at the exact projections the collaboration
-// funnel sends. Every number below is produced by `src/sync/driveQuota`; the pins
-// are the accepted table, so a projection change shows up as a diff rather than a
-// silent re-tune. `experiments/collaboration/driveFieldCostModel.mjs` mirrors the
-// same model in plain JS and prints this table.
+// Pboard's local request-cost PROJECTION, pinned at the exact projections the
+// collaboration funnel sends. Every number below is produced by
+// `src/sync/driveQuota.driveProjectedCost`; the pins are the accepted table, so a
+// projection change shows up as a diff rather than a silent re-tune. The
+// projection is diagnostics only — the ledger charges Google's documented
+// per-method cost, pinned in the last block of this file.
+// `experiments/collaboration/driveFieldCostModel.mjs` mirrors the projection in
+// plain JS and prints this table.
 
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -12,9 +15,15 @@ import {
   DRIVE_COST_PAGETOKEN,
   DRIVE_COST_WINDOW_MS,
   DRIVE_DEFAULT_COST_PER_MINUTE,
+  DRIVE_UNIT_DOWNLOAD,
+  DRIVE_UNIT_EDIT,
+  DRIVE_UNIT_LIST,
+  DRIVE_UNIT_OTHER,
+  DRIVE_UNIT_READ,
   driveCostResource,
   driveFieldCost,
   driveRequestCost,
+  driveProjectedCost,
   fieldEntries,
 } from "../src/sync/driveQuota";
 import { createDrivePermissionTransport } from "../src/sync/drivePermissions";
@@ -33,7 +42,7 @@ function request(path: string, query: Record<string, string> = {}): string {
 type Row = { label: string; url: string; expected: number };
 
 function pin(row: Row): void {
-  expect({ label: row.label, cost: driveRequestCost(row.url) }).toEqual({ label: row.label, cost: row.expected });
+  expect({ label: row.label, cost: driveProjectedCost(row.url) }).toEqual({ label: row.label, cost: row.expected });
 }
 
 describe("pinned cost model constants", () => {
@@ -48,7 +57,7 @@ describe("pinned cost model constants", () => {
   });
 });
 
-describe("the accepted request-cost table", () => {
+describe("the accepted projection table", () => {
   const table: Row[] = [
     { label: "share dialog identity read", url: request("about", { fields: "user(emailAddress,displayName)" }), expected: 3 },
     { label: "single-resource get, parents only", url: request(`files/${FILE}`, { fields: "parents" }), expected: 2 },
@@ -135,13 +144,13 @@ describe("the accepted request-cost table", () => {
   it("does not add page size to a single-resource get", () => {
     const fields = { fields: "parents", pageSize: "1000" };
     expect(driveCostResource(request(`files/${FILE}`, { fields: "parents" }))).toBe("get");
-    expect(driveRequestCost(request(`files/${FILE}`, fields))).toBe(driveRequestCost(request(`files/${FILE}`, { fields: "parents" })));
-    expect(driveRequestCost(request(`files/${FILE}`, fields))).toBe(2);
+    expect(driveProjectedCost(request(`files/${FILE}`, fields))).toBe(driveProjectedCost(request(`files/${FILE}`, { fields: "parents" })));
+    expect(driveProjectedCost(request(`files/${FILE}`, fields))).toBe(2);
     // Only a pageToken surcharge survives on a single-resource get.
-    expect(driveRequestCost(request(`files/${FILE}`, { fields: "parents", pageSize: "1000", pageToken: "CAIHEAE" }))).toBe(12);
+    expect(driveProjectedCost(request(`files/${FILE}`, { fields: "parents", pageSize: "1000", pageToken: "CAIHEAE" }))).toBe(12);
     // A create POST on the list resource still prices its four bare fields with no page size asked for.
     expect(driveCostResource(request("files", { fields: "id,name,mimeType,modifiedTime" }))).toBe("list");
-    expect(driveRequestCost(request("files", { fields: "id,name,mimeType,modifiedTime" }))).toBe(DRIVE_COST_BASE + 4 * DRIVE_COST_FIELD);
+    expect(driveProjectedCost(request("files", { fields: "id,name,mimeType,modifiedTime" }))).toBe(DRIVE_COST_BASE + 4 * DRIVE_COST_FIELD);
   });
 
   it("prices the page-size term only for the resources dominated by it", () => {
@@ -149,14 +158,14 @@ describe("the accepted request-cost table", () => {
       const base = request(resource === "permlist" ? `files/${FILE}/permissions` : "files", { fields: "files(id)" });
       const q: Record<string, string> = resource === "search" ? { q: "trashed = false" } : {};
       expect(driveCostResource(`${base}&${new URLSearchParams({ ...q, pageSize: "100" })}`)).toBe(resource);
-      expect(driveRequestCost(`${base}&${new URLSearchParams({ ...q, pageSize: "100" })}`)).toBe(DRIVE_COST_BASE + DRIVE_COST_FIELD_GROUP + 100);
+      expect(driveProjectedCost(`${base}&${new URLSearchParams({ ...q, pageSize: "100" })}`)).toBe(DRIVE_COST_BASE + DRIVE_COST_FIELD_GROUP + 100);
     }
   });
 
   it("keeps resource precedence and base-only routes", () => {
     // alt=media outranks both the projection and the page size.
     expect(driveCostResource(request("files", { fields: "nextPageToken,files(id)", pageSize: "1000", alt: "media" }))).toBe("flat");
-    expect(driveRequestCost(request("files", { fields: "nextPageToken,files(id)", pageSize: "1000", alt: "media" }))).toBe(1);
+    expect(driveProjectedCost(request("files", { fields: "nextPageToken,files(id)", pageSize: "1000", alt: "media" }))).toBe(1);
     // A permission list outranks a query, and a query turns a bare files call into search.
     expect(driveCostResource(request(`files/${FILE}/permissions`, { q: "x", fields: "permissions(id)", pageSize: "20" }))).toBe("permlist");
     expect(driveCostResource(request("files", { q: "trashed = false", fields: "files(id)", pageSize: "2" }))).toBe("search");
@@ -164,15 +173,15 @@ describe("the accepted request-cost table", () => {
     expect(driveCostResource(request("about", { fields: "user(emailAddress)" }))).toBe("about");
     // generateIds is base-only no matter what it projects.
     expect(driveCostResource(request("files/generateIds", { count: "1", fields: "ids", pageSize: "100" }))).toBe("flat");
-    expect(driveRequestCost(request("files/generateIds", { count: "1", fields: "ids", pageSize: "100" }))).toBe(1);
+    expect(driveProjectedCost(request("files/generateIds", { count: "1", fields: "ids", pageSize: "100" }))).toBe(1);
   });
 
   it("holds the boundaries: no projection, no page size, unusable page size", () => {
     expect(driveFieldCost("")).toBe(0);
-    expect(driveRequestCost(request(`files/${FILE}`))).toBe(1);
-    expect(driveRequestCost(request("files", { fields: "files(id)" }))).toBe(3);
-    expect(driveRequestCost(request("files", { fields: "files(id)", pageSize: "0" }))).toBe(3);
-    expect(driveRequestCost(request("files", { fields: "files(id)", pageSize: "abc" }))).toBe(3);
+    expect(driveProjectedCost(request(`files/${FILE}`))).toBe(1);
+    expect(driveProjectedCost(request("files", { fields: "files(id)" }))).toBe(3);
+    expect(driveProjectedCost(request("files", { fields: "files(id)", pageSize: "0" }))).toBe(3);
+    expect(driveProjectedCost(request("files", { fields: "files(id)", pageSize: "abc" }))).toBe(3);
   });
 
   it("counts a nested selection as one entry, not a comma-split field list", () => {
@@ -218,19 +227,19 @@ describe("funnel URLs as the funnel actually sends them", () => {
     return { urls, fetcher, query: (url: string) => new URL(url).searchParams };
   }
 
-  it("prices the recorded permission-list URL at 24, its continuation at 34", async () => {
+  it("projects the recorded permission-list URL at 24, its continuation at 34", async () => {
     const h = harness();
     await createDrivePermissionTransport(auth, h.fetcher).listPermissions(FILE);
-    expect(h.urls.map((url) => driveRequestCost(url))).toEqual([24, 34]);
+    expect(h.urls.map((url) => driveProjectedCost(url))).toEqual([24, 34]);
     expect(h.query(h.urls[0]).get("fields")).toBe("nextPageToken,permissions(id,type,role,emailAddress,displayName)");
     expect(h.query(h.urls[0]).get("pageSize")).toBe("20");
     expect(h.query(h.urls[1]).get("pageToken")).toBe("CAIHEAE");
-    // The accepted table prices the same projection at 23 because it carries no
+    // The accepted table projects the same URL at 23 because it carries no
     // continuation token; the funnel asks for one, so its recorded URL prices 24.
-    expect(driveRequestCost(request(`files/${FILE}/permissions`, { fields: "permissions(id,type,role,emailAddress,displayName)", pageSize: "20" }))).toBe(23);
+    expect(driveProjectedCost(request(`files/${FILE}/permissions`, { fields: "permissions(id,type,role,emailAddress,displayName)", pageSize: "20" }))).toBe(23);
   });
 
-  it("prices each collaboration listing at 24, continued by 34", async () => {
+  it("projects each collaboration listing at 24, continued by 34", async () => {
     const h = harness();
     const transport = createDrivePermissionTransport(auth, h.fetcher);
     await transport.listFiles("board-1");
@@ -238,8 +247,8 @@ describe("funnel URLs as the funnel actually sends them", () => {
     await transport.listSharedWithMe();
     expect(h.urls).toHaveLength(6);
     const firstPage = h.urls.filter((url) => !h.query(url).get("pageToken"));
-    expect(firstPage.map((url) => driveRequestCost(url))).toEqual([24, 24, 24]);
-    expect(h.urls.filter((url) => h.query(url).get("pageToken")).map((url) => driveRequestCost(url))).toEqual([34, 34, 34]);
+    expect(firstPage.map((url) => driveProjectedCost(url))).toEqual([24, 24, 24]);
+    expect(h.urls.filter((url) => h.query(url).get("pageToken")).map((url) => driveProjectedCost(url))).toEqual([34, 34, 34]);
     for (const url of firstPage) {
       expect(h.query(url).get("fields")).toBe("nextPageToken,files(id,name,mimeType,modifiedTime,parents)");
       expect(h.query(url).get("pageSize")).toBe("20");
@@ -260,10 +269,10 @@ describe("funnel URLs as the funnel actually sends them", () => {
     expect(h.urls).toHaveLength(1);
     expect(h.query(h.urls[0]).get("pageSize")).toBe("2");
     expect(h.query(h.urls[0]).get("fields")).toBe("files(id,name,mimeType,modifiedTime,parents)");
-    expect(driveRequestCost(h.urls[0])).toBe(5);
+    expect(driveProjectedCost(h.urls[0])).toBe(5);
   });
 
-  it("prices the recorded inventory page at 204 and its continuation at 214", async () => {
+  it("projects the recorded inventory page at 204 and its continuation at 214", async () => {
     const h = harness();
     const store = createOperationDriveStore({
       auth,
@@ -275,8 +284,8 @@ describe("funnel URLs as the funnel actually sends them", () => {
     await store.inventory();
     expect(h.urls).toHaveLength(2);
     expect(h.query(h.urls[0]).get("pageSize")).toBe("200");
-    expect(driveRequestCost(h.urls[0])).toBe(204);
-    expect(driveRequestCost(h.urls[1])).toBe(214);
+    expect(driveProjectedCost(h.urls[0])).toBe(204);
+    expect(driveProjectedCost(h.urls[1])).toBe(214);
   });
 
   it("keeps createdTime out of every permission projection", async () => {
@@ -294,5 +303,52 @@ describe("funnel URLs as the funnel actually sends them", () => {
       expect(fields).not.toContain("createdTime");
     }
     expect(projections[0]).toBe("nextPageToken,permissions(id,type,role,emailAddress,displayName)");
+  });
+});
+
+// What the ledger actually books. Google prices a Drive request by method, not by
+// how much the caller projected or how many rows a page asks for
+// (https://developers.google.com/workspace/drive/api/guides/limits), so this table
+// is the quota accounting truth and the projection above is a diagnostic.
+describe("the documented per-method cost Google charges", () => {
+  const charged: Row[] = [
+    { label: "identity read", url: request("about", { fields: "user(emailAddress,displayName)" }), expected: DRIVE_UNIT_READ },
+    { label: "board snapshot metadata", url: request(`files/${FILE}`, { fields: "id,name,mimeType,modifiedTime" }), expected: DRIVE_UNIT_READ },
+    { label: "shared-root name probe, page size 2", url: request("files", { q: "name contains 'x'", fields: "files(id)", pageSize: "2" }), expected: DRIVE_UNIT_LIST },
+    { label: "collaboration listing, page size 20", url: request("files", { fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)", pageSize: "20" }), expected: DRIVE_UNIT_LIST },
+    { label: "inventory page, page size 200", url: request("files", { fields: "nextPageToken,files(id,name,size,createdTime)", pageSize: "200" }), expected: DRIVE_UNIT_LIST },
+    { label: "permission listing", url: request(`files/${FILE}/permissions`, { fields: "permissions(id,role)", pageSize: "20" }), expected: DRIVE_UNIT_LIST },
+    { label: "changes feed page", url: request("changes", { pageToken: "CAI", pageSize: "1000", spaces: "drive" }), expected: DRIVE_UNIT_LIST },
+    { label: "content download", url: request(`files/${FILE}`, { alt: "media" }), expected: DRIVE_UNIT_DOWNLOAD },
+    { label: "changes start page token", url: request("changes/startPageToken", { spaces: "drive" }), expected: DRIVE_UNIT_OTHER },
+    { label: "pre-generated file id", url: request("files/generateIds", { count: "1", space: "drive", type: "files" }), expected: DRIVE_UNIT_OTHER }
+  ];
+
+  it("prices every funnel URL by its method, whatever it projects", () => {
+    for (const row of charged) {
+      expect({ label: row.label, cost: driveRequestCost(row.url) }).toEqual({ label: row.label, cost: row.expected });
+    }
+  });
+
+  it("prices a two-row name probe exactly like a 1,000-row inventory page", () => {
+    const probe = request("files", { q: "name contains 'x'", fields: "files(id)", pageSize: "2" });
+    const inventory = request("files", { fields: "nextPageToken,files(id,name,size,createdTime)", pageSize: "1000" });
+    expect(driveRequestCost(probe)).toBe(DRIVE_UNIT_LIST);
+    expect(driveRequestCost(inventory)).toBe(DRIVE_UNIT_LIST);
+    // The projection is what made these look different: 5 units against 1,004.
+    expect(driveProjectedCost(probe)).toBe(5);
+    expect(driveProjectedCost(inventory)).toBe(1004);
+  });
+
+  it("prices writes at the edit rate and reads at the read rate", () => {
+    expect(driveRequestCost(request("files"), "POST")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(`https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable`, "POST")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(`https://www.googleapis.com/upload/drive/v3/files/${FILE}?uploadType=media`, "PATCH")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(request(`files/${FILE}/permissions`), "POST")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(request(`files/${FILE}/permissions/perm-1`), "PATCH")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(request(`files/${FILE}`), "DELETE")).toBe(DRIVE_UNIT_EDIT);
+    expect(driveRequestCost(request(`files/${FILE}`))).toBe(DRIVE_UNIT_READ);
+    // A page of files is a list even though a read of one of them is not.
+    expect(driveRequestCost(request("files", { fields: "files(id)" }))).toBe(DRIVE_UNIT_LIST);
   });
 });

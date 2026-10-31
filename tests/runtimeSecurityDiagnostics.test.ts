@@ -1,12 +1,16 @@
 import "fake-indexeddb/auto";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDriveRuntime } from "../src/sync/runtime";
+import { defaultDriveIdentityCache } from "../src/sync/driveIdentity";
 import { ensureDeviceKey, generateDeviceKey } from "../src/collab/security/keys";
 import { signManifest, type BoardPermissionManifest, type SignedManifest } from "../src/collab/security/manifest";
 import { hashBlob } from "../src/storage/blobStore";
 import type { RxRepository } from "../src/storage/rxdbRepository";
 
-afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+// Each fixture below stubs its own `about` endpoint. The account-identity cache
+// lives as long as a JS context — one extension worker or one sidebar page — and
+// this process runs many fake contexts, so drop it between cases.
+afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); defaultDriveIdentityCache().invalidate(); });
 async function fixture() {
   vi.stubEnv("DEV", true); vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "websocket");
   vi.stubEnv("VITE_PBOARD_SIGNALING_WS_URL", "wss://relay.example.test/ws");

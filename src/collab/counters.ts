@@ -12,9 +12,10 @@ import { driveCostResource, driveRequestCost, type DriveCostResource } from "../
 export type CollaborationCounters = {
   /** Drive requests issued, by purpose. */
   driveRequests: { sync: number; reconcile: number; discovery: number; identity: number; other: number };
-  /** Drive request cost, by resource. `byResource` holds the authoritative number:
-   *  Google's reported `X-Drive-Request-Cost` when the response carried it, otherwise
-   *  the projection, which is the local model (`projected`) and not a measurement.
+  /** Drive request cost, by resource, in Google quota units. `byResource` holds the
+   *  authoritative number: Google's reported `X-Drive-Request-Cost` when the response
+   *  carried it, otherwise `projected` — this context's estimate, priced from the URL
+   *  at Google's documented per-method cost, so still an estimate and not a measurement.
    */
   driveCost: {
     requests: number;
@@ -125,7 +126,7 @@ export const collaborationCounters = {
     if (!enabled()) return;
     counters.driveRequests[purpose] += 1;
   },
-  /** Price one Drive request; Google's reported cost outranks the local projection. */
+  /** Price one Drive request in quota units; Google's reported cost outranks the estimate. */
   countDriveCost(resource: DriveCostResource, projected: number, reported?: number): void {
     if (!enabled()) return;
     const cost = counters.driveCost;
@@ -228,11 +229,12 @@ export const collaborationCounters = {
         : drivePurpose ?? "other";
       counters.driveRequests[purpose] += 1;
       const response = await fetcher(input, init);
-      // Only Drive endpoints are priced, and the header number outranks the model.
+      // Only Drive endpoints are priced, and the header number outranks the table.
       if (url.includes("/drive/v3/")) {
         const header = response.headers?.get("X-Drive-Request-Cost");
         const reported = header ? Number(header) : undefined;
-        collaborationCounters.countDriveCost(driveCostResource(url), driveRequestCost(url), reported);
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        collaborationCounters.countDriveCost(driveCostResource(url), driveRequestCost(url, method), reported);
       }
       return response;
     };

@@ -149,6 +149,22 @@ export class DriveStub {
       this.files.push(file);
       return json({ id: file.id });
     }
+    if (api && method === "DELETE" && new URL(url).pathname.endsWith("/permissions")) {
+      const target = decodeURIComponent(pathParts.at(-2)!);
+      const permissionId = decodeURIComponent(pathParts.at(-1)!);
+      const kept = (this.permissions.get(target) ?? []).filter(permission => permission.id !== permissionId);
+      if (this.permissions.has(target)) this.permissions.set(target, kept);
+      return new Response(null, { status: 204 });
+    }
+    if (api && method === "DELETE") {
+      // Drive answers a successful delete with an empty 204.
+      const id = decodeURIComponent(pathParts.at(-1)!);
+      const file = this.byId(id);
+      if (!file || file.trashed) return json({ error: { message: "missing" } }, 404);
+      file.trashed = true;
+      file.modifiedTime = stamp();
+      return new Response(null, { status: 204 });
+    }
     if (api && method === "PATCH") {
       const id = decodeURIComponent(pathParts.at(-1)!);
       const file = this.byId(id);

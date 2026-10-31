@@ -2,6 +2,7 @@ import type { GoogleAuthProvider } from '../googleAuth';
 import type { RxRepository } from '../../storage/rxdbRepository';
 import type { ImmutableFile } from './driveStore';
 import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, DriveQuotaExceededError, type DriveQuotaThrottle } from '../driveQuota';
+import { shareGet } from '../driveSharedRequest';
 
 type Folder = { boardId: string; files: ImmutableFile[]; needsFull: boolean; refreshedAt: number };
 type Cache = { id: string; kind: 'drive-change-cache'; boardId: string; account: string; token: string | null; folders: Record<string, Folder> };
@@ -17,7 +18,7 @@ export function createDriveChanges(options: {
   let queue: Promise<unknown> = Promise.resolve(), cache: Cache | undefined, lastPoll = -Infinity, unavailableUntil = 0;
   function locked<T>(work: () => Promise<T>): Promise<T> { const result = queue.then(work); queue = result.catch(() => undefined); return result; }
   async function call(path: string) {
-    const url = `https://www.googleapis.com/drive/v3/${path}`, cost = driveRequestCost(url);
+    const url = `https://www.googleapis.com/drive/v3/${path}`, cost = driveRequestCost(url, "GET");
     const send = async (refresh: boolean) => {
       const token = await options.auth.getAccessToken(refresh);
       await quota.acquire(cost);
@@ -25,7 +26,13 @@ export function createDriveChanges(options: {
       quota.observe(cost, response.headers);
       return response;
     };
-    let response = await send(false); if (response.status === 401) response = await send(true);
+    // Boards are synchronized sequentially, but several synchronize in one
+    // round and each asks the feed for the same page at the same cursor.
+    const response = await shareGet("GET", url, () => send(false));
+    if (response.status === 401) return await page(await shareGet("GET", `${url}|renewed`, () => send(true)));
+    return await page(response);
+  }
+  async function page(response: Response) {
     if (!response.ok) {
       let detail = '';
       try {

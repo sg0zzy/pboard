@@ -153,6 +153,20 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
     });
   }
 
+  /**
+   * Dismiss a recorded failure without touching the pending change: the board is
+   * still dirty when it was dirty, so the next attempt is a real Drive request
+   * and a fresh failure is recorded again. Nothing here resets retry scheduling
+   * or the quota cooldown — see `clearDriveQuotaCooldown`.
+   */
+  async function clearError(projectId: string): Promise<void> {
+    await withStorageLock(storage, projectSyncStorageKey(projectId), async () => {
+      const current = await load(projectId);
+      if (current.status !== "error" && current.error === undefined) return;
+      await write(projectId, { ...current, status: current.dirty ? "pending" : "synced", error: undefined });
+    });
+  }
+
   async function ensureInitiallyDirty(projectId: string): Promise<void> {
     const current = await get(projectId);
     if (!current.dirty && !current.lastSyncedAt && !current.remoteFileId) await markDirty(projectId);
@@ -162,7 +176,7 @@ export function createDriveSyncStateStore(storage: KeyValueStorage) {
     await set({ projectId, dirty: false, status: "synced" });
   }
 
-  return { get, set, markDirty, markSyncing, markSynced, markUploadStale, markError, ensureInitiallyDirty, forget };
+  return { get, set, markDirty, markSyncing, markSynced, markUploadStale, markError, clearError, ensureInitiallyDirty, forget };
 }
 
 export type DriveSyncStateStore = ReturnType<typeof createDriveSyncStateStore>;

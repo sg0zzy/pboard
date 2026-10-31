@@ -17,10 +17,11 @@ import { collaborationCounters } from "../collab/counters";
 import { createGoogleBrokerEnrollment, googleBrokerEnabled } from "../collab/googleBrokerEnrollment";
 import { experimentalSignalingEnabled, selectRuntimeSignaling } from "../collab/signalingSelection";
 import { createDriveBoardStore, BOARD_SNAPSHOT_FILENAME } from "./driveBoardStore";
+import { defaultDriveIdentityCache, type DriveIdentityCache } from "./driveIdentity";
 import { createBoardSyncV2 } from "./boardSyncV2";
 import { createDriveTransport } from "./driveTransport";
 import { createPrivateDriveHistory } from "./privateDriveHistory";
-import { createGoogleDriveProvider, type GoogleDriveProvider } from "./googleDriveProvider";
+import { createGoogleDriveProvider, type DriveReconcileResult, type GoogleDriveProvider } from "./googleDriveProvider";
 import { createBackendProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "./snapshot";
 import { createDriveSyncStateStore, createDriveTombstoneStore } from "./state";
 import { cleanupLegacySource, migrateLegacyBoards, type LegacyMigrationDeps, type LegacyMigrationResult } from "./legacyMigration";
@@ -57,16 +58,27 @@ import { parseStrictJson } from "../collab/security/canonical";
 import { verifyMutation, createMutationReplayCache, type MutationGuardInstall } from "../collab/security/mutation";
 import type { CollaborationSecurityOptions } from "../collab/manager";
 
+/** Storage key holding the timestamp of the last completed reconcile round.
+ * Every context that shares storage reads it, which is how the sidebar's
+ * mount-time discovery skips the round the extension worker just finished.
+ * Exported so a test can start a session with no reconcile history. */
+export const DRIVE_LAST_RECONCILED_AT_KEY = "pboardDriveLastReconciledAt";
+
 /** Platform-independent Drive and WebRTC wiring shared by browser and Android. */
-export function createDriveRuntime({ auth: googleAuth, storage, getRepository, fetcher: rawFetcher = fetch, hasSignalingHostPermission, onReconciled, operationSync = true }: {
+export function createDriveRuntime({ auth: googleAuth, storage, getRepository, fetcher: rawFetcher = fetch, hasSignalingHostPermission, onReconciled, identity = defaultDriveIdentityCache(), operationSync = true }: {
   /** Legacy protocol is retained only for compatibility tests/recovery tooling. */
   operationSync?: boolean;
   auth: GoogleAuthProvider; storage: KeyValueStorage; getRepository: () => Promise<RxRepository | null>; fetcher?: typeof fetch;
   hasSignalingHostPermission?: (origin: string) => Promise<boolean>; onReconciled?: () => Promise<void>;
+  identity?: DriveIdentityCache;
 }) {
   // Diagnostics build: count every Drive request issued through any provider
   // below by purpose; a production build returns the fetcher unchanged.
   const fetcher = collaborationCounters.instrumentFetcher(rawFetcher);
+  /** Each subsystem builds its own permission transport, but they all resolve
+   * the account through one cache: `about.get` used to be paid once per
+   * consumer, several times per board, on every startup and every poll. */
+  const permissionTransport = () => createDrivePermissionTransport(googleAuth, fetcher, undefined, identity);
   let signalingSettings: CollaborationSettings | undefined;
   const independentCollaboration = () => signalingSettings?.provider === "websocket";
   const legacyBroker = () => signalingSettings === undefined && googleBrokerEnabled();
@@ -219,6 +231,38 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     const saved = (await storage.get(COLLABORATION_SETTINGS))[COLLABORATION_SETTINGS] as { provider?: unknown } | undefined;
     return saved?.provider === "websocket";
   };
+  /** How long a completed round answers a discovery-triggered reconcile. The
+   * recurring alarm and every explicit user action pass `force`. */
+  const RECONCILE_COALESCE_MS = 30_000;
+  let reconcileRound: Promise<DriveReconcileResult> | null = null;
+  async function lastReconciledAt(): Promise<number> {
+    return Number((await storage.get(DRIVE_LAST_RECONCILED_AT_KEY))[DRIVE_LAST_RECONCILED_AT_KEY]) || 0;
+  }
+  async function performReconcileAll(): Promise<DriveReconcileResult> {
+    if (operationSync) return reconcileOperations();
+    const finish = async <T>(result: T): Promise<T> => {
+      // Opportunistic maintenance after every reconcile round (pending
+      // board-leave ACL removals); never fails or delays the reconcile.
+      void onReconciled?.().catch(() => undefined);
+      return result;
+    };
+    if (await v2Mode()) {
+      // Silent legacy relocation first (connect is consent): boards found
+      // in AppData or legacy shared folders join the unified layout before
+      // this pass reconciles, and failures never block normal sync. The
+      // account ordering preference also pulls/uploads here (it lives in
+      // AppData by product decision); in legacy mode the drive provider
+      // does both from its own reconcile.
+      await Promise.all([
+        runLegacyPass().catch(() => undefined),
+        syncAccountPreferences().catch(() => undefined)
+      ]);
+      return finish(await boardSyncV2.reconcileAll());
+    }
+    return finish(await (collaborationCounters.enabled
+      ? collaborationCounters.withDrivePurpose("reconcile", () => collaborationCounters.timed("reconcile", () => driveProvider.reconcileAll()))
+      : driveProvider.reconcileAll()));
+  }
   const googleDrive: GoogleDriveProvider = {
     ...driveProvider,
     // A fresh connect must immediately restore this account's boards; waiting
@@ -226,37 +270,30 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     // local state next to a fully synced cloud.
     connect: async () => {
       await driveProvider.connect();
-      void googleDrive.reconcileAll().catch(() => undefined);
+      void googleDrive.reconcileAll({ force: true }).catch(() => undefined);
     },
     syncProject: async (projectId, options) => operationSync ? syncOperations(projectId, options?.force ?? false) : await v2Mode()
       ? boardSyncV2.syncProject(projectId, options)
       : collaborationCounters.enabled
         ? collaborationCounters.withDrivePurpose("sync", () => collaborationCounters.timed("sync:project", () => driveProvider.syncProject(projectId, options)))
         : driveProvider.syncProject(projectId, options),
-    reconcileAll: async () => {
-      if (operationSync) return reconcileOperations();
-      const finish = async <T>(result: T): Promise<T> => {
-        // Opportunistic maintenance after every reconcile round (pending
-        // board-leave ACL removals); never fails or delays the reconcile.
-        void onReconciled?.().catch(() => undefined);
-        return result;
-      };
-      if (await v2Mode()) {
-        // Silent legacy relocation first (connect is consent): boards found
-        // in AppData or legacy shared folders join the unified layout before
-        // this pass reconciles, and failures never block normal sync. The
-        // account ordering preference also pulls/uploads here (it lives in
-        // AppData by product decision); in legacy mode the drive provider
-        // does both from its own reconcile.
-        await Promise.all([
-          runLegacyPass().catch(() => undefined),
-          syncAccountPreferences().catch(() => undefined)
-        ]);
-        return finish(await boardSyncV2.reconcileAll());
-      }
-      return finish(await (collaborationCounters.enabled
-        ? collaborationCounters.withDrivePurpose("reconcile", () => collaborationCounters.timed("reconcile", () => driveProvider.reconcileAll()))
-        : driveProvider.reconcileAll()));
+    reconcileAll: async (options) => {
+      // One round at a time per JS context. Startup reaches this from several
+      // callers at once (worker start, the sidebar's "reconcile now" message,
+      // the sidebar's discovery effect, an erasure retry), and an unguarded
+      // second round re-lists every folder AppData and Drive expose.
+      if (reconcileRound) return await reconcileRound;
+      // A fresh round in the *other* context (the sidebar page and the worker
+      // each build a runtime) is recorded in shared storage, so the sidebar's
+      // discovery effect does not repeat the round the worker just finished.
+      // Only a completed round stamps; failures stay immediately retryable.
+      if (!options?.force && Date.now() - await lastReconciledAt() < RECONCILE_COALESCE_MS)
+        return { status: "reconciled", imported: 0, pulled: 0, pushed: 0, deleted: 0 };
+      const round = performReconcileAll().finally(() => { if (reconcileRound === round) reconcileRound = null; });
+      reconcileRound = round;
+      const result = await round;
+      await storage.set({ [DRIVE_LAST_RECONCILED_AT_KEY]: Date.now() });
+      return result;
     },
     deleteProject: async (projectId) => operationSync ? (async () => {
       if (!await driveConnected()) return 'pending' as const;
@@ -282,7 +319,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     await storage.set({ [LEGACY_MIGRATIONS_KEY]: records });
   }
   const legacyHistoryTransport = createDriveTransport(googleAuth, fetcher, "history-");
-  const legacyPermissionTransport = createDrivePermissionTransport(googleAuth, fetcher);
+  const legacyPermissionTransport = permissionTransport();
   const legacyMigrationDeps: LegacyMigrationDeps = {
     skipBoard: operationSync ? async boardId => {
       const rx = await getRepository(); if (rx?.operationSource.bindings.has(boardId)) return true;
@@ -383,7 +420,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
   const sharedProjects = createSharedProjectStore(storage);
 
   const drivePermissions = createDrivePermissionService({
-    transport: createDrivePermissionTransport(googleAuth, fetcher),
+    transport: permissionTransport(),
     sharedProjects,
     findOwnershipFolder: async (projectId) => await v2Mode() ? boardStore.existingBoardFolder(projectId) : null,
     prepareOperationBoard: operationSync ? async projectId => { await operationService.open(projectId); } : undefined,
@@ -466,7 +503,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     }
     const projectId = topic.split("-").slice(2, -1).join("-");
     const store = createDriveSignalStore({
-      transport: createDrivePermissionTransport(googleAuth, fetcher),
+      transport: permissionTransport(),
       sharedProjects,
       projectId,
       peerId: collaborationPeerId,
@@ -687,7 +724,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
 
   // Manifest fetch helpers: board manifests are stored as signed envelope JSON.
   async function readBoardManifest(projectFileId: string, folderId: string, strict = false): Promise<string | null> {
-    const transport = createDrivePermissionTransport(googleAuth, fetcher);
+    const transport = permissionTransport();
     const name = "pboard-manifest.json";
     const direct = await transport.findFile(name, folderId).catch(error => { if (strict) throw error; return null; });
     if (direct) return transport.downloadFileOrNull(direct.id);
@@ -806,9 +843,9 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
    */
   async function connectedAccountEmail(): Promise<string> {
     collaborationCounters.countAccountIdentity(false);
-    const identity = await createDrivePermissionTransport(googleAuth, fetcher).currentIdentity();
-    if (!identity) throw new Error("Could not identify the Google Drive account");
-    return identity.email.trim().toLowerCase();
+    const user = await permissionTransport().currentIdentity();
+    if (!user) throw new Error("Could not identify the Google Drive account");
+    return user.email.trim().toLowerCase();
   }
 
   async function connectedAccountId(): Promise<string | null> {
@@ -852,7 +889,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       Boolean(await (await getRepository())?.isDeletedProject(projectId))
   });
 
-  const enrollmentTransport = createDrivePermissionTransport(googleAuth, fetcher);
+  const enrollmentTransport = permissionTransport();
   const experimentalEnrollment = createDeviceEnrollment({
     storage,
     async identity(kind, scope) {
@@ -981,7 +1018,7 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
       if (unifiedCopy) await drive.protectLegacy(unifiedCopy);
     },
     async realtime(boardId, session, drive) {
-      const transport = createDrivePermissionTransport(googleAuth, fetcher), peerId = crypto.randomUUID();
+      const transport = permissionTransport(), peerId = crypto.randomUUID();
       // Board viewers retain the existing separate signaling-folder permission.
       const realtimeFolder = await drivePermissions.realtimeFolderId(boardId);
       const topic = `pboard-operations-${boardId}`, prefix = `sig-${topic}-`;

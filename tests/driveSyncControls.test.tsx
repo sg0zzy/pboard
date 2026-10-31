@@ -2,17 +2,21 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const m = vi.hoisted(() => ({ connected: false, dirty: true, status: 'pending', connect: vi.fn(), authorize: vi.fn(), reconcile: vi.fn(), sync: vi.fn() }));
+const m = vi.hoisted(() => ({ connected: false, dirty: true, status: 'pending', error: '', connect: vi.fn(), authorize: vi.fn(), reconcile: vi.fn(), sync: vi.fn(), clearError: vi.fn(), clearWorker: vi.fn() }));
 vi.mock('../src/platform/browser', () => ({ browser: { storage: { onChanged: { addListener: vi.fn(), removeListener: vi.fn() } } } }));
 vi.mock('../src/sync/browser', () => ({ googleAuth: { isConfigured: () => true, connect: m.connect },
   googleDrive: { getConnectionState: async () => m.connected ? 'connected' : 'disconnected' },
-  driveSyncState: { get: async () => ({ projectId: 'board', dirty: m.dirty, status: m.status }) }, authorizePrivatePersistence: m.authorize }));
-vi.mock('../src/sync/client', () => ({ requestDriveReconciliation: m.reconcile, requestProjectSync: m.sync }));
+  driveSyncState: { get: async () => ({ projectId: 'board', dirty: m.dirty, status: m.status, ...(m.error ? { error: m.error } : {}) }) },
+  clearDriveSyncError: (projectId: string) => m.clearError(projectId),
+  authorizePrivatePersistence: m.authorize }));
+vi.mock('../src/sync/client', () => ({ requestDriveReconciliation: m.reconcile, requestProjectSync: m.sync, requestDriveErrorClear: m.clearWorker }));
+import type { DriveProjectSyncState } from '../src/sync/state';
 import { DriveSyncControls } from '../src/sidebar/components/DriveSyncControls';
 import { driveSyncState } from '../src/sync/browser';
 let root: Root, host: HTMLDivElement;
 beforeEach(() => {
-  vi.clearAllMocks(); m.connected = false; m.dirty = true; m.status = 'pending';
+  vi.clearAllMocks(); m.connected = false; m.dirty = true; m.status = 'pending'; m.error = '';
+  m.clearError.mockResolvedValue(undefined); m.clearWorker.mockResolvedValue({ ok: true });
   m.connect.mockImplementation(async () => { m.connected = true; }); m.authorize.mockResolvedValue(undefined); m.sync.mockResolvedValue({ ok: true });
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
@@ -128,4 +132,36 @@ it('ignores an old board status read that completes after the newly selected boa
   expect(host.querySelector('.drive-status')?.getAttribute('title')).toContain('Current board needs retry');
   await act(async () => { release({ projectId: 'board', dirty: false, status: 'synced' }); });
   expect(host.querySelector('.drive-status')?.getAttribute('title')).toContain('Current board needs retry');
+});
+
+it('dismisses a Drive failure in this page and in the worker that ran the request', async () => {
+  m.connected = true;
+  const reads: DriveProjectSyncState[] = [
+    { projectId: 'board', dirty: true, status: 'error', error: 'Google Drive request failed (403): rateLimitExceeded' },
+    { projectId: 'board', dirty: true, status: 'pending' }
+  ];
+  vi.spyOn(driveSyncState, 'get').mockImplementation(async () => reads.shift() ?? reads[0]);
+  await render();
+  expect(host.textContent).toContain('rateLimitExceeded');
+
+  await click('button[aria-label="Clear the Drive error message"]');
+  expect(m.clearError).toHaveBeenCalledWith('board');
+  expect(m.clearWorker).toHaveBeenCalledWith('board');
+  expect(host.textContent).not.toContain('rateLimitExceeded');
+  expect(host.textContent).toContain('Error cleared');
+});
+
+it('reports a dismissal the worker refused instead of claiming success', async () => {
+  m.connected = true; m.status = 'error'; m.dirty = true; m.error = 'Google Drive request failed (403): rateLimitExceeded';
+  m.clearWorker.mockResolvedValueOnce({ ok: false, reason: 'Google Drive state could not be cleared' });
+  await render();
+  await click('button[aria-label="Clear the Drive error message"]');
+  expect(host.textContent).toContain('Google Drive state could not be cleared');
+  expect(host.textContent).not.toContain('Error cleared');
+});
+
+it('offers no dismissal while the board is healthy', async () => {
+  m.connected = true; m.dirty = false; m.status = 'synced';
+  await render();
+  expect(host.querySelector('button[aria-label="Clear the Drive error message"]')).toBeNull();
 });

@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DRIVE_COST_WINDOW_MS,
   DRIVE_DEFAULT_COST_PER_MINUTE,
+  DRIVE_UNIT_DOWNLOAD,
+  DRIVE_UNIT_LIST,
   DriveQuotaExceededError,
   createDriveQuotaThrottle,
   defaultDriveQuotaThrottle,
@@ -195,7 +197,7 @@ describe("quota precedence through each funnel", () => {
 // 3. Defers only: a full window delays a request, it never refuses or adds one.
 describe("defers only", () => {
   it("delays past the window instead of refusing, and issues exactly one request per call", async () => {
-    const { throttle, waits, events } = makeThrottle(10);
+    const { throttle, waits, events } = makeThrottle(2_000);
     const urls: string[] = [];
     const fetcher = vi.fn<typeof fetch>(async (input) => {
       urls.push(String(input));
@@ -203,19 +205,19 @@ describe("defers only", () => {
     });
     const transport = createDriveTransport(fakeAuth(), fetcher, "project-", undefined, throttle);
     const cost = driveRequestCost("https://www.googleapis.com/drive/v3/files/file-1?alt=media");
-    expect(cost).toBe(1);
+    expect(cost).toBe(DRIVE_UNIT_DOWNLOAD);
 
     const calls = 13;
     for (let i = 0; i < calls; i++) expect(await transport.download("file-1")).toBe("ok");
 
-    // Ten single-cost calls fit the window; the eleventh waits for the window to roll, then goes out.
+    // Ten downloads fit the window; the eleventh waits for the window to roll, then goes out.
     expect(waits).toEqual([WINDOW]);
     expect(events.filter((event) => event.type === "defer")).toEqual([{ type: "defer", projected: cost, cost, waitMs: WINDOW }]);
     expect(fetcher).toHaveBeenCalledTimes(calls);
     expect(throttle.snapshot().requests).toBe(calls);
     expect(throttle.snapshot().deferrals).toBe(1);
-    expect(throttle.snapshot().charged).toBe(3);
-    expect(throttle.snapshot().limit).toBe(10);
+    expect(throttle.snapshot().charged).toBe(3 * cost);
+    expect(throttle.snapshot().limit).toBe(2_000);
   });
 
   it("a cost larger than the whole window is still issued, never refused", async () => {
@@ -223,7 +225,9 @@ describe("defers only", () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ files: [] })));
     const transport = createDriveTransport(fakeAuth(), fetcher, "project-", undefined, throttle);
     const pageTokenCost = driveRequestCost("https://www.googleapis.com/drive/v3/files?pageSize=100&pageToken=t");
-    expect(pageTokenCost).toBe(111);
+    // Google prices a list at a flat 100 units whatever the page size, so a single
+    // page already exceeds this ten-unit window and is still issued.
+    expect(pageTokenCost).toBe(DRIVE_UNIT_LIST);
     for (let i = 0; i < 3; i++) expect(await transport.listProjectFiles()).toEqual([]);
     expect(waits.length).toBe(3);
     expect(waits.every((ms) => Number.isFinite(ms) && ms > 0)).toBe(true);
@@ -398,6 +402,27 @@ describe("Google quota cooldown", () => {
     fetcher.mockResolvedValueOnce(new Response('recovered'));
     expect(await transport.download('file')).toBe('recovered');
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("sends the next request to Drive after an explicit dismissal", async () => {
+    const { throttle } = makeThrottle();
+    const fetcher = vi.fn<typeof fetch>(async () => deny(QUOTA_BODY));
+    const transport = createDriveTransport(fakeAuth(), fetcher, 'project-', undefined, throttle);
+    const denial = await rejection(transport.download('file')) as DriveQuotaExceededError;
+    expect(denial.waitMs).toBe(WINDOW);
+    // While the cooldown is open another caller is answered locally: no request
+    // leaves, so nothing new is learned about whether Google still refuses.
+    expect(await rejection(transport.download('file'))).toBeInstanceOf(DriveQuotaExceededError);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    // Dismissing the error re-opens the door: the next attempt reaches Drive.
+    throttle.clearCooldown();
+    expect(await rejection(transport.download('file'))).toBeInstanceOf(DriveQuotaExceededError);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    // The escalation restarts instead of continuing to the five-minute ceiling,
+    // so a repeated refusal is reported inside one window.
+    const parked = await rejection(transport.download('file')) as DriveQuotaExceededError;
+    expect(parked.waitMs).toBe(WINDOW);
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it.each(['permissions', 'transport'])("does not replay a quota-shaped 429 through %s", async path => {

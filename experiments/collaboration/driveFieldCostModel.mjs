@@ -1,16 +1,17 @@
 /**
- * Plain-JS mirror of the Drive request-cost model in src/sync/driveQuota (no
- * import from src/, no network): it prints the table the funnel's real
- * projection strings cost.
+ * Plain-JS mirror of Pboard's request PROJECTION in src/sync/driveQuota
+ * (`driveProjectedCost`; no import from src/, no network): it prints what the
+ * funnel's real projection strings look like under the local model.
  *
- * The table is a DERIVED LOCAL MODEL — base 1 per Drive metadata request, +1 per
- * top-level projected field, 2 for a projected field carrying a nested selection,
- * +pageSize for list/search/permission-list requests, +10 when a pageToken
- * continues a page, base-only for `alt=media` and `generateIds`. Google's reported
- * `X-Drive-Request-Cost` header is authoritative and MAY DIFFER from these
- * numbers; when that header is present the throttle charges the reported value,
- * so real usage always wins over this model. The model only DEFERS; it never adds
- * a request and never suppresses a 403.
+ * The projection is a DERIVED LOCAL MODEL and diagnostics only — base 1 per Drive
+ * metadata request, +1 per top-level projected field, 2 for a projected field
+ * carrying a nested selection, +pageSize for list/search/permission-list requests,
+ * +10 when a pageToken continues a page, base-only for `alt=media` and
+ * `generateIds`. It is NOT what Google bills: the quota ledger charges the
+ * documented flat per-method cost (read 5, list 100, edit 50, download 200, other
+ * 5), and Google's reported `X-Drive-Request-Cost` header, when a response carries
+ * one, outranks both. `tests/driveFieldCostModel.test.ts` pins this table and the
+ * documented per-method table.
  */
 
 const DRIVE_COST_BASE = 1;
@@ -52,8 +53,8 @@ function driveCostResource(input) {
   return "get";
 }
 
-/** Prices the request the funnel actually sends, from its URL. */
-function driveRequestCost(input) {
+/** Projects the request the funnel actually sends, from its URL. */
+function driveProjectedCost(input) {
   const url = new URL(input, "https://www.googleapis.com/drive/v3");
   const resource = driveCostResource(input);
   if (resource === "flat") return DRIVE_COST_BASE;
@@ -97,7 +98,7 @@ const rows = [
 const labelWidth = Math.max(...rows.map((row) => row[0].length));
 const projectionWidth = Math.max(...rows.map((row) => new URL(row[1], API).searchParams.get("fields")?.length ?? 0));
 
-console.log(`Drive request cost — derived local model (Google's reported X-Drive-Request-Cost may differ)`);
+console.log(`Drive request projection — derived local model, diagnostics only (Google charges the documented per-method cost; its reported X-Drive-Request-Cost outranks both)`);
 console.log(`constants: base ${DRIVE_COST_BASE}, field ${DRIVE_COST_FIELD}, nested field group ${DRIVE_COST_FIELD_GROUP}, pageToken ${DRIVE_COST_PAGETOKEN}, window ${DRIVE_COST_WINDOW_MS} ms, budget ${DRIVE_DEFAULT_COST_PER_MINUTE} cost/minute`);
 console.log();
 console.log(`${"cost".padStart(5)}  ${"resource".padEnd(8)}  ${"projection".padEnd(projectionWidth)}  request`);
@@ -105,7 +106,7 @@ for (const [label, url] of rows) {
   const parsed = new URL(url, API);
   const fields = parsed.searchParams.get("fields") ?? "";
   const query = [...parsed.searchParams.entries()].filter(([key]) => key !== "fields").map(([key, value]) => `${key}=${value}`).join("&");
-  console.log(`${String(driveRequestCost(url)).padStart(5)}  ${driveCostResource(url).padEnd(8)}  ${fields.padEnd(projectionWidth)}  ${label} (${query || "no query"})`);
+  console.log(`${String(driveProjectedCost(url)).padStart(5)}  ${driveCostResource(url).padEnd(8)}  ${fields.padEnd(projectionWidth)}  ${label} (${query || "no query"})`);
 }
 
 console.log();

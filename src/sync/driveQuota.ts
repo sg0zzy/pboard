@@ -2,23 +2,35 @@ import { driveSecondDelayMs } from "./driveRetry";
 /**
  * Drive request-cost accounting and a quota-aware throttle.
  *
- * The cost table is a DERIVED LOCAL MODEL: base 1 unit per Drive metadata
- * request, +1 per top-level projected field, 2 for a projected field carrying
- * a nested selection, +pageSize for list/search/permission-list requests, +10
- * when a pageToken continues a page, and base-only for `alt=media` and
- * `generateIds`. Google reports the authoritative `X-Drive-Request-Cost` per
- * response; when that header is present the throttle charges the reported
- * value instead of the projection, so real usage always wins over the model.
- * The same page's per-method table prices a request in quota units: 5 for a read
- * (`files.get`), 100 for a list, 200 for a download, 50 for an edit, 5 for other
- * actions. The projection is a pre-flight estimate only, so it can sit below the
- * documented cost of a download or above that of a large-page list; the reported
- * header is the accounting truth whenever Google supplies one.
+ * Two different numbers are kept apart deliberately:
+ *
+ * - `driveRequestCost` is what Google charges for a request: the documented
+ *   flat per-method cost in quota units (read 5, list 100, edit 50, download
+ *   200, other 5). This is the only value the ledger accumulates, so the
+ *   ledger is comparable with the Cloud console's "Total Query Cost" metric.
+ * - `driveProjectedCost` is Pboard's old pre-flight model (base 1, +1 per
+ *   projected field, +pageSize for page-priced resources). It is retained for
+ *   diagnostics only: page size is NOT part of Google's pricing, so the
+ *   projection prices a two-row name lookup at 6 units where Google charges
+ *   100, and a 1,000-row changes page at 1,005 where Google charges 100.
+ *
+ * Either number is a single browser context's view. Google's per-user limit
+ * also counts every other device, browser profile and service that calls the
+ * API as the same user in the same Cloud project, and Google additionally
+ * enforces short-window rate checks that no per-minute budget predicts; a
+ * "well under the limit" ledger therefore never proves the traffic is cheap.
+ * Google reports the authoritative `X-Drive-Request-Cost` per response when it
+ * supplies one, and that reported value always wins over the table.
  *
  * Projected overshoots defer a request. An actual quota denial opens a shared
  * cooldown: subsequent callers receive the quota error without hitting Drive.
  */
 
+export const DRIVE_UNIT_READ = 5;
+export const DRIVE_UNIT_LIST = 100;
+export const DRIVE_UNIT_EDIT = 50;
+export const DRIVE_UNIT_DOWNLOAD = 200;
+export const DRIVE_UNIT_OTHER = 5;
 export const DRIVE_COST_BASE = 1;
 export const DRIVE_COST_FIELD = 1;
 export const DRIVE_COST_FIELD_GROUP = 2;
@@ -71,8 +83,25 @@ export function driveCostResource(input: string): DriveCostResource {
   return "get";
 }
 
-/** Prices the request the funnel actually sends, from its URL. */
-export function driveRequestCost(input: string): number {
+/** What Google charges for one request, in quota units: the documented flat
+ * per-method cost, independent of projection size or page size.
+ * https://developers.google.com/workspace/drive/api/guides/limits */
+export function driveRequestCost(input: string, method = "GET"): number {
+  const url = new URL(input, "https://www.googleapis.com/drive/v3");
+  const path = url.pathname;
+  const write = /^(post|patch|put|delete)$/i.test(method);
+  if (path.endsWith("/changes/startPageToken") || path.includes("/generateIds") || path.includes("/listLabels")) return DRIVE_UNIT_OTHER;
+  if (path.endsWith("/changes")) return DRIVE_UNIT_LIST;
+  if (path.includes("/about")) return DRIVE_UNIT_READ;
+  if (path.endsWith("/permissions")) return write ? DRIVE_UNIT_EDIT : DRIVE_UNIT_LIST;
+  if (url.searchParams.get("alt") === "media") return DRIVE_UNIT_DOWNLOAD;
+  if (path.endsWith("/files")) return write ? DRIVE_UNIT_EDIT : DRIVE_UNIT_LIST;
+  return write ? DRIVE_UNIT_EDIT : DRIVE_UNIT_READ;
+}
+
+/** Pboard's pre-flight projection of a request. Diagnostics only; never
+ * charged, because page size is not part of Google's pricing. */
+export function driveProjectedCost(input: string): number {
   const url = new URL(input, "https://www.googleapis.com/drive/v3");
   const resource = driveCostResource(input);
   if (resource === "flat") return DRIVE_COST_BASE;
@@ -138,12 +167,14 @@ export function driveQuotaError(status: number, detail: string, throttle: DriveQ
   const accounted = projected.charged + projectedCost;
   // Google can deny a request while the local window is still inside the budget, so
   // the message states the relation that holds instead of claiming an overshoot.
+  // The overshoot branch says "projected" because a request the window cannot hold
+  // is never booked: the ledger still holds only `projected.charged`.
   const budget = accounted > projected.limit
     ? `projected cost ${accounted} > limit ${projected.limit}`
     : `charged ${accounted} of limit ${projected.limit}`;
   // The advertised cooldown wins when it is longer than the local window reset.
   const waitMs = Math.max(observation.waitMs, driveSecondDelayMs(detail) ?? 0);
-  return throttle.cooldown(new DriveQuotaExceededError(`${base}; local estimate: ${budget}; retry after ${waitMs}ms`, failure, accounted, waitMs));
+  return throttle.cooldown(new DriveQuotaExceededError(`${base}; drive quota ledger: ${budget} units/min for this context only — Google's metric also counts this account's other devices and short-window rate checks; retry after ${waitMs}ms`, failure, accounted, waitMs));
 }
 
 export type DriveQuotaObservation = { cost: number; waitMs: number };
@@ -159,6 +190,14 @@ export interface DriveQuotaThrottle {
   acquire(projectedCost: number, signal?: AbortSignal | null): Promise<DriveQuotaObservation>;
   /** Corrects the projection that `acquire` booked with the real `X-Drive-Request-Cost`; an observation without an acquire books nothing. */
   observe(projectedCost: number, headers?: Headers | null): number;
+  /**
+   * Drop a recorded Google denial so the next caller actually reaches Drive.
+   * The charged window stays: this clears the wait, never the accounting. An
+   * explicit dismissal also restarts the denial escalation, because a user who
+   * dismisses a failure to watch whether it returns must not be held at the
+   * five-minute ceiling by the very failure they dismissed.
+   */
+  clearCooldown(): void;
   snapshot(): DriveQuotaSnapshot;
 }
 
@@ -243,7 +282,12 @@ export function createDriveQuotaThrottle(options: {
     quotaError = withWait(error, blockedUntil - now());
     return quotaError;
   }
-  return { reserve, acquire, observe, snapshot, cooldown };
+  function clearCooldown() {
+    blockedUntil = 0;
+    denials = 0;
+    quotaError = undefined;
+  }
+  return { reserve, acquire, observe, snapshot, cooldown, clearCooldown };
 }
 
 /** One ledger per JS context. Google's quota also includes other contexts/devices. */
@@ -251,4 +295,16 @@ let shared: DriveQuotaThrottle | undefined;
 export function defaultDriveQuotaThrottle(): DriveQuotaThrottle {
   if (!shared) shared = createDriveQuotaThrottle();
   return shared;
+}
+
+/**
+ * Let this context's next Drive request go out instead of replaying the stored
+ * denial. Backs the sidebar's "clear error" action, which is the way to find out
+ * whether Google still denies the request or whether the failure was a transient
+ * window. The charged unit window is deliberately untouched, so the ledger keeps
+ * counting; if the limit is still exhausted, the next attempt is denied again and
+ * the error reappears.
+ */
+export function clearDriveQuotaCooldown(): void {
+  defaultDriveQuotaThrottle().clearCooldown();
 }

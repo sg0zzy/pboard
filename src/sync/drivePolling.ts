@@ -19,7 +19,7 @@ export function registerDriveAccountPolling() {
       let cooldown = 0;
       try {
         if (await googleDrive.getConnectionState() === 'connected') {
-          await googleDrive.reconcileAll();
+          await googleDrive.reconcileAll({ force: true });
           attempt = 0;
         }
       } catch (error) {

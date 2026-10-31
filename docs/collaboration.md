@@ -62,7 +62,7 @@ My Drive/
 
 `src/sync/drivePermissions.ts` creates/reuses this layout and caches folder, project-file, and realtime-folder IDs in `pboardDriveSharedProjects`. Enabling sharing uploads the local snapshot without deleting the old private backup. Private snapshot reconciliation skips shared boards; shared snapshot writes use the separate shared-sync path.
 
-The project **folder** is the main permission target; child files inherit access. Viewers receive `reader`, editors receive `writer`, and the folder owner is the board owner. Viewer signaling needs writes, so the permission service grants separate writer access to the realtime folder; role changes retain signaling writer access, while member removal revokes it separately. Account identity comes from Drive's `about?fields=user(emailAddress,displayName)` endpoint, not the People API.
+The project **folder** is the main permission target; child files inherit access. Viewers receive `reader`, editors receive `writer`, and the folder owner is the board owner. Viewer signaling needs writes, so the permission service grants separate writer access to the realtime folder; role changes retain signaling writer access, while member removal revokes it separately. Account identity comes from Drive's `about?fields=user(emailAddress,displayName)` endpoint, not the People API. Because the email belongs to the access token, `src/sync/driveIdentity.ts` resolves it once per JS context per token and shares the in-flight lookup, so every consumer of the account — the erasure sweep, the preference round, the changes feed, the role checks — pays one request instead of one each.
 
 | Role | Board content | Membership | Project removal |
 | --- | --- | --- | --- |
@@ -190,6 +190,12 @@ pboardCounters.snapshot()
 pboardCounters.snapshot().driveCost
 pboardCounters.clear()
 ```
+
+`driveCost.projected` and `driveCost.byResource` are in Google quota units, priced
+by method (`X-Drive-Request-Cost` when a response reports it); they cover the one
+context reading them, so read them in both the background page and the sidebar and
+add — Google's per-user limit adds this account's other browsers, devices and the
+signaling service on top.
 
 The counters are the fastest way to attribute a load to a component: a
 `renders` count that grows while the board is idle points at a subscription
@@ -645,6 +651,75 @@ holds the room at the fast cadence for as long as peers are present.
 while a room is young, silence after the idle boundary, one poll per slow
 interval thereafter, the fast cadence held by a live peer and re-armed by a
 send.
+
+### One browser start asked Drive the same questions once per caller
+
+The extension worker and the sidebar page each build a runtime, and each one
+reconciles at startup. Neither the identity lookup, the AppData listings nor the
+reconcile round was shared, so the same question was asked once per caller and
+once per context: a warm start of three boards measured 89 Drive requests,
+of which 16 were `about?fields=user(…)` — the account's email, resolved again by
+the erasure sweep, the preference round, the changes feed once per board, and
+once more when the feed persisted its cursor — and 28 were `files.list` over the
+same AppData prefixes. Because both contexts also start within a second or two
+of each other, the burst lands inside the short window Google checks per user
+and per method, which is what produced the spike in `DriveAbout.Get` and
+`DriveFiles.List` while the per-minute budget looked untouched.
+
+Three mechanisms, none of which is a time cache of mutable state, take it back:
+
+- `src/sync/driveIdentity.ts` keys the account identity by access token, so a
+  token refresh or an account switch costs exactly one lookup and the concurrent
+  callers join the one in flight. A failed lookup is never cached.
+- `src/sync/driveSharedRequest.ts` replays only requests that are *already in
+  flight*, for idempotent `GET`s only. Presence polling and change detection
+  still see a fresh answer on the next tick, which is what the
+  `cache: "no-store"` funnels guarantee.
+- `reconcileAll` is single-flight per context and stamps a completed round in
+  shared storage (`pboardDriveLastReconciledAt`, 30-second window), which is the
+  only coordination the two contexts have. Every explicit user action, the
+  connect path and the recurring alarm pass `{ force: true }`; a failed round
+  stamps nothing and stays immediately retryable.
+
+The same measurement exposed why the local quota ledger looked healthy while
+Google was denying requests: it priced a request from its projection
+(`1 + fields + pageSize`), so a three-board start "spent" 2,994 units of the
+325,000 units/minute per-user budget — 0.9 % — while Google had already charged
+3,590 for those 89 requests. Google prices a request by *method* (read 5, list
+100, edit 50, download 200, other 5) and page size is not part of the price, so
+the old model under-priced a two-row name lookup (6 where Google charges 100)
+and over-priced a 1,000-row changes page (1,005 where Google charges 100). The
+ledger now accumulates the documented per-method cost and stays comparable with
+the Cloud console's Total Query Cost metric; the projection survives as
+`driveProjectedCost`, for diagnostics only. Neither number is the whole truth:
+Google's per-user metric also counts this account's other devices, browser
+profiles and the signaling service's own verification calls, and it enforces
+short-window rate checks that no per-minute budget predicts.
+
+`tests/startupRequestProfile.test.ts` boots the worker and the sidebar over one
+storage and one Drive stub and prints the per-method profile for cold, warm,
+WebRTC-enabled and identity-denied starts. It pins two identity reads per
+startup, a warm three-board start inside 70 requests and 4,500 units, that a
+first-ever start costs more than a steady-state one, and that denying the
+identity lookup costs one failed request rather than a retry storm.
+
+A denial also parks the context that saw it: `driveQuota` keeps a shared
+cooldown, so every later caller is answered locally for up to five minutes and
+nothing new is learned about whether Google still refuses. The ✕ beside a Drive
+error clears that state so it can be observed: `clearDriveSyncError` forgets the
+board's stored failure and this page's cooldown, and `DRIVE_CLEAR_PROJECT_ERROR`
+makes the worker forget its own — the worker is the context that usually issued
+the denied request. Neither call forgives a pending change, so the next sync is
+a real request that reports the failure again if the limit is genuinely spent;
+that is how a one-off rate window is told apart from exhaustion.
+
+`tests/driveSyncControls.test.tsx`, `tests/background.test.ts`,
+`tests/recovery/syncStateWrite.test.ts` and the dismissal case in
+`tests/driveQuota.test.ts` pin the four halves of that: the button appears only
+with a failure on screen and clears both contexts, the worker refuses an unnamed
+board and reports a failed dismissal, the stored board stays dirty and is written
+once, and a dismissed cooldown lets the next request reach Drive with the
+escalation restarted at one window.
 
 ## Sync v2 components (unified storage wired; buffered realtime opt-in per board)
 
