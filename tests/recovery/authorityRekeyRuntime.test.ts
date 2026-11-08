@@ -130,7 +130,11 @@ it('recovers the owner authority from the unified folder without legacy project.
   expect(a.published).toBeTruthy();
   const calls = vi.mocked(a.fetcher).mock.calls;
   expect(calls.some(([input]) => String(input).includes('/folder-v2/permissions'))).toBe(true);
-  expect(calls.filter(([input]) => String(input).includes('googleapis.com')).every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
+  // Read-only against the board itself: the only writes are the public grant
+  // mirror publications (board-grant files, account appdata), never board or
+  // permission data.
+  expect(calls.filter(([input, init]) => String(input).includes('googleapis.com')
+    && !/pboard-board-grant/.test(String(init?.body ?? ''))).every(([, init]) => !init?.method || init.method === 'GET')).toBe(true);
 });
 
 it('refuses unified-folder re-key for a writer even with a stale legacy owned-folder record', async () => {

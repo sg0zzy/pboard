@@ -227,19 +227,20 @@ describe("funnel URLs as the funnel actually sends them", () => {
     return { urls, fetcher, query: (url: string) => new URL(url).searchParams };
   }
 
-  it("projects the recorded permission-list URL at 24, its continuation at 34", async () => {
+  it("asks a permission listing for the page maximum and is charged one listing per page", async () => {
     const h = harness();
     await createDrivePermissionTransport(auth, h.fetcher).listPermissions(FILE);
-    expect(h.urls.map((url) => driveProjectedCost(url))).toEqual([24, 34]);
+    // `permissions.list` coerces anything above 100 to 100, so asking for 20 only
+    // meant that a board with more than twenty grants paid twice.
     expect(h.query(h.urls[0]).get("fields")).toBe("nextPageToken,permissions(id,type,role,emailAddress,displayName)");
-    expect(h.query(h.urls[0]).get("pageSize")).toBe("20");
+    expect(h.query(h.urls[0]).get("pageSize")).toBe("100");
     expect(h.query(h.urls[1]).get("pageToken")).toBe("CAIHEAE");
-    // The accepted table projects the same URL at 23 because it carries no
-    // continuation token; the funnel asks for one, so its recorded URL prices 24.
-    expect(driveProjectedCost(request(`files/${FILE}/permissions`, { fields: "permissions(id,type,role,emailAddress,displayName)", pageSize: "20" }))).toBe(23);
+    // What Google charges is the ledger's business: one listing per page, first
+    // page or continuation, independent of the page size asked for.
+    expect(h.urls.map((url) => driveRequestCost(url, "GET"))).toEqual([DRIVE_UNIT_LIST, DRIVE_UNIT_LIST]);
   });
 
-  it("projects each collaboration listing at 24, continued by 34", async () => {
+  it("asks each collaboration listing for a full page and is charged one listing per page", async () => {
     const h = harness();
     const transport = createDrivePermissionTransport(auth, h.fetcher);
     await transport.listFiles("board-1");
@@ -247,12 +248,21 @@ describe("funnel URLs as the funnel actually sends them", () => {
     await transport.listSharedWithMe();
     expect(h.urls).toHaveLength(6);
     const firstPage = h.urls.filter((url) => !h.query(url).get("pageToken"));
-    expect(firstPage.map((url) => driveProjectedCost(url))).toEqual([24, 24, 24]);
-    expect(h.urls.filter((url) => h.query(url).get("pageToken")).map((url) => driveProjectedCost(url))).toEqual([34, 34, 34]);
+    const continued = h.urls.filter((url) => h.query(url).get("pageToken"));
     for (const url of firstPage) {
       expect(h.query(url).get("fields")).toBe("nextPageToken,files(id,name,mimeType,modifiedTime,parents)");
-      expect(h.query(url).get("pageSize")).toBe("20");
+      // A listing costs a flat 100 units whatever its page size, so the old
+      // `pageSize=20` turned one room's 25 presence files into two 100-unit
+      // requests per poll; the maximum page makes it one again.
+      expect(h.query(url).get("pageSize")).toBe("1000");
     }
+    expect(h.urls.map((url) => driveRequestCost(url, "GET"))).toEqual(firstPage.concat(continued).map(() => DRIVE_UNIT_LIST));
+    // The projection grows with the page asked for — that is precisely why the
+    // ledger prices by method and this only diagnoses. Identical shapes must at
+    // least project identically.
+    const projected = firstPage.map((url) => driveProjectedCost(url));
+    expect(new Set(projected).size).toBe(1);
+    expect(continued.map((url) => driveProjectedCost(url))).toEqual(projected.map((value) => value + DRIVE_COST_PAGETOKEN));
   });
 
   it("reads parents from the listing projection, never as a per-file lookup", async () => {
@@ -316,6 +326,7 @@ describe("the documented per-method cost Google charges", () => {
     { label: "board snapshot metadata", url: request(`files/${FILE}`, { fields: "id,name,mimeType,modifiedTime" }), expected: DRIVE_UNIT_READ },
     { label: "shared-root name probe, page size 2", url: request("files", { q: "name contains 'x'", fields: "files(id)", pageSize: "2" }), expected: DRIVE_UNIT_LIST },
     { label: "collaboration listing, page size 20", url: request("files", { fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)", pageSize: "20" }), expected: DRIVE_UNIT_LIST },
+    { label: "collaboration listing, page size 1000", url: request("files", { fields: "nextPageToken,files(id,name,mimeType,modifiedTime,parents)", pageSize: "1000" }), expected: DRIVE_UNIT_LIST },
     { label: "inventory page, page size 200", url: request("files", { fields: "nextPageToken,files(id,name,size,createdTime)", pageSize: "200" }), expected: DRIVE_UNIT_LIST },
     { label: "permission listing", url: request(`files/${FILE}/permissions`, { fields: "permissions(id,role)", pageSize: "20" }), expected: DRIVE_UNIT_LIST },
     { label: "changes feed page", url: request("changes", { pageToken: "CAI", pageSize: "1000", spaces: "drive" }), expected: DRIVE_UNIT_LIST },

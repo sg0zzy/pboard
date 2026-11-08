@@ -7,6 +7,8 @@ import { validateWebSocketEndpoint } from "./security/endpoint";
 import { prepareRelayAdmission, type RelayAuthorization } from "./security/relayAdmission";
 import { collaborationDiagnostic } from "./diagnostics";
 import { collaborationCounters } from "./counters";
+import { trackTransportSocket, type TransportDial } from "../sync/transportDiagnostics";
+import { automaticAuthBudget, type AuthBudget } from "./authBudget";
 
 export type ServiceAdmissionRequest = { challenge: string; session: string; room: string; key: StoredDeviceKey };
 
@@ -20,6 +22,11 @@ export function createExperimentalWebSocketSignaling(options: {
   loopbackDevelopment?: boolean;
   webSocket?: typeof WebSocket;
   getServiceAdmission?: (request: ServiceAdmissionRequest) => Promise<string>;
+  /** Shared per-context automatic-auth budget. This transport's `GET /ws` is
+   * one request in the proxy's stick table like any other dial's, so it waits
+   * for a slot rather than opening beside the log's connections. Production
+   * omits it and shares the module singleton. */
+  authBudget?: AuthBudget;
 }): PboardSignaling {
   const url = new URL(options.url);
   const loopback = import.meta.env.DEV && options.loopbackDevelopment && url.protocol === "ws:" &&
@@ -28,6 +35,9 @@ export function createExperimentalWebSocketSignaling(options: {
       (!loopback && validateWebSocketEndpoint(options.url).check !== "ok")) throw new Error("Invalid experimental signaling endpoint");
   const Socket = options.webSocket ?? WebSocket;
   let socket: WebSocket | undefined;
+  /** The diagnostics record of the socket this transport currently holds, so
+   *  `leave()` can attribute its own close. */
+  let currentDial: TransportDial | undefined;
   let stopped = false;
   let presence: SignedPresenceEnvelope | undefined;
   let presenceHandler: (peer: string, envelope: SignedPresenceEnvelope) => void = () => {};
@@ -61,15 +71,37 @@ export function createExperimentalWebSocketSignaling(options: {
     const admission = options.getAuthorization
       ? await prepareRelayAdmission(options.topic, await options.getAuthorization(), key.keyId) : undefined;
     if (stopped) return;
+    // Admission from the shared budget, immediately before the socket is
+    // built: this upgrade is counted by the same proxy stick table as the
+    // operation log's, and the peer transport is a third dial per board on a
+    // relay postured build. A dial that never reaches the network spends
+    // nothing.
+    const gate = await (options.authBudget ?? automaticAuthBudget).acquireRelayDial();
+    if (stopped) return;
+    if (gate.paced) debug("relay.dial_paced");
     ownId = key.keyId;
     debug("relay.connecting");
     const ws = new Socket(options.url);
     socket = ws;
+    // Bound to this dial, not to the closure's current socket: a socket a newer
+    // connect() has already replaced still ended, and it must not be recorded
+    // as the replacement's close. This transport is the third possible dial per
+    // board on a relay-postured build, so the ledger has to name it.
+    const dial = trackTransportSocket(ws, "signaling:room", options.topic, key.keyId);
+    currentDial = dial;
+    // A refused upgrade reaches a browser as a socket failure with no `429` to
+    // report, so the budget records the spend as failed rather than letting the
+    // snapshot read like healthy dials.
+    let authenticated = false;
     joined = false;
     // Serialize signing and inbound processing so authentication cannot race close/rejoin.
     let inbound = Promise.resolve();
     let pending = 0;
-    deadline = setTimeout(() => ws.close(), 10_000);
+    deadline = setTimeout(() => {
+      // Never answered: the client calls `close()`, but the cause is the network.
+      dial?.closed(undefined, { by: "network", reason: "timeout:connect" });
+      ws.close();
+    }, 10_000);
     ws.onmessage = (event) => {
       if (++pending > 64) { errorHandler(new Error("Experimental signaling inbound queue exceeded")); ws.close(); return; }
       inbound = inbound.then(async () => {
@@ -108,6 +140,7 @@ export function createExperimentalWebSocketSignaling(options: {
           }
           case "authenticated":
             if (message.peerId !== ownId || message.session !== ownSession) throw new Error("Signaling identity mismatch");
+            authenticated = true;
             debug("relay.authenticated");
             send({ type: "join" }); break;
           case "joined":
@@ -159,13 +192,18 @@ export function createExperimentalWebSocketSignaling(options: {
     };
     ws.onerror = () => { debug("relay.network_error"); errorHandler(new Error("Experimental signaling WebSocket failed")); };
     ws.onclose = (event) => {
+      // Recorded before the ownership guard: an older socket that a new dial has
+      // already replaced still ended, and the ledger counts connections.
+      dial?.closed(event);
       if (socket !== ws) return;
+      if (!authenticated) (options.authBudget ?? automaticAuthBudget).noteRelayDialFailure();
       debug("relay.closed", { code: event.code });
       joined = false; ownSession = ""; peers.clear(); roster(); clearInterval(heartbeat); clearTimeout(deadline);
       if (!stopped) {
         const delay = Math.min(30_000, 500 * 2 ** Math.min(attempts++, 6)) * (0.75 + Math.random() * 0.5);
         debug("relay.reconnect_scheduled", { count: Math.round(delay) });
         collaborationCounters.countEvent("relay.reconnect");
+        dial?.reconnected(delay);
         retry = setTimeout(() => { void connect().catch(fail); }, delay);
       }
     };
@@ -188,6 +226,9 @@ export function createExperimentalWebSocketSignaling(options: {
     onError(handler) { errorHandler = handler; },
     async leave() {
       stopped = true; clearTimeout(retry); clearTimeout(deadline); clearInterval(heartbeat);
+      // Leaving is a close this client asked for; the browser reports it as a
+      // clean close either way.
+      currentDial?.closed(undefined, { by: "client", reason: "leave" });
       rejectJoin?.(new Error("Experimental signaling stopped"));
       if (joined && socket?.readyState === Socket.OPEN) send({ type: "leave" });
       joined = false; socket?.close(); socket = undefined; peers.clear();

@@ -47,7 +47,17 @@ export type CollaborationCounters = {
   timings: Record<string, { runs: number; lastMs: number; totalMs: number }>;
   /** Aggregated subsystem activity, by event name (idle-work attribution). */
   events: Record<string, number>;
-  /** Live gauges: subscriptions, sockets, sessions that are currently open. */
+  /**
+   * Live gauges, by name. Three families are maintained by the helpers below
+   * and are the ones an invariant test reads:
+   *  - `timer.<name>` — callbacks still scheduled (`countedInterval`/`countedTimeout`).
+   *    The key exists only while the timer is armed, so the key set is the
+   *    armed set. This is what makes "the timer set is the same at 1 board and
+   *    at 100 boards" a single comparison.
+   *  - `transport.open` and `transport.topic.<topic>` — application WebSockets
+   *    dialled and not yet closed, counted where the socket is built.
+   *  - `rx.subscriptions` and `journal.listeners` — handles currently held.
+   */
   active: Record<string, number>;
 };
 
@@ -68,6 +78,21 @@ const counters: CollaborationCounters = {
   events: {},
   active: {}
 };
+
+/**
+ * Every counted timer that is still armed, by its native handle: the name it
+ * reports under and the function that removes it. Kept out of the handle so
+ * the handle stays the platform's own value (a number under jsdom, an object
+ * under Node) and every `clearInterval`-shaped call site is untouched.
+ */
+const armed = new Map<ReturnType<typeof setTimeout>, { name: string; release: () => void }>();
+
+/**
+ * Live application WebSockets per room topic. The gauge is the projection of
+ * this map, so a `clear()` cannot make a dialled socket disappear from the
+ * report a test then reads.
+ */
+const socketTopics = new Map<string, number>();
 
 /**
  * Whether the counters are collected.
@@ -121,6 +146,18 @@ export const collaborationCounters = {
     counters.timings = {};
     counters.events = {};
     counters.active = {};
+    // A timer that is still armed, or a socket that is still dialled, is still
+    // work: `clear()` zeroes the *counters* and must not claim an idle context
+    // the registry can see is not idle. So the gauges are republished from the
+    // registries rather than simply emptied.
+    for (const entry of armed.values()) {
+      const key = `timer.${entry.name}`;
+      counters.active[key] = (counters.active[key] ?? 0) + 1;
+    }
+    for (const [topic, count] of socketTopics) {
+      counters.active['transport.open'] = (counters.active['transport.open'] ?? 0) + count;
+      counters.active[`transport.topic.${topic}`] = count;
+    }
   },
   countDriveRequest(purpose: keyof CollaborationCounters["driveRequests"]): void {
     if (!enabled()) return;
@@ -148,6 +185,71 @@ export const collaborationCounters = {
   setActive(name: string, value: number): void {
     if (!enabled()) return;
     counters.active[name] = value;
+  },
+  /**
+   * Move a live gauge by `by`, keeping the key absent at zero so the key set
+   * of `active` reads as "what is live". The timer registry, the socket
+   * registry and the subscription gauges all move through here.
+   */
+  adjustActive(name: string, by = 1): void {
+    if (!enabled()) return;
+    const next = (counters.active[name] ?? 0) + by;
+    if (next > 0) counters.active[name] = next;
+    else delete counters.active[name];
+  },
+  /**
+   * `setInterval` with a gauge: `active['timer.<name>']` counts callbacks still
+   * scheduled. The armed set is therefore the key set of `active` filtered to
+   * `timer.`, which is what makes "identical timer set at one board and at a
+   * hundred" one comparison. Disarm with `clearCountedTimer` — a plain
+   * `clearInterval` would leave the gauge armed and the invariant test unable
+   * to tell an armed timer from a forgotten one.
+   */
+  countedInterval(name: string, run: () => void, ms: number): ReturnType<typeof setInterval> {
+    if (!enabled()) return setInterval(run, ms);
+    const handle = setInterval(run, ms);
+    armed.set(handle, { name, release: () => { armed.delete(handle); collaborationCounters.adjustActive(`timer.${name}`, -1); } });
+    collaborationCounters.adjustActive(`timer.${name}`, 1);
+    return handle;
+  },
+  /**
+   * `setTimeout` with a gauge. The gauge drops when the callback runs as well
+   * as when it is cleared: a timeout that fired is no longer scheduled, and
+   * that is the difference between "armed" and "exists".
+   */
+  countedTimeout(name: string, run: () => void, ms: number): ReturnType<typeof setTimeout> {
+    if (!enabled()) return setTimeout(run, ms);
+    const handle = setTimeout(() => { armed.get(handle)?.release(); run(); }, ms);
+    armed.set(handle, { name, release: () => { armed.delete(handle); collaborationCounters.adjustActive(`timer.${name}`, -1); } });
+    collaborationCounters.adjustActive(`timer.${name}`, 1);
+    return handle;
+  },
+  /**
+   * Clears a handle from `countedInterval`/`countedTimeout` and disarms its
+   * gauge. Safe on a plain handle and on `undefined`, and idempotent: the
+   * release is removed from the registry the first time it runs.
+   */
+  clearCountedTimer(handle: ReturnType<typeof setTimeout> | undefined): void {
+    if (handle === undefined) return;
+    // The platform treats `clearTimeout`/`clearInterval` as one operation on
+    // the same timer list, so one call disarms either kind of handle.
+    clearTimeout(handle);
+    armed.get(handle)?.release();
+  },
+  /** One application WebSocket became live; `topic` is the room it dialled. */
+  noteSocketOpen(topic: string): void {
+    if (!enabled()) return;
+    socketTopics.set(topic, (socketTopics.get(topic) ?? 0) + 1);
+    collaborationCounters.adjustActive('transport.open', 1);
+    collaborationCounters.adjustActive(`transport.topic.${topic}`, 1);
+  },
+  /** That socket closed, however it ended. Pairs with `noteSocketOpen`. */
+  noteSocketClose(topic: string): void {
+    if (!enabled()) return;
+    const left = (socketTopics.get(topic) ?? 0) - 1;
+    if (left > 0) socketTopics.set(topic, left); else socketTopics.delete(topic);
+    collaborationCounters.adjustActive('transport.open', -1);
+    collaborationCounters.adjustActive(`transport.topic.${topic}`, -1);
   },
   countBackgroundSync(outcome: "attempts" | "settled" | "unsettled" | "failed" | "scheduled"): void {
     if (!enabled()) return;
@@ -257,4 +359,10 @@ declare global {
   var pboardCounters: CollaborationCountersApi | undefined;
   /** Set by the build when the counters are collected. */
   var __PBOARD_DIAGNOSTICS__: boolean;
+  /**
+   * The diagnostics console handle, installed by
+   * `exposeCollaborationDiagnostics` in whichever context opened a board.
+   * Async because it awaits the room reader it was given.
+   */
+  var pboardCollaboration: (() => Promise<Record<string, unknown>>) | undefined;
 }

@@ -532,12 +532,12 @@ input:focus, textarea:focus, select:focus { border-color: var(--md-sys-color-out
 .shared-board-inbox li > span, .shared-board-inbox small { display: block; }
 .shared-board-inbox button { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 
-.board-maintenance { position: relative; font-size: .75em; }
-.board-maintenance summary { cursor: pointer; padding: .3em; border: 1px solid var(--md-sys-color-outline-variant); border-radius: 5px; }
-.board-maintenance-panel { display: flex; flex-wrap: wrap; align-items: center; gap: .5em; margin-top: .4em; max-width: min(22rem, 100%); overflow-wrap: anywhere; }
-.board-maintenance[open] { flex-basis: 100%; }
-.board-maintenance-panel button { font: inherit; }
-.board-maintenance-panel [role="status"], .board-maintenance-preview { flex-basis: 100%; }
+.board-retention { position: relative; font-size: .75em; }
+.board-retention summary { cursor: pointer; padding: .3em; border: 1px solid var(--md-sys-color-outline-variant); border-radius: 5px; }
+.board-retention-panel { display: flex; flex-wrap: wrap; align-items: center; gap: .5em; margin-top: .4em; max-width: min(22rem, 100%); overflow-wrap: anywhere; }
+.board-retention[open] { flex-basis: 100%; }
+.board-retention-panel button { font: inherit; }
+.board-retention-panel [role="status"], .board-retention-preview { flex-basis: 100%; }
 
 .webrtc-toggle { position: relative; }
 .webrtc-toggle::after { content: ''; position: absolute; right: 2px; bottom: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--md-sys-color-primary); border: 1px solid var(--md-sys-color-surface); }
@@ -546,3 +546,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--md-sys-color-out
 .webrtc-toggle[data-state="disabled"]::after { background: var(--md-sys-color-outline); border-radius: 0; height: 2px; }
 .webrtc-toggle[data-state="disabled"] svg { opacity: .55; }
 .webrtc-toggle[data-state="error"]::after { background: var(--md-sys-color-error); }
+/* Deleted-board Drive cleanup: the deletion's second half, reported where the
+   board's sync status was. Silent in the steady state (confirmed or nothing
+   owed), so it never competes with the live board's own controls. */
+.deletion-cleanup-status { flex-basis: 100%; margin: 4px 0 0; max-width: 16rem; overflow-wrap: anywhere; text-align: right;
+  font-size: .6875em; line-height: 1.3; color: var(--md-sys-color-on-surface-variant); }
+.deletion-cleanup-status[data-cleanup-stage="failed"] { color: var(--md-sys-color-error); }

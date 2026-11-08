@@ -6,6 +6,7 @@ import type { DriveBoardStore } from '../driveBoardStore';
 import { serializeProjectSnapshot, deserializeProjectSnapshot, type ProjectSnapshot } from '../snapshot';
 import { deserializeBoardSnapshotV2, v2EntitiesToV1 } from '../snapshotV2';
 import { createOperationDriveStore, type OperationDriveStore, type DriveRole } from './driveStore';
+import { driveResourceKnownGone, isDriveGone, noteDriveResourceGone, clearDriveResourceGoneMemory } from '../driveHttp';
 import { OperationSession } from './session';
 import { OperationEngine } from './engine';
 import { legacyBootstrap, preserveLocalFork } from './migration';
@@ -15,7 +16,54 @@ import { parseStrictJson } from '../../collab/security/canonical';
 import type { OperationBinding } from './source';
 
 type MigrationMarker = { protocol: string; boardId: string; snapshotFileId?: string; baselineSegmentIds?: string[]; baselineIntegrity?: string; legacyFileIds: string[] };
+/** The owner-facing gardening preview: what the retention policy currently finds
+ * deletable, and what the confirmation gate in `BoardRetentionControls` will
+ * hand to `garden`. `garden` re-previews and refuses if the set changed, so a
+ * confirmation always speaks about the exact reviewed plan. */
+export type GardeningPreview = {
+  eligibleSegmentIds: string[];
+  eligibleSnapshotIds: string[];
+  retainedSnapshotIds: string[];
+  policy: string;
+  eligibleFileIds: string[];
+  eligibleSnapshots: number;
+  bytes: number;
+};
 const SNAPSHOT_LIMIT = 32 * 1024 * 1024;
+/** First delay before a rejected realtime factory may be tried again; it
+ * doubles per consecutive failure up to a minute (see `setRealtimeEnabled`). */
+const REALTIME_RETRY_BASE_MS = 5_000;
+const REALTIME_RETRY_MAX_MS = 60_000;
+/**
+ * Did the legacy file a migration locked still refuse writes?
+ *
+ * The locked legacy snapshot is a write barrier: while the operation protocol
+ * owns a board, nothing may write the pre-protocol file it was migrated from.
+ * A file Drive no longer has cannot be written by anybody, so the barrier
+ * holds. Reporting a deleted file as the removable kind of violation asked the
+ * user to re-lock a file that does not exist and failed every later sync of the
+ * board, because the check re-runs before each one: a board whose legacy
+ * checkpoint had been deleted 404ed forever instead of syncing.
+ */
+export async function legacyBarrierIntact(drive: { metadata(fileId: string): Promise<{ contentRestrictions?: { readOnly?: boolean }[] }> }, fileId: string): Promise<boolean> {
+  // Terminal for an id: Drive never reuses one, and the barrier check runs
+  // before every sync of every board, so re-asking about a deleted checkpoint
+  // once per sync was a 404 per legacy file per round — dozens of ids across a
+  // library of migrated boards. Ask once, remember the verdict, and let any
+  // other failure re-ask as it always did.
+  if (driveResourceKnownGone(fileId)) return true;
+  try {
+    return (await drive.metadata(fileId)).contentRestrictions?.some(restriction => restriction.readOnly) ?? false;
+  } catch (error) {
+    if (!isDriveGone(error)) throw error;
+    noteDriveResourceGone(fileId);
+    return true;
+  }
+}
+
+/** Test seam: forget which legacy files were reported gone. */
+export function clearLegacyBarrierMemory(): void { clearDriveResourceGoneMemory(); }
+
 export function createOperationService(options: {
   auth: GoogleAuthProvider; store: DriveBoardStore; fetcher: typeof fetch; getRepository: () => Promise<RxRepository | null>;
   sharedLayout: (boardId: string) => Promise<{ folderId: string | null; projectFileId: string | null }>;
@@ -24,20 +72,72 @@ export function createOperationService(options: {
   recoverLegacyImage?: (boardId: string, imageId: string) => Promise<import('../../types').BoardImage | null>;
   freezeLegacyMirrors?: (boardId: string, drive: OperationDriveStore) => Promise<void>;
   realtime?: (boardId: string, session: OperationSession, drive: OperationDriveStore) => Promise<{ broadcast: (ops: import('./protocol').Operation[]) => Promise<boolean>; close: () => Promise<void> }>;
+  /** Test seam: shorten the backoff a rejected realtime factory waits out. */
+  realtimeRetryBaseMs?: number;
   recordLayout: (boardId: string, folderId: string, projectFileId: string) => Promise<void>;
   onStatus?: (boardId: string, error?: string) => Promise<void>;
 }) {
-  const sessions = new Map<string, { session: OperationSession; drive: OperationDriveStore; stop: () => void; binding: OperationBinding }>();
+  const sessions = new Map<string, { session: OperationSession; drive: OperationDriveStore; binding: OperationBinding }>();
   const opening = new Map<string, Promise<OperationSession>>();
+  /**
+   * The one journal listener this service holds, shared by every open board.
+   *
+   * It used to be one listener per board, subscribed in `performOpen` and
+   * released only by `close`, so a browser that had opened N boards held N
+   * listeners for the rest of the session — each of them woken by every write
+   * to any board, and each of them keeping its board's session reachable. The
+   * rule now: **at most one listener while at least one board is open, and none
+   * once the last one closes**. The journal names the board in the changed-table
+   * list (`operation-board:<id>`), so one listener can dispatch exactly as the
+   * N did, and the count no longer depends on how many boards have been visited.
+   */
+  let journalStop: (() => void) | undefined;
+  const refreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  function scheduleRefresh(boardId: string) {
+    const entry = sessions.get(boardId);
+    if (!entry) return;
+    clearTimeout(refreshTimers.get(boardId));
+    // Coalesce a burst of writes to one refresh: the session re-reads the whole
+    // local log, so a write per keystroke must not become a read per keystroke.
+    refreshTimers.set(boardId, setTimeout(() => {
+      refreshTimers.delete(boardId);
+      void entry.session.refreshLocal().catch(error => options.onStatus?.(boardId, String(error)));
+    }, 8));
+  }
+  function watchJournal(rx: RxRepository) {
+    if (journalStop) return;
+    journalStop = rx.journal.subscribe(tables => {
+      if (!tables.includes('operations') && !tables.includes('operationCheckpoint')) return;
+      for (const table of tables) {
+        if (!table.startsWith('operation-board:')) continue;
+        scheduleRefresh(table.slice('operation-board:'.length));
+      }
+    });
+  }
+  function unwatchJournal() {
+    for (const timer of refreshTimers.values()) clearTimeout(timer);
+    refreshTimers.clear();
+    journalStop?.(); journalStop = undefined;
+  }
   async function repository() { const rx = await options.getRepository(); if (!rx) throw new Error('Operation synchronization requires local RxDB storage'); return rx; }
   async function readSnapshot(drive: OperationDriveStore, id: string, boardId: string) {
     return parseSnapshotAsync(await drive.read(id, SNAPSHOT_LIMIT), boardId);
   }
   async function syncImages(rx: RxRepository, drive: OperationDriveStore, boardId: string, images: { id: string }[], publish = true) {
     if (!images.length) return;
-    const files = await drive.inventory(), verified = await rx.operationSource.local.downloadedFiles(boardId);
     const role = await drive.folderRole();
-    for (const imageId of new Set(images.map(image => image.id))) {
+    // What this device has already uploaded, by content hash. Read before the
+    // listing is even asked for, and read once per sweep rather than per image:
+    // the sweep runs after every sync of every board, and every file here is
+    // named after its content, so one receipt answers "these exact bytes are on
+    // Drive" for good. Asking the cached listing instead was the reason a
+    // publishing sync inside the listing's five-minute window uploaded the same
+    // immutable file again — once per sync, for every image on the board.
+    const published = publish && ['owner', 'editor'].includes(role) ? await rx.operationSource.local.publishedImages(boardId) : new Set<string>();
+    const pending = [...new Set(images.map(image => image.id))].filter(imageId => !published.has(imageId));
+    if (!pending.length) return;
+    const files = await drive.inventory(), verified = await rx.operationSource.local.downloadedFiles(boardId);
+    for (const imageId of pending) {
       const candidates = files.filter(file => file.name === `image-${imageId}.json`);
       let local = await rx.blobs.getBlob(imageId), durable = false;
       for (const file of candidates) {
@@ -46,15 +146,38 @@ export function createOperationService(options: {
           const image = await drive.readImage(file.id, imageId);
           if (!local) { await rx.putImage(image); local = await rx.blobs.getBlob(imageId); }
           await rx.operationSource.local.downloaded(boardId, file.id); durable = true; break;
-        } catch { /* Preserve corrupt candidates and try another immutable copy. */ }
+        } catch (error) {
+          // A copy that is *gone* is not a copy to retry: Drive never reuses an id,
+          // so a 404 here is final, and this loop runs in the after-sync of every sync
+          // of every board — one deleted image file was a 404 per poll for as long as
+          // the board was open. Remember the verdict in the ledger that stops asking.
+          // A copy that is present but unreadable stays retryable, because that one
+          // can succeed.
+          if (isDriveGone(error)) await rx.operationSource.local.downloaded(boardId, file.id);
+        }
       }
-      if (durable) continue;
+      if (durable) {
+        // A copy was read (or is already receipted) from the board's own Drive
+        // folder, so these exact bytes are published: remember it, and later
+        // sweeps skip the upload without needing the listing to still name the
+        // file (the listing is cached and lags a fresh allocation — which is
+        // exactly how one publishing sync inside the cache window uploaded the
+        // same immutable file again). Only a publishing writer records it: a
+        // viewer's receipt is about reading, and a non-publishing sync must not
+        // stand in for an upload this device never made.
+        if (publish && ['owner', 'editor'].includes(role)) { await rx.operationSource.local.imagePublished(boardId, imageId); published.add(imageId); }
+        continue;
+      }
       if (!local && options.recoverLegacyImage) {
         const recovered = await options.recoverLegacyImage(boardId, imageId);
         if (recovered) { const actual = await rx.putImage(recovered); if (actual !== imageId) throw new Error('Legacy image hash mismatch; original asset retained'); local = await rx.blobs.getBlob(imageId); }
       }
       if (local && (role === 'viewer' || !publish)) continue;
       if (!local || !['owner', 'editor'].includes(role)) throw new Error(`Image ${imageId.slice(0, 12)} is not yet available on Google Drive; text edits remain saved`);
+      // Content-addressed names make the upload idempotent but not free: this
+      // sweep runs after every sync of every board, so an image already
+      // published by this device is not uploaded again.
+      if (published.has(imageId)) continue;
       const id = `image:${boardId}:${imageId}`;
       let intent = await rx.journal.read<{ fileId: string } | undefined>('operationCheckpoints', store => store.get(id));
       if (!intent) {
@@ -63,6 +186,8 @@ export function createOperationService(options: {
       }
       await drive.publishImage(intent.fileId, imageId, { dataUrl: await blobToDataUrl(local.blob), mimeType: local.mimeType, width: local.width, height: local.height });
       await rx.operationSource.local.downloaded(boardId, intent.fileId);
+      await rx.operationSource.local.imagePublished(boardId, imageId);
+      published.add(imageId);
     }
   }
   async function open(boardId: string, allowRemoved = false): Promise<OperationSession> {
@@ -100,7 +225,7 @@ export function createOperationService(options: {
           const marker = parseStrictJson(await drive.read(file.id)) as unknown as MigrationMarker;
           if (marker.protocol !== PROTOCOL || marker.boardId !== boardId || !Array.isArray(marker.legacyFileIds) || (typeof marker.snapshotFileId !== 'string' && !Array.isArray(marker.baselineSegmentIds))) throw new Error('Unsupported board protocol. Upgrade Pboard; local work is retained.');
           for (const id of marker.legacyFileIds) {
-            if (!(await drive.metadata(id)).contentRestrictions?.some(r => r.readOnly)) throw new Error('The legacy write barrier was removed. Re-lock the legacy snapshot before syncing.');
+            if (!await legacyBarrierIntact(drive, id)) throw new Error('The legacy write barrier was removed. Re-lock the legacy snapshot before syncing.');
           }
           legacyIds.push(...marker.legacyFileIds);
         }
@@ -205,12 +330,27 @@ export function createOperationService(options: {
       }
       await rx.operationSource.local.saveCheckpoint(base.checkpoint());
       await rx.operationSource.local.observe(boardId, base.vector(), base.logicalClock());
+      // A board whose migration record already existed on Drive was published by
+      // another device; this one only consumed it. Otherwise this device wrote
+      // the marker just above. Recorded so the account room is told about the
+      // board once, by the device that created it, rather than by every device
+      // that imports it on its next reconcile round.
+      await rx.operationSource.local.markBoardOrigin(boardId, markers.length ? 'imported' : 'created');
       binding = { id: `binding:${boardId}`, kind: 'operation-binding', boardId, folderId, role, legacyFileIds: [...new Set(legacyIds)], baseRevision };
       await rx.bindOperationBoard(binding, covered);
       await rx.operationSource.recover(boardId);
     } else await rx.bindOperationBoard({ ...binding, role });
     let realtime: Awaited<ReturnType<NonNullable<typeof options.realtime>>> | undefined;
     let realtimeGeneration = 0;
+    // A realtime factory failure is expensive in the relay posture — the call
+    // runs the authority bootstrap, the key courier and grant publication
+    // before it can even reach the log — and the sidebar re-enables realtime
+    // on every ten-second role pass. Without a window, one rejecting relay
+    // bought a full handshake per pass per browser forever, which is the
+    // enrollment churn this posture must not create. Failures are therefore
+    // retried at most once per backoff window (and once immediately more
+    // after the window has passed); success closes the window.
+    let realtimeFailure: Error | undefined, realtimeRetryAt = 0, realtimeRetryDelayMs = options.realtimeRetryBaseMs ?? REALTIME_RETRY_BASE_MS;
     let verifiedRole: DriveRole = role, verifiedAt = Date.now();
     const verifyRole = async () => {
       verifiedRole = await drive.folderRole(); verifiedAt = Date.now();
@@ -219,16 +359,28 @@ export function createOperationService(options: {
       return verifiedRole;
     };
     const session = new OperationSession({ boardId, polling: false, realtime: false,
-      beforeSync: async () => { await rx.operationSource.recover(boardId); for (const id of binding!.legacyFileIds) if (!(await drive.metadata(id)).contentRestrictions?.some(r => r.readOnly)) throw new Error('Legacy write protection was removed. Re-lock the legacy checkpoint before synchronization.'); },
+      beforeSync: async () => { await rx.operationSource.recover(boardId); for (const id of binding!.legacyFileIds) if (!await legacyBarrierIntact(drive, id)) throw new Error('Legacy write protection was removed. Re-lock the legacy checkpoint before synchronization.'); },
       afterSync: async publish => syncImages(rx, drive, boardId, (await rx.db.cards.find({ selector: { projectId: boardId } }).exec()).flatMap(card => card.imageId ? [{ id: card.imageId }] : []), publish),
       broadcast: operations => realtime?.broadcast(operations) ?? Promise.resolve(false),
       setRealtimeEnabled: async enabled => {
         const generation = ++realtimeGeneration;
-        if (!enabled) { const old = realtime; realtime = undefined; await old?.close(); }
+        if (!enabled) { const old = realtime; realtime = undefined; realtimeFailure = undefined; realtimeRetryAt = 0; realtimeRetryDelayMs = options.realtimeRetryBaseMs ?? REALTIME_RETRY_BASE_MS; await old?.close(); }
         else if (!realtime && options.realtime) {
-          const candidate = await options.realtime(boardId, session, drive);
-          if (generation !== realtimeGeneration) await candidate.close();
-          else realtime = candidate;
+          // The window keeps a rejecting relay from being re-handshaked by
+          // every ten-second role pass: the failure answer is already known,
+          // and the expensive part (bootstrap, courier, grant publication)
+          // is the whole factory, not the connection it ends in.
+          if (realtimeRetryAt > Date.now()) throw realtimeFailure ?? new Error('Board live transport is waiting to retry');
+          try {
+            const candidate = await options.realtime(boardId, session, drive);
+            if (generation !== realtimeGeneration) await candidate.close();
+            else { realtime = candidate; realtimeFailure = undefined; realtimeRetryAt = 0; realtimeRetryDelayMs = options.realtimeRetryBaseMs ?? REALTIME_RETRY_BASE_MS; }
+          } catch (error) {
+            realtimeFailure = error instanceof Error ? error : new Error(String(error));
+            realtimeRetryAt = Date.now() + realtimeRetryDelayMs;
+            realtimeRetryDelayMs = Math.min(REALTIME_RETRY_MAX_MS, realtimeRetryDelayMs * 2);
+            throw error;
+          }
         }
       }, local: rx.operationSource.local, drive,
       role: verifyRole,
@@ -237,20 +389,35 @@ export function createOperationService(options: {
       onError: error => { void options.onStatus?.(boardId, error instanceof Error ? error.message : 'Board synchronization failed'); }
     });
     await session.open();
-    let scheduled: ReturnType<typeof setTimeout> | undefined;
-    const stop = rx.journal.subscribe(tables => {
-      if ((!tables.includes('operations') && !tables.includes('operationCheckpoint')) || !tables.includes(`operation-board:${boardId}`)) return;
-      clearTimeout(scheduled); scheduled = setTimeout(() => { void session.refreshLocal().catch(error => options.onStatus?.(boardId, String(error))); }, 8);
-    });
-    sessions.set(boardId, { session, drive, binding, stop: () => { clearTimeout(scheduled); stop(); } });
+    sessions.set(boardId, { session, drive, binding });
+    watchJournal(rx);
     return session;
   }
   return {
     open,
     async sync(boardId: string, force = false, publish = true) { const session = await open(boardId); await session.sync(force, publish); await options.onStatus?.(boardId); },
-    async flushRemoval(boardId: string) { const session = await open(boardId, true); if (await sessions.get(boardId)!.drive.folderRole() !== 'owner') return; await session.sync(true); },
-    async compact(boardId: string) { return (await open(boardId)).compact(); },
-    async previewGardening(boardId: string) {
+    async flushRemoval(boardId: string) {
+      const session = await open(boardId, true);
+      if (await sessions.get(boardId)!.drive.folderRole() !== 'owner') return;
+      // A removal must reach the devices already attached to this board's log,
+      // not only the Drive copy. The browser that deletes is usually switching
+      // away, and a Drive-only publish leaves every peer that still has the
+      // board open looking at content that no longer exists until its next
+      // poll. Attaching the live channel for the duration is best effort: the
+      // Drive publication on its own is still correct, just slower.
+      let attached = false;
+      // Durable copy first, then the live channel: attaching makes the session
+      // replay every operation the relay never carried, which for a removal is
+      // the whole point — the browser that deletes is on its way out, and no
+      // peer is going to poll a board nobody is on.
+      try { await session.sync(true); }
+      finally {
+        try { await session.setRealtime(true); attached = true; await session.broadcastUnsent(); }
+        catch { attached = false; }
+        if (attached) await session.setRealtime(false).catch(() => undefined);
+      }
+    },
+    async previewGardening(boardId: string): Promise<GardeningPreview> {
       await (await open(boardId)).sync(true);
       const { drive } = sessions.get(boardId)!;
       if (await drive.folderRole() !== 'owner') throw new Error('Only the Drive board owner may garden history');
@@ -281,6 +448,13 @@ export function createOperationService(options: {
     async role(boardId: string) { await open(boardId); return sessions.get(boardId)!.session.access(); },
     async layout(boardId: string) { await open(boardId); return sessions.get(boardId)!.binding; },
     active(boardId: string) { return sessions.get(boardId)?.session; },
-    async close(boardId: string) { const current = sessions.get(boardId); sessions.delete(boardId); current?.stop(); await current?.session.close(); }
+    async close(boardId: string) {
+      const current = sessions.get(boardId); sessions.delete(boardId);
+      // Drop this board's coalesced refresh before the session goes: a pending
+      // timer would call into a session that is being closed.
+      clearTimeout(refreshTimers.get(boardId)); refreshTimers.delete(boardId);
+      if (!sessions.size) unwatchJournal();
+      await current?.session.close();
+    }
   };
 }

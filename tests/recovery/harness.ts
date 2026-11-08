@@ -10,6 +10,7 @@ import type { DriveTransport } from '../../src/sync/driveTransport';
 import type { GoogleAuthProvider } from '../../src/sync/googleAuth';
 import type { KeyValueStorage } from '../../src/storage/repository';
 import { createBoardGrantService } from '../../src/collab/boardGrants';
+import { instantAuthBudget } from '../helpers/authBudget';
 import { generateDeviceKey, type StoredDeviceKey } from '../../src/collab/security/keys';
 
 export class MemoryStorage implements KeyValueStorage {
@@ -96,7 +97,7 @@ export async function openDevice(cloud: DriveFixture, account = 'account-a') {
       getAccountId: async () => connected ? identity : null, snapshotTransport: cloud.transport(identity),
       erasureTransport: cloud.transport(identity, 'erased-'), imageTransport: cloud.transport(identity, 'image-') }) });
   let publishedGrant: unknown;
-  const grants = createBoardGrantService({ storage,
+  const grants = createBoardGrantService({ storage, authBudget: instantAuthBudget(),
     getKey: async scope => { if (destroyed) throw new Error('Original keys unavailable'); if (!keys.has(scope)) keys.set(scope, await generateDeviceKey()); return keys.get(scope)!; },
     peekKey: async purpose => keys.get(purpose) ?? null,
     publicGrantHistory: async board => (await (await getRepo()).journal.publicGrants.where('boardId').equals(board).toArray()).map(g => g.manifest),

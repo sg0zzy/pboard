@@ -120,6 +120,18 @@ describe("handleDriveSyncMessage", () => {
     expect(invalidateSharedDiscovery.mock.invocationCallOrder[0]).toBeLessThan(reconcileAll.mock.invocationCallOrder[0]);
   });
 
+  it("answers a background refresh with an unforced round and leaves the listing cache alone", async () => {
+    // The sidebar's startup discovery sends this. The worker's own cold start
+    // runs the same round at the same moment over the same account and the same
+    // local database, so this one must be able to answer from that round
+    // rather than repeating every folder listing — and it must not throw away
+    // the 60-second shared-project listing the cold start just filled.
+    const result = await handleDriveSyncMessage({ type: DRIVE_RECONCILE_MESSAGE, force: false });
+    expect(result).toEqual({ ok: true, result: reconcileResult });
+    expect(reconcileAll).toHaveBeenCalledWith({ force: false });
+    expect(invalidateSharedDiscovery).not.toHaveBeenCalled();
+  });
+
   it("surfaces an Error from reconcileAll as the reason", async () => {
     reconcileAll.mockRejectedValue(new Error("reconcile boom"));
     const result = await handleDriveSyncMessage({ type: DRIVE_RECONCILE_MESSAGE });

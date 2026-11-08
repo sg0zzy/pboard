@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PboardSignal, PboardSignaling } from '../../src/collab/signaling';
 import type { Frontier, Operation } from '../../src/sync/operations/protocol';
 import { createOperationRealtime } from '../../src/sync/operations/realtime';
+import { DriveQuotaExceededError } from '../../src/sync/driveQuota';
 
 /** Loopback DataChannel and peer connection: no real ICE, so frame rules, limits and
  * permission gates are observed as the transport itself enforces them. Delivery is
@@ -30,6 +31,9 @@ type Node = {
   id: string; connections: FakeConnection[]; channels: FakeChannel[];
   signals: Array<{ to: string; signal: PboardSignal }>; errors: string[]; open: string[];
   applied: Operation[]; recovered: number; left: boolean; allowRead: boolean; allowWrite: boolean;
+  /** Thrown by the permission check instead of answering it: a refusal to verify
+   * is a different event from a verification that answered no. */
+  verdict?: unknown;
   frontier: Frontier;
   roster?: (peers: string[]) => void; signal?: (from: string, signal: PboardSignal) => void;
 };
@@ -115,7 +119,7 @@ async function connect(options: { roster?: string[] } = {}) {
       onSignal: handler => { node.signal = handler; },
       leave: async () => { node.left = true; },
     } satisfies PboardSignaling,
-    canRead: async () => node.allowRead,
+    canRead: async () => { if (node.verdict) throw node.verdict; return node.allowRead; },
     canWrite: async () => node.allowWrite,
     receive: async operations => { node.applied.push(...operations); },
     frontier: () => node.frontier,
@@ -151,6 +155,23 @@ describe('realtime transport frame rules', () => {
     expect(await transports[0].broadcast([edit('z'.repeat(100))])).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
     expect(nodes[1].applied).toEqual([edit('z'.repeat(100))]);
+    await Promise.all(transports.map(transport => transport.close()));
+  });
+
+  it('keeps a live peer while Drive refuses to answer role checks, and drops it when one answers no', async () => {
+    // While the account is throttled every role check rejects. Disconnecting for
+    // that dropped data channels that were working and cost a full renegotiation
+    // once the quota cleared, so a room went down for a provider-side delay. A
+    // verification that actually answers "not allowed" still disconnects.
+    const { nodes, transports } = await connect();
+    expect(nodes[0].open).toEqual([nodes[1].id]);
+    nodes[0].verdict = new DriveQuotaExceededError('quota', { reason: 'rateLimitExceeded' }, 100, 60_000);
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(nodes[0].open).toEqual([nodes[1].id]);
+    nodes[0].verdict = undefined;
+    nodes[0].allowRead = false;
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(nodes[0].open).toEqual([]);
     await Promise.all(transports.map(transport => transport.close()));
   });
 
@@ -385,6 +406,22 @@ describe('realtime transport signalling', () => {
     nodes[0].connections[0].onicecandidate?.({ candidate: null });
     expect(nodes[0].signals.length).toBe(2);
     await Promise.all(transports.map(transport => transport.close()));
+  });
+
+  it('counts a negotiation that failed outright, once per failure', async () => {
+    // `connected 0` with a healthy roster means either "no candidate pair ever worked"
+    // or "the peer never got as far as negotiating", and only the first one is a
+    // missing relay server. Both states otherwise look identical from the console.
+    const { nodes, transports } = await connect();
+    const connection = nodes[0].connections[0];
+    connection.connectionState = 'failed';
+    connection.onconnectionstatechange?.();
+    expect(transports[0].metrics.iceFailed).toBe(1);
+    expect(nodes[0].open).toEqual([]);
+    // The same connection reports again as it comes down; that is one failure, not two.
+    connection.connectionState = 'closed';
+    connection.onconnectionstatechange?.();
+    expect(transports[0].metrics.iceFailed).toBe(1);
   });
 
   it('closes a data channel that belongs to a connection already replaced', async () => {

@@ -188,7 +188,7 @@ describe('mobile navigation and editing', () => {
   it('shows an honest Drive notice and dismisses it with system back', async () => {
     await act(async () => root.render(<App />));
     await click('Google Drive integration');
-    expect(host.querySelector('[role="status"]')?.textContent).toContain('not yet configured');
+    expect(host.querySelector('[role="status"]')?.textContent).toContain('Google Drive is not connected');
     await act(async () => native.back!());
     expect(host.querySelector('[role="status"]')?.textContent).toBe('');
     expect(native.exit).not.toHaveBeenCalled();

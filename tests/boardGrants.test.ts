@@ -1,5 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { createBoardGrantService, rendezvousOrigin } from "../src/collab/boardGrants";
+import { createBoardGrantService, DEFAULT_RENDEZVOUS, rendezvousOrigin } from "../src/collab/boardGrants";
+import { instantAuthBudget } from "./helpers/authBudget";
+import { setWebRtcDisabled } from "../src/collab/liveTransport";
 import { generateDeviceKey } from "../src/collab/security/keys";
 import { signManifest } from "../src/collab/security/manifest";
 import { selectRuntimeSignaling } from "../src/collab/signalingSelection";
@@ -21,7 +23,7 @@ function fixture() {
     const storage = { get: async (id: string) => ({ [id]: structuredClone(values[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(values, structuredClone(patch)); } };
     const keys = new Map<string, Awaited<ReturnType<typeof generateDeviceKey>>>();
     const getKey = async (scope: string) => { if (!keys.has(scope)) keys.set(scope, await generateDeviceKey()); return keys.get(scope)!; };
-    const make = () => createBoardGrantService({ storage, getKey, fetcher, onAuthorization });
+    const make = () => createBoardGrantService({ storage, getKey, fetcher, onAuthorization, authBudget: instantAuthBudget() });
     return { service: make(), make, keys, values };
   }
   return { client, fetcher, network };
@@ -39,6 +41,21 @@ it("keeps Drive as the production default, with explicit production WebSocket op
   expect(selectRuntimeSignaling("pboard-collab-board-cards", drive, context, settings)).toHaveProperty("join");
   expect(drive).toHaveBeenCalledTimes(1);
   expect(() => rendezvousOrigin("ws://127.0.0.1:8787/ws")).toThrow();
+});
+it("resolves the relay while peer pools are off, without rewriting the stored choice", async () => {
+  const f = fixture(), owner = f.client();
+  try {
+    setWebRtcDisabled(true);
+    // Nothing stored, and Drive signaling has no transport to signal into.
+    expect(await owner.service.settings()).toEqual({ provider: "websocket", url: DEFAULT_RENDEZVOUS });
+    await owner.service.configure({ provider: "drive", url: DEFAULT_RENDEZVOUS });
+    expect(await owner.service.settings()).toEqual({ provider: "websocket", url: DEFAULT_RENDEZVOUS });
+    // Restoring the peer pools restores the selection the person actually made.
+    setWebRtcDisabled(false);
+    expect((await owner.service.settings()).provider).toBe("drive");
+  } finally {
+    setWebRtcDisabled(false);
+  }
 });
 it("requires owner approval and independently verified authority, without Google or Drive ACL access", async () => {
   const f = fixture(), owner = f.client(), joining = f.client(), outsider = f.client();

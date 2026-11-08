@@ -17,6 +17,13 @@ export type DriveReconcileResult = {
   pulled: number;
   pushed: number;
   deleted: number;
+  /** What the relay heal leg did per board (`healed:<steps>`, `idle:<reason>`,
+   * `failed:<reason>`), the operation-protocol loop's answer to "and what about
+   * the live channel?" — present only when the round actually ran the loop.
+   * A board whose Drive sync failed still has an entry: the legs are isolated
+   * per board, and the round must say what the relay did instead of silently
+   * returning `reconciled`. */
+  relay?: Record<string, string>;
 };
 
 export interface GoogleDriveProvider {

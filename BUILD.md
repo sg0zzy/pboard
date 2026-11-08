@@ -6,7 +6,20 @@ Policy authority: [DEVELOPMENT_STANDARDS.md](DEVELOPMENT_STANDARDS.md). This gui
 
 Node 24.15.0 or newer in the 24 series (`.nvmrc`: 24), npm, Git and a POSIX host are required. Use `npm ci` at the root. Firefox requires 142+, Chromium 114+ with Side Panel support. The managed builder currently supports Linux/macOS POSIX hosts; Windows users need WSL or equivalent. Unsupported native Windows shell invocation is not a configured host.
 
-Android additionally needs `npm ci` in `apps/android`, JDK 21, `ANDROID_HOME` (or `ANDROID_SDK_ROOT`) pointing to SDK platform 36 and build-tools with `aapt`, `zipalign`, `apksigner`; SDK platform-tools for explicit device installation. Minimum device API is 33. Existing Gradle/Capacitor dependencies and wrapper remain repository-owned.
+Android additionally needs `npm ci` in `apps/android`, JDK 21 or newer, and an Android SDK with platform 36 and build-tools containing `aapt`, `zipalign` and `apksigner`; SDK platform-tools is needed only for explicit device installation. Minimum device API is 33. Existing Gradle/Capacitor dependencies and wrapper remain repository-owned. Nothing needs to be exported when the SDK and JDK are installed in a standard place: `scripts/android-toolchain.mjs` resolves them in the order below and uses the first candidate that passes validation.
+
+SDK, in order (`scripts/local-build.mjs` android target):
+
+1. `ANDROID_HOME` — the variable Gradle itself prefers.
+2. `ANDROID_SDK_ROOT` — its deprecated alias, honoured only when `ANDROID_HOME` is unset.
+3. Conventional install locations: `$HOME/Android/Sdk`, then `$HOME/Library/Android/sdk` on macOS, then `/usr/lib/android-sdk`.
+4. `sdk.dir` in `apps/android/android/local.properties` — Gradle reads that file, so honouring it keeps a local Gradle build and the managed build pointed at the same SDK. The file is machine-specific, git-ignored and excluded from the build snapshot.
+
+The resolved SDK is validated for what the build actually invokes: `platforms/android-36`, and the newest `build-tools/<version>` must contain `aapt` (APK badging), `apksigner` (certificate verification) and `zipalign` (Gradle packaging). `platform-tools/adb` is required only for `--install`/`--run`. A candidate that exists but is incomplete fails with the exact missing pieces and the path inspected — it never falls through to a later candidate, so a stale installation cannot be used silently. The resolved SDK is exported as `ANDROID_HOME`/`ANDROID_SDK_ROOT` to the Capacitor sync and Gradle it launches, and its origin is recorded in `build-info.json`.
+
+JDK: `JAVA_HOME` when set (its `bin/java` must be executable), otherwise the `java` on `PATH`; both must report major version 21 or newer. "No java found", "JAVA_HOME is not executable" and "java too old" are reported as distinct failures.
+
+When no SDK is found the build fails with the variables to set and every path it checked.
 
 | Target ID | Platform / architecture | Final package / profile | Local | CI | Beta | Stable |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -28,12 +41,25 @@ scripts/build_all.sh firefox chromium        # explicit subset
 npm run build                               # managed Firefox build + package
 npm run build:chromium                       # managed Chromium build + package
 npm run build:all                            # managed builds of both browsers
+npm run build:diagnostics                   # both browsers with transport/view diagnostics compiled in
+
+`build:diagnostics` sets `VITE_PBOARD_DIAGNOSTICS=1` for both browser builds, which compiles in the
+per-connection ledger behind `(await pboardCollaboration()).transport` — connection ids, dial
+triggers, close codes and reasons, reconnect delays, and the view read/emission counters. Without
+the flag the ledger is compiled out entirely (no allocation, no behaviour change) and the console
+says so, so an empty `transport` object is never mistaken for "no connections".
+
+**Never ship a diagnostics build to users.** It retains up to 32 connection records and the view
+counters in memory, and the normal `npm run build`, `build:chromium`, `build:all`, `package:*`,
+`release:*` and `scripts/build_all.sh` paths do not set the flag.
 npm run check                               # root typecheck/tests + both browser builds/verification
 npm --prefix apps/android run typecheck
 npm --prefix apps/android test
 npm run apk:debug                           # managed Android build
 npm run apk:debug:install                    # explicit adb update installation
 npm run apk:debug:run                        # explicit install and launch
+cargo test --manifest-path services/pboard-signaling/Cargo.toml
+cargo clippy --manifest-path services/pboard-signaling/Cargo.toml --all-targets
 ```
 
 Every managed invocation accepts dirty input, captures a private copy before compilation, and reserves its own directory before starting. Root commands leave unpacked browser output at `dist/` / `dist/chromium/` for temporary installation. The compiler's `PBOARD_STAGE=1` mode, `npm run package:*`, and Android's native `npm run android:debug` are low-level intermediate/reviewer operations; use the managed commands above to preserve final local output. Package verification compares archive bytes with the corresponding build and verifies browser-background startup. Firefox additionally runs `npm run lint:firefox` with warnings as errors.
@@ -41,6 +67,43 @@ Every managed invocation accepts dirty input, captures a private copy before com
 `npm run release:firefox`, `release:chromium`, and `release:all` are historical aliases for checks/builds; they do not publish. `scripts/compile-manifests.sh` remains available. `scripts/prepare-build.sh` now forwards to the managed builder without selecting a version. `--skip-frontend`/`--skip-android-build` are rejected: reusing an unverified old bundle cannot establish source identity. `--stable-apk` is rejected on the test-only builder; use official release packaging for production APKs.
 
 Version bump and beta/stable tagging commands are documented in [RELEASE.md](RELEASE.md#shell-commands). They are separate from local compilation.
+
+### Verification actually run
+
+These are the checks a change is validated with, in this order. `npm run check` bundles the first four (root typecheck, the vitest suite, both browser builds and `scripts/verify-build.mjs`); the relay and Android commands are separate because they have their own toolchains. `npm run check` runs `npm run build:all`, which invokes the managed builder — it takes a private snapshot of the tree, writes its artifacts under `local_artifacts/`, and then restores the verified unpacked trees to `dist/` and `dist/chromium/` for temporary loading.
+
+```sh
+npm run typecheck                            # tsc --noEmit, root
+npm test                                     # vitest run over tests/**/*.test.{ts,tsx,mjs}
+npm run build:all                            # managed Firefox + Chromium builds
+node scripts/verify-build.mjs all            # manifests, required files, background startup in a bare sandbox
+npm --prefix apps/android run typecheck
+npm --prefix apps/android test
+cargo test --manifest-path services/pboard-signaling/Cargo.toml
+cargo clippy --manifest-path services/pboard-signaling/Cargo.toml --all-targets
+```
+
+The vitest configuration includes `tests/**/*.test.{ts,tsx,mjs}`, so the isolated two-browser suite under `tests/multiBrowser/` runs as part of `npm test` rather than as a separate harness. `verify-build.mjs` takes `firefox`, `chromium` or `all`; with no argument it verifies `all`, and it is the gate that fails a build whose bundled background script cannot start. `cargo clippy --all-targets` is the lint gate for the relay and must report zero warnings.
+
+## Relay service (`services/pboard-signaling`)
+
+The collaboration relay is a separate Rust/Axum crate with its own toolchain (a current stable Rust, no Node). It is built and tested from the repository root:
+
+```sh
+cargo build --manifest-path services/pboard-signaling/Cargo.toml
+cargo test --manifest-path services/pboard-signaling/Cargo.toml
+cargo build --release --locked --manifest-path services/pboard-signaling/Cargo.toml
+```
+
+A release build for deployment is built with `--locked` so the committed `Cargo.lock` decides the dependency tree. Do not ship a `test-google-fixture` build: that feature enables a synthetic Google endpoint used by the native browser harnesses.
+
+The binary's own contract is in [services/pboard-signaling/PROTOCOL.md](services/pboard-signaling/PROTOCOL.md). Three properties of it belong in a build/release guide because they decide what can be shipped next to what:
+
+- **Server first.** A v2 server answers an `authenticate` that declares `version: 3` by closing the socket; a v3 server serves a v2 client unchanged, and a client activates v3 only when the welcome lists 3 in `supportedVersions`. So the relay is deployed before any client build that speaks v3, and never the other way round.
+- **An older binary refuses a v3 database.** The operation log carries one shared `sync_schema` version, and a build refuses a file newer than it knows. The first start of a v3 build migrates the database; from that moment the previously deployed binary exits at startup. A rollback is therefore a v3-aware binary, or the archived database plus the old binary — never a bare executable swap.
+- **The account inbox is additive.** Its three tables deliberately do not raise the shared schema version, so a v3-aware build from before the inbox opens the same file and ignores them.
+
+None of this is deployed by a repository build: the crate is implemented and tested here, and deploying it is a separately authorized host operation. See [RELEASE.md](RELEASE.md#relay-service-releases) for how it relates to product releases.
 
 ## Managed artifacts
 
@@ -142,9 +205,12 @@ Suggested listing description:
 >
 > Boards save on your device first. No Pboard account is required. Connecting
 > Google Drive optionally enables asynchronous snapshot synchronization and
-> board sharing. Connected boards and images are sent to Google; shared boards
-> can also transfer to collaborators through Drive and WebRTC. Full Drive
-> authorization is requested to discover and manage incoming shared boards.
+> board sharing. Connected boards and images are sent to Google. A shared board
+> can additionally exchange live operations with collaborators through an
+> authenticated relay operated by the publisher's project; those operations are
+> sealed with the board's own content key, which the relay never receives. Full
+> Drive authorization is requested to discover and manage incoming shared
+> boards.
 >
 > Pboard has no advertising, analytics, telemetry, or AI API integration.
 > Capturing or sharing content is under your control. Pboard is open source
@@ -165,20 +231,22 @@ in persistent sidebar boards, with optional synchronization and sharing.**
 | Permission / host | Justification |
 | --- | --- |
 | `storage` | Persist extension settings, synchronization state, and local authorization state; board documents and images also use local IndexedDB. |
-| `contextMenus` | Capture selected text, links, images, and the current page through explicit menu actions. |
+| `contextMenus` (Firefox: `menus`) | Capture selected text, links, images, and the current page through explicit menu actions. |
 | `clipboardWrite` | Copy cards or a structured board when the user clicks Copy. |
 | `activeTab` | Temporarily access the current page after an extension action, shortcut, or context-menu invocation. |
 | `scripting` | Read requested selections/links and inject the temporary region-capture overlay. |
-| `sidePanel` | Display the project's boards and capture controls alongside the current page. |
+| `sidePanel` (Firefox: `sidebar_action`) | Display the project's boards and capture controls alongside the current page. |
 | `identity` | Authorize optional Google Drive sync and sharing after Connect Drive. |
 | `alarms` | Schedule asynchronous uploads after connected boards become dirty. |
+| `tabs` | Read the active tab's address and title for "Pin current page" and the capture toolbar. It does not read tab contents. |
 | ChatGPT hosts | Load the bundled selection adapter on the two supported ChatGPT origins. |
 | Google API hosts | Read/write Pboard Drive files and sharing permissions; exchange, refresh, or revoke authorization as appropriate for the browser. |
-| Optional `<all_urls>` | Permit capture on user-chosen sites from the side panel, including region screenshots and inspecting selections/links when temporary access is unavailable. Access is requested through a capture action. |
+| Optional `<all_urls>` | Permit capture on user-chosen sites from the side panel, including region screenshots and inspecting selections/links when temporary access is unavailable, and grant the optional host access a configured WSS relay origin needs. Access is requested through a capture action or the collaboration control, never silently. |
 
 Select **No remote code**: runtime code is bundled locally; Google requests
-transfer data, and STUN establishes peer connections. Confirm this against
-the final package whenever dependencies or runtime loading change.
+transfer data, and a Google/Twilio STUN server is contacted only when a peer
+connection is attempted. Confirm this against the final package whenever
+dependencies or runtime loading change.
 
 Do not claim that no user data is handled simply because storage is local
 first. Match dashboard declarations to `docs/privacy.md`: captured website
@@ -261,10 +329,19 @@ secret (`VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`, documented in
 a clean review checkout it is absent and the build still succeeds.
 
 Building with `VITE_PBOARD_SIGNALING_PROVIDER=websocket` additionally shows two
-testing buttons in the sidebar header. The bug button toggles the experimental
-device enrollment and live collaboration diagnostics panel — otherwise reserved
-for development builds. The people button switches live (WebRTC) collaboration
-on or off: while off, opening a board starts no signaling or peer transports.
+testing buttons in the sidebar header.
+
+- The bug button toggles the diagnostics section (`src/sidebar/App.tsx:886-898`),
+  which renders the idle-activity counters panel. The counters are aggregated
+  and only collected in a build made with `VITE_PBOARD_DIAGNOSTICS=1`, so in an
+  ordinary build the section opens and shows nothing. The section's initial
+  state is `import.meta.env.DEV && provider === "websocket"`.
+- The people button switches the collaboration manager on or off
+  (`App.tsx:218` → `collaborationManager.setEnabled`); while off, opening a
+  board starts no signaling or peer transports. In the extension that toggle
+  concerns peer pools that the peer-stub build excludes anyway, so the board
+  continues to converge through Drive while it is off.
+
 Both choices persist across reloads. Neither changes trust behavior; boards
 stay fully usable offline while collaboration is off.
 
@@ -281,10 +358,56 @@ the sidebar JavaScript chunks. Run `npm run package:firefox` to package and
 verify all runtime files before submission.
 
 The sidebar is split into several chunks. `react` and `storage` are separated
-by the build config; the WebRTC transport (`simplepeer.min-*.js`) and the ZIP
-codec are loaded on demand, because each is needed only for live collaboration
-or for a board import/export. The background service worker is a single IIFE
-and therefore carries its dependencies inline; it cannot be code-split.
+by the build config, and the ZIP codec is loaded on demand because a board
+import/export is the only thing that needs it. The background service worker is
+a single IIFE and therefore carries its dependencies inline; it cannot be
+code-split.
+
+The WebRTC peer stack is not in the extension at all. The extension's
+composition root calls `setWebRtcDisabled(true)` (`src/sync/browser.ts`), so no
+peer pool, DataChannel, peer history session or Drive signaling poll can start in
+it; the Android app builds the same `createDriveRuntime` without that call and
+does run them. Every peer import therefore goes through one module,
+`src/collab/peerRuntime.ts`, and the `peerRuntimeStub()` plugin
+(`scripts/peer-runtime-stub.mjs`) resolves that one path to
+`peerRuntime.stub.ts` in `vite.sidebar.config.ts` and
+`vite.background.config.ts`. Android has no such plugin and gets the real
+modules, so it still loads `rxdb/plugins/replication-webrtc`, `webrtcHandler`,
+`scopedPull`, `imageSync`, `signaling` and `operations/realtime` exactly as
+before. The stub throws instead of returning empty values: a board that silently
+stopped collaborating would be worse than a build that fails on the first
+attempt. Removing the plugin, or importing one of those modules directly outside
+`peerRuntime.ts`, puts the stack back in the extension bundle.
+
+Bundle budget, measured 6 November 2026 from the current `dist/`, after the peer
+stack left the extension. Sizes are kB = bytes/1000, gzip is `gzip -9` on each
+file:
+
+| File | Bytes | kB | gzip kB |
+| --- | ---: | ---: | ---: |
+| `assets/sidebar-*.js` | 611,445 | 611.4 | 176.0 |
+| `assets/storage-*.js` | 292,722 | 292.7 | 91.3 |
+| `assets/react-*.js` | 218,842 | 218.8 | 67.4 |
+| `assets/browser-*.js` | 12,405 | 12.4 | — |
+| `assets/rolldown-runtime-*.js` | 589 | 0.6 | — |
+| `assets/sidebar-*.css` | 39,333 | 39.3 | — |
+| `background.js` | 798,971 | 799.0 | 237.0 |
+
+The peer stack's own chunk is gone: it was 40.6 kB in the main chunk plus the
+whole 97 kB `simplepeer.min-*.js` chunk, and the background IIFE was 961.53 kB
+while it was inlined there — 164 kB it should never have carried, since an IIFE
+cannot split. `assets/snapshotWorker-*.js` (18,707 bytes) is a worker entry, not
+part of the sidebar's first paint.
+
+The sidebar build sets `build.chunkSizeWarningLimit` to 600 kB
+(`vite.sidebar.config.ts:39`), and the main chunk is now ~11 kB over it, so the
+advisory fires on every build. That is the honest signal the budget exists to
+produce: the remaining weight is application code the sidebar needs before it
+can paint, not a vendor that can be moved. Raising the limit is a decision for
+the owner, not a fix; the alternatives are measuring what dominates the chunk or
+deferring a feature behind `import()`. The background IIFE is exempt only
+because the manifest loads it as a classic script; its size is a genuine cost on
+every browser start, not something the build can be configured away.
 
 To compare byte-for-byte, unpack the submitted `.xpi`/`.zip` and diff it
 against a fresh `dist/`. For official archives, first account for the documented four-field version stamp in `manifest.json`; a Mozilla-signed XPI also has service-generated signature files. For the unsigned staging ZIP, remaining differences are file order

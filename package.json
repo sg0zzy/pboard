@@ -17,7 +17,8 @@
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
     "test:ui:perf": "node experiments/collaboration/ui-perf.mjs",
     "test:recovery": "node scripts/recovery/run.mjs",
-    "test:buffer": "cargo build --manifest-path services/pboard-signaling/Cargo.toml --bin pboard-signaling && node services/pboard-signaling/buffer-probe.mjs",    "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
+    "test:buffer": "cargo build --manifest-path services/pboard-signaling/Cargo.toml --bin pboard-signaling && node services/pboard-signaling/buffer-probe.mjs",
+    "test:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs",
     "demo:collaboration": "node services/pboard-signaling/run-collaboration-test.mjs --interactive",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build:all && npm run verify:build",
@@ -26,7 +27,8 @@
     "apk:debug": "node scripts/build-apk.mjs",
     "apk:debug:install": "node scripts/build-apk.mjs --install",
     "apk:debug:run": "node scripts/build-apk.mjs --run",
-    "lint:firefox": "web-ext lint --config web-ext-lint-config.cjs --warnings-as-errors"
+    "lint:firefox": "web-ext lint --config web-ext-lint-config.cjs --warnings-as-errors",
+    "build:diagnostics": "VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs firefox && VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs chromium"
   },
   "dependencies": {
     "dexie": "^4.4.6",

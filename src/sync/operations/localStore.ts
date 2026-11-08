@@ -139,6 +139,43 @@ export class LocalOperationStore {
   async downloaded(boardId: string, fileId: string): Promise<void> {
     await this.journal.receipts.put({ id: `operation-download:${boardId}:${fileId}`, changeId: fileId, destination: `operation-download:${boardId}` });
   }
+  /**
+   * Images whose exact bytes this device has published to the board's Drive
+   * folder, keyed by the image's content hash — which is what its Drive file is
+   * *named* (`image-<hash>.json`). The image sweep runs after every sync of
+   * every board, and without this ledger "already published" could only be
+   * answered by a Drive listing, which is cached for minutes: a publishing sync
+   * inside that window saw no candidate and uploaded the same immutable file
+   * again, once per sync. Content-addressed names make the upload idempotent,
+   * so the receipt is the honest record of "these bytes are already there".
+   */
+  async publishedImages(boardId: string): Promise<Set<string>> {
+    const receipts = await this.journal.receipts.where('destination').equals(`operation-image-published:${boardId}`).toArray();
+    return new Set(receipts.map(row => row.changeId));
+  }
+  async imagePublished(boardId: string, imageId: string): Promise<void> {
+    await this.journal.receipts.put({ id: `operation-image-published:${boardId}:${imageId}`, changeId: imageId, destination: `operation-image-published:${boardId}` });
+  }
+  /**
+   * Whether this device is the one that put the board's operation protocol on
+   * Drive. Recorded once, at the moment `performOpen` publishes or consumes the
+   * board's immutable migration record: the publisher created the board's Drive
+   * presence, the consumer merely imported it. The account room's lifecycle
+   * records need exactly this distinction — a device that imported a board has
+   * nothing to announce, because the device that published the record already
+   * did, and re-announcing from every importer was one record per device per
+   * board per round.
+   */
+  async boardOrigin(boardId: string): Promise<'created' | 'imported' | undefined> {
+    const row = await this.journal.read<{ origin?: 'created' | 'imported' } | undefined>('operationCheckpoints', store => store.get(`board-origin:${boardId}`));
+    return row?.origin;
+  }
+  async markBoardOrigin(boardId: string, origin: 'created' | 'imported'): Promise<void> {
+    await this.journal.operationTransaction<void>(boardId, ['operationCheckpoints'], (tx, result) => {
+      tx.objectStore('operationCheckpoints').put({ id: `board-origin:${boardId}`, kind: 'board-origin', boardId, origin });
+      result(undefined);
+    });
+  }
   async saveCheckpoint(checkpoint: import('./engine').EngineCheckpoint): Promise<void> {
     await this.journal.operationTransaction<void>(checkpoint.boardId, ['operationCheckpoints'], (tx, result) => {
       tx.objectStore('operationCheckpoints').put({ id: checkpoint.boardId, boardId: checkpoint.boardId, checkpoint });
@@ -185,6 +222,24 @@ export class LocalOperationStore {
       request.onsuccess = () => { if (request.result) store.put({ ...request.result, realtimeSent: true }); };
       result(undefined);
     });
+  }
+  /** Operations this device wrote that the live channel never carried.
+   *
+   * A broadcast is attempted once, at the moment the edit is recorded. If the
+   * room was closed then — the browser was on another board, the tab was
+   * asleep, the socket was down — the operation went to Drive only, and the
+   * peer still looking at the board learns of it on its next poll: for a board
+   * nobody is on, that is never. `realtimeSent` is the durable record of which
+   * operations the relay has seen, so a re-attach can hand them over instead.
+   * Bounded to the newest operations: Drive remains the durable carrier for
+   * anything older, and a re-attach must not turn into a replay of the board.
+   */
+  async unsent(boardId: string, limit = 512): Promise<Operation[]> {
+    const rows = await this.journal.read<OutboxRow[]>('operationOutbox', store => store.index('boardId').getAll(boardId));
+    const pending = rows.filter(row => !row.realtimeSent);
+    return pending.slice(Math.max(0, pending.length - limit))
+      .sort((left, right) => left.operation.seq - right.operation.seq)
+      .map(row => row.operation);
   }
   async prepared(boardId: string, pendingOnly = false): Promise<PreparedSegment[]> {
     return this.journal.read('operationSegments', store => store.index(pendingOnly ? 'pendingBoard' : 'boardId').getAll(boardId));

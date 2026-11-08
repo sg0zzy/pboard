@@ -1,8 +1,9 @@
 import type { GoogleAuthProvider } from "./googleAuth";
 import { DRIVE_TRANSIENT_ATTEMPTS, DRIVE_TRANSIENT_STATUSES, driveRetryDelayMs, isDriveReplayableMethod } from "./driveRetry";
-import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, driveRequestSignature, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
 import { driveBoundedRetryDelayMs } from "./driveRetry";
 import { shareGet } from "./driveSharedRequest";
+import { driveHttpError } from "./driveHttp";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -48,7 +49,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     const detail = await errorDetail(response);
     // Quota denial stays distinguishable from permission denial.
     if (isDriveQuotaFailure(detail)) return driveQuotaError(response.status, detail, quota);
-    return new Error(`Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
+    return driveHttpError(response.status, `Google Drive request failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
 
   async function authorizedFetch(input: string, init: RequestInit = {}, retry = true, attempt = 0, spentMs = 0): Promise<Response> {
@@ -71,7 +72,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     // by another browser, including when the URL is unchanged between polls.
     const response = await fetcher(input, { ...init, headers,
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
-    quota.observe(cost, response.headers);
+    quota.observe(cost, response.headers, driveRequestSignature(input, init.method ?? "GET"));
     if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt, spentMs);
     if (response.status === 429 && isDriveQuotaFailure(await errorDetail(response.clone()))) throw await requestError(response);
     // A transient Google-side failure (internalError, rate limit) usually

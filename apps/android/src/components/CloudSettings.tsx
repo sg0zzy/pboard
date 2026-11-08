@@ -10,6 +10,12 @@ export function CloudSettings({ service, state }: { service: AndroidSync | null;
     </div>
     {state.busy && <p role="status">Syncing…</p>}
     {state.lastSynced && <p>Last synced: {state.lastSynced}</p>}
+    {state.connected && (() => {
+      const channel = service.accountStatus();
+      const cause = channel.reason || channel.error || '';
+      const authority = channel.authority ? ` · authority ${channel.authority.state}${channel.authority.reason ? `: ${channel.authority.reason}` : ''}` : '';
+      return <p>Account sync: {channel.state}{cause ? ` — ${cause}` : ''}{authority}</p>;
+    })()}
     {state.error && <p role="alert">{state.error}</p>}
   </section>;
 }

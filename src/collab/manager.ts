@@ -1,4 +1,3 @@
-import { replicateWebRTC } from "rxdb/plugins/replication-webrtc";
 import type { RxWebRTCReplicationPool } from "rxdb/plugins/replication-webrtc";
 import type { RxCollection, WithDeleted } from "rxdb";
 import type { PboardRole } from "../sync/drivePermissions";
@@ -8,17 +7,27 @@ import { manifestHash, manifestIsCurrent, roleForDevice, validateManifest } from
 import type { VerifiedSessionContext } from "./security/session";
 import type { MutationGuardInstall } from "./security/mutation";
 import type { RelayAuthorization } from "./security/relayAdmission";
+import { webrtcDisabledForTesting } from "./liveTransport";
 import type { RxRepository } from "../storage/rxdbRepository";
 import { createContentKeyStore } from "../storage/contentKeyStore";
 const contentKeyStore = createContentKeyStore();
 import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
-import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
-import { scopeMasterChanges } from "./scopedPull";
 import { collaborationCounters } from "./counters";
-import { createProjectImageSync, type ProjectImageSync, type SharedImageTransport } from "./imageSync";
+import type { ProjectImageSync, SharedImageTransport } from "./imageSync";
 import type { PeerHistorySession } from "./peerHistory";
+import { createPboardWebRTCConnectionHandler, createProjectImageSync, replicateWebRTC, scopeMasterChanges } from "./peerRuntime";
+
+/**
+ * Every WebRTC module this manager needs is imported from `./peerRuntime`, and
+ * nothing else imports it. The extension's build aliases that one path to
+ * `peerRuntime.stub.ts`, so the peer stack — transport, connection handler,
+ * scoped pull, history exchange, image sync — is not in the extension bundle at
+ * all; the Android build has no such alias and gets the real modules. The
+ * manager never reaches them in the extension: `doStart()` returns at the
+ * `webrtcDisabledForTesting()` gate before `openRooms()` is called.
+ */
 
 /**
  * Current project role from the selected collaboration policy. Independent
@@ -37,6 +46,10 @@ export type CollaborationState = {
   sharedFileId: string | null;
   /** Signaling peer ids connected to the current project's shared-content pools. */
   connectedPeers: string[];
+  /** Sidebar sentence for a board whose collaboration is not peer-to-peer. The
+   * peer path leaves it undefined, so "N connected browsers" stays accurate
+   * exactly where it is accurate. */
+  note?: string;
   /** True once the manager has resolved a role for the current start() call. */
   ready: boolean;
   error: string | null;
@@ -489,6 +502,18 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   }
 
   async function doStart(projectId: string): Promise<void> {
+    if (webrtcDisabledForTesting()) {
+      // The peer pools this manager owns are switched off in this build; the
+      // board's live channel is the operation log, which the sync runtime opens
+      // directly. Recording the board keeps a later enable/stop pair coherent, and
+      // `ready` is set because there is no transport left to wait for: leaving it
+      // false would advertise "checking live collaboration" forever for a channel
+      // this build does not have.
+      startedProjectId = projectId;
+      ready = true;
+      error = null;
+      return;
+    }
     // Retire the previous board without waiting for its transports to close:
     // the new board opens its own signaling and DataChannel meanwhile.
     const previous = session;

@@ -1,8 +1,33 @@
 # Drive-first operation synchronization
 
-Status: active default browser and Android runtime, 28 October 2026. Supersedes
-peer-authority and mutable-board synchronization for normal application use.
-No dependency, authentication service, backend, or framework was added.
+Status: active default browser and Android runtime, 28 October 2026; revised
+6 November 2026. Supersedes peer-authority and mutable-board synchronization for
+normal application use. No dependency, authentication service, backend, or
+framework was added.
+
+What changed since the first draft, in one place, because the rest of this document
+is the design argument and reads as if none of it had:
+
+- `operationSync` is the **default** (`src/sync/runtime.ts:174`,
+  `operationSync = true`), so the Drive-first operation protocol below is what runs.
+  Membership is the Drive folder ACL (`src/sync/drivePermissions.ts:720`, `invite`),
+  and the separate identity-sharing authority (`usesIdentitySharing`) is inactive in
+  that mode (`runtime.ts:2559`).
+- There is **no authoritative peer election** anywhere. The optional WebRTC leg
+  (below) is a latency path, not an authority, and nothing in the operation protocol
+  waits for a peer.
+- In the **extension** the WebRTC leg does not run at all: `src/sync/browser.ts:17`
+  calls `setWebRtcDisabled(true)` and both extension bundles alias
+  `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`
+  (`scripts/peer-runtime-stub.mjs`), whose exports throw. A board without the
+  durable operation log therefore has no live channel and converges through Drive.
+  **Android still runs it**: `apps/android/src/sync/service.ts` builds the same
+  runtime without that call.
+- The owner "Maintenance"/"Compact" button is **gone**
+  (`src/sidebar/components/BoardMaintenanceControls.tsx` was deleted). Snapshot
+  publication is automatic from the consolidation cycle
+  ([operation log](websocket-operation-log.md)); only deletion — "History
+  retention" in the collaboration disclosure — is manual and confirmed.
 
 ## Original architecture assessment (28 October 2026)
 
@@ -72,6 +97,16 @@ causal vector. One strict journal transaction allocates the sequence, stores the
 operation and its outbox row. Shared extension contexts serialize allocation in
 IndexedDB; independent profiles/devices have independent random actors even on
 the same Google account. No timestamp or account email allocates operation IDs.
+
+Structural validation (shape, identity, frontier, size) is closed and throws for
+every vocabulary. *Vocabulary* is tolerant: `isKnownVocabulary` separates an
+unrecognized collection or field name from invalidity, so an older client skips
+such an operation whole — receipted and sequenced so its stream never wedges,
+never applied — instead of rejecting the batch and re-failing every reconnect.
+The engine owns the skip ledger (`skippedOperations`, carried in checkpoints);
+any device holding one refuses to publish a log snapshot or compact, because
+pruning is scoped to snapshot receipts and a skipped operation is not among
+them. The refusal must be lifted by a client that can read the vocabulary.
 
 `engine.ts` uses per-property registers ordered by (Lamport clock, actor in code
 unit order, sequence). Causally later operations have greater clocks. Concurrent
@@ -175,9 +210,30 @@ own records (`src/sync/driveTransport.ts:31,68,83,114`), so that claim is scoped
 the operation protocol.
 Account preferences and private erasure markers use the existing regular root.
 
-Local edits commit immediately and are sent over WebRTC immediately when available.
+**Images are uploaded once, by content, not on every publish.** The image sweep
+runs after every sync of every board, and it used to ask the cached Drive listing
+whether `image-<hash>.json` already existed — the listing is cached for minutes, so
+a publishing sync inside that window re-uploaded the same immutable file once per
+sync, for every image on the board. A device-local receipt now answers that
+question instead: `publishedImages` reads
+`operation-image-published:<board>` receipts keyed by the content hash, which is
+what the file is *named* (`src/sync/operations/localStore.ts:141-159`), and
+`syncImages` filters those ids before it lists anything
+(`src/sync/operations/service.ts:126-140`). Content-addressed names also make an
+identical upload idempotent, so the receipt is an optimisation and a record, never
+a correctness dependency. The same sweep records a download receipt per verified
+file, and a copy that is *gone* is remembered as gone rather than retried: Drive
+never reuses a file id, so a 404 on an image copy is final.
+
+Local edits commit immediately and are sent over the live channel immediately when
+one exists. In the extension that channel is the durable operation log or nothing —
+`setWebRtcDisabled(true)` (`src/sync/browser.ts:17`) plus the build-time
+`peerRuntime` stub mean no peer pool or DataChannel can start — so with no log the
+edit waits for the next Drive round. On Android the optional WebRTC leg below is
+still live.
 Automatic Drive publication runs at the earlier of 30 minutes of editing inactivity
-or 25 minutes after the oldest unpublished operation. Since 25 minutes is shorter,
+or 25 minutes after the oldest unpublished operation (`src/sync/syncPolicy.ts:3-4`).
+Since 25 minutes is shorter,
 the oldest-operation deadline normally wins. Pending operation timestamps survive
 restart; older outbox rows without timestamps are treated as overdue. Manual Sync
 flushes immediately. Background Drive polling starts at 10 minutes and backs off
@@ -202,12 +258,20 @@ inventory. Automatic feed checks are shared across boards within a context and
 run at most once every 15 seconds; manual Sync checks immediately unless quota
 cooldown is active. Full inventory also runs every five minutes and on manual Sync.
 Quota-denied feed calls propagate without falling back to full board listings.
-Active board polling adapts from 15 to 120 seconds with jitter; board activation
-recovers immediately. Existing account discovery/background alarms remain.
+Fallback board polling is **10 minutes doubling to one hour** with positive jitter
+(`src/sync/syncPolicy.ts:5-15`, used by `operations/session.ts:319-322`); an earlier
+draft of this document claimed an adaptive 15→120 s active-board poll, and no such
+timer exists in the tree. Board activation recovers immediately — opening a board
+runs one `session.sync(false, false)` before any timer fires
+(`src/sync/runtime.ts:2518-2520`) — and per-edit flush timers stay active
+independently of the selected board. Existing account discovery/background alarms
+remain.
 Polling continues with WebRTC enabled or disabled. Manual Sync always runs a fresh
-pass, discovers snapshots/logs, retries the outbox and preserves concurrent local
-edits. Status cannot report synced with an unpublished outbox or clear a newer
-local dirty token.
+pass over the boards this context **already knows**, discovers their
+snapshots/logs, retries the outbox and preserves concurrent local edits. It does
+**not** rediscover: a board this client has never heard of is found by the account
+feed or a reload, not by the button. Status cannot report synced with an
+unpublished outbox or clear a newer local dirty token.
 
 ### Request cost and quota
 
@@ -267,6 +331,17 @@ detection compares the observed permission id instead of a creation timestamp.
 
 ## Optional WebRTC
 
+**Platform scope at this revision: absent from the extension, live on Android.**
+The extension calls `setWebRtcDisabled(true)` (`src/sync/browser.ts:17`) and both of
+its bundles resolve `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`, whose
+exports throw — so nothing in the paragraphs below can start in a shipped extension,
+and a board without the durable operation log has no live channel at all. Android
+builds the same runtime without the posture call and executes this section for real
+(`apps/android/src/sync/service.ts`). The code is retained, not dead: it is one
+platform's live path. What replaced it *in the extension* is the multiplexed
+operation log ([operation log](websocket-operation-log.md)) or, failing its
+preconditions, plain Drive synchronization.
+
 `realtime.ts` uses native DataChannels and the existing Drive signaling folder.
 Only operations with the same durable IDs and a small frontier handshake are
 sent. A mismatch triggers Drive recovery; no full-board reconnection transfer,
@@ -288,11 +363,16 @@ to Drive delivery. Signaling failure never disables Drive synchronization.
 Generation-fenced setup closes a connection that finishes after disabling.
 Roster reconciliation replaces failed channels; successful Drive revalidation
 can resume suspended WebRTC. The existing persisted local WebRTC toggle closes signaling/channels and leaves
-Drive recovery/publication running. Main-toolbar Drive Sync is reused. Owner
-Compact and confirmed gardening live in a compact Maintenance disclosure, with
-busy/result/error states and keyboard-accessible controls. Header wrapping is
-verified at 240/320/480/800 px. No durable operation is produced by intermediate
-UI drag positions; the final committed repository change is durable.
+Drive recovery/publication running. Main-toolbar Drive Sync is reused.
+Owner-only history retention (the confirmed gardening preview and its
+confirmation) lives in a History retention disclosure nested in the
+collaboration controls, with busy/result/error states and keyboard-accessible
+controls; deleting history stays preview-plus-confirm by design and never runs
+automatically. Snapshot publication itself no longer has a button at all — the
+consolidation cycle publishes automatically (see
+[the operation log](websocket-operation-log.md)). Header wrapping is verified
+at 240/320/480/800 px. No durable operation is produced by intermediate UI drag
+positions; the final committed repository change is durable.
 
 ## Migration and old clients
 
@@ -340,8 +420,17 @@ unions; incomparable branches cannot overwrite one another. Later/unpublished
 operations replay over the checkpoint. No owner-online editing requirement,
 mutable snapshot pointer, distributed lock or overwrite exists.
 
-Compaction deletes nothing. There is no automatic gardening. A manual preview
-shows counts, recoverable bytes and policy and requires confirmation. It retains
+**Snapshot creation has no button.** On the log path the consolidation cycle
+publishes automatically — owner-only, every five minutes, on backgrounding,
+`pagehide` and board close (`src/sync/runtime.ts:24,1834-1859`) — and the owner
+"Maintenance"/"Compact" control that used to trigger it was deleted with
+`src/sidebar/components/BoardMaintenanceControls.tsx`. What remains manual is
+deletion, and only deletion.
+
+Compaction itself deletes nothing. There is no automatic gardening. A manual
+preview — **History retention**, nested in the collaboration disclosure
+(`src/sidebar/components/BoardRetentionControls.tsx`) — shows counts, recoverable
+bytes and policy and requires confirmation. It retains
 at least **three** verified snapshots, every incomparable branch, and all history
 newer than **90 days**. A log's exact operation receipts must be present in **every**
 retained checkpoint before deletion. Old snapshots need coverage in every retained
@@ -351,6 +440,15 @@ and folder membership. Interrupted deletion requires a fresh review. Files move
 to Drive Trash; legacy snapshots, markers and images are never gardened. An
 offline client can load retained checkpoints and replay its unpublished work;
 late segments without coverage remain protected regardless of their age.
+
+Two separate retention mechanisms exist and must not be confused: this Drive-side
+gardening, which is manual and requires an owner's confirmation, and the relay's
+own operation-log sweep, which is automatic, server-side, and bounded by the
+checkpoint the relay recorded — [operation log](websocket-operation-log.md),
+"Retention sweep and publication-receipt evidence". Neither can delete history the
+other still needs: the relay only prunes below a committed checkpoint plus a
+7-day window, and gardening only deletes files a retained snapshot's receipts
+cover.
 
 ## Validation and measured limits
 

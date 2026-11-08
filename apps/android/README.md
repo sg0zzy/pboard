@@ -71,7 +71,7 @@ npm run apk:debug:install  # ... then adb install -r
 npm run apk:debug:run      # ... then install and launch the activity
 ```
 
-The script checks ANDROID_HOME, JDK 21+, the Capacitor CLI and gradle, and fails with the missing prerequisite. Flags: `--skip-frontend` reuses the previous bundle (Gradle-only rebuild), `--install`/`--run` need exactly one connected device unless only one of several is authorized. APK output: `apps/android/android/app/build/outputs/apk/debug/app-debug.apk`.
+The script resolves the SDK (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, then standard install locations such as `$HOME/Android/Sdk`, then `sdk.dir` in `android/local.properties`) and JDK 21+ (`JAVA_HOME`, else `java` on PATH), and fails naming the missing prerequisite. Flags: `--skip-frontend` reuses the previous bundle (Gradle-only rebuild), `--install`/`--run` need exactly one connected device unless only one of several is authorized. APK output: `apps/android/android/app/build/outputs/apk/debug/app-debug.apk`.
 
 Manual equivalent:
 

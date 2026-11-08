@@ -3,7 +3,7 @@ import { getRxStorageMemory } from "rxdb/plugins/storage-memory";
 import { draftCommand, pendingValue, validatePending } from "./pendingWork";
 import { liveBoardRole, liveBoardEntitlement, registerAuthorizationJournal, recordLiveBoardAdmission, installLiveBoardMutations } from "../collab/security/liveMutations";
 import { canonicalize } from "../collab/security/canonical";
-import { documentValue, makeChange, scope, pendingHeads, adoptedPendingIds, confirmableIds, type PendingEdit, type PendingReviewRecord, type OperationRecord } from "./changeJournal";
+import { documentValue, makeChange, scope, pendingHeads, adoptedPendingIds, confirmableIds, type PendingEdit, type PendingReviewRecord, type OperationRecord, type BoardCleanupState } from "./changeJournal";
 import { admitPendingEdit, portableJournalChanges, certifyLocalHistory, verifyPendingAdmission } from "../collab/security/journalProof";
 import { reconcile, validateRecord } from "./causalReconciliation";
 import { withUntrustedImport } from "../collab/security/liveMutations";
@@ -16,8 +16,11 @@ import { normalizeCardDisplayMode } from "../cardDisplayModes";
 import type { AppState, BoardImage, BoardItem, BoardItemStatus, BoardItemType, BoardTemplate, Project } from "../types";
 import type { CollaborationRole } from "../collab/manager";
 import { blobToDataUrl, createIndexedDbBlobStore, hashBlob, imageToBlob, type BlobStore } from "./blobStore";
-import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys } from "./orderKey";
-import { mergeProjectOrder, parseProjectOrder, projectDeletionTime as orderDeletionTime, sameProjectOrder, type ProjectOrderPreference } from "./projectOrder";
+import { compareOrdered, initialOrderKeys, orderKeyBetween, rebalanceOrderKeys, safeOrderKeyBetween } from "./orderKey";
+import { collaborationCounters } from "../collab/counters";
+import { mergeBoardOrder, mergeProjectOrder, parseProjectOrder, projectDeletionTime as orderDeletionTime, sameProjectOrder, type ProjectOrderPreference } from "./projectOrder";
+import { planLegacyDeletionMigration, type BoardTombstoneFact, type LegacyDeletionPlan } from "./boardTombstone";
+import type { BoardTombstoneMerge } from "./changeJournal";
 import { cardSchema, projectSchema, settingSchema, type CardRecord, type ProjectRecord, type SettingRecord } from "./rxdbSchemas";
 import type { MutationGuardInstall } from "../collab/security/mutation";
 import type { RepositoryEvents } from "./repository";
@@ -99,6 +102,17 @@ export async function createRxRepository(options: {
   name?: string;
   /** Internal pure-command scratchpad; never exposed to a remote provider. */
   pendingScratch?: boolean;
+  /**
+   * Whether an unbound signed board holds commands as reviewable pending work.
+   * Default true — the signed-mutation-guard world, where a context without
+   * the live board authority must not write the journal it cannot sign.
+   * The operation-protocol composition root sets this false: that build has
+   * no live-role guard to admit drafts, so a held draft is a queue nothing
+   * drains. There, every board is taken over by the operation service at the
+   * next synchronization — the Drive-first path that predates the relay
+   * posture — and local edits wait in the ordinary journal, not in review.
+   */
+  offlineDrafts?: boolean;
   blobs?: BlobStore;
   events?: RepositoryEvents;
   storage?: RxStorage<any, any>;
@@ -295,6 +309,10 @@ export async function createRxRepository(options: {
     const operationBinding = operationSource.bindings.get(projectId);
     if (operationBinding) {
       if (operationBinding.role === 'revoked' || operationBinding.role === 'viewer') throw new Error('Google Drive editing access is unavailable; retained local work is exportable');
+      // The board's own log can delete the board while this device still has
+      // it open. Authoring another operation for it would push content its
+      // owner erased back into the log; the retained journal still exports.
+      if (!(await projects.findOne(projectId).exec())) throw new Error('This board was deleted; your retained history is exportable');
       return;
     }
     const permission = await journal.permissions.get(projectId);
@@ -306,7 +324,13 @@ export async function createRxRepository(options: {
     const signed = permission?.authorityKeyId || (await projects.findOne(projectId).exec())?._sec
       || (await journal.hasSignedHistory(projectId))
       || (await pendingEdits()).some(e => e.boardId === projectId);
-    if (signed && !liveBoardRole(cards, projectId) && !(allowPending && permission?.deviceKeyId && permission.role !== "viewer")) {
+    // The hold exists so unsigned writes to a signed board go to review
+    // instead of to a journal this context cannot sign. With drafts disabled
+    // (the operation-protocol build, which never installs a live board role
+    // and therefore can never admit what it held) holding would be the very
+    // stranding this posture must not produce: the edit stays local and the
+    // operation service takes the board over at the next synchronization.
+    if (options.offlineDrafts !== false && signed && !liveBoardRole(cards, projectId) && !(allowPending && permission?.deviceKeyId && permission.role !== "viewer")) {
       throw new Error("Current board authorization is required; cached content remains readable and exportable");
     }
   }
@@ -413,14 +437,48 @@ export async function createRxRepository(options: {
     for (const edit of edits) if (counts.get(edit.base.documentId) === 1) byId.set(edit.base.documentId, edit.value);
     return [...byId.values()].filter(row => !row._deleted).sort((a, b) => compareOrdered(a as { id: string; orderKey: string }, b as { id: string; orderKey: string }));
   }
+  /** The account list this repository is currently scoped to; the same value
+   *  `orderPreference()` reads. Tombstones are per account list for the same
+   *  reason the preference is: a collaborator's leave must not hide the
+   *  owner's copy on a device that holds both. */
+  function tombstoneScope(): string | null { return projectOrderAccount; }
+  /**
+   * Boards this account list does not show: durable tombstones, permanent
+   * erasures, and legacy `deletedProjectIds` markers this device has not
+   * adopted as tombstones yet (a device that learned a deletion only from the
+   * preference file). Every list read uses this one set, so a board cannot be
+   * hidden by one path and visible to another — which is also what stops the
+   * preference sync from re-adding an id it would immediately drop again.
+   */
+  async function hiddenBoardIds(): Promise<Set<string>> {
+    const hidden = await journal.deletedBoards(tombstoneScope());
+    for (const entry of await journal.boardErasures()) hidden.add(entry.boardId);
+    const scope = tombstoneScope();
+    const facts = new Map<string, BoardTombstoneFact[]>();
+    for (const boardId of await deletedProjectIds()) {
+      const row = facts.get(boardId) ?? await journal.boardTombstoneFacts(boardId);
+      facts.set(boardId, row);
+      // A fact (of either kind) is this device's own decision and outranks the
+      // projection; without one, the marker stands.
+      if (!row.some(fact => fact.accountId === scope)) hidden.add(boardId);
+    }
+    return hidden;
+  }
   async function allProjectRecords() {
-    const deleted = await deletedProjectIds();
-    const erased = new Set((await journal.boardErasures()).map(entry => entry.boardId));
-    return (await overlay("projects", (await projects.find().exec()).map(doc => doc.toJSON()))).filter(doc => !deleted.includes(doc.id) && !erased.has(doc.id)) as ProjectRecord[];
+    const hidden = await hiddenBoardIds();
+    return (await overlay("projects", (await projects.find().exec()).map(doc => doc.toJSON())))
+      .filter(doc => !hidden.has(doc.id)) as ProjectRecord[];
   }
   let projectOrderAccount: string | null = null;
   const localOrderId = "localProjectOrder";
   const accountOrderId = (account: string) => `projectOrder:${account}`;
+  /**
+   * The last legacy-deletion migration's stated ambiguity. Kept because the
+   * whole point of the migration's unknown case is that somebody must be able
+   * to read it: a board that no preference lists and no tombstone covers is
+   * neither deleted nor confirmed alive, and this is where that is said.
+   */
+  let legacyDeletionDiagnostic: { at: string; ambiguous: string[]; adopted: string[] } | null = null;
   async function orderPreference(): Promise<ProjectOrderPreference | null> {
     let preference = projectOrderAccount ? await settings.findOne(accountOrderId(projectOrderAccount)).exec() : null;
     if (!preference) {
@@ -430,16 +488,48 @@ export async function createRxRepository(options: {
     }
     return preference ? parseProjectOrder(preference.value) : null;
   }
+  /**
+   * The account's legacy deletion projection. It is written on every delete so
+   * an older build (and a Drive preference file an older build reads) still sees
+   * the board as deleted, but it is **never** the source: the durable
+   * `board.deleted` tombstone is (`storage/boardTombstone.ts`). A preference
+   * merge or a `board.order` record that drops this field therefore cannot
+   * resurrect a board.
+   */
   async function deletedProjectIds(): Promise<string[]> {
     return (await orderPreference())?.deletedProjectIds ?? [];
   }
-  /** When this account's list dropped the board, in epoch milliseconds; null when it never left the list or a restore outranks the marker. Re-share detection needs the moment, not only the flag. */
+  /**
+   * When this board left this account's list, in epoch milliseconds; null when
+   * it never left or the latest deletion has been restored. Re-share detection
+   * needs the moment, not only the flag.
+   *
+   * A tombstone outranks the preference projection: the projection's value is
+   * only used for boards this device has not migrated into a tombstone yet.
+   * The timestamp chooses nothing here — the *fact* decides deleted/restored,
+   * and the time is only the answer to "since when".
+   */
   async function projectDeletionTime(projectId: string): Promise<number | null> {
+    const scope = tombstoneScope();
+    const tombstone = await journal.boardTombstone(projectId, scope);
+    if (tombstone.deleted) return tombstone.fact ? Date.parse(tombstone.fact.at) : null;
+    if ((await journal.boardTombstoneFacts(projectId)).some(fact => fact.accountId === scope)) return null;
     const preference = await orderPreference();
     return preference ? orderDeletionTime(preference, projectId) : null;
   }
+  /**
+   * Permanent erasure, or a durable `board.deleted` tombstone. The account
+   * preference's `deletedProjectIds` is consulted only for a board this device
+   * has no tombstone fact for at all — the legacy projection, kept so a
+   * deletion written by an older build stays hidden until migration adopts it.
+   * A `restored` fact therefore also outranks a stale preference marker.
+   */
   async function isDeletedProject(projectId: string): Promise<boolean> {
-    return !!await journal.boardErasure(projectId) || (await deletedProjectIds()).includes(projectId);
+    if (await journal.boardErasure(projectId)) return true;
+    const scope = tombstoneScope();
+    if ((await journal.boardTombstone(projectId, scope)).deleted) return true;
+    if ((await journal.boardTombstoneFacts(projectId)).some(fact => fact.accountId === scope)) return false;
+    return (await deletedProjectIds()).includes(projectId);
   }
   async function orderedProjects() {
     const records = await allProjectRecords();
@@ -471,6 +561,24 @@ export async function createRxRepository(options: {
     const preference = await settings.findOne(accountOrderId(account)).exec();
     return preference ? parseProjectOrder(preference.value) : null;
   }
+  /**
+   * Reflects this device's durable tombstones into a preference document.
+   *
+   * The preference field is only the legacy projection of the tombstone, and
+   * the tombstone never depends on it — but the projection must not *contradict*
+   * it either: an order record, a Drive merge or a local reorder that carried
+   * the id back into `ids` (or dropped it from `deletedProjectIds`) would make
+   * an older build, or the Drive copy an older build reads, present a board
+   * this device has deleted. Applying this before every preference write makes
+   * that impossible while keeping the field derived, never authoritative.
+   */
+  async function withTombstoneProjection(preference: ProjectOrderPreference): Promise<ProjectOrderPreference> {
+    const tombstoned = await hiddenBoardIds();
+    if (!tombstoned.size) return preference;
+    const deleted = [...new Set([...(preference.deletedProjectIds ?? []), ...tombstoned])].sort();
+    const ids = preference.ids.filter(id => !tombstoned.has(id));
+    return { ...preference, ids, deletedProjectIds: deleted };
+  }
   async function applyProjectOrder(account: string, preference: ProjectOrderPreference) {
     return locked(async () => {
       // Keep ids for boards not imported yet; they receive their saved rank as
@@ -478,11 +586,11 @@ export async function createRxRepository(options: {
       const id = accountOrderId(account);
       const doc = await settings.findOne(id).exec();
       if (!doc) {
-        await settings.upsert({ id, value: JSON.stringify(preference) });
+        await settings.upsert({ id, value: JSON.stringify(await withTombstoneProjection(preference)) });
         return;
       }
       const current = doc.value;
-      const mergedOrder = mergeProjectOrder(parseProjectOrder(current), preference);
+      const mergedOrder = await withTombstoneProjection(mergeProjectOrder(parseProjectOrder(current), preference));
       const merged = JSON.stringify(mergedOrder);
       // The account's order is merged on every account-preference sync. The
       // merge returns a new value each time, so writing it unconditionally
@@ -496,6 +604,110 @@ export async function createRxRepository(options: {
       // that difference is not a change.
       if (sameProjectOrder(parseProjectOrder(current), mergedOrder)) return;
       await doc.incrementalModify((existing) => ({ ...existing, value: merged }));
+    });
+  }
+  /** The clock of the last order record this device applied from the account
+   * room. The preference document's own `updatedAt` is the *local* intent's
+   * clock (a Drive merge and a reorder both move it), so remembering the last
+   * remote clock separately is what lets a replay after a restart be recognised
+   * as already applied instead of flipping the list back. */
+  const orderClockId = (account: string) => `projectOrderClock:${account}`;
+  function parseOrderClock(value: string | undefined): { updatedAt: number; seq: number; tie: string } | undefined {
+    if (!value) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== 'object') return undefined;
+      const clock = parsed as { updatedAt?: unknown; seq?: unknown; tie?: unknown };
+      if (typeof clock.updatedAt !== 'number' || typeof clock.seq !== 'number') return undefined;
+      return { updatedAt: clock.updatedAt, seq: clock.seq, tie: typeof clock.tie === 'string' ? clock.tie : '' };
+    } catch { return undefined; }
+  }
+  /**
+   * Applies a total order received over the account room, keeping this
+   * device's own boards.
+   *
+   * Three rules, and each has a reason:
+   *
+   * 1. **Never import, never resurrect.** The received ids are woven into the
+   *    list this device actually holds (`mergeBoardOrder` in
+   *    `storage/projectOrder.ts`), so an id this device does not have is
+   *    dropped. Making a board appear is the creation record's job and the
+   *    Drive listing's; an order is a property of a list that already exists.
+   * 2. **A local board the order does not mention keeps its slot.** It is
+   *    anchored to its local predecessor, so a sender that has not seen a newer
+   *    board cannot drag it to the front or the back.
+   * 3. **Newer wins, by the account plane's own rule.** `updatedAt` first,
+   *    `seq` second, the log row id last — the same comparison the account-room
+   *    projection already made (`operations/accountLifecycle.ts`). It is
+   *    repeated here because a *local* reorder may be newer than the record that
+   *    just arrived (two sessions reordered at once): the local preference's
+   *    `updatedAt` is that local intent's clock. A record tied with the local
+   *    clock wins, and both devices compare the same values, so the loser is
+   *    superseded deterministically rather than flipped back and forth.
+   *
+   * Applying an order writes the local preference document only. It never
+   * fires `projectOrderChanged`, so a received order cannot be published
+   * again: that is the difference between the record being the realtime path
+   * and the Drive poll becoming the realtime path.
+   */
+  async function applyRealtimeProjectOrder(account: string, order: { ids: string[]; updatedAt: number; seq: number; tie?: string }): Promise<boolean> {
+    return locked(async () => {
+      const next = { updatedAt: order.updatedAt, seq: order.seq, tie: order.tie ?? '' };
+      const previous = parseOrderClock((await settings.findOne(orderClockId(account)).exec())?.value);
+      const doc = await settings.findOne(accountOrderId(account)).exec();
+      const current = doc ? parseProjectOrder(doc.value) : undefined;
+      const localClock = current ? Date.parse(current.updatedAt) : Number.NEGATIVE_INFINITY;
+      const local = (await orderedProjects()).map(record => record.id);
+      // Older than this device's own intent: the local reorder happened after
+      // this record and already supersedes it. Ignoring is what makes the loser
+      // of two concurrent reorders *visibly* superseded rather than silently
+      // reverted, and it is why a record replayed after a restart cannot flip a
+      // newer local order back.
+      if (next.updatedAt < localClock) return false;
+      // Within one instant there is no clock to compare — two sessions that
+      // reordered in the same millisecond produce the same `updatedAt`, and the
+      // local intent was never stamped by the log, so it has no `seq` to lose on.
+      // The answer must still be the same on both devices, so it is computed from
+      // the one thing both devices can see identically: the two orders
+      // *restricted to the boards they share*. Each session compares the same two
+      // permutations of the same set — its own and the record's — and both keep
+      // the greater one, so the loser is superseded on both sides. Restricting is
+      // what makes the comparison symmetric: the raw lists routinely differ in
+      // length (a board only one device has), and comparing those directly would
+      // resolve differently on each side.
+      if (next.updatedAt === localClock) {
+        const known = new Set(local);
+        const shared = new Set(order.ids.filter(id => known.has(id)));
+        const mine = local.filter(id => shared.has(id));
+        const theirs = order.ids.filter(id => shared.has(id));
+        if (JSON.stringify(theirs) <= JSON.stringify(mine)) return false;
+      }
+      // A record this device already applied is a replay (the log re-delivering
+      // after a reconnect), not a newer fact.
+      if (previous && next.updatedAt === previous.updatedAt && next.seq === previous.seq && next.tie === previous.tie) return false;
+      // A tombstoned board is never re-admitted by an order record, and receiving
+      // one never clears the tombstone. The id is dropped from the woven list and
+      // from the saved ranks; the record cannot say anything about a board this
+      // device has deleted, because an order is a rank, not a creation.
+      const tombstoned = await journal.deletedBoards(account);
+      const received = order.ids.filter(id => !tombstoned.has(id));
+      const merged = mergeBoardOrder(local.filter(id => !tombstoned.has(id)), received);
+      // Saved ranks for boards this device has not imported are kept without
+      // being resurrected: they are ranks, not rows (`applyProjectOrder`'s own
+      // rule), so a later import finds its place and nothing appears now.
+      const held = new Set(merged);
+      const ids = [...merged, ...(current?.ids ?? []).filter(id => !held.has(id) && !tombstoned.has(id))];
+      const idsMoved = !current || current.ids.length !== ids.length || current.ids.some((id, index) => id !== ids[index]);
+      await settings.upsert({ id: orderClockId(account), value: JSON.stringify(next) });
+      if (!idsMoved) return true;
+      // The preference document's clock becomes the record's own clock, not this
+      // device's wall clock: both sessions then store the *same* document, so the
+      // Drive copy they eventually upload is identical and the poll cannot
+      // alternate between two "newest" orders. The local clock is never below it
+      // here (the guard above), so this is monotonic in this repository too.
+      await settings.upsert({ id: accountOrderId(account), value: JSON.stringify(await withTombstoneProjection({ ...(current ?? {}), ids,
+        updatedAt: new Date(order.updatedAt).toISOString() })) });
+      return true;
     });
   }
   async function projectCardRecords(projectId: string, includeDeleted = false, includePending = true) {
@@ -573,8 +785,24 @@ export async function createRxRepository(options: {
   async function importProject(project: Project, items: BoardItem[], preserveOrderKey?: string) {
     return locked(() => withUntrustedImport([cards, projects], () => importProjectData(project, items, preserveOrderKey)));
   }
+  /**
+   * The single import entry point every path funnels through (shared
+   * discovery, Drive listing adoption, snapshot/segment recovery, legacy
+   * migration, `importState`, collaboration copies).
+   *
+   * A tombstoned board is refused here even when the copy claims to exist. The
+   * refusal is causal, not chronological: a snapshot, a Drive file and a
+   * legacy row carry no operation vector, so none of them dominates the
+   * tombstone, and an old creation therefore loses to it regardless of its
+   * timestamps. Only an explicit `restored` fact (written by
+   * `unhideProject`) makes the board admissible again — and `isDeletedProject`
+   * answers from that fact, never from the preference projection when a fact
+   * exists.
+   */
   async function importProjectData(project: Project, items: BoardItem[], preserveOrderKey?: string) {
-    if (await isDeletedProject(project.id)) return;
+    // `isDeletedProject` is the tombstone plus the legacy preference fallback
+    // for a marker this build has not adopted yet; both mean "decided gone".
+    if (await isDeletedProject(project.id) || await journal.boardDeletionBlocks(project.id)) return;
     const existing = await projects.findOne(project.id).exec();
     const orderKey = preserveOrderKey ?? existing?.orderKey ?? orderKeyBetween((await allProjectRecords()).at(-1)?.orderKey ?? null, null);
     const sorted = [...items].sort((a, b) => a.order - b.order);
@@ -655,14 +883,24 @@ export async function createRxRepository(options: {
     for (const [index, project] of state.projects.entries()) {
       await importProject(project, state.boardItems.filter((item) => item.projectId === project.id), projectKeys[index]);
     }
-    await settings.upsert({ id: projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId,
-      value: JSON.stringify(state.projects.map((project) => project.id)) });
+    // The preference document this migration writes must carry every deletion
+    // fact this device already knows, or the legacy build reading it would
+    // re-present a board this build has tombstoned.
+    const orderId = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+    const existingOrder = await settings.findOne(orderId).exec();
+    await settings.upsert({ id: orderId, value: JSON.stringify(await withTombstoneProjection({
+      ...(existingOrder ? parseProjectOrder(existingOrder.value) : { updatedAt: "1970-01-01T00:00:00.000Z" }),
+      ids: state.projects.map((project) => project.id) })) });
     await settings.upsert({ id: "currentProjectId", value: state.currentProjectId ?? "" });
     const importedProjects = await listProjects();
-    if (importedProjects.length !== state.projects.length || importedProjects.some((project) => !state.projects.some((original) => original.id === project.id))) {
+    // A tombstoned board in the legacy state is *expected* to be absent: the
+    // migration must not fail because it refused to re-admit one.
+    const tombstoned = await journal.deletedBoards(tombstoneScope());
+    const expectedProjects = state.projects.filter(project => !tombstoned.has(project.id));
+    if (importedProjects.length !== expectedProjects.length || importedProjects.some((project) => !expectedProjects.some((original) => original.id === project.id))) {
       throw new Error("RxDB migration project verification failed");
     }
-    for (const project of state.projects) {
+    for (const project of expectedProjects) {
       const expected = state.boardItems.filter((card) => card.projectId === project.id);
       const actual = await listCards(project.id);
       if (expected.length !== actual.length || expected.some((card) => !actual.some((imported) => imported.id === card.id))) {
@@ -673,6 +911,56 @@ export async function createRxRepository(options: {
         if (!imported?.imageId || !(await blobs.hasBlob(imported.imageId))) throw new Error(`RxDB migration image verification failed for ${card.id}`);
       }
     }
+  }
+  /**
+   * Adopts the legacy `deletedProjectIds` projection as durable tombstones.
+   *
+   * Only reliable evidence is adopted: a preference document that *carries* the
+   * field and names the board in it. A board that is absent from every
+   * preference and has no tombstone is **unknown**, not deleted — the migration
+   * reports it and decides nothing, because inventing either decision is how a
+   * live board gets destroyed or a deleted one comes back. Nothing here touches
+   * Drive: no folder is trashed, no file deleted.
+   *
+   * Idempotent: a board that already holds any fact (a tombstone written by
+   * this build, or a restore) is skipped, so re-running the migration after a
+   * restore cannot re-delete the board.
+   */
+  /** A preference document id carries its account scope: `localProjectOrder` is
+   *  the account-less list, `projectOrder:<account>` is that account's. */
+  function accountOfPreference(preferenceId: string): string | null {
+    return preferenceId.startsWith("projectOrder:") ? preferenceId.slice("projectOrder:".length) : null;
+  }
+  async function migrateLegacyDeletions(): Promise<LegacyDeletionPlan> {
+    const localProjectIds = (await projects.find().exec()).map(doc => String(doc.toJSON().id));
+    const preferenceIds = [...new Set([localOrderId,
+      ...(await settings.find().exec()).map(doc => doc.toJSON().id).filter(id => id.startsWith("projectOrder:"))])];
+    const preferences: { preferenceId: string; preference: ProjectOrderPreference }[] = [];
+    for (const preferenceId of preferenceIds) {
+      const row = await settings.findOne(preferenceId).exec();
+      if (!row) continue;
+      try { preferences.push({ preferenceId, preference: parseProjectOrder(row.value) }); }
+      catch { /* A malformed preference is not evidence of anything. */ }
+    }
+    // A preference's marker is only already adopted when a fact exists in *that
+    // preference's own account list*; another list's fact is another list's
+    // decision.
+    const facts = new Map<string, BoardTombstoneFact[]>();
+    for (const boardId of localProjectIds) facts.set(boardId, await journal.boardTombstoneFacts(boardId));
+    const plan = planLegacyDeletionMigration({ preferences, localProjectIds,
+      alreadyRecorded: (boardId, preferenceId) => (facts.get(boardId) ?? []).some(fact => fact.accountId === accountOfPreference(preferenceId)) });
+    for (const { boardId, preferenceId, updatedAt } of plan.adopt) {
+      const at = Number.isFinite(Date.parse(updatedAt)) ? updatedAt : now();
+      await journal.recordBoardDeletion({ boardId, accountId: accountOfPreference(preferenceId), context: await observedContext(boardId), role: "owner",
+        at, evidence: `legacy-preference:${preferenceId}`, kind: "deleted", clock: Math.max(0, Date.parse(at)) });
+    }
+    if (plan.ambiguous.length) {
+      // A diagnosis, not a decision: these boards are still listed.
+      legacyDeletionDiagnostic = { at: now(), ambiguous: plan.ambiguous.map(entry => entry.boardId), adopted: plan.adopt.map(entry => entry.boardId) };
+    } else if (plan.adopt.length) {
+      legacyDeletionDiagnostic = { at: now(), ambiguous: [], adopted: plan.adopt.map(entry => entry.boardId) };
+    }
+    return plan;
   }
   async function migrationComplete() { return (await settings.findOne("migrationVersion").exec())?.value === "1"; }
   async function markMigrationComplete() { await settings.upsert({ id: "migrationVersion", value: "1" }); }
@@ -699,8 +987,17 @@ export async function createRxRepository(options: {
     const previous = existing ? Date.parse(parseProjectOrder(existing.value).updatedAt) : 0;
     const updatedAt = new Date(Math.max(Date.parse(now()), previous + 1)).toISOString();
     const deletedProjectIds = existing ? parseProjectOrder(existing.value).deletedProjectIds : undefined;
-    await settings.upsert({ id, value: JSON.stringify({ ...(existing ? parseProjectOrder(existing.value) : {}), ids: orderedIds, updatedAt,
-      ...(deletedProjectIds ? { deletedProjectIds } : {}) }) });
+    await settings.upsert({ id, value: JSON.stringify(await withTombstoneProjection({ ...(existing ? parseProjectOrder(existing.value) : {}), ids: orderedIds, updatedAt,
+      ...(deletedProjectIds ? { deletedProjectIds } : {}) })) });
+    // The settling point of a reorder: `reorderProjects` is called once per
+    // drop/commit, never per drag preview (`ProjectPicker` computes a preview
+    // and calls this only when it settles), and this assignment is the moment
+    // the list stopped moving. The published ids are the list this device
+    // holds, so a peer merges a total order over a set it can recognise.
+    // Fire-and-forget: the handler publishes to the relay, and a relay ack is
+    // never a condition of the local reorder — nor may it re-enter this lock.
+    void Promise.resolve(events.projectOrderChanged?.({ account: projectOrderAccount, ids: orderedIds,
+      updatedAt: Date.parse(updatedAt) })).catch(() => undefined);
   }); }
   async function renameProject(projectId: string, name: string) { return locked(async () => {
     const trimmed = name.trim();
@@ -713,6 +1010,96 @@ export async function createRxRepository(options: {
     await touchProject(projectId);
     await changed(projectId);
   }); }
+  /** Boards whose owner erase is running in this context. The operation
+   * projection consults it so a batch that lands mid-erase yields instead of
+   * rewriting the row the erase is about to tombstone. */
+  const erasingBoards = new Set<string>();
+  function isErasingBoard(projectId: string): boolean { return erasingBoards.has(projectId); }
+  /**
+   * Tombstone the board row, and only succeed when the row says it is deleted.
+   *
+   * The projection of verified operations (`projectOperations` in
+   * src/sync/operations/projection.ts) rewrites the board row on every applied
+   * batch — its `revision` is the operation vector and `tailOrderKey` follows
+   * the card order, while `updatedAt` keeps the value the log carries. A
+   * document read before this point is therefore routinely stale by the time a
+   * tombstone is written, and RxDB rejects the write with a `CONFLICT`. If that
+   * failure were swallowed the board would stay alive locally and on every
+   * other device while the account list already dropped it, which is the state
+   * in which the board's log refuses to synchronize at all.
+   *
+   * So: re-read the row for every attempt (the window then closes to a single
+   * storage batch), let the projection yield for the duration, and give up
+   * after four attempts — one for the normal case, one to absorb the batch that
+   * was already inside its storage write when the latch went up, two for a
+   * storage failure that repeats it. Anything still failing at that point is an
+   * unknown writer and must reach the user as a failed deletion rather than
+   * spin in the repository's mutation lock.
+   */
+  const ERASE_ATTEMPTS = 4;
+  async function eraseProjectDocument(projectId: string): Promise<void> {
+    erasingBoards.add(projectId);
+    try {
+      /** The stored row, including a tombstone the document cache hides. */
+      const storedRow = async () => (await projects.storageInstance.findDocumentsById([projectId], true))[0] as unknown as { _deleted?: boolean } | undefined;
+      let failure: unknown;
+      for (let attempt = 0; attempt < ERASE_ATTEMPTS; attempt++) {
+        const row = await storedRow();
+        // Already tombstoned — by this call or by a device that got here first
+        // — is the outcome the caller asked for, not an error.
+        if (!row || row._deleted) return;
+        const current = await projects.findOne(projectId).exec();
+        try {
+          if (current) await current.remove();
+        } catch (error) { failure = error; continue; }
+        const after = await storedRow();
+        if (!after || after._deleted) return;
+        failure ??= new Error('Board deletion was rejected by local storage; the board remains listed and its content is untouched');
+      }
+      throw failure instanceof Error ? failure : new Error('Board deletion did not complete; the board remains listed and its content is untouched');
+    } finally { erasingBoards.delete(projectId); }
+  }
+  /** The context this device has observed for a board, so a tombstone written
+   *  now is ordered after everything it has already seen. Empty is honest and
+   *  sufficient against copies that carry no context at all. */
+  async function observedContext(projectId: string): Promise<import("./boardTombstone").CausalContext> {
+    const observed: import("./boardTombstone").CausalContext = operationSource.bindings.has(projectId)
+      ? await operationSource.local.observed(projectId).then(state => state.frontier, () => ({}))
+      : {};
+    const facts = await journal.boardTombstoneFacts(projectId);
+    for (const fact of facts) {
+      observed[fact.actorId] = Math.max(observed[fact.actorId] ?? 0, fact.seq);
+      for (const [actor, seq] of Object.entries(fact.context)) observed[actor] = Math.max(observed[actor] ?? 0, seq);
+    }
+    return observed;
+  }
+  /**
+   * Persist the durable tombstone. This is the **first** durable write of a
+   * deletion and it must happen before `eraseProjectDocument`, before the list
+   * hide is reported and before anything is published: a crash after this line
+   * leaves the tombstone (and therefore the decision), while a crash before it
+   * leaves an untouched board. Nothing in the delete path may reorder the two.
+   *
+   * The Drive cleanup is a *later* durable write (`beginBoardCleanup`), because
+   * whether this device owes it depends on a role decision — a collaborator
+   * leaving keeps the owner's folder — that is only known after the fact. The
+   * ordering that matters is preserved either way: no cleanup record exists
+   * before the tombstone that authorises it.
+   *
+   * The write is also announced to the rest of the account. That announcement is
+   * fire-and-forget and comes *after* the durable write —
+   * the fact is what the deletion is, and a relay that is down must not delay or
+   * fail the user's action. `projectTombstoned` is the composition root's seam
+   * (`storage/browser.ts` → `accountChannel.publishTombstone`); a repository
+   * with no such listener simply does not announce, which is what the Drive
+   * preference projection still covers.
+   */
+  async function recordDeletion(projectId: string, role: import("./boardTombstone").DeletionRole, kind: "deleted" | "restored", evidence: string) {
+    const fact = await journal.recordBoardDeletion({ boardId: projectId, accountId: tombstoneScope(), context: await observedContext(projectId),
+      role, at: now(), evidence, kind });
+    void events.projectTombstoned?.(projectId, fact);
+    return fact;
+  }
   async function deleteProject(projectId: string) {
     const doc = await projects.findOne(projectId).exec();
     if (!doc) return;
@@ -720,6 +1107,17 @@ export async function createRxRepository(options: {
     const permission = await journal.permissions.get(projectId);
     const operationBinding = operationSource.bindings.get(projectId);
     const signed = !operationBinding && (!!doc._sec || !!permission?.authorityKeyId);
+    /** Exactly one deletion fact per `deleteProject` call, written at the first
+     *  decision point and never again. `role` is what this device knew then. */
+    let tombstoned = false;
+    const ensureTombstone = async (role: import("./boardTombstone").DeletionRole) => {
+      if (tombstoned) return;
+      tombstoned = true;
+      await recordDeletion(projectId, role, "deleted", `local-delete:${role}`);
+    };
+    /** The account-list projection of the decision. It never writes a fact: the
+     *  tombstone above is the record, this field only lets an older build (and
+     *  the Drive preference file an older build reads) agree. */
     const hide = () => locked(async () => {
       const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
       const preference = await settings.findOne(id).exec();
@@ -739,7 +1137,20 @@ export async function createRxRepository(options: {
     // Signed-board authority comes from its verified grant, never a Drive ACL.
     // Keep its handle visible until signed tombstones are durable: selection
     // changes stop the collaboration manager and uninstall the signing guard.
-    if (!signed) await hide();
+    // For an unsigned board the account marker commits *before* the Drive
+    // ownership check is awaited, so the list answers immediately and a
+    // verification that never comes still leaves the board out of it; what the
+    // erase below protects is the other half — content surviving a committed
+    // marker, which is why a failed erase rolls the marker back.
+    //
+    // The durable tombstone precedes both, and precedes the ownership
+    // verification for the unsigned case: it is the first write of the
+    // deletion, so a crash between the decision and the rest can never lose the
+    // decision. For a signed board the verification is a local grant read (no
+    // destructive work happens before it), so the fact is written with the
+    // verified role, still before `projectDeleting` publishes anything and
+    // before the erase.
+    if (!signed) { await ensureTombstone(permission?.role ?? options.mutatorRole ?? "owner"); await hide(); }
     let role = operationBinding ? (options.resolveDeletionRole ? await options.resolveDeletionRole(projectId) : operationBinding.role) : (signed ? liveBoardRole(projects, projectId) ?? permission?.role
       : options.resolveDeletionRole ? await options.resolveDeletionRole(projectId) : permission?.role ?? options.mutatorRole ?? "owner");
     if (signed && role === "owner" && options.reverifySharedDeletionRole) {
@@ -753,23 +1164,46 @@ export async function createRxRepository(options: {
         // Unverifiable: keep the verified grant's verdict.
       }
     }
+    if (signed) await ensureTombstone(role ?? "owner");
     const canDeleteContent = role === "owner" && (!signed || liveBoardRole(projects, projectId) === "owner");
     // Non-owners remove only their account's list handle. Cached rows, images,
     // pending work and conflicts are retained independently of transport state.
-    if (canDeleteContent) {
-      await events.projectDeleting?.(projectValue(doc.toJSON()));
+    if (!canDeleteContent) {
+      await hide();
+      await events.projectHidden?.(projectId);
+      return;
+    }
+    await events.projectDeleting?.(projectValue(doc.toJSON()));
+    // This device is about to destroy the board's content, so it also owes the
+    // board's Drive folder a move to Trash. Written *after* the tombstone
+    // above — which is what authorises the move — and before the erase, so a
+    // crash at any point leaves the intent durable and the next session
+    // resumes it. A collaborator's leave returned above and owes nothing: the
+    // owner's folder is not theirs to trash.
+    await journal.beginBoardCleanup(projectId, tombstoneScope(), now(), Date.now(), doc.toJSON().name as string | undefined).catch(() => undefined);
+    // The account marker is already committed (that is what the ownership check
+    // above waits behind, so the list answers immediately). What must never
+    // happen is a board that stays hidden while its content survives: hiding a
+    // board whose erase failed is the half-deleted state where
+    // `isDeletedProject()` reports the board gone, every later synchronization
+    // of it is refused with "This board was removed", and no device was told
+    // anything. So a failed erase puts the board back in the list and rejects;
+    // the caller reports the delete as the failure it is.
+    try {
       await locked(async () => {
+        await eraseProjectDocument(projectId);
         for (const card of await projectCardRecords(projectId, false, false)) {
           await (await cards.findOne(card.id).exec())?.incrementalPatch({ deletedAt: now() });
         }
-        await doc.remove();
       });
+    } catch (error) {
+      await unhideProject(projectId).catch(() => undefined);
+      throw error;
     }
-    if (signed) await hide();
+    await hide();
     // Preference sync can itself queue repository writes. Release the mutation
     // lock before notifying listeners so removing a board cannot deadlock sync.
-    if (canDeleteContent) await events.projectDeleted?.(projectId);
-    else await events.projectHidden?.(projectId);
+    await events.projectDeleted?.(projectId);
   }
   async function changeProjectTemplate(projectId: string, template: BoardTemplate): Promise<number> { return locked(async () => {
     const doc = await projects.findOne(projectId).exec();
@@ -788,10 +1222,10 @@ export async function createRxRepository(options: {
     return remapped;
   }); }
   async function addItem(input: { projectId: string; content: string; title?: string; type?: BoardItemType; status?: BoardItemStatus; displayMode?: BoardItem["displayMode"]; source?: BoardItem["source"]; image?: BoardImage; afterItemId?: string }): Promise<BoardItem> { return locked(async () => {
+    await assertCanMutate(input.projectId);
     const projectDoc = await projects.findOne(input.projectId).exec();
     if (!projectDoc) throw new Error("Project not found");
     const project = projectValue(projectDoc.toJSON());
-    await assertCanMutate(input.projectId);
     let beforeKey: string | null = null;
     let afterKey: string | null = null;
     if (input.afterItemId) {
@@ -837,7 +1271,7 @@ export async function createRxRepository(options: {
     const project = await getProject(doc.projectId);
     if (patch.type && project && !isTypeSupported(project.template, patch.type)) throw new Error("Card type is not supported by this board template");
     const permission = await journal.permissions.get(doc.projectId);
-    if (permission?.authorityKeyId && (!liveBoardRole(cards, doc.projectId) || (await pendingFor(itemId)).length)) {
+    if (options.offlineDrafts !== false && permission?.authorityKeyId && (!liveBoardRole(cards, doc.projectId) || (await pendingFor(itemId)).length)) {
       const earlier = await pendingFor(itemId);
       if (earlier.length > 1) throw new Error("Parallel offline drafts need explicit review; all versions are retained");
       const base = earlier[0]?.base ?? await makeChange({ boardId: doc.projectId, collection: "cards", documentId: itemId,
@@ -885,8 +1319,12 @@ export async function createRxRepository(options: {
     // The duplicate is a new local mutation; stale provenance from the source
     // (wrong documentId, wrong payload hash) must not be inherited.
     const { _sec: staleProvenance, ...sourceRecord } = source.toJSON();
+    // A concurrent duplicate midpoint can leave the next card sharing the
+    // source's rank; no key fits between equal ranks, so append past that
+    // neighbour instead of failing the duplicate over a comparator error.
+    const nextKey = ordered[index + 1]?.orderKey ?? null;
     const record: CardRecord = { ...sourceRecord, id: newId(), status: "candidate",
-      orderKey: orderKeyBetween(source.orderKey, ordered[index + 1]?.orderKey ?? null), createdAt: timestamp, updatedAt: timestamp };
+      orderKey: safeOrderKeyBetween(source.orderKey, nextKey) ?? orderKeyBetween(source.orderKey, null), createdAt: timestamp, updatedAt: timestamp };
     await cards.insert(record);
     await touchProject(source.projectId, timestamp, record.orderKey);
     await changed(source.projectId);
@@ -953,7 +1391,23 @@ export async function createRxRepository(options: {
     const after = position + 1 < orderedIds.length ? await cards.findOne(orderedIds[position + 1]).exec() : null;
     if ((before && (before.projectId !== projectId || before.deletedAt)) ||
         (after && (after.projectId !== projectId || after.deletedAt))) throw new Error("Move neighbors are invalid");
-    const key = orderKeyBetween(before?.orderKey ?? null, after?.orderKey ?? null);
+    const beforeKey = before?.orderKey ?? null;
+    const afterKey = after?.orderKey ?? null;
+    const key = safeOrderKeyBetween(beforeKey, afterKey);
+    if (key === null) {
+      // Degenerate slot: the neighbours share an order key (two devices minted
+      // the same midpoint concurrently) or the caller's list is stale. No key
+      // fits strictly between equal ranks, so honour the requested sequence
+      // with a fresh lattice — the fallback an ambiguous multi-card
+      // permutation already takes — rather than let the fractional-indexing
+      // comparator throw mid-drag.
+      const keys = initialOrderKeys(orderedIds.length);
+      const timestamp = now();
+      for (const [index, id] of orderedIds.entries()) await (await cards.findOne(id).exec())?.incrementalPatch({ orderKey: keys[index], updatedAt: timestamp });
+      await touchProject(projectId, timestamp, keys.at(-1));
+      await changed(projectId);
+      return;
+    }
     if (key === item.orderKey) return;
     const timestamp = now();
     await item.incrementalPatch({ orderKey: key, updatedAt: timestamp });
@@ -974,13 +1428,45 @@ export async function createRxRepository(options: {
     await doc.remove();
     if ((await settings.findOne("currentProjectId").exec())?.value === projectId) await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
   }
-  /** Reverses only this account's list preference (D04). Cached content and retained conflict/pending evidence stay untouched. */
+  /** Reverses only this account's list preference (D04). Cached content and retained conflict/pending evidence stay untouched.
+   *
+   * The explicit restore is the *only* supported way a tombstoned board comes
+   * back locally. It writes a `restored` fact into the same record with the
+   * prior facts folded into its context, so the restore causally dominates the
+   * deletion it reverses; nothing else (a Drive file, an old snapshot, an old
+   * order record, a stale preference marker) may produce that fact.
+   *
+   * A restore *received* from a peer is a different thing: the fact already
+   * exists (`applyBoardTombstoneFact` merged it into this store), so this
+   * device must not mint a second `restored` fact for the same decision — it
+   * only has to make its own list and row agree with the fact it now holds.
+   * That is what `reflectRestore`/`rebuildFromRetained` are for, and why the
+   * restore path is split into those two steps. */
   async function unhideProject(projectId: string) {
     if (await journal.boardErasure(projectId)) throw new Error('This board was permanently deleted.');
     if (await getProject(projectId)) return; // Board already visible; nothing to restore.
     const doc = await projects.findOne(projectId).exec();
     const wasHidden = await isDeletedProject(projectId);
     if (!doc && !wasHidden) throw new Error("This board's cached copy is unavailable locally; its evidence remains exportable");
+    if (wasHidden) await recordDeletion(projectId, (await journal.boardTombstone(projectId)).fact?.role ?? "owner",
+      "restored", "explicit-restore");
+    await reflectRestore(projectId, wasHidden);
+    // An owner-authorized removal removed the project document itself. Rebuild
+    // the board row and cards from the latest non-deleted variant in the
+    // retained history — the deletion tombstones stay in the journal as
+    // evidence, but the explicit restore brings the pre-deletion state back.
+    if (!doc) await rebuildFromRetained(projectId);
+    await changed(projectId);
+  }
+  /**
+   * Reflects a `restored` fact into this device's account list: the id goes
+   * back into `ids`, out of `deletedProjectIds`, and gets a `restoreEvents`
+   * stamp so a preference merge keeps it visible against older markers.
+   *
+   * Shared by the explicit local restore and a restore received from a peer;
+   * the latter must not re-stamp the *fact*, only this document.
+   */
+  async function reflectRestore(projectId: string, wasHidden: boolean) {
     await locked(async () => {
       const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
       const preference = await settings.findOne(id).exec();
@@ -996,11 +1482,15 @@ export async function createRxRepository(options: {
         await settings.upsert({ id, value: JSON.stringify(next) });
       }
     });
-    // An owner-authorized removal removed the project document itself. Rebuild
-    // the board row and cards from the latest non-deleted variant in the
-    // retained history — the deletion tombstones stay in the journal as
-    // evidence, but the explicit restore brings the pre-deletion state back.
-    if (!doc) await locked(async () => {
+  }
+  /**
+   * Rebuilds one board's row (and its cards) from the latest non-deleted
+   * variant in the retained journal. Used by an explicit restore and by a
+   * restore received from a peer — both are "the fact says this board is
+   * admissible again", so both rebuild through the same one path.
+   */
+  async function rebuildFromRetained(projectId: string) {
+    await locked(async () => {
       const entries = (await journal.entries.where("boardId").equals(projectId).toArray()).filter(e => e.state === "committed");
       const groups = new Map<string, typeof entries>();
       for (const entry of entries) { const id = scope(entry), group = groups.get(id); if (group) group.push(entry); else groups.set(id, [entry]); }
@@ -1029,10 +1519,65 @@ export async function createRxRepository(options: {
           () => (collection as typeof projects).upsert(chosen.value as never)));
       }
     });
-    await changed(projectId);
+  }
+  /**
+   * Merges one tombstone fact received from the peer channel into this device's
+   * durable store, through the same ordering rule the local delete/restore path
+   * writes through, and makes this device's list agree with the result.
+   *
+   * That is the whole of the consume path, and it is deliberately small:
+   *
+   *  - **One store, one rule.** `journal.mergeBoardTombstone` is `mergeFacts` +
+   *    `latestFact` over the same `boardTombstones` row `recordBoardDeletion`
+   *    writes. There is no second merge and no second decision anywhere, so two
+   *    devices that received the same facts in different orders hold the same
+   *    bytes and answer `isDeletedProject` identically.
+   *  - **A duplicate is a no-op**, reported as such: a replayed `opId`, an
+   *    older fact, or a concurrent fact that lost the tie leaves the deciding
+   *    fact unchanged, so nothing is hidden, nothing is re-shown and the caller
+   *    answers `duplicate`.
+   *  - **Deletion needs no Drive.** The fact *is* the evidence; a peer that
+   *    never saw the deletion hides the board immediately, and every import
+   *    gate (`isDeletedProject`, `boardDeletionBlocks`) refuses it from then on
+   *    — including a fresh reconcile round's Drive adoption.
+   *  - **Restore re-admits** through the explicit restore's own two steps, so a
+   *    received restore and a local one leave the same state. It only rebuilds
+   *    a row this device still has history for: a peer that never held the
+   *    board gets nothing to rebuild and simply stops hiding it.
+   */
+  async function applyBoardTombstoneFact(boardId: string, fact: BoardTombstoneFact): Promise<BoardTombstoneMerge> {
+    const merged = await journal.mergeBoardTombstone({ boardId, fact });
+    if (merged.duplicate) return merged;
+    if (merged.deleted) {
+      // The list, the selection and any open editor read through
+      // `isDeletedProject`, so the decided-gone state is already enough. Keep
+      // the legacy projection in step so an older build reading the Drive
+      // preference file agrees, and drop the selection off the board.
+      await locked(async () => {
+        const id = projectOrderAccount ? accountOrderId(projectOrderAccount) : localOrderId;
+        const preference = await settings.findOne(id).exec();
+        if (preference) {
+          const parse = parseProjectOrder(preference.value);
+          if (!(parse.deletedProjectIds ?? []).includes(boardId) || parse.ids.includes(boardId))
+            await settings.upsert({ id, value: JSON.stringify(await withTombstoneProjection({ ...parse,
+              ids: parse.ids.filter(candidate => candidate !== boardId),
+              deletedProjectIds: [...new Set([...(parse.deletedProjectIds ?? []), boardId])].sort() })) });
+        }
+      });
+      if ((await settings.findOne("currentProjectId").exec())?.value === boardId)
+        await settings.upsert({ id: "currentProjectId", value: (await listProjects())[0]?.id ?? "" });
+      return merged;
+    }
+    // A received restore: the fact already decides admissibility, so this device
+    // only has to stop hiding the board and put it back in its own list.
+    const hadRow = Boolean(await projects.findOne(boardId).exec());
+    await reflectRestore(boardId, true);
+    if (hadRow && !await getProject(boardId)) await rebuildFromRetained(boardId);
+    await changed(boardId);
+    return merged;
   }
   function subscribe<T>(query: { $: { subscribe: (next: () => void) => { unsubscribe(): void } } }, read: () => Promise<T>, listener: (value: T) => void) {
-    const { refresh, readNow, stop } = subscribeRead(read, listener);
+    const { refresh, readNow, stop } = subscribeRead("cards", read, listener);
     const sub = query.$.subscribe(refresh);
     // A card's list is the documents plus the pending-edit overlay over them.
     // A journal change in the change log, the receipts or the drafts does not
@@ -1051,15 +1596,43 @@ export async function createRxRepository(options: {
   // finishes between two of them would publish an intermediate value and
   // start another read. A short settling window turns a burst into a single
   // read: the reader waits for the burst to end before it reads once.
-  function subscribeRead<T>(read: () => Promise<T>, listener: (value: T) => void) {
+  //
+  // `unchanged` is what makes a subscription a *view* subscription: the
+  // sources of a whole-collection read (`projects.find()`, `settings.find()`)
+  // fire for writes that cannot change what the reader renders — the
+  // projection rewrites a board row on every applied operation batch, and a
+  // receipt is written per downloaded file — so publishing every re-read is a
+  // full sidebar render for a write the person cannot see, on any board. With
+  // a comparator the read still happens once per settled burst, and the
+  // listener is called only when the value it renders actually moved. The
+  // freshly read value is what the listener receives: a suppressed emission
+  // never leaves a stale value behind, because the next genuine change
+  // publishes the whole current value, not a patch.
+  function subscribeRead<T>(label: string, read: () => Promise<T>, listener: (value: T) => void, unchanged?: (previous: T, next: T) => boolean) {
     let active = true, running = false, dirty = false, settling: ReturnType<typeof setTimeout> | undefined;
+    let published: { value: T } | undefined;
     const start = () => {
       if (!active || running) return;
       running = true;
       void Promise.resolve().then(async () => {
         while (active && dirty) {
           dirty = false;
-          try { const value = await read(); if (active && !dirty) listener(value); }
+          collaborationCounters.countEvent("view.read");
+          collaborationCounters.countEvent(`view.read.${label}`);
+          const readStarted = collaborationCounters.enabled ? performance.now() : 0;
+          try {
+            const value = await read();
+            if (collaborationCounters.enabled) collaborationCounters.time(`view.read.${label}.ms`, performance.now() - readStarted);
+            if (!active || dirty) continue;
+            if (published && unchanged?.(published.value, value)) { published = { value }; continue; }
+            published = { value };
+            // Distinct from the UI's own `countEmission("projects")`: that counts
+            // values that reached React, this counts values the subscription
+            // published. They differ exactly where a render was suppressed by a
+            // later re-read inside the same burst.
+            collaborationCounters.countEmission(`view.emit.${label}`);
+            listener(value);
+          }
           catch { console.error('Local recovery view could not refresh; local data is retained.'); }
         }
       }).finally(() => { running = false; if (active && dirty) refresh(); });
@@ -1073,16 +1646,54 @@ export async function createRxRepository(options: {
       clearTimeout(settling);
       settling = setTimeout(() => { settling = undefined; start(); }, SETTLE_MS);
     };
+    // A live gauge of the repository subscriptions this context holds. Every
+    // reader goes through this one helper, so a switch that adds a subscription
+    // and never releases it climbs `active['rx.subscriptions']` — which is the
+    // "does a board switch return to its starting count" question, answerable
+    // without reading every `useEffect` in the UI.
+    collaborationCounters.adjustActive("rx.subscriptions", 1);
+    let counted = true;
     return {
       refresh,
       // The first read is immediate: a subscription must publish its current
       // value without waiting for a settling window.
       readNow: () => { dirty = true; start(); },
-      stop: () => { active = false; clearTimeout(settling); }
+      stop: () => {
+        active = false; clearTimeout(settling);
+        if (counted) { counted = false; collaborationCounters.adjustActive("rx.subscriptions", -1); }
+      }
     };
   }
+  /**
+   * What the sidebar's project list renders: each visible board's identity and
+   * the value the picker shows, in list order. `updatedAt` and `revision` are
+   * deliberately absent — `revision` is the projection's operation-vector sum
+   * and `updatedAt` is bumped by every local edit on any board, so comparing
+   * either makes a background board's work a full list render, which is
+   * exactly the cost this comparison exists to remove. Nothing in the sidebar
+   * reads them (`ProjectPicker` renders `project.name`; the list is otherwise
+   * `projects.length`), and `subscribeProjects` still re-reads on every
+   * settled burst, so a suppressed emission never leaves a stale value behind:
+   * the next genuine change publishes the whole current list.
+   */
+  const projectListShape = (projects: Project[]): string => JSON.stringify(projects.map(project => [
+    project.id, project.name, project.template
+  ]));
+  /**
+   * What the current-board subscription renders: the selected board (or, when
+   * the selection is gone, the first listed board) as the board the sidebar
+   * shows — its identity, its name, and the template that decides how its
+   * items are drawn. Renaming it or changing its template still notifies;
+   * adding a card on it does not, because the card subscriptions own that
+   * render. `revision` is excluded for the same reason as in the list: it
+   * moves on every applied batch and is not displayed.
+   */
+  const currentProjectShape = (project: Project | null): string => JSON.stringify(project
+    ? [project.id, project.name, project.template]
+    : null);
   const subscribeProjects = (listener: (value: Project[]) => void) => {
-    const { refresh, readNow, stop } = subscribeRead(listProjects, listener);
+    const { refresh, readNow, stop } = subscribeRead("projects", listProjects, listener,
+      (previous, next) => projectListShape(previous) === projectListShape(next));
     const first = projects.find().$.subscribe(refresh);
     const second = settings.find().$.subscribe(refresh);
     // The project list mirrors the project documents, the settings that record
@@ -1098,7 +1709,8 @@ export async function createRxRepository(options: {
     return () => { stop(); first.unsubscribe(); second.unsubscribe(); stopJournal(); };
   };
   const subscribeCurrentProject = (listener: (value: Project | null) => void) => {
-    const { refresh, readNow, stop } = subscribeRead(getCurrentProject, listener);
+    const { refresh, readNow, stop } = subscribeRead("currentProject", getCurrentProject, listener,
+      (previous, next) => currentProjectShape(previous) === currentProjectShape(next));
     const first = settings.find().$.subscribe(refresh);
     const second = projects.find().$.subscribe(refresh);
     const stopJournal = journal.subscribe((tables) => {
@@ -1242,7 +1854,7 @@ export async function createRxRepository(options: {
     async bindOperationBoard(binding: OperationBinding, coveredIds: string[] = []) { await operationSource.bind(binding, coveredIds); },
     reconciliation, privateRecovery, installBoardSecurity, admitPendingWork, listPendingWork, reviewPendingWork, discardRemovedBoardWork, permanentlyDeleteBoard, applyPrivateBoardErasure,
     subscribePendingWork(listener: (value: Awaited<ReturnType<typeof listPendingWork>>) => void) {
-      const { refresh, readNow, stop } = subscribeRead(listPendingWork, listener);
+      const { refresh, readNow, stop } = subscribeRead("pendingWork", listPendingWork, listener);
       const unsubscribe = journal.subscribe((tables) => { if (tables.includes("pendingEdits")) invalidatePendingEdits(); refresh(); }); readNow();
       return () => { stop(); unsubscribe(); };
     },
@@ -1252,7 +1864,58 @@ export async function createRxRepository(options: {
         const image = await blobs.getBlob(imageId); if (!image) throw new Error('A pending image is missing; the draft remains locally recoverable');
         return { ...image, imageId, blob: undefined, dataUrl: await blobToDataUrl(image.blob) };
       })) }; }, ...conflicts, load, exportAll, exportProject, importProject, mergeSharedSnapshot, importState, removeProject, migrationComplete, markMigrationComplete, markMigrationIncomplete, setMutatorRole,
-    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, isDeletedProject, projectDeletionTime, renameProject, deleteProject, changeProjectTemplate, unhideProject,
+    createProject, selectProject, reorderProjects, setProjectOrderAccount, getProjectOrder, applyProjectOrder, applyRealtimeProjectOrder, isDeletedProject, projectDeletionTime, renameProject, deleteProject, isErasingBoard, changeProjectTemplate, unhideProject,
+    migrateLegacyDeletions, legacyDeletionDiagnostic: () => legacyDeletionDiagnostic, boardDeletionState: (boardId: string) => journal.boardTombstone(boardId),
+    /** Merge one tombstone fact received from the account room. See
+     *  `applyBoardTombstoneFact`: the same store and the same ordering rule as
+     *  the local delete/restore path, plus the list/row agreement the fact
+     *  implies on this device. */
+    applyBoardTombstoneFact,
+    /**
+     * What happened to the board's Drive folder — the deletion's second half.
+     * `null` means this device owed nothing (a collaborator's leave, an adopted
+     * legacy marker, or a board deleted by a build before the cleanup existed).
+     * `pending`/`failed` carry the reason the folder is still there; `trashed`
+     * carries the confirmed folder ids. Read by the deletion report next to the
+     * board's own sync status, never by the list itself.
+     */
+    boardDriveCleanup: (boardId: string) => journal.boardCleanup(boardId),
+    /** Every board whose Drive folder this device still owes, for the deletion
+     *  report: `pending`/`failed` only, and bounded by how many boards were
+     *  deleted rather than by how many boards exist. */
+    pendingBoardCleanups: () => journal.pendingBoardCleanups(),
+    /**
+     * The deletion report the UI reads: pending cleanups, filtered to boards
+     * that are still deleted (a restore clears the record, and a record left by
+     * an older build must not name a live board). One read, so the panel cannot
+     * show a board the list has already resurrected.
+     */
+    boardCleanupReport: async () => {
+      const rows = await journal.pendingBoardCleanups();
+      if (!rows.length) return [];
+      const visible = new Set((await listProjects()).map(project => project.id));
+      const stillDeleted: typeof rows = [];
+      for (const row of rows) {
+        // `isDeletedProject` consults the tombstone and the erasure marker; the
+        // visible list check catches a board the projection already brought back
+        // before the tombstone read settles.
+        if (visible.has(row.boardId)) continue;
+        if (await isDeletedProject(row.boardId)) stillDeleted.push(row);
+      }
+      return stillDeleted;
+    },
+    /** The deletion report, live. One journal subscription while a reader is
+     *  attached (the header while the sidebar is open), released by its
+     *  unsubscribe — the same shape as every other recovery view. */
+    subscribeBoardCleanups(listener: (value: { boardId: string; cleanup: BoardCleanupState }[]) => void) {
+      const read = async () => { try { listener(await api.boardCleanupReport()); } catch { listener([]); } };
+      const unsubscribe = journal.subscribe(tables => { if (!tables.length || tables.includes("boardTombstones")) void read(); });
+      void read();
+      return () => { unsubscribe(); };
+    },
+    recordBoardDeletion: (boardId: string, input: { kind?: "deleted" | "restored"; role?: "owner" | "editor" | "viewer"; evidence: string; at?: string }) =>
+      journal.recordBoardDeletion({ boardId, accountId: tombstoneScope(), context: {}, role: input.role ?? "owner", at: input.at ?? now(),
+        evidence: input.evidence, kind: input.kind ?? "deleted" }),
     addItem, updateItem, deleteItem, duplicateItem, emptyTrash, mergeItems, reorderItems, moveItem, rebalanceProject,
     getCurrentProject, getProject, listProjects, listCards, listCardsByStatus, getCard,
     subscribeProjects, subscribeCurrentProject, subscribeCards, subscribeCard,
@@ -1264,6 +1927,7 @@ export async function createRxRepository(options: {
     const resolve = api.resolveConflict;
     api.resolveConflict = async request => {
       const permission = await journal.permissions.get(request.boardId);
+      if (options.offlineDrafts === false) return resolve(request);
       if (!permission?.authorityKeyId || liveBoardRole(cards, request.boardId)) return resolve(request);
       await assertCanMutate(request.boardId, true);
       await locked(async () => {
@@ -1289,6 +1953,13 @@ export async function createRxRepository(options: {
         else if ((projectCommands as readonly string[]).includes(command)) boardId = args[0];
         else boardId = (await getCard(args[0]))?.projectId ?? (await cards.findOne(args[0]).exec())?.projectId;
         if (!boardId) return original(...args);
+        // Draft routing belongs to the signed-guard world. In the operation
+        // build (offlineDrafts: false) no live role is ever installed, so a
+        // draft here could never be admitted: the edit would sit under
+        // "Synchronization pending" while its overlay made it look saved.
+        // Commands run for real instead and the operation service takes the
+        // board over — Drive-first — at the next synchronization.
+        if (options.offlineDrafts === false) return original(...args);
         const permission = await journal.permissions.get(boardId);
         if (operationSource.bindings.has(boardId)) return original(...args);
         if (!permission?.authorityKeyId) {
@@ -1314,6 +1985,10 @@ export async function createRxRepository(options: {
     }
   }
   for (const marker of await journal.boardErasures()) await locked(() => eraseLocalBoardData(marker.boardId));
+  // Legacy `deletedProjectIds` markers become tombstones before anything reads
+  // the board list. Reliable evidence only; the unknown case is reported, not
+  // decided, and no Drive object is touched.
+  await migrateLegacyDeletions().catch(() => undefined);
   return api;
 }
 

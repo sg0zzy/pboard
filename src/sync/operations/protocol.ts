@@ -12,6 +12,20 @@ export type Operation = Command & {
   clock: number; deps: Frontier;
 };
 export const PROTOCOL = 'pboard-operations-v1';
+
+/**
+ * The wire beacon an admitted writer submits while it waits for the board's
+ * content key (see the runtime's key-handoff wait). It is a structurally
+ * complete operation — the log accepts it like any other row — but it is
+ * sealed with a throwaway key, so nobody can ever open it as a command: its
+ * payload never claims to change the board, and devices that hold the real
+ * key treat the unreadable row as the signal to run the key courier and wrap
+ * the board key for the requester's published wrap key.
+ */
+export function keyHandoffBeacon(boardId: string, opId: string): Operation {
+  return { collection: 'cards', entityId: opId, kind: 'patch', fields: { pboardKeyHandoff: 1 }, unset: [],
+    schemaVersion: 1, boardId, actorId: '', seq: 0, opId, clock: 0, deps: {} };
+}
 export const MAX_OPERATION_BYTES = 2 * 1024 * 1024;
 export const MAX_SEGMENT_BYTES = 4 * 1024 * 1024;
 export const MAX_SEGMENT_OPERATIONS = 128;
@@ -35,6 +49,21 @@ export function validateFrontier(value: unknown): asserts value is Frontier {
 const projectFields = new Set(['name', 'template', 'createdAt', 'updatedAt']);
 const cardFields = new Set(['title', 'content', 'type', 'status', 'displayMode', 'source', 'image', 'orderKey', 'createdAt', 'updatedAt', 'deletedAt']);
 const optional = new Set(['title', 'displayMode', 'source', 'image', 'deletedAt']);
+/**
+ * Whether this build knows the *vocabulary* of a structurally sound command: an
+ * unrecognized collection, or a field name a known collection does not list,
+ * makes the answer false. False never means "invalid" — identity, frontier,
+ * size and shape are still validated strictly for every operation, because that
+ * is what stops forgery. It means "this client cannot read it": such an
+ * operation must be skipped whole by the caller, never applied partially and
+ * never rejected, so a writer running a newer vocabulary cannot permanently
+ * wedge an older reader that refuses to ingest the batch containing it.
+ */
+export function isKnownVocabulary(command: Pick<Command, 'collection' | 'fields' | 'unset'>): boolean {
+  const fields = command.collection === 'projects' ? projectFields : command.collection === 'cards' ? cardFields : null;
+  if (!fields) return false;
+  return Object.keys(command.fields).every(key => fields.has(key)) && command.unset.every(key => fields.has(key));
+}
 function validField(collection: Collection, key: string, value: Json): boolean {
   if (!(collection === 'projects' ? projectFields : cardFields).has(key)) return false;
   if (key === 'name' || key === 'content') return typeof value === 'string';
@@ -57,10 +86,17 @@ function validField(collection: Collection, key: string, value: Json): boolean {
   return false;
 }
 export function validateCommand(command: Command): void {
-  if (!record(command) || !['projects', 'cards'].includes(command.collection) || !validId(command.entityId)
+  // Shape and identity are strict for every vocabulary; only semantics over
+  // *known* vocabulary are checked below, so this stays the forgery gate.
+  if (!record(command) || typeof command.collection !== 'string' || !validId(command.entityId)
     || !['create', 'patch', 'delete'].includes(command.kind) || !record(command.fields) || !Array.isArray(command.unset)
-    || command.unset.some(key => typeof key !== 'string' || !optional.has(key) || command.collection !== 'cards' || own(command.fields, key))
+    || command.unset.some(key => typeof key !== 'string')
     || new Set(command.unset).size !== command.unset.length
+    || command.unset.some(key => own(command.fields, key))) throw new Error('Invalid board command');
+  // Structurally sound but unreadable is the caller's skip decision, not this
+  // validator's throw; see `isKnownVocabulary`.
+  if (!isKnownVocabulary(command)) return;
+  if (command.unset.some(key => !optional.has(key) || command.collection !== 'cards')
     || Object.entries(command.fields).some(([key, value]) => !validField(command.collection, key, value))) throw new Error('Invalid board command');
   if (command.kind === 'delete' && (Object.keys(command.fields).length || command.unset.length)) throw new Error('Delete must not contain property edits');
   if (command.kind === 'create') {
@@ -70,6 +106,10 @@ export function validateCommand(command: Command): void {
   }
   if (command.kind === 'patch' && !Object.keys(command.fields).length && !command.unset.length) throw new Error('Empty property edit');
 }
+/** Throws for anything structurally wrong with the operation, whatever vocabulary
+ * it speaks. An operation over vocabulary this build does not know passes here —
+ * `isKnownVocabulary` is the companion check that turns "passes" into "apply it"
+ * versus "skip and remember it". */
 export function validateOperation(op: Operation, boardId: string): void {
   validateCommand(op);
   if (op.schemaVersion !== 1 || op.boardId !== boardId || !validId(op.boardId) || !validId(op.actorId)

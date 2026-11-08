@@ -11,17 +11,17 @@ Use this index to find the maintained description of each part of Pboard. Develo
 | [Repository README](../README.md) | Overview, installation, Drive configuration, and Pages setup |
 | [Product specification](../SPECIFICATION.md) | Implemented user behavior and product limits |
 | [Build and release guide](../BUILD.md) | Build commands, validation, packaging, Mozilla submission, and reviewer reproduction |
-| [Refactor status](../REFACTOR_STATE.md) | Short implementation status and remaining verification |
+| [Refactor status](../REFACTOR_STATE.md) | Short implementation status and remaining verification (partly predates the operation-log runtime) |
 | [Local storage architecture](rxdb-storage-refactor.md) | RxDB schemas, ordering, images, migration, fallback, rollback, and historical measurements |
-| [Approved synchronization contract](architecture/synchronization-contract.md) | Two operating modes, causal reconciliation, authorization and recovery acceptance criteria |
+| [Synchronization contract (historical)](architecture/synchronization-contract.md) | Superseded by the Drive-first operation contract; retained as the acceptance baseline its 55 scenario IDs still index |
 | [Recovery validation](architecture/recovery-validation.md) | Local fault harness, fresh-device recovery, security evidence and explicit implementation gaps |
-| [Durable change journal](architecture/causal-change-journal.md) | Local causal history, persistent variants, reconciliation rules and pending transport integration |
+| [Durable change journal](architecture/causal-change-journal.md) | Local journal and reconciliation foundation; transport integration now lives in the operation log |
 | [Offline authorization and service admission](architecture/offline-authorization.md) | Durable permissions, pending edits, independent Google service gate and remaining Job 8 blockers |
 | [Independent image transfer](architecture/independent-image-transfer.md) | Peer DataChannel attachment exchange, private asset store and recovery limits |
 | [Operating modes and unified recovery](architecture/operating-modes-status.md) | Job 11 binding/status/scheduling implementation and Job 12 gate status |
 | [Authenticated peer history](architecture/peer-causal-history.md) | Signed causal changes, bounded peer exchange, retained conflicts and compatibility limits |
 | [Manual conflict resolution](architecture/conflict-resolution.md) | Version comparison, persistent drafts, signed resolutions and recovery limits |
-| [Collaboration architecture](collaboration.md) | Drive layout, sharing, snapshots, signaling, WebRTC conflicts, account preferences, and security limits |
+| [Collaboration architecture](collaboration.md) | Current transport (one WebSocket per context, multiplexed rooms), Drive layout and ACL authority, snapshots and consolidation, lifecycle hints, budgets, measured costs, **status and known gaps**, and preserved history |
 | [Collaboration security implementation plan](collaboration-security-plan.md) | Proposed encrypted transport policy, device authentication, receiver authorization, migration, and release verification |
 | [Privacy policy](privacy.md) | Published disclosures and contact details |
 | [Terms of Service](terms.md) | Software license, content, optional integrations, and service limitations |
@@ -38,8 +38,22 @@ Use this index to find the maintained description of each part of Pboard. Develo
 
 ## Maintenance notes
 
-This review corrected legacy-only storage descriptions, outdated browser/Node requirements, the Google scope list, and unsupported claims about peer authentication and automatic WebSocket fallback. Repeated handoff phase lists and contradictory test totals were consolidated; dated benchmark evidence was retained. No runtime behavior was changed.
+This review (6 November 2026) brought the entry points and the collaboration
+guide in line with the running code: one WebSocket per browser context with
+multiplexed rooms (protocol 3), Drive as the durable store and ACL authority, the
+relay as a bounded operation log with replay, and the account channel's
+inert-in-production status stated as a gap. It also removed the per-board-socket
+and WebRTC-as-current-transport descriptions and corrected the Drive flush
+intervals. No runtime behavior was changed.
 
-When code changes, update the relevant maintained guide and link to it from the handoff rather than copying its architecture. Use package/manifests for version requirements, package scripts for validation commands, and `src/storage`, `src/sync`, and `src/collab` for runtime behavior. Date validation evidence and state which harness was run; Google mocks are not real-Drive verification.
+When code changes, update the relevant maintained guide and link to it from the
+handoff rather than copying its architecture. Use package/manifests for version
+requirements, package scripts for validation commands, and `src/storage`,
+`src/sync`, and `src/sync/operations` for runtime behavior. Date validation
+evidence and state which harness was run; Google mocks are not real-Drive
+verification.
+
+Peer-era documents remain as history and carry a banner saying what superseded
+them; they are not rewritten into claims about the current product.
 
 Private history persistence and recovery: [Job 6 architecture and validation](architecture/private-drive-history.md).

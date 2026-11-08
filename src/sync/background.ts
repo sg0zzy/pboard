@@ -1,6 +1,6 @@
 import { browser } from "../platform/browser";
 import { drivePermissions, googleDrive, driveSyncState } from "./browser";
-import { isDriveClearErrorMessage, isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
+import { isDriveClearErrorMessage, isDriveReconcileMessage, isDriveSyncProjectMessage, WORKER_EPOCH_KEY } from "./messages";
 import { clearDriveQuotaCooldown } from "./driveQuota";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
 import { dirtyFlushAt, drivePollDelay } from "./syncPolicy";
@@ -95,6 +95,12 @@ export function registerDriveBackgroundSync() {
     })();
   });
 
+  // A worker cold start is a fact worth recording durably: the sidebar watches
+  // this stamp and runs the conditional relay heal leg for its open board.
+  // The leg is a no-op for a healthy board — the MV3 worker restarts routinely
+  // on idle, and unconditional reconnecting would be churn wearing the costume
+  // of robustness.
+  void browser.storage.local.set({ [WORKER_EPOCH_KEY]: Date.now() }).catch(() => undefined);
   void googleDrive.reconcileAll({ force: true }).catch(() => undefined);
   // Alarms may be lost on browser restart. Restore their absolute deadlines
   // from durable dirty state, including while no sidebar is open.
@@ -141,8 +147,13 @@ export function handleDriveSyncMessage(message: unknown): Promise<unknown> | und
   }
   if (isDriveReconcileMessage(message)) {
     // An explicit user action must not serve the 60-second discovery cache.
-    drivePermissions.invalidateSharedDiscovery();
-    return googleDrive.reconcileAll({ force: true })
+    // A background refresh (`force: false`, the sidebar's startup discovery)
+    // answers from the round the worker just ran instead of repeating it: the
+    // two contexts share this account and this local database, so a second
+    // round over the same facts can only cost time.
+    const force = message.force !== false;
+    if (force) drivePermissions.invalidateSharedDiscovery();
+    return googleDrive.reconcileAll({ force })
       .then((result) => ({ ok: true, result }))
       .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive reconciliation failed" }));
   }

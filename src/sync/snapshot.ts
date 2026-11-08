@@ -172,6 +172,10 @@ export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getR
     const rx = await getRx();
     if (!rx) return legacy.apply(snapshot, canApply);
     if (canApply && !(await canApply())) return false;
+    // The repository refuses a tombstoned board's import; say so here rather
+    // than reporting an import that did not happen. A snapshot carries no
+    // causal context, so it can never dominate a tombstone.
+    if (await rx.isDeletedProject(snapshot.project.id)) return false;
     await rx.importProject(snapshot.project, snapshot.items);
     return true;
   }
@@ -179,6 +183,9 @@ export function createBackendProjectSnapshotStore(storage: KeyValueStorage, getR
     const rx = await getRx();
     if (!rx) return legacy.applyIfNewer(snapshot, canApply);
     if (canApply && !(await canApply())) return "blocked";
+    // A deleted board is a decided answer, not a newer/older comparison: the
+    // snapshot is refused and reported, never counted as applied or equal.
+    if (await rx.isDeletedProject(snapshot.project.id)) return "blocked";
     const local = await rx.getProject(snapshot.project.id);
     if (local) {
       const comparison = compareProjectTimestamps(snapshot.project, local);

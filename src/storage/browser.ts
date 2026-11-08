@@ -2,11 +2,12 @@ import { importLocalBoard, type ImportedCard } from './importBoard';
 import { collaborationCounters } from "../collab/counters";
 import { createRepository, STORAGE_KEY } from "./repository";
 import { browser } from "../platform/browser";
-import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount, leaveSharedBoard } from "../sync/browser";
+import { drivePermissions, driveSyncState, driveTombstones, googleAuth, googleDrive, sharedProjects, registerRxRepositoryResolver, syncAccountPreferences, collaborationManager, privateErasureAccount, leaveSharedBoard, accountChannel } from "../sync/browser";
 import { createProjectDeletionRoleResolver } from "../sync/projectDeletion";
 import { createRxRepository, type RxRepository } from "./rxdbRepository";
 import type { AppState, BoardItem, BoardItemStatus, Project } from "../types";
 import type { ConflictRecord } from "./conflictResolution";
+import type { BoardCleanupState } from "./boardCleanup";
 import { eraseLegacyBoardCopies } from './boardErasure';
 
 export const STORAGE_BACKEND_KEY = "pboardStorageBackend";
@@ -35,6 +36,13 @@ const resolveDeletionRole = createProjectDeletionRoleResolver({ sharedProjects, 
   connected: async () => await googleAuth.getConnectionState() === "connected" });
 async function openRxRepository(): Promise<RxRepository> {
   if (!rxRepositoryPromise) rxRepositoryPromise = createRxRepository({ resolveDeletionRole,
+    // This composition root is an operation-protocol build: the operation
+    // service takes every board over at the next synchronization, and nothing
+    // here ever installs the live board role that pending-work admission
+    // demands. Draft retention would strand edits under "Synchronization
+    // pending" forever, so commands run for real and Drive-first sync owns
+    // their delivery.
+    offlineDrafts: false,
     reverifySharedDeletionRole: async (projectId) => await googleAuth.getConnectionState() === "connected" ? await drivePermissions.myRole(projectId) : null,
     events: {
     projectErased: projectId => eraseLegacyBoardCopies(browser.storage.local, projectId),
@@ -46,6 +54,12 @@ async function openRxRepository(): Promise<RxRepository> {
       void leaveSharedBoard(projectId).catch(() => undefined);
     },
     projectChanged: (projectId) => driveSyncState.markDirty(projectId),
+    // The account list order is a property of the account, not of a board: it
+    // travels as one `board.order` record on the account room
+    // (`runtime.ts:publishProjectOrder`). Fire-and-forget — the reorder has
+    // already been stored locally and the Drive preference document is the
+    // durable copy.
+    projectOrderChanged: order => { void accountChannel.publishLocalOrder(order); },
     projectDeleting: async (project) => {
       const syncState = await driveSyncState.get(project.id);
       await driveTombstones.add({ projectId: project.id,
@@ -55,6 +69,20 @@ async function openRxRepository(): Promise<RxRepository> {
     projectDeleted: async (projectId) => {
       await syncAccountPreferences();
       await googleDrive.deleteProject(projectId);
+    },
+    // The deletion *fact*, announced on the account room so a peer that never
+    // saw the deletion receives the evidence itself rather than a hint it must
+    // verify. Fire-and-forget: the fact is already durable, the Drive preference
+    // projection and the board log are unchanged, and a relay that is down must
+    // not delay or fail the delete. `accountChannel` only exists on the account
+    // plane, so a build without one simply does not announce — the preference
+    // document remains the fallback carrier.
+    projectTombstoned: (boardId, fact) => {
+      if (fact.accountId === null) return;
+      void accountChannel.publishTombstone(boardId, {
+        kind: fact.kind, opId: fact.opId, actorId: fact.actorId, seq: fact.seq,
+        clock: fact.clock, context: fact.context, role: fact.role
+      }).catch(() => undefined);
     }
   } }).catch((error) => { rxRepositoryPromise = null; throw error; });
   return rxRepositoryPromise;
@@ -191,10 +219,13 @@ export const repository = {
     const unsubscribe = rx.journal.subscribe(() => {
       clearTimeout(scheduled); scheduled = setTimeout(refresh, 125);
     });
-    const timer = setInterval(refresh, 10_000); // Access/grant expiry can change without a document write.
+    // Counted: this scan is per subscription, and the subscription belongs to
+    // the open conflict panel — not to a board — so its presence in the armed
+    // set must not change with the number of boards.
+    const timer = collaborationCounters.countedInterval("conflicts.scan", refresh, 10_000); // Access/grant expiry can change without a document write.
     collaborationCounters.setActive("conflicts.subscription", 1);
     refresh();
-    return () => { active = false; clearTimeout(scheduled); clearInterval(timer); unsubscribe(); collaborationCounters.setActive("conflicts.subscription", 0); };
+    return () => { active = false; clearTimeout(scheduled); collaborationCounters.clearCountedTimer(timer); unsubscribe(); collaborationCounters.setActive("conflicts.subscription", 0); };
   },
   listProjects: async (): Promise<Project[]> => {
     const rx = await selectedRxRepository();
@@ -238,6 +269,19 @@ export const repository = {
   },
   exportAll: async () => { const rx = await selectedRxRepository(); return rx ? rx.exportAll() : legacyRepository.load(); },
   listPendingWork: async () => (await selectedRxRepository())?.listPendingWork() ?? [],
+  /**
+   * Deleted boards whose Drive folder this device still owes a move to Trash,
+   * with the stage and reason — the deletion's second half, reported next to
+   * the sync status. A backend without the record (legacy, failed migration)
+   * owes nothing, which is the empty answer, not an error.
+   */
+  boardCleanupReport: async (): Promise<{ boardId: string; cleanup: BoardCleanupState }[]> =>
+    (await selectedRxRepository())?.boardCleanupReport() ?? [],
+  subscribeBoardCleanups: async (listener: (value: { boardId: string; cleanup: BoardCleanupState }[]) => void): Promise<() => void> => {
+    const rx = await selectedRxRepository();
+    if (!rx) { listener([]); return () => {}; }
+    return rx.subscribeBoardCleanups(listener);
+  },
   subscribePendingWork: async (listener: Parameters<RxRepository['subscribePendingWork']>[0]) => (await getRxRepository()).subscribePendingWork(listener),
   reviewPendingWork: async (...args: Parameters<RxRepository['reviewPendingWork']>) => (await getRxRepository()).reviewPendingWork(...args),
   discardRemovedBoardWork: async (...args: Parameters<RxRepository['discardRemovedBoardWork']>) => {

@@ -4,7 +4,7 @@ Licensed under the [GNU General Public License v3.0](LICENSE.md).
 
 Pboard is a local-first Firefox and Chromium extension that keeps the current state of a project alongside AI conversations and ordinary web research. Conversations remain the place for exploration; Pboard stores the goals, ideas, decisions, constraints, questions, risks, references, and notes that still matter.
 
-Pboard captures selected text, links, images, and page regions, with a dedicated ChatGPT selection adapter where needed. Boards save locally first in RxDB/IndexedDB. Optional Google Drive synchronization and sharing can transfer board content to Google and collaborators. There is no Pboard account, publisher-operated backend, telemetry, or AI API integration.
+Pboard captures selected text, links, images, and page regions, with a dedicated ChatGPT selection adapter where needed. Boards save locally first in RxDB/IndexedDB. Optional Google Drive synchronization and sharing can transfer board content to Google and collaborators, and an optional live channel connects to the operator's own Pboard relay. There is no Pboard account, no telemetry, and no AI API integration. What live collaboration does and does not do today is stated honestly in [`docs/collaboration.md`](docs/collaboration.md#status-and-known-gaps).
 
 The implemented product behavior and limitations are recorded in [`SPECIFICATION.md`](SPECIFICATION.md). See the [documentation index](docs/README.md) for architecture, build instructions, refactor status, and historical research.
 
@@ -75,8 +75,10 @@ background/service worker (context menus, page action/action, and region capture
 RxDB/IndexedDB + image Blob store (default)
   └─ browser.storage.local AppState (legacy fallback)
 React sidebar ─ reactive project/card subscriptions
-  ├─ optional Google Drive snapshots + sharing
-  └─ optional WebRTC collaboration
+  ├─ optional Google Drive: board folders, immutable snapshots,
+  │  operation segments, attachments, and the sharing ACL
+  └─ optional Pboard relay: one WebSocket per browser context,
+     bounded per-board operation log with replay
 ```
 
 Provider-specific page access lives in `src/providers`. The rest of the board knows only the shared `ChatProviderAdapter` contract, so another provider can be added without changing storage or sidebar code.
@@ -91,7 +93,7 @@ The default repository stores projects, cards, and settings as separate RxDB doc
 - `activeTab`: temporarily access only the current tab after an explicit Pboard shortcut or menu action.
 - `scripting`: read the current selection through a one-off script triggered by `Alt+Shift+C`, inspect selected text and focused links for the capture toolbar, and inject the short-lived region-capture overlay when region capture is used. The toolbar asks for optional page access if it cannot inspect selected text or links through `activeTab`; Chromium also needs optional access for region screenshots from the side panel.
 - `identity`: run the optional Google OAuth authorization-code flow after an explicit **Connect Drive** action.
-- `alarms`: schedule an optional dirty-project Drive sync after roughly 25 seconds of inactivity.
+- `alarms`: run the background drain for an optional dirty-board Drive sync; the flush itself is idle-driven (30 minutes of edit idle, capped at 25 minutes after the first unpublished edit) rather than a short timer.
 - Host access to `https://chatgpt.com/*` and `https://chat.openai.com/*`: load the selection adapter only on supported ChatGPT origins. Firefox region capture uses temporary `activeTab` access. Optional `<all_urls>` access is requested for Chromium region capture and when the sidebar cannot inspect a page's selection or focused link through existing access.
 - Host access to Google OAuth and Drive API endpoints: exchange/refresh the optional OAuth token and persist snapshots in `appDataFolder`; Pboard requests `drive.appdata` for private sync and the full `drive` scope for boards shared by other users (discovery and collaboration on files this account does not own; `drive.file` cannot reliably find incoming invitations).
 
@@ -103,19 +105,19 @@ Drive snapshots synchronize current data; they are not a historical backup or a 
 
 Google Drive support requires separate OAuth clients for Chromium and Firefox. Their public client IDs are set in `src/sync/googleDriveConfig.ts` (per browser, per stage); the Chromium production client ID and the `drive.appdata` and `drive` scopes are also declared in `manifest.chromium.json` for Chrome's native `identity.getAuthToken()` flow. Keep those two Chromium client-ID values identical. Firefox uses authorization-code PKCE with the loopback redirect derived from its fixed add-on ID (`http://127.0.0.1/mozoauth2/...`). If Google's Desktop OAuth client requires a client secret for Firefox token exchange, copy `.env.example` to the git-ignored `.env.local` and set `VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET`; Vite embeds it in the extension bundle, so it must not be treated as a confidential server-side secret. `<stage>` is `dev` under `npm run dev` and `production` under `npm run build` / `build:chromium`.
 
-The integration requests `https://www.googleapis.com/auth/drive.appdata` for private snapshots and the full `https://www.googleapis.com/auth/drive` scope for boards shared by other users, and explicitly shows Google's account selector. After upgrading from a build that requested only private sync access, reconnect Drive to grant sharing access. Access/refresh token state stays in extension-local storage. Project content continues to save locally first; Drive writes run asynchronously after manual sync, project switching, a debounced visibility loss, or about 25 seconds of dirty idle time. A Drive failure never rolls back local data.
+The integration requests `https://www.googleapis.com/auth/drive.appdata` for private snapshots and the full `https://www.googleapis.com/auth/drive` scope for boards shared by other users, and explicitly shows Google's account selector. After upgrading from a build that requested only private sync access, reconnect Drive to grant sharing access. Access/refresh token state stays in extension-local storage. Project content continues to save locally first; Drive writes run asynchronously after manual sync, project switching, a debounced visibility loss, or the idle flush — 30 minutes of edit idle, capped at 25 minutes after the first unpublished edit (`DRIVE_EDIT_IDLE_MS` / `DRIVE_MAX_UNPUBLISHED_MS`, `src/sync/syncPolicy.ts:3-4`). A Drive failure never rolls back local data.
 
 Sharing searches explicitly use Drive's `drive` space; private sync searches use `appDataFolder`. If sharing reports `insufficientScopes`, reload the rebuilt extension, disconnect Drive with the cloud button, then use **Connect Drive** and allow both requested permissions. Chrome checks the granted scopes when available and reports incomplete authorization before using that token.
 
 Firefox reconnects with fresh consent and replaces the refresh token for the new grant. It checks the token response's scopes when provided and rejects incomplete sharing authorization or a missing new refresh token, rather than reusing an older grant.
 
-To use live collaboration between Firefox and Chrome on the same Google account, connect Drive in both browsers and open the same project. In **Share project**, choose **Enable live collaboration** once if the board is still private. This creates the shared Drive layout without inviting another email. Keep both sidebars open; the dialog shows whether it is waiting for another browser, connected, or encountering an error. Private Drive snapshot sync alone does not enable WebRTC. Connecting Drive or enabling sharing starts collaboration on the current board without requiring a project switch; another open browser discovers newly enabled sharing during its next access check (about ten seconds).
+To use live collaboration between Firefox and Chrome on the same Google account, connect Drive in both browsers and open the same project. Live boards use one authenticated WebSocket to the Pboard relay, which multiplexes every room — and the account channel — on a single connection per browser context, so board switching costs no new socket. In a normal install that live channel is usually not available: the account-level discovery channel needs an enrolment step that no shipped panel performs, so a newly created board reaches a second browser through the Drive publication flush plus a poll, or on reload. The full, unsmoothed list is in [the collaboration gaps](docs/collaboration.md#status-and-known-gaps).
 
-Live collaboration replicates five content mutations in both directions between two sessions of the same account: the board template (project category), card state, card category, card creation and card deletion. A template change remaps card types the new template does not support, and deletions travel as tombstones so the other session's trash matches. `npm run test:webrtc:browser` exercises this against two isolated headless Chromium profiles.
+Content converges deterministically: card and board changes are opaque operations applied by `src/sync/operations/engine.ts` on a per-field `(clock, actorId, seq)` order, so duplicate delivery is a no-op. This is not a character-level CRDT — two people typing in the same field at the same instant converge on one value. Editing a board that a second browser does not have open is not delivered passively; that browser picks the change up on its next Drive round or when the board is reopened. `npm run test:webrtc:browser` is retained for the legacy peer path and still runs against two isolated headless Chromium profiles, but it does not exercise the shipped transport.
 
-Project list reordering is saved in private Drive app data and restored when another browser connects to the same Google account, including when the original browser is closed. Open sidebars also sync order over WebRTC, even when they display different or private projects. Each account has its own order; collaborators' orders and the selected project stay independent. Project deletions also sync between that account's sessions and remain recorded in Drive, so old shared backups cannot restore a deleted board. Confirming a deletion hides the board immediately; ownership verification and content deletion continue in the background and report failures as a notice. Only owners can delete shared project content. Editors and viewers can remove a shared project from their own list; this syncs across their sessions while preserving the owner’s project and cards. Viewers can also reorder their own project list. Account rendezvous records stay in private Drive app data, separate from shared project folders.
+Project list reordering is saved as a Drive preference file and applied during reconciliation, so it is restored when another browser of the same account connects, including when the original browser is closed. It is not realtime: the other sidebar picks the new order up on its next round. Each account has its own order; collaborators' orders and the selected project stay independent. Project deletions remain recorded in Drive, so an old backup cannot restore a deleted board. Confirming a deletion hides the board immediately; ownership verification and content deletion continue in the background and report failures as a notice. Only owners can delete shared project content. Editors and viewers can remove a shared project from their own list.
 
-Shared image cards send their references over WebRTC and their image files through the shared Drive folder. Owners and editors upload images; viewers download them. Open boards fetch missing images and refresh cards automatically, including images added after the browsers connect. Image arrival may lag behind card text by a few seconds. Snapshot sync also restores missing images whose hashes match the current cards while preserving newer card text.
+Shared image metadata converges through the operation log; the bytes travel only through the board's Drive folder. Owners and editors upload, viewers download, size and SHA-256 are checked, and an arrival refreshes the card without replacing newer text. Image arrival may lag behind card text.
 
 The Firefox build uses the native `sidebar_action`, a toolbar `action` that opens the Pboard sidebar, and the Firefox page action. The Chromium build uses the MV3 `side_panel` and `action` APIs. Shared code goes through `src/platform/browser.ts`, which normalizes the runtime namespace and context-menu namespace.
 
@@ -188,8 +190,8 @@ src/messaging/    typed message contracts
 src/providers/    isolated provider adapters
 src/sidebar/      React board UI and prompt serialization
 src/storage/      RxDB repository, legacy adapter, migration, and Blob store
-src/collab/       WebRTC pools, signaling, and shared image sync
-src/sync/         Google auth, private/shared snapshots, and account preferences
+src/collab/       board grants, device keys, relay authorization, and the peer path the extension stubs out
+src/sync/         Google auth, Drive transport and snapshots, the operation log (operations/), and account preferences
 src/types/        extensible project and board item types
 tests/            domain, serialization, messaging, and adapter tests
 ```

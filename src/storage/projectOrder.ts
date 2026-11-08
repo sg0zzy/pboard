@@ -1,6 +1,54 @@
 export type ProjectOrderPreference = { ids: string[]; updatedAt: string; deletedProjectIds?: string[]; restoreEvents?: Record<string, string> };
 
 /**
+ * Weave a received total order into the list this device actually holds.
+ *
+ * The rule, in the order it is applied:
+ *
+ * 1. **A received id this device does not have is never imported.** Order is
+ *    a property of the list, not a creation: a board arrives only through the
+ *    verified `board.created` path (or the Drive listing). So an unknown id is
+ *    dropped rather than appended, and nothing here can make a board exist.
+ * 2. **A local id the received order does not mention keeps its slot relative
+ *    to the local ids around it.** Boards the sender has not seen yet (it has
+ *    not polled, or the board is new) are not ordered by the record, so they
+ *    must not be dragged to the front or the back: each unmentioned id is
+ *    anchored to its predecessor in the *local* order, and the merged sequence
+ *    is the received order with those runs re-inserted after their anchor.
+ *    Concretely: walk the local list, and before emitting the local
+ *    successor of an unmentioned id, emit that id. A local id whose anchor is
+ *    itself unmentioned stays in the run; a run whose anchor is absent from
+ *    the received order (impossible unless the whole local list is unknown)
+ *    goes to the front in local order.
+ * 3. **Known ids are ordered exactly as the record gives them.** The record is
+ *    a total order over the set its author had, and over that set the merge is
+ *    the identity.
+ *
+ * This is a pure list operation: the caller decides *whether* to apply it
+ * (that is the clock's job, in the projection) and what to persist.
+ */
+export function mergeBoardOrder(local: readonly string[], received: readonly string[]): string[] {
+  const known = new Set(local);
+  const remote = [...new Set(received)].filter(id => known.has(id));
+  const mentioned = new Set(remote);
+  // Runs of local ids the record does not mention, keyed by the local id that
+  // immediately precedes the run. `null` is the run at the head of the list.
+  const runs = new Map<string | null, string[]>();
+  let anchor: string | null = null;
+  for (const id of local) {
+    if (mentioned.has(id)) { anchor = id; continue; }
+    const run = runs.get(anchor);
+    if (run) run.push(id); else runs.set(anchor, [id]);
+  }
+  const merged = [...(runs.get(null) ?? [])];
+  for (const id of remote) {
+    merged.push(id);
+    merged.push(...(runs.get(id) ?? []));
+  }
+  return merged;
+}
+
+/**
  * Whether two project orders describe the same thing.
  *
  * The order is compared by content, not by its serialized text: the same

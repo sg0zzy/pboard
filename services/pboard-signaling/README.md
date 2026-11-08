@@ -959,7 +959,9 @@ expiry/cross-session binding, valid-Google/no-board denial and resource limits.
 
 The candidate passed `--check-config` as the service account against the existing
 OVH settings before atomic executable replacement and a restart of only
-`pboard-signaling`. Existing authority key, enrollment registry, operator grants,
+`pboard-signaling`. (That binary's `--check-config` built the application before
+reading the argument, so it opened and migrated the operation log; the current
+build's check is a true dry run — see the 6 November section below.) Existing authority key, enrollment registry, operator grants,
 systemd configuration, limits, proxy/TLS, DNS and application data were preserved.
 Their rollback copies remain on the server in the root-only directory
 `/var/backups/pboard-signaling/20261020T163353Z-google-service-admission/`.
@@ -1002,6 +1004,7 @@ scenario is historical evidence, not a measurement of this updated boundary.
 An isolated source copy was built with `cargo build --release --locked
 --no-default-features`; the candidate passed `--check-config` as the service user
 with the existing effective environment before atomic replacement and restart.
+(Historic: that check was not a dry run — see the 6 November section below.)
 Only the executable was replaced. Credentials, authority/enrollment state,
 systemd settings, TLS/proxy configuration, DNS, OAuth and application data were
 preserved. Public health, WSS service-admission advertisement and anonymous join
@@ -1015,7 +1018,9 @@ Nonsecret local binary/provenance: `/home/ste2/code/pboard/services/pboard-signa
 Live read-only inspection confirmed **128 total connections in Rust**, **16 peers
 per room**, and an HAProxy backend cap of **64 connections** plus a queue of 32.
 These limits were not raised. Two collection rooms normally use two WebSockets
-per active browser, and HTTP/control traffic also shares the backend. Historical
+per active browser **on the v2 protocol**, and HTTP/control traffic also shares the
+backend; a v3 client multiplexes every room, so it uses one socket per browser
+context (see the 6 November section below). Historical
 2,000-socket measurements concern the older loopback relay on the development
 machine; they establish neither current secure-stack nor VPS capacity.
 
@@ -1135,3 +1140,103 @@ change; current unpacked builds are `dist/manifest.json` and
 `dist/chromium/manifest.json`. Active clients reconnect and republish protected
 invitations after the restart. No application version bump, commit, tag, push or
 product release was performed.
+
+### 6 November 2026: protocol v3, schema version 3, account inbox — implemented, not deployed
+
+This section is the current state of the service source and it **supersedes the
+deployment facts above only once it is deployed**, which it is not. Everything in
+this build is implemented and tested in this repository; the running service is
+still the 3 November binary (`ac2aed54…`), and no host, unit, drop-in, proxy or
+`/var/lib` change accompanies this work.
+
+What the build adds, none of it changing an existing frame:
+
+- **Protocol v3** — several rooms on one connection (`attach`/`detach`, per-room
+  role, per-room revocation that detaches only that room, `refused` never closing
+  the socket, at most 32 rooms per connection, unknown actions answered
+  `refused{code:"unknown_action"}` when the connection negotiated ≥ 3).
+- **`attach` may carry `deviceKeyId`**, verified against that device, so one
+  connection can hold several rooms under different device keys. The account
+  channel is one more room on that connection, not a second socket.
+- **Schema version 3** — typed publication receipts (`checkpoint.evidence_kind`),
+  a `coverage` table recording when each prefix of the log was declared covered,
+  and an hourly retention sweep in `src/main.rs` (≤16 boards and ≤20,000 rows per
+  board per pass, on the blocking pool, first tick skipped, shut down on SIGTERM
+  after the pass in flight commits or rolls back). Before the sweep nothing aged
+  out, so a board that reached 200,000 operations stayed `log_full` permanently.
+- **Byte accounting** — the 4 MiB *lifetime* connection total is replaced by 4 MiB
+  per rolling 60 s per connection plus 2 MiB per rolling 60 s per attached room.
+  `PBOARD_SIGNALING_MAX_SESSION_BYTES` is retired and ignored; the knobs are
+  `PBOARD_SIGNALING_MAX_SESSION_WINDOW_BYTES` and
+  `PBOARD_SIGNALING_MAX_ROOM_WINDOW_BYTES`.
+- **A per-account hint inbox** — `src/account_inbox.rs`: sealed hints addressed by
+  account hash, 4 KiB × 64 per inbox, seven-day TTL, eviction rather than refusal
+  at 1024 inboxes, in three additive tables that deliberately do not raise the
+  shared schema version. The client half is not wired, so nothing on the wire
+  changes for any shipped build.
+
+Operational consequences, stated here because they decide what may be deployed:
+
+- **`--check-config` is a true dry run.** Arguments are parsed before anything
+  touches a file, so the check validates the grants file, the identity
+  configuration, the resource limits, the transport policy and the filesystems it
+  needs, and stats `sync-log.db` without opening it — printing
+  `skipped sync log schema` to say so. The previous binary decided the argument
+  *after* building the application, so a pre-flight check opened and migrated the
+  database; that is fixed, not merely documented.
+- **`--help` exists**, and exit codes are 0 (success), 1 (configuration or runtime
+  failure) and 2 (usage error).
+- **An older binary refuses a v3 database.** The first serving start migrates the
+  file, after which a binary that knows only ≤ 2 exits with
+  `database was written by a newer Pboard service`. Rollback is a v3-aware binary,
+  or the archived database plus the old binary — never a bare executable swap.
+- **Server first.** A v2 server answers a v3 `authenticate` by closing the socket;
+  a v3 server serves a v2 client unchanged, and the client activates v3 only when
+  the welcome lists 3 in `supportedVersions`. Deploying the server before any v3
+  client is therefore safe in both directions; the reverse is not.
+
+Journal lines this build adds, all greppable in `src/`: `operation log retention
+sweep started` and `operation log pruned`, plus the debug-level `operation log
+pruned board`; `prune_skipped`; `retention sweep query failed` and `retention
+sweep task failed`; and `account_inbox_evicted`. `log_full` and `snapshot_required`
+are **wire codes** in a sync reply, not journal lines — do not grep for them.
+
+The deployment procedure, verification commands and rollback are operator
+documentation and are not repeated here. Verified in this repository on this
+revision: `cargo test` (155 tests) and `cargo clippy --all-targets` (0 warnings).
+
+### Control-frame keep-alive fix — 8 November 2026
+
+The operator's instruction to deploy and restart authorized updating only the
+Pboard signaling executable on `cecosl` / `pboard.cecosl.ovh`. The candidate was
+built by `build-local-release.mjs` from the repository working tree (`cargo
+build --release --locked`, feature-free; retained under the ignored
+`local_artifacts/20261108T133303Z/` with its source manifest). Before
+activation: `cargo test` (156 tests, including the new control-frame
+regression) and `cargo clippy --all-targets` (0 warnings). Activation completed
+at **2026-11-08T13:36:01Z**. Only the executable was atomically replaced and
+only this service was restarted; the operation log reopened on
+`/var/lib/pboard-signaling` (16 boards) and the listener returned immediately.
+
+Current deployed executable SHA-256 (supersedes the 27 October reference):
+`c0aba8cf33787860ccdf76e8234d33cc027e108aa0f889e9c93b8e792782c4b9`,
+confirmed by hashing `/proc/<MainPID>/exe` after start.
+
+Rollback executable:
+`/var/backups/pboard-signaling/20261108T-control-frames/pboard-signaling.previous`
+(previous SHA-256 `eb8fb0a12dcb1741bc800b571691ac7c547e6745571776c51506990222fa6e4a`).
+Restore it through a temporary executable in `/opt/pboard-signaling/`,
+atomically rename it to `pboard-signaling`, then restart only
+`pboard-signaling.service`.
+
+Configuration was not touched by this operation: `/etc/pboard-signaling/grants.json`
+(`ba6dd7d82157d5fb7d9795b58f9be5db467f8b1cc58e922c7d8f8bc4dcaa3e75`) and
+`/etc/systemd/system/pboard-signaling.service`
+(`eaeab32c0bff4d8f1a7f9b18bd64e05e018465c5a97f596e2fe8d0226c1d5065`).
+
+Validation after activation: loopback and public `/healthz` returned `ok`;
+`automatic-smoke.mjs` against the live endpoint passed its full automatic-
+admission suite; the journal since activation shows zero `invalid_frame`
+disconnects and one clean `server_shutdown` of the pre-update session. The
+browser-side confirmation this fix targets — a board left idle past the
+browser's keep-alive interval no longer detaching — remains a live-user check.

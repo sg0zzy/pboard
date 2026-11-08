@@ -8,9 +8,17 @@ const f = vi.hoisted(() => ({ sync: vi.fn(), getProject: vi.fn(), selectProject:
 vi.mock('../src/platform/browser', () => ({ browser: { permissions: { request: vi.fn() } } }));
 vi.mock('../src/storage/browser', () => ({ repository: { getProject: f.getProject, selectProject: f.selectProject, getCurrentProject: f.getCurrentProject } }));
 vi.mock('../src/sync/browser', () => ({
+  healRelay: async () => 'idle:no-room',
   boardCollaboration: { settings: async () => ({ provider: 'websocket', url: 'wss://pboard.cecosl.ovh/ws' }), ownsAuthority: async () => false,
     identitySharing: { sync: f.sync, collaborators: async () => [] }, pairing: { pending: async () => null } },
-  collaborationManager: { start: f.start, stop: f.stop, state: () => ({ error: null, ready: true, role: 'editor', connectedPeers: [] }) }
+  collaborationManager: { start: f.start, stop: f.stop, state: () => ({ error: null, ready: true, role: 'editor', connectedPeers: [] }) },
+  // The panel's account section reads the account channel; this scenario is about
+  // the sharing directory, so it reports a healthy channel and offers nothing.
+  accountChannel: { status: () => ({ account: null, state: 'connected', reason: 'ready', authority: { state: 'adopted', reason: 'the account authority pin was reused' }, outbox: 0 }), subscribe: () => () => {}, repinPublishedAuthority: async () => { throw new Error('unused'); } },
+  // The retention disclosure nested in these controls resolves its owner
+  // through these; nobody is an owner here.
+  googleDrive: { getConnectionState: async () => 'disconnected' },
+  operationService: { subscribeRole: async (_: string, __: (owner: boolean) => void) => () => {}, role: async () => 'editor', previewGardening: async () => { throw new Error('unused'); }, garden: async () => { throw new Error('unused'); } }
 }));
 let container: HTMLDivElement, root: ReturnType<typeof createRoot>;
 const reply = (ready = false) => ({ email: 'b@example.test', boards: [{ publication: { policy: { boardId: 'invited-board', ownerEmail: 'a@example.test' } } }], ready: ready ? ['invited-board'] : [] });
@@ -31,7 +39,9 @@ it('shows a newly discovered invitation outside collapsed settings, waits for th
   expect(inbox.textContent).toContain('a@example.test'); expect(inbox.textContent).toContain('Waiting for owner');
   expect(buttons()).toHaveLength(0); expect(f.start).not.toHaveBeenCalled();
   f.sync.mockResolvedValue(reply(true));
-  await act(async () => vi.advanceTimersByTimeAsync(5_000));
+  // The closed panel polls at the idle cadence (see googleBoardSharingCadence.test.tsx);
+  // an unattended inbox still surfaces invitations within one idle interval.
+  await act(async () => vi.advanceTimersByTimeAsync(61_000));
   expect(buttons()).toHaveLength(1);
   f.start.mockImplementation(async () => { f.getProject.mockResolvedValue({ id: 'invited-board' }); });
   await act(async () => buttons()[0].click());

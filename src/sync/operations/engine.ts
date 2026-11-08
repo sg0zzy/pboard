@@ -1,15 +1,35 @@
-import { canonical, digest, positive, record, validId, validateFrontier, validateOperation, type Collection, type Frontier, type Operation } from './protocol';
+import { canonical, digest, isKnownVocabulary, positive, record, validId, validateFrontier, validateOperation, type Collection, type Frontier, type Operation } from './protocol';
 import type { Json } from '../../collab/security/canonical';
 
 type Stamp = { clock: number; actorId: string; seq: number };
 type Register = { stamp: Stamp; value: Json; unset: boolean };
-type Entity = { collection: Collection; id: string; created: boolean; deleted: boolean; fields: Record<string, Register> };
+/** `bootstrap` marks an entity the board already had when its receipted
+ * history began — a card or project first *observed* through an update, with
+ * no create operation inside this history or any snapshot's receipts. Only a
+ * snapshot build for the very first log checkpoint (nothing pruned, nothing
+ * committed) ever writes the marker, and restoring one requires every field
+ * the entity carries to be stamped by a receipted operation — the marker
+ * claims the entity existed, never manufactures content for it. */
+type Entity = { collection: Collection; id: string; created: boolean; deleted: boolean; fields: Record<string, Register>; bootstrap?: boolean;
+  /** Largest edit timestamp this entity has ever been *shown* — every
+   * applied operation's `updatedAt`, including values a concurrent contest
+   * retired from the field register. Provenance the projection may rely on:
+   * the materialized register proves what the document displays, this proves
+   * what the entity's receipted history carried. */
+  seenUpdatedAt?: string };
 export type EngineCheckpoint = {
   schemaVersion: 1; boardId: string; frontier: Frontier; clock: number;
   receipts: Record<string, { hash: string; clock: number }>; entities: Entity[];
+  /** Ids of operations this build received but could not read (unknown vocabulary).
+   * Emitted only when non-empty so every checkpoint of understood history stays
+   * byte-identical; carried through the local checkpoint because the refusal to
+   * consolidate must survive a reload, not just the page that first skipped. */
+  skipped?: string[];
 };
 const compare = (a: Stamp, b: Stamp) => a.clock - b.clock || (a.actorId < b.actorId ? -1 : a.actorId > b.actorId ? 1 : 0) || a.seq - b.seq;
 const keyOf = (op: Pick<Operation, 'collection' | 'entityId'>) => `${op.collection}:${op.entityId}`;
+/** The per-actor sequence encoded in an opId (`actorId:seq`; actor ids never contain a colon). */
+const skippedSequence = (opId: string) => Number(opId.slice(opId.lastIndexOf(':') + 1)) || 0;
 
 /** No transport, wall clock, peer role, RxDB internals, or board replay in application. */
 export class OperationEngine {
@@ -18,19 +38,59 @@ export class OperationEngine {
   private invalid = new Map<string, string>();
   private entities = new Map<string, Entity>();
   private pending = new Map<string, Operation>();
+  /** Operations that passed structural validation but speak vocabulary this
+   * build cannot read. Owned here, at the engine, because the engine is the one
+   * materializer every ingestion path funnels through — Drive segments, the log
+   * via `receiveRealtime`, peer realtime, WAL replay and checkpoint joins alike
+   * — and the skip is a property of materialization (an op receipted and
+   * sequenced but never applied), not of any transport. Callers read it with
+   * `skippedOperations()`; the session acts on it before publishing snapshots. */
+  private skipped = new Map<string, number>();
   private waiting = new Map<string, Map<number, Set<string>>>();
   private clock = 0;
   private queue: Promise<unknown> = Promise.resolve();
-  readonly metrics = { applied: 0, duplicates: 0, received: 0, applyMilliseconds: 0 };
+  readonly metrics = { applied: 0, duplicates: 0, received: 0, skipped: 0, applyMilliseconds: 0 };
   constructor(readonly boardId: string) { if (!validId(boardId)) throw new Error('Invalid board identity'); }
   vector(): Frontier { return { ...this.frontier }; }
   logicalClock(): number { return this.clock; }
   inconsistencies(): Record<string, string> { return Object.fromEntries(this.invalid); }
+  /** Operations received structurally valid but unreadable for this build, with
+   * the per-actor sequence each carried. Non-empty for the rest of the engine's
+   * life — reloads re-derive it from the checkpoint that carried it — and every
+   * path that would publish history this device cannot reproduce must refuse
+   * while it is. */
+  skippedOperations(): { opId: string; seq: number }[] {
+    return [...this.skipped.entries()]
+      .map(([opId, seq]) => ({ opId, seq }))
+      .sort((a, b) => a.opId < b.opId ? -1 : a.opId > b.opId ? 1 : 0);
+  }
   unresolvedReferences(): string[] {
-    const missing = [...this.entities.values()].filter(entity => !entity.created && !entity.deleted).map(entity => `${entity.collection}:${entity.id}`);
-    if ([...this.entities.values()].some(entity => entity.collection === 'cards') && !this.entities.get(`projects:${this.boardId}`)?.created)
+    const missing = [...this.entities.values()].filter(entity => !entity.created && !entity.deleted && !entity.bootstrap).map(entity => `${entity.collection}:${entity.id}`);
+    const project = this.entities.get(`projects:${this.boardId}`);
+    if ([...this.entities.values()].some(entity => entity.collection === 'cards') && !project?.created && !project?.bootstrap)
       missing.push(`projects:${this.boardId}`);
     return missing.sort();
+  }
+  /** A copy of this engine prepared for snapshot publication. With
+   * `bootstrapUnresolved` the copy records every entity that is neither
+   * created nor deleted as a bootstrap entity — the claim that the board
+   * already had it when the receipted history began — and seeds the project
+   * entity itself when cards exist without one, because a board cannot hold
+   * cards without its project. The caller has already established that this
+   * is sound (nothing below this point has been pruned or committed); the
+   * copy changes provenance metadata only, never a field value, and the live
+   * engine is not touched, so no local projection adopts the marker. */
+  snapshotEngine(options: { bootstrapUnresolved?: boolean } = {}): OperationEngine {
+    const data = this.serialize();
+    if (options.bootstrapUnresolved) {
+      for (const entity of data.entities) if (!entity.created && !entity.deleted) entity.bootstrap = true;
+      const key = `projects:${this.boardId}`;
+      const project = data.entities.find(entity => entity.collection === 'projects' && entity.id === this.boardId);
+      if (!project && data.entities.some(entity => entity.collection === 'cards')) {
+        data.entities.push({ collection: 'projects', id: this.boardId, created: false, deleted: false, fields: Object.create(null), bootstrap: true });
+      }
+    }
+    return OperationEngine.restoreVerified(data);
   }
   pendingCount(): number { return this.pending.size; }
   /** Serialize callers so WebCrypto completion order never admits conflicting IDs. */
@@ -60,6 +120,10 @@ export class OperationEngine {
       this.metrics.received++;
       if (this.receipts.has(op.opId)) { this.metrics.duplicates++; continue; }
       this.receipts.set(op.opId, { hash: hashes.get(op.opId)!, clock: op.clock });
+      // Remembered before materialization and kept for the engine's life: the
+      // op is receipted and sequenced like any other — so its stream is never
+      // permanently blocked behind it — but never applied to an entity.
+      if (!isKnownVocabulary(op)) { this.skipped.set(op.opId, op.seq); this.metrics.skipped++; }
       this.pending.set(op.opId, op);
       this.tryApply(op, touched);
     }
@@ -89,30 +153,42 @@ export class OperationEngine {
         this.invalid.set(current.opId, 'Logical clock does not follow causal dependencies');
         continue; // Retain corrupt input for diagnosis; never advance its prefix.
       }
-      const key = keyOf(current);
-      const entity = this.entities.get(key) ?? { collection: current.collection, id: current.entityId, created: false, deleted: false, fields: Object.create(null) };
-      if (current.kind === 'create') entity.created = true;
-      if (current.kind === 'delete') entity.deleted = true;
-      const stamp = { clock: current.clock, actorId: current.actorId, seq: current.seq };
-      for (const field of [...Object.keys(current.fields), ...current.unset]) {
-        const old = entity.fields[field];
-        if (!old || compare(stamp, old.stamp) > 0) entity.fields[field] = {
-          stamp, unset: current.unset.includes(field), value: current.fields[field] ?? null
-        };
-      }
-      this.entities.set(key, entity);
-      if (current.collection === 'cards' && typeof current.fields.updatedAt === 'string') {
-        const projectKey = `projects:${this.boardId}`;
-        const project = this.entities.get(projectKey) ?? { collection: 'projects' as const, id: this.boardId, created: false, deleted: false, fields: Object.create(null) };
-        this.entities.set(projectKey, project);
-        if ( (!project.fields.updatedAt || compare(stamp, project.fields.updatedAt.stamp) > 0)) {
-          project.fields.updatedAt = { stamp, value: current.fields.updatedAt, unset: false }; touched.add(projectKey);
+      // A skipped operation advances causality — its stream moves on, its
+      // dependents stop waiting — but never touches an entity: half-applying
+      // fields this build cannot interpret is exactly the corruption the skip
+      // exists to prevent.
+      if (!this.skipped.has(current.opId)) {
+        const key = keyOf(current);
+        const entity: Entity = this.entities.get(key) ?? { collection: current.collection, id: current.entityId, created: false, deleted: false, fields: Object.create(null) };
+        if (current.kind === 'create') entity.created = true;
+        if (current.kind === 'delete') entity.deleted = true;
+        const stamp = { clock: current.clock, actorId: current.actorId, seq: current.seq };
+        for (const field of [...Object.keys(current.fields), ...current.unset]) {
+          const old = entity.fields[field];
+          if (!old || compare(stamp, old.stamp) > 0) entity.fields[field] = {
+            stamp, unset: current.unset.includes(field), value: current.fields[field] ?? null
+          };
         }
+        // Admission retires a value from the register on losing a contest; it
+        // never un-shows it. `seenUpdatedAt` keeps what was admitted monotone.
+        if (typeof current.fields.updatedAt === 'string' && current.fields.updatedAt > (entity.seenUpdatedAt ?? '')) {
+          entity.seenUpdatedAt = current.fields.updatedAt;
+        }
+        this.entities.set(key, entity);
+        if (current.collection === 'cards' && typeof current.fields.updatedAt === 'string') {
+          const projectKey = `projects:${this.boardId}`;
+          const project: Entity = this.entities.get(projectKey) ?? { collection: 'projects' as const, id: this.boardId, created: false, deleted: false, fields: Object.create(null) };
+          this.entities.set(projectKey, project);
+          if (current.fields.updatedAt > (project.seenUpdatedAt ?? '')) project.seenUpdatedAt = current.fields.updatedAt;
+          if ( (!project.fields.updatedAt || compare(stamp, project.fields.updatedAt.stamp) > 0)) {
+            project.fields.updatedAt = { stamp, value: current.fields.updatedAt, unset: false }; touched.add(projectKey);
+          }
+        }
+        this.metrics.applied++; touched.add(key);
       }
       this.pending.delete(current.opId);
       this.frontier[current.actorId] = current.seq;
       this.clock = Math.max(this.clock, current.clock);
-      this.metrics.applied++; touched.add(key);
       const actorWait = this.waiting.get(current.actorId), waiting = actorWait?.get(current.seq);
       if (waiting) {
         actorWait!.delete(current.seq);
@@ -132,7 +208,7 @@ export class OperationEngine {
   }
   entity(collection: Collection, id: string): Record<string, Json> | null {
     const entity = this.entities.get(`${collection}:${id}`);
-    if (!entity?.created || entity.deleted) return null;
+    if (!entity || (!entity.created && !entity.bootstrap) || entity.deleted) return null;
     const result: Record<string, Json> = { id };
     if (collection === 'cards') result.projectId = this.boardId;
     for (const field of Object.keys(entity.fields).sort()) {
@@ -140,6 +216,23 @@ export class OperationEngine {
       if (!register.unset) result[field] = structuredClone(register.value);
     }
     return result;
+  }
+  /** Largest edit timestamp this entity's receipted history has ever carried —
+   * including the value a concurrent contest retired from the field register.
+   * A projection guard asks whether the entity was shown a document's newer
+   * timestamp, not whether the register still displays it: a winner chosen at
+   * equal logical clocks may carry an older wall clock than this device's own
+   * losing edit, and that retired value is provenance the entity has, not a
+   * local change the engine is missing. */
+  seenUpdatedAt(collection: Collection, id: string): string {
+    const entity = this.entities.get(`${collection}:${id}`);
+    if (!entity) return '';
+    // The register itself is always a shown value too: checkpoints written
+    // before provenance tracking carry the value without the tracker.
+    const register = entity.fields.updatedAt;
+    const shown = register && !register.unset && typeof register.value === 'string' ? register.value : '';
+    const seen = entity.seenUpdatedAt ?? '';
+    return seen > shown ? seen : shown;
   }
   state(): { project: Record<string, Json> | null; cards: Record<string, Json>[] } {
     const project = this.entity('projects', this.boardId);
@@ -150,10 +243,19 @@ export class OperationEngine {
   }
   canonicalState(): string { return canonical(this.state()); }
   checkpoint(): EngineCheckpoint {
+    // The invariant, kept meaningful for every caller that hands a checkpoint
+    // to a durable store: nothing unacked (`pending`), no entity whose
+    // existence is unproven (`unresolvedReferences()` — bootstrap-marked
+    // entities count as proven for a board whose history predates its log),
+    // so a snapshot built here reproduces exactly what this engine applied.
     if (this.pending.size || this.unresolvedReferences().length) throw new Error('Cannot snapshot incomplete operation history');
-    return structuredClone({ schemaVersion: 1, boardId: this.boardId, frontier: this.vector(), clock: this.clock,
+    return this.serialize();
+  }
+  private serialize(): EngineCheckpoint {
+    return structuredClone({ schemaVersion: 1 as const, boardId: this.boardId, frontier: this.vector(), clock: this.clock,
       receipts: Object.fromEntries([...this.receipts].sort(([a], [b]) => a < b ? -1 : 1)),
-      entities: [...this.entities.entries()].sort(([a], [b]) => a < b ? -1 : 1).map(([, entity]) => entity) });
+      entities: [...this.entities.entries()].sort(([a], [b]) => a < b ? -1 : 1).map(([, entity]) => entity),
+      ...(this.skipped.size ? { skipped: [...this.skipped.keys()].sort() } : {}) });
   }
   /** Join verified causal checkpoints without replay or a preferred owner.
    * Register max and tombstone OR form the same join as operation delivery. */
@@ -170,10 +272,21 @@ export class OperationEngine {
       }
       for (const [actor, seq] of Object.entries(other.frontier)) result.frontier[actor] = Math.max(result.frontier[actor] ?? 0, seq);
       result.clock = Math.max(result.clock, other.clock);
+      // A skip known to any branch is known to the join: the refusal it carries
+      // is monotone, and losing it through a merge would reopen the hole.
+      for (const [id, seq] of other.skipped) result.skipped.set(id, seq);
       for (const [key, entity] of other.entities) {
         const target = result.entities.get(key);
         if (!target) { result.entities.set(key, entity); continue; }
         target.created ||= entity.created; target.deleted ||= entity.deleted;
+        // A bootstrap provenance known to one branch is known to the join: it
+        // is the same monotone claim the skip ledger is — losing it through a
+        // merge would make an explained entity unresolved again.
+        if (entity.bootstrap) target.bootstrap = true;
+        // Provenance seen by any branch is provenance the join holds: like the
+        // bootstrap marker and the skip ledger, losing it would let a merged
+        // engine forget a value it legitimately projected with.
+        if ((entity.seenUpdatedAt ?? '') > (target.seenUpdatedAt ?? '')) target.seenUpdatedAt = entity.seenUpdatedAt;
         for (const [field, register] of Object.entries(entity.fields)) {
           const previous = target.fields[field];
           if (!previous || compare(register.stamp, previous.stamp) > 0) target.fields[field] = register;
@@ -189,6 +302,7 @@ export class OperationEngine {
     const data = structuredClone(input), engine = new OperationEngine(data.boardId);
     engine.frontier = Object.assign(Object.create(null), data.frontier); engine.clock = data.clock;
     engine.receipts = new Map(Object.entries(data.receipts));
+    engine.skipped = new Map((data.skipped ?? []).map(id => [id, skippedSequence(id)]));
     engine.entities = new Map(data.entities.map(entity => [`${entity.collection}:${entity.id}`, entity]));
     return engine;
   }
@@ -206,6 +320,8 @@ export class OperationEngine {
     for (const entity of data.entities) {
       if (!record(entity) || !['cards', 'projects'].includes(entity.collection) || !validId(entity.id)
         || typeof entity.created !== 'boolean' || typeof entity.deleted !== 'boolean' || !record(entity.fields)
+        || (entity.bootstrap !== undefined && entity.bootstrap !== true)
+        || (entity.seenUpdatedAt !== undefined && typeof entity.seenUpdatedAt !== 'string')
         || (entity.collection === 'projects' && entity.id !== data.boardId)) throw new Error('Invalid checkpoint entity');
       for (const [field, register] of Object.entries(entity.fields) as [string, Register][]) {
         if (!record(register) || !record(register.stamp) || !positive(register.stamp.clock) || register.stamp.clock > data.clock
@@ -230,6 +346,19 @@ export class OperationEngine {
     engine.frontier = Object.assign(Object.create(null), data.frontier);
     engine.clock = data.clock;
     engine.receipts = new Map(Object.entries(data.receipts));
+    // Skipped ids must be well-formed identities with receipts in this very
+    // checkpoint: the marker claims "this client saw and could not read it",
+    // and a checkpoint that renames or drops the operation would be claiming
+    // a history its receipts do not actually carry.
+    if (data.skipped !== undefined) {
+      if (!Array.isArray(data.skipped)) throw new Error('Invalid checkpoint skipped operations');
+      for (const id of data.skipped) {
+        const at = typeof id === 'string' ? id.lastIndexOf(':') : -1;
+        if (at < 1 || !validId(id.slice(0, at)) || !positive(Number(id.slice(at + 1)))
+          || !record(data.receipts[id]) || engine.skipped.has(id)) throw new Error('Invalid checkpoint skipped operation');
+        engine.skipped.set(id, skippedSequence(id));
+      }
+    }
     return engine;
   }
 }

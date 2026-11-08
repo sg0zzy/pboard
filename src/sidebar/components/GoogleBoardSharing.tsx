@@ -4,6 +4,15 @@ import { BoardExistingSignedDataError } from "../../collab/authorityErrors";
 import { boardCollaboration, collaborationManager } from '../../sync/browser';
 import { repository } from '../../storage/browser';
 
+/** Cadence for the directory inbox while no one is looking at the panel. The
+ * enrolment exchange this triggers is real relay work — challenge, verified
+ * Google identity, policy evaluation per browser — and running it every five
+ * seconds per open board made the relay journal say "verified identity"
+ * around the clock. Five seconds belongs to the panel the person is reading;
+ * a minute keeps an unattended inbox honest without driving enrolment from a
+ * per-round path. A focus of the window still refreshes immediately. */
+const SHARING_REFRESH_IDLE_MS = 60_000;
+
 /** Account-assisted enrollment; content still arrives only over WebRTC. */
 export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string | null; onChanged: () => void }) {
   const [email, setEmail] = useState('');
@@ -16,6 +25,7 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
   const [syncError, setSyncError] = useState('');
   const busyRef = useRef(false);
   const [hasAuthority, setHasAuthority] = useState(false);
+  const [sharingOpen, setSharingOpen] = useState(false);
   useEffect(() => {
     let active = true, running = false;
     let timer: ReturnType<typeof setInterval> | undefined;
@@ -53,10 +63,14 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
       finally { running = false; }
     }
     const refresh = () => void sync();
-    refresh(); timer = setInterval(refresh, IDENTITY_REFRESH_MS);
+    // Fast only while the sharing panel is the thing the person is reading;
+    // idle otherwise. The full-speed interval was driving Google identity
+    // enrolment against the relay every five seconds per open board — the
+    // journal churn of a process that was never idle is never idle behaviour.
+    refresh(); timer = setInterval(refresh, sharingOpen ? IDENTITY_REFRESH_MS : SHARING_REFRESH_IDLE_MS);
     window.addEventListener('focus', refresh);
     return () => { active = false; clearInterval(timer); window.removeEventListener('focus', refresh); };
-  }, [projectId]);
+  }, [projectId, sharingOpen]);
   async function run(work: () => Promise<void>) {
     if (busyRef.current) return;
     busyRef.current = true; setBusy(true); setMessage('');
@@ -111,7 +125,7 @@ export function GoogleBoardSharing({ projectId, onChanged }: { projectId: string
     </aside>}
     {message && <p role="status">{message}</p>}
     {syncError && <p role="status">{syncError}</p>}
-    <details><summary>Google account sharing</summary>
+    <details onToggle={event => setSharingOpen((event.currentTarget as HTMLDetailsElement).open)}><summary>Google account sharing</summary>
     <fieldset disabled={busy}>
     <legend>Google account sharing</legend>
     <p>{email ? `Verified account: ${email}. Devices on this account request board grants automatically.` : 'Connect Google using the existing account button to discover your boards and invitations. Manual device pairing remains available below.'}</p>

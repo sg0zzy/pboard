@@ -4,8 +4,9 @@ import type { BoardImage } from '../../types';
 import { parseStrictJson } from '../../collab/security/canonical';
 import type { GoogleAuthProvider } from '../googleAuth';
 import { canonical, digest, MAX_SEGMENT_BYTES, validateSegment, type Segment } from './protocol';
-import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from '../driveQuota';
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, driveRequestSignature, isDriveQuotaFailure, type DriveQuotaThrottle } from '../driveQuota';
 import { shareGet } from '../driveSharedRequest';
+import { driveHttpError, isDriveGone, noteDriveResourceGone, driveResourceKnownGone } from '../driveHttp';
 
 const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
@@ -34,7 +35,7 @@ export function createOperationDriveStore(options: {
       // Respect projected budget deferrals and real Google quota cooldowns.
       await quota.acquire(cost, init.signal);
       const response = await fetcher(url, { ...init, headers, cache: 'no-store' });
-      quota.observe(cost, response.headers);
+      quota.observe(cost, response.headers, driveRequestSignature(url, init.method ?? "GET"));
       return response;
     };
     // Every board's inventory, metadata and segment reads run through here, and
@@ -61,7 +62,7 @@ export function createOperationDriveStore(options: {
       // A quota denial must reach the UI as a quota, not as a storage failure.
       const detail = await errorDetail(response);
       if (isDriveQuotaFailure(detail)) throw driveQuotaError(response.status, detail, quota);
-      throw new Error(`Google Drive operation storage failed (${response.status})`);
+      throw driveHttpError(response.status, `Google Drive operation storage failed (${response.status})`);
     }
     return response;
   }
@@ -146,7 +147,18 @@ export function createOperationDriveStore(options: {
   async function protectLegacy(fileId: string): Promise<void> {
     const boardRole = await options.role();
     if (!['owner', 'editor'].includes(boardRole)) throw new Error('Current Google Drive permission cannot protect the legacy checkpoint');
-    const file = await metadata(fileId);
+    if (driveResourceKnownGone(fileId)) return;
+    let file: Awaited<ReturnType<typeof metadata>>;
+    try {
+      file = await metadata(fileId);
+    } catch (error) {
+      // A legacy copy that has been deleted cannot be written by anybody, so
+      // there is nothing left to protect. Failing here stopped a board being
+      // adopted at all — which is what a second device hit when it opened boards
+      // whose pre-protocol files the first device had since removed.
+      if (isDriveGone(error)) { noteDriveResourceGone(fileId); return; }
+      throw error;
+    }
     if (!['board.json.gz', 'project.json', `project-${options.boardId}.pboard`].includes(file.name)
       || (file.name === 'project.json' && !file.parents?.includes(options.folderId))) throw new Error('Legacy migration file identity mismatch');
     if (file.contentRestrictions?.some(restriction => restriction.readOnly)) return;
@@ -154,7 +166,23 @@ export function createOperationDriveStore(options: {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentRestrictions: [
         { readOnly: true, ownerRestricted: boardRole === 'owner' && file.ownedByMe === true, reason: 'Pboard operation protocol: upgrade Pboard before editing this board.' }
       ] })
-    }); await required(response);
+    });
+    if (!response.ok) {
+      // Drive refuses a content-restriction update it will not apply, and answers
+      // as though the file were not there. Ask what it actually holds before
+      // deciding: nothing at all (deleted), the restriction already applied by the
+      // owner, or a file owned by another account — which only that owner can
+      // lock, and whose board must still open. Only a file this account owns and
+      // still cannot lock is a real failure.
+      const detail = await errorDetail(response);
+      if (isDriveQuotaFailure(detail)) throw driveQuotaError(response.status, detail, quota);
+      const current = await metadata(fileId).catch((error: unknown) => {
+        if (isDriveGone(error)) { noteDriveResourceGone(fileId); return null; }
+        throw error;
+      });
+      if (current === null || current.contentRestrictions?.some(restriction => restriction.readOnly) || !current.ownedByMe) return;
+      throw new Error('Legacy write barrier could not be applied: this account owns the file but Drive refused to restrict it.');
+    }
     if (!(await metadata(fileId)).contentRestrictions?.some(r => r.readOnly)) throw new Error('Legacy write barrier could not be verified');
   }
   return {

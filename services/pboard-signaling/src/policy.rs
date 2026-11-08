@@ -31,7 +31,8 @@ impl Limits {
         setting!(message_bytes, "MAX_MESSAGE_BYTES");
         setting!(messages_per_second, "MESSAGES_PER_SECOND");
         setting!(bytes_per_second, "BYTES_PER_SECOND");
-        setting!(session_bytes, "MAX_SESSION_BYTES");
+        setting!(bytes_per_window, "MAX_SESSION_WINDOW_BYTES");
+        setting!(room_bytes_per_window, "MAX_ROOM_WINDOW_BYTES");
         setting!(session_signals, "MAX_SESSION_SIGNALS");
         setting!(global_messages_per_second, "GLOBAL_MESSAGES_PER_SECOND");
         setting!(global_bytes_per_second, "GLOBAL_BYTES_PER_SECOND");
@@ -61,7 +62,10 @@ impl Limits {
             || !(1024..=crate::MAX_MESSAGE).contains(&self.message_bytes)
             || !(1..=120).contains(&self.messages_per_second)
             || !(1024..=1024 * 1024).contains(&self.bytes_per_second)
-            || !(1024..=16 * 1024 * 1024).contains(&self.session_bytes)
+            || !(1024..=64 * 1024 * 1024).contains(&self.bytes_per_window)
+            || !(1024..=self.bytes_per_window).contains(&self.room_bytes_per_window)
+            || self.byte_window.is_zero()
+            || self.byte_window > Duration::from_secs(3600)
             || !(1..=1024).contains(&self.session_signals)
             || !(1..=1024).contains(&self.global_messages_per_second)
             || !(1024..=16 * 1024 * 1024).contains(&self.global_bytes_per_second)

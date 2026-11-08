@@ -38,6 +38,21 @@ export const DRIVE_COST_PAGETOKEN = 10;
 export const DRIVE_COST_WINDOW_MS = 60_000;
 export const DRIVE_QUOTA_MAX_COOLDOWN_MS = 5 * DRIVE_COST_WINDOW_MS;
 /**
+ * What one browser context lets itself spend per minute, as a share of the
+ * per-user budget below. The extension runs two independent ledgers (the worker
+ * and the sidebar page), and Google's per-user figure also counts every other
+ * device, browser profile and app acting as the same user, plus short-window
+ * rate checks that no per-minute figure predicts. A context that spends the
+ * whole per-user budget therefore guarantees a denial for everything else, and
+ * a runaway caller is then denied by Google rather than deferred locally, which
+ * is the worst of both: the spend happens, the retry storm follows, and the
+ * error names neither the loop nor the caller. Self-limiting at roughly a third
+ * of the per-user budget keeps the account headroom for the other context and
+ * turns an overrunning loop into a sleep instead of a 403.
+ */
+export const DRIVE_CONTEXT_COST_BUDGET = 100_000;
+
+/**
  * The documented per-minute budget, in Drive quota units: 1,000,000 per project and
  * 325,000 per user per project
  * (https://developers.google.com/workspace/drive/api/guides/limits, last updated
@@ -47,6 +62,12 @@ export const DRIVE_QUOTA_MAX_COOLDOWN_MS = 5 * DRIVE_COST_WINDOW_MS;
  * tripped a full-window deferral instead of going out.
  */
 export const DRIVE_DEFAULT_COST_PER_MINUTE = 325_000;
+/**
+ * The floor a context backs off to when Google keeps denying it. Low enough that
+ * a denied account still edits and syncs, high enough that the extension still
+ * polls; the UI reports the deferral rather than silently stalling forever.
+ */
+export const DRIVE_MIN_COST_PER_MINUTE = 4_000;
 
 /** Resources whose cost is dominated by the page size they ask for. */
 export type DriveCostResource = "about" | "get" | "list" | "search" | "permlist" | "flat";
@@ -112,6 +133,36 @@ export function driveProjectedCost(input: string): number {
   return cost;
 }
 
+/**
+ * A spend signature: the *shape* of a request, with the per-board arguments
+ * folded away. Attribution has to group a loop's requests together — a listing
+ * of three different board folders is one loop spending three times, not three
+ * unrelated things — while still naming the loop well enough to go find it.
+ */
+export function driveRequestSignature(input: string, method = "GET"): string {
+  const url = new URL(input, "https://www.googleapis.com/drive/v3");
+  const path = url.pathname
+    .replace(/^\/upload\/drive\/v3\//, "upload/")
+    .replace(/^\/drive\/v3\//, "")
+    // Resource ids vary per file; the endpoint they belong to is the useful part.
+    .split("/")
+    .map((segment) => (segment.length > 16 ? "*" : segment))
+    .join("/");
+  const query = url.searchParams.get("q");
+  const detail = url.searchParams.get("alt") === "media"
+    ? " media"
+    : query
+      // Keep the predicate, drop the quoted ids and names it is applied to.
+      ? `?q=${query.replace(/'[^']*'/g, "'…'").slice(0, 44)}`
+      : url.pathname.endsWith("/changes") && url.searchParams.get("pageToken")
+        ? "?cursor"
+        : "";
+  return `${method.toUpperCase()} ${path}${detail}`;
+}
+
+/** Quota units and request count charged to one `driveRequestSignature`. */
+export type DriveQuotaSpend = { signature: string; units: number; requests: number };
+
 export type DriveQuotaFailure = {
   reason: string;
   metric?: string;
@@ -174,12 +225,40 @@ export function driveQuotaError(status: number, detail: string, throttle: DriveQ
     : `charged ${accounted} of limit ${projected.limit}`;
   // The advertised cooldown wins when it is longer than the local window reset.
   const waitMs = Math.max(observation.waitMs, driveSecondDelayMs(detail) ?? 0);
-  return throttle.cooldown(new DriveQuotaExceededError(`${base}; drive quota ledger: ${budget} units/min for this context only — Google's metric also counts this account's other devices and short-window rate checks; retry after ${waitMs}ms`, failure, accounted, waitMs));
+  // Name the spend, not just the total: a denial that says only "charged 175525"
+  // cannot be acted on, and the loop that spent it is otherwise found by reading
+  // every caller. Two shapes are enough to point at a loop, and the window is
+  // quoted so the rate is not overstated by a partial window.
+  const windowMs = Math.max(1, projected.windowMs);
+  const spenders = projected.spend.slice(0, 2).map((entry) => `${entry.signature} ${entry.units}u/${entry.requests}req`).join(", ");
+  const attribution = spenders
+    ? `${projected.requests} requests in ${windowMs}ms, largest: ${spenders}`
+    : `${projected.requests} requests in ${windowMs}ms`;
+  return throttle.cooldown(new DriveQuotaExceededError(`${base}; drive quota ledger: ${budget} units/min for this context only (${attribution}; assumed account figure ${projected.accountLimit}, which the Cloud console may set lower) — Google's metric also counts this account's other devices and short-window rate checks; retry after ${waitMs}ms`, failure, accounted, waitMs));
 }
 
 export type DriveQuotaObservation = { cost: number; waitMs: number };
 export type DriveQuotaEvent = { type: "defer" | "observed"; projected: number; cost: number; waitMs: number };
-export type DriveQuotaSnapshot = { limit: number; windowStart: number; charged: number; requests: number; deferrals: number; lastWaitMs: number };
+export type DriveQuotaSnapshot = {
+  /** What this context defers at *now* — the live ceiling, which falls under
+   * denial from `DRIVE_CONTEXT_COST_BUDGET` toward `DRIVE_MIN_COST_PER_MINUTE`. */
+  limit: number;
+  /** The budget this context started the session with, before any backoff. */
+  configuredLimit: number;
+  /** The documented per-user figure, for comparison with the Cloud console — an
+   * assumption, not a measurement of this project's quota. */
+  accountLimit: number;
+  /** When the current window opened, so a spend rate can be quoted honestly. */
+  windowStart: number;
+  /** How long the current window has been running, in milliseconds. */
+  windowMs: number;
+  charged: number;
+  requests: number;
+  deferrals: number;
+  lastWaitMs: number;
+  /** This window's spend by request shape, largest first. */
+  spend: DriveQuotaSpend[];
+};
 
 export interface DriveQuotaThrottle {
   /** Record a real Google denial, independently of the local cost estimate. */
@@ -188,8 +267,14 @@ export interface DriveQuotaThrottle {
   reserve(projectedCost: number): DriveQuotaObservation;
   /** Sleeps on projected exhaustion; rejects with the saved quota error during a server cooldown. */
   acquire(projectedCost: number, signal?: AbortSignal | null): Promise<DriveQuotaObservation>;
-  /** Corrects the projection that `acquire` booked with the real `X-Drive-Request-Cost`; an observation without an acquire books nothing. */
-  observe(projectedCost: number, headers?: Headers | null): number;
+  /**
+   * Corrects the projection that `acquire` booked with the real
+   * `X-Drive-Request-Cost`; an observation without an acquire books nothing.
+   * `signature` (see `driveRequestSignature`) attributes the charge to a request
+   * shape so a denial can name the loop that caused it; requests that fail
+   * before a response are counted but not attributed.
+   */
+  observe(projectedCost: number, headers?: Headers | null, signature?: string): number;
   /**
    * Drop a recorded Google denial so the next caller actually reaches Drive.
    * The charged window stays: this clears the wait, never the accounting. An
@@ -207,7 +292,20 @@ export function createDriveQuotaThrottle(options: {
   sleep?: (ms: number, signal?: AbortSignal | null) => Promise<void>;
   log?: (event: DriveQuotaEvent) => void;
 } = {}): DriveQuotaThrottle {
-  const limit = options.maxCostPerMinute ?? DRIVE_DEFAULT_COST_PER_MINUTE;
+  const limit = options.maxCostPerMinute ?? DRIVE_CONTEXT_COST_BUDGET;
+  /**
+   * The figure `acquire` actually defers at. It starts at `limit` and falls to
+   * `DRIVE_MIN_COST_PER_MINUTE` as Google denies this context, then walks back.
+   *
+   * `DRIVE_DEFAULT_COST_PER_MINUTE` is a documented figure, not this project's
+   * measured one: a project's effective per-user quota can be lower (unverified
+   * OAuth consent, a granted quota override elsewhere, a shared billing account),
+   * and other devices spend the same bucket. A denial while the local window is
+   * well inside the assumed budget is evidence the assumption is wrong, and the
+   * only honest response to it is to spend less — waiting for a human to read the
+   * Cloud console does not stop the requests that are being refused now.
+   */
+  let ceiling = limit;
   const now = options.now ?? Date.now;
   const log = options.log;
   const sleep = options.sleep ?? ((ms: number, signal?: AbortSignal | null) => new Promise<void>((resolve) => {
@@ -225,14 +323,54 @@ export function createDriveQuotaThrottle(options: {
   let lastDenial = -Infinity;
   let denials = 0;
   let quotaError: DriveQuotaExceededError | undefined;
-  /** What `acquire` booked for the request now being accounted for; `observe` may only correct that amount. */
-  let pendingCharge: number | null = null;
+  /**
+   * Requests `acquire` booked that `observe` has not accounted for yet, oldest
+   * first.
+   *
+   * A queue rather than one slot: several requests are in flight at once (a
+   * roster read downloads peer records in parallel, a reconcile round reads
+   * several boards), and with a single slot a response corrected whatever the
+   * most recent acquire had booked — including a different request's — and a
+   * second `observe` for one response charged the difference a second time,
+   * because nothing marked the first correction as done. Matching the oldest
+   * booking is exact for the serialized traffic that dominates, and keeps the
+   * window total right whatever the completion order.
+   */
+  const pending: number[] = [];
+  /** Requests that never saw a response must not grow the queue without bound. */
+  const MAX_UNOBSERVED = 256;
 
-  const rollWindow = () => { if (now() - windowStart >= DRIVE_COST_WINDOW_MS) { windowStart = now(); charged = 0; if (pendingCharge !== null) pendingCharge = 0; } };
+  /** This window's charged units per request shape; bounded below. */
+  const spendBySignature = new Map<string, DriveQuotaSpend>();
+  const MAX_SPEND_SIGNATURES = 40;
+  function charge(signature: string | undefined, units: number) {
+    const key = signature ?? "unattributed";
+    const entry = spendBySignature.get(key);
+    if (entry) { entry.units += units; entry.requests += 1; return; }
+    // A context touching more distinct shapes than this will not be diagnosed by
+    // the fortieth of them; `charged` and `requests` still count everything.
+    if (spendBySignature.size >= MAX_SPEND_SIGNATURES) return;
+    spendBySignature.set(key, { signature: key, units, requests: 1 });
+  }
+  const rollWindow = () => {
+    if (now() - windowStart >= DRIVE_COST_WINDOW_MS) {
+      // A window that closed without a denial earns back a quarter of the gap to
+      // the configured budget: recovery is fast enough to be useful the same
+      // session and slow enough that a genuinely smaller quota re-triggers the
+      // backoff instead of being overrun each minute.
+      if (ceiling < limit) ceiling = Math.min(limit, ceiling + Math.max(1_000, Math.ceil((limit - ceiling) / 4)));
+      windowStart = now();
+      charged = 0;
+      spendBySignature.clear();
+      // Bookings from the closed window are not corrected into the new one; the
+      // requests themselves are already counted where they were spent.
+      pending.length = 0;
+    }
+  };
 
   function reserve(projectedCost: number): DriveQuotaObservation {
     rollWindow();
-    return { cost: projectedCost, waitMs: charged + projectedCost <= limit ? 0 : windowStart + DRIVE_COST_WINDOW_MS - now() };
+    return { cost: projectedCost, waitMs: charged + projectedCost <= ceiling ? 0 : windowStart + DRIVE_COST_WINDOW_MS - now() };
   }
 
   async function acquire(projectedCost: number, signal?: AbortSignal | null): Promise<DriveQuotaObservation> {
@@ -249,32 +387,53 @@ export function createDriveQuotaThrottle(options: {
     if (quotaError && now() < blockedUntil) throw withWait(quotaError, blockedUntil - now());
     rollWindow();
     requests += 1;
-    pendingCharge = projectedCost;
-    charged += pendingCharge;
+    while (pending.length >= MAX_UNOBSERVED) pending.shift();
+    pending.push(projectedCost);
+    charged += projectedCost;
     return observation;
   }
 
-  function observe(projectedCost: number, headers?: Headers | null): number {
+  function observe(projectedCost: number, headers?: Headers | null, signature?: string): number {
     const header = headers?.get?.("X-Drive-Request-Cost");
     // An absent or blank header is not a zero cost; the projection stands.
     const reported = header ? Number(header) : NaN;
     const cost = Number.isFinite(reported) ? reported : projectedCost;
     rollWindow();
     // An observation with no booked projection is a report, not a charge: a
-    // read-only accounting pass must not consume budget.
-    if (pendingCharge !== null) { charged += cost - pendingCharge; pendingCharge = cost; }
+    // read-only accounting pass must not consume budget, and must not be
+    // attributed to a shape as if it had been sent.
+    const booked = pending.shift();
+    if (booked !== undefined) {
+      charged += cost - booked;
+      charge(signature, cost);
+    }
     log?.({ type: "observed", projected: projectedCost, cost, waitMs: lastWaitMs });
     return cost;
   }
 
   function snapshot(): DriveQuotaSnapshot {
-    return { limit, windowStart, charged, requests, deferrals, lastWaitMs };
+    // Reading the ledger closes an expired window first: a report of `windowMs`
+    // longer than the window, or of a ceiling that a rolled window would have
+    // earned back, is worse than no report.
+    rollWindow();
+    return {
+      limit: ceiling, configuredLimit: limit, accountLimit: DRIVE_DEFAULT_COST_PER_MINUTE,
+      windowStart, charged, requests, deferrals, lastWaitMs,
+      windowMs: Math.max(0, now() - windowStart),
+      spend: [...spendBySignature.values()].sort((left, right) => right.units - left.units)
+    };
   }
 
   function withWait(error: DriveQuotaExceededError, waitMs: number) {
     return new DriveQuotaExceededError(error.message.replace(/retry after \d+ms$/, `retry after ${waitMs}ms`), error.failure, error.cost, waitMs);
   }
   function cooldown(error: DriveQuotaExceededError) {
+    // Only a real Google response reaches here. Halve the ceiling whatever the
+    // local window looked like: the request was refused, and refusing to spend
+    // less is how a denied account stays denied.
+    // The floor never exceeds the configured budget, which a test or an embedder
+    // may set far below it.
+    ceiling = Math.max(Math.min(DRIVE_MIN_COST_PER_MINUTE, limit), Math.floor(ceiling / 2));
     if (now() - lastDenial > DRIVE_QUOTA_MAX_COOLDOWN_MS) denials = 0;
     const delay = Math.min(DRIVE_QUOTA_MAX_COOLDOWN_MS, DRIVE_COST_WINDOW_MS * 2 ** Math.min(denials++, 3));
     lastDenial = now();
@@ -295,6 +454,21 @@ let shared: DriveQuotaThrottle | undefined;
 export function defaultDriveQuotaThrottle(): DriveQuotaThrottle {
   if (!shared) shared = createDriveQuotaThrottle();
   return shared;
+}
+
+/**
+ * Publish this context's ledger as `pboardDriveQuota()` in the console.
+ *
+ * The work counters behind `pboardCounters` are compiled out of a production
+ * build, so when Google denies a request there is normally nothing to read
+ * except the one line the error carries. The ledger is always collected, and a
+ * rate limit is a *sustained* condition: reading `charged`, `requests` and
+ * `spend` while the board is idle says whether something is still looping,
+ * without waiting for the next denial to print itself.
+ */
+export function exposeDriveQuotaDiagnostics(): void {
+  const target = globalThis as { pboardDriveQuota?: () => DriveQuotaSnapshot };
+  target.pboardDriveQuota = () => defaultDriveQuotaThrottle().snapshot();
 }
 
 /**

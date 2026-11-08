@@ -5,6 +5,7 @@ import { LocalOperationStore } from '../../src/sync/operations/localStore';
 import { OperationSession } from '../../src/sync/operations/session';
 import type { Command } from '../../src/sync/operations/protocol';
 import { ImmutableDriveFake } from './driveFake';
+import { DriveQuotaExceededError } from '../../src/sync/driveQuota';
 import { DRIVE_MAX_UNPUBLISHED_MS, DRIVE_POLL_MS } from '../../src/sync/syncPolicy';
 const date = '2026-01-01';
 const board: Command = { collection: 'projects', entityId: 'board', kind: 'create', fields: { name: 'Board', template: 'project', createdAt: date, updatedAt: date }, unset: [] };
@@ -19,6 +20,13 @@ async function client(fake: ImmutableDriveFake, name = crypto.randomUUID(), hook
 }
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.useRealTimers(); });
 async function seeded(fake: ImmutableDriveFake) { const a = await client(fake); await a.session.edit(board); await a.session.edit(card); await a.session.sync(); return a; }
+/** The log-path snapshot publication the consolidation cycle performs; tests
+ * drive it directly to stay about the session, not the relay. */
+async function publishLogSnapshot(session: OperationSession) {
+  const { snapshot } = await session.prepareLogSnapshot();
+  await session.publishLogSnapshot(snapshot);
+  return snapshot.snapshotId;
+}
 
 describe('operation session integration against simulated regular Drive', () => {
   it('manual sync discovers remote segments while realtime is connected and keeps unpublished edits', async () => {
@@ -28,6 +36,94 @@ describe('operation session integration against simulated regular Drive', () => 
     await b.session.sync(true); await a.session.sync(true);
     expect(b.session.state().cards[0]).toMatchObject({ title: 'Local pending', content: 'Remote edit' });
     expect(a.session.state()).toEqual(b.session.state());
+  });
+  it('consolidating through the log covers history that only ever travelled through Drive segments', async () => {
+    // A board that switches to the operation log keeps the history it published as
+    // Drive segments: the sync loop reads every `operations-*` file unconditionally,
+    // and what a checkpoint must prove before those files may be collected is receipt
+    // coverage per operation. Both halves matter — if adoption silently stopped, or if
+    // a log-path snapshot failed to cover the adopted operations, migrating a legacy
+    // board would mean choosing between its old edits and its new log.
+    const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake);
+    await b.session.sync();
+    await a.session.edit(patch({ content: 'Legacy edit, never in the log' }));
+    await a.session.sync();
+    await b.session.sync(true);
+    expect(b.session.state().cards[0]).toMatchObject({ content: 'Legacy edit, never in the log' });
+
+    const drive = fake.store();
+    const published: string[] = [];
+    for (const file of [...fake.files.values()].filter(entry => entry.name.startsWith('operations-'))) {
+      for (const operation of (await drive.readSegment(file.id)).operations) published.push(operation.opId);
+    }
+    expect(published.length).toBeGreaterThan(0);
+
+    const { snapshot } = await b.session.prepareLogSnapshot();
+    for (const opId of published) expect(Object.keys(snapshot.checkpoint.receipts)).toContain(opId);
+  });
+
+  it('keeps realtime switched on when a role check cannot run, and off when access is revoked', async () => {
+    // The quota ledger refuses requests during an ordinary editing burst. Reading
+    // that as lost access turned realtime off for the rest of the session — the
+    // data channel stayed open while incoming operations were ignored — so a
+    // collaborator went silent with nothing wrong but a throttled minute.
+    const fake = new ImmutableDriveFake();
+    await seeded(fake);
+    const enabled: boolean[] = [];
+    const quota = () => { throw new DriveQuotaExceededError('drive quota ledger: deferred', { reason: 'rateLimitExceeded' }, 100, 60_000); };
+    const b = await client(fake, crypto.randomUUID(), { role: quota, setRealtimeEnabled: async (value: boolean) => { enabled.push(value); } });
+    await b.session.setRealtime(true); enabled.length = 0;
+    await expect(b.session.sync()).rejects.toThrow(/quota ledger/);
+    expect(enabled).toEqual([]);
+    await expect(b.session.receiveRealtime([])).rejects.toThrow(/quota ledger/); // the role check runs before anything is applied
+    expect(enabled).toEqual([]);
+    // Quota was only the first failure anyone noticed. Any error means the question
+    // was never answered, and the sidebar re-enables realtime on its next role
+    // refresh ten seconds later, so closing the room for one made the room restart
+    // about every ten seconds — `starts` in `pboardCollaboration()` climbing past
+    // sixty — and a peer connection rebuilt on that schedule never finishes ICE.
+    // The failure is recorded instead of acted on, so it is still findable.
+    const broken = await client(fake, crypto.randomUUID(), {
+      role: () => { throw new Error('Request failed with status 503'); },
+      setRealtimeEnabled: async (value: boolean) => { enabled.push(value); },
+    });
+    await broken.session.setRealtime(true); enabled.length = 0;
+    await expect(broken.session.sync()).rejects.toThrow(/503/);
+    expect(enabled).toEqual([]);
+    expect(broken.session.metrics).toMatchObject({ roleCheckFailures: 1, roleCheckError: 'Request failed with status 503' });
+    // A real revocation still closes the room.
+    const revoked = await client(fake, crypto.randomUUID(), { role: async () => 'revoked' as const, setRealtimeEnabled: async (value: boolean) => { enabled.push(value); } });
+    await revoked.session.setRealtime(true); enabled.length = 0;
+    await expect(revoked.session.sync()).rejects.toThrow(/revoked/);
+    expect(enabled).toEqual([false]);
+  });
+  it('forgets a Drive file it can list but no longer read, and retries one that merely failed', async () => {
+    // Drive lists a compacted segment for minutes after deleting it. Each listing used
+    // to cost a download that answered 404, and the rejection stopped that poll
+    // applying anything else — so a board with one vanished file stopped synchronising
+    // at all, and paid for the privilege every poll forever.
+    const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake);
+    await b.session.sync();
+    await a.session.edit(patch({ content: 'Later edit' })); await a.session.sync();
+    fake.files.set('vanished', { id: 'vanished', name: 'operations-vanished.json', parents: ['folder'], body: '{ "operations": [] }', createdTime: '2026-01-02T00:00:00Z' });
+    fake.unreadable.add('vanished');
+    fake.requests.length = 0;
+    await b.session.sync();
+    expect(b.session.state().cards[0]).toMatchObject({ content: 'Later edit' }); // the files that do exist still arrived
+    expect(b.session.metrics.goneResources).toBe(1);
+    expect((await b.local.downloadedFiles('board')).has('vanished')).toBe(true);
+    expect(fake.requests.filter(request => request.url.includes('vanished') && request.url.includes('alt=media'))).toHaveLength(1);
+    fake.requests.length = 0;
+    await b.session.sync(true);
+    expect(fake.requests.filter(request => request.url.includes('vanished'))).toEqual([]); // Drive's answer is terminal: never asked again
+    // A 500 is not a verdict about the file, and swallowing it would lose the segment.
+    const c = await client(fake), segment = [...fake.files.values()].find(file => file.name.startsWith('operations-') && file.id !== 'vanished')!;
+    fake.failing.add(segment.id);
+    await expect(c.session.sync()).rejects.toThrow(/500/);
+    expect((await c.local.downloadedFiles('board')).has(segment.id)).toBe(false);
+    fake.failing.delete(segment.id);
+    await c.session.sync();
+    expect(c.session.state().cards[0]).toMatchObject({ content: 'Later edit' });
   });
   it('edits immediately with all network calls failing, survives restart and later publishes', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake);
@@ -65,21 +161,22 @@ describe('operation session integration against simulated regular Drive', () => 
     const resumed = await client(fake, a.name); await resumed.session.sync(true);
     expect(fake.files.size).toBe(1); expect((await resumed.local.outbox('board'))[0].driveFileId).toBeTruthy();
   });
-  it('allows normal editing while a compaction upload is paused', async () => {
+  it('allows normal editing while a snapshot upload is paused', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake), store = a.session.options.drive;
     let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
     let started!: () => void; const ready = new Promise<void>(resolve => { started = resolve; });
     const publish = store.publishSnapshot;
     vi.spyOn(store, 'publishSnapshot').mockImplementation(async (...args) => { started(); await gate; return publish(...args); });
-    const compacting = a.session.compact(); await ready;
-    await a.session.edit(patch({ title: 'During compaction' })); release(); await compacting;
+    const prepared = await a.session.prepareLogSnapshot();
+    const publishing = a.session.publishLogSnapshot(prepared.snapshot); await ready;
+    await a.session.edit(patch({ title: 'During compaction' })); release(); await publishing;
     await a.session.sync(); const b = await client(fake); await b.session.sync();
     expect(b.session.state().cards[0].title).toBe('During compaction');
   });
   it('publishes concurrent owner snapshots without a lock or mutable pointer, and recovers without the compacted logs', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake); await b.session.sync();
     await a.session.edit(patch({ title: 'A' })); await b.session.edit(patch({ content: 'B' }));
-    await Promise.all([a.session.compact(), b.session.compact()]);
+    await Promise.all([publishLogSnapshot(a.session), publishLogSnapshot(b.session)]);
     const snapshots = [...fake.files.values()].filter(file => file.name.startsWith('snapshot-'));
     expect(snapshots).toHaveLength(2);
     // Test recovery from retained checkpoints; actual gardening is a separate
@@ -88,19 +185,24 @@ describe('operation session integration against simulated regular Drive', () => 
     const fresh = await client(fake); await fresh.session.sync();
     expect(fresh.session.state().cards[0]).toMatchObject({ title: 'A', content: 'B' });
   });
-  it('refuses editor/viewer compaction and repeated activation shares one local job', async () => {
-    const fake = new ImmutableDriveFake(), a = await seeded(fake);
-    fake.role = 'viewer'; await expect(a.session.compact()).rejects.toThrow();
-    fake.role = 'editor'; await expect(a.session.compact()).rejects.toThrow();
-    fake.role = 'owner'; const first = a.session.compact(), second = a.session.compact();
-    expect(first).toBe(second); await first;
-    expect([...fake.files.values()].filter(file => file.name.startsWith('snapshot-'))).toHaveLength(1);
+  it('refuses to publish another session\'s unprepared snapshot and never re-uploads a published one', async () => {
+    const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake);
+    const { snapshot } = await a.session.prepareLogSnapshot();
+    await a.session.publishLogSnapshot(snapshot);
+    const published = [...fake.files.values()].filter(file => file.name.startsWith('snapshot-'));
+    expect(published).toHaveLength(1);
+    await a.session.publishLogSnapshot(snapshot);
+    expect([...fake.files.values()].filter(file => file.name.startsWith('snapshot-'))).toEqual(published);
+    const foreign = await b.session.prepareLogSnapshot();
+    await expect(a.session.publishLogSnapshot(foreign.snapshot)).rejects.toThrow('Snapshot was never prepared');
   });
   it('recovers a snapshot upload whose success acknowledgement was lost', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake);
-    fake.timeoutNext = true; await expect(a.session.compact()).rejects.toThrow();
+    const { snapshot } = await a.session.prepareLogSnapshot();
+    fake.timeoutNext = true; await expect(a.session.publishLogSnapshot(snapshot)).rejects.toThrow();
     const snapshots = [...fake.files.values()].filter(file => file.name.startsWith('snapshot-')); expect(snapshots).toHaveLength(1);
-    const id = await a.session.compact(); expect(id).toBe(JSON.parse(snapshots[0].body).snapshotId);
+    await a.session.publishLogSnapshot(snapshot);
+    expect(JSON.parse(snapshots[0].body).snapshotId).toBe(snapshot.snapshotId);
     expect([...fake.files.values()].filter(file => file.name.startsWith('snapshot-'))).toHaveLength(1);
   });
   it('revalidates an established realtime session and closes it on revocation while preserving the outbox', async () => {
@@ -189,7 +291,7 @@ it('recovers operations downloaded by another extension context before allocatin
 });
 it('merges a checkpoint discovered by another extension context even after its file receipt is shared', async () => {
   const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake, a.name), remote = await client(fake);
-  await remote.session.sync(); await remote.session.edit(patch({ content: 'Durable new checkpoint' })); await remote.session.compact();
+  await remote.session.sync(); await remote.session.edit(patch({ content: 'Durable new checkpoint' })); await publishLogSnapshot(remote.session);
   await a.session.sync(); await b.session.sync();
   expect(b.session.state()).toEqual(a.session.state()); expect(b.session.state().cards[0].content).toBe('Durable new checkpoint');
 });

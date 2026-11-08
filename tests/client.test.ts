@@ -68,13 +68,24 @@ describe("requestProjectSync", () => {
 });
 
 describe("requestDriveReconciliation", () => {
-  it("forwards {type} to runtime.sendMessage", async () => {
+  it("forwards a forced round by default: a pressed control must do real work", async () => {
     await sendMessage.mockResolvedValueOnce({ ok: true });
 
     await requestDriveReconciliation();
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith({ type: DRIVE_RECONCILE_MESSAGE });
+    expect(sendMessage).toHaveBeenCalledWith({ type: DRIVE_RECONCILE_MESSAGE, force: true });
+  });
+
+  it("forwards a background refresh as unforced, so the worker may coalesce it", async () => {
+    await sendMessage.mockResolvedValueOnce({ ok: true });
+
+    await requestDriveReconciliation({ force: false });
+
+    // The sidebar's startup discovery: the worker's cold start runs the same
+    // round at the same moment, and a second round over the same account and
+    // the same local database can only cost time.
+    expect(sendMessage).toHaveBeenCalledWith({ type: DRIVE_RECONCILE_MESSAGE, force: false });
   });
 
   it("returns the response object on success", async () => {

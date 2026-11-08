@@ -17,6 +17,38 @@ export type RepositoryEvents = {
   projectDeleting?: (project: Project) => void | Promise<void>;
   projectDeleted?: (projectId: string) => void | Promise<void>;
   projectHidden?: (projectId: string) => void | Promise<void>;
+  /**
+   * A durable tombstone fact was written on this device — the deletion, the
+   * explicit restore, or the rollback that reverses a failed erase. This is the
+   * only hook that turns the fact into an announcement on the account room, so
+   * a peer that never saw the deletion receives the evidence itself
+   * (`accountChannel.publishTombstone`).
+   *
+   * Fire-and-forget by contract: the fact is already durable when this runs, so
+   * neither a throwing listener nor an absent one (a repository built without
+   * one, a test scratch database) may affect the deletion. A *received* fact is
+   * never re-announced through here — that is what keeps two devices from
+   * echoing each other's tombstones.
+   */
+  projectTombstoned?: (boardId: string, fact: { accountId: string | null; opId: string; actorId: string;
+    seq: number; clock: number; context: Record<string, number>;
+    role: "owner" | "editor" | "viewer" | "revoked" | "private"; kind: "deleted" | "restored" }) => void | Promise<void>;
+  /**
+   * The account list order moved: a *settling* reorder, not a drag preview.
+   * `account` is the account-order scope the preference was written to (the
+   * hashed Google account), or null while this device keeps a local-only list.
+   * `updatedAt` is the preference document's own clock (epoch ms), so the
+   * record and the durable Drive copy carry the same clock and a receiver that
+   * stores the record's clock writes the same document the sender has.
+   *
+   * The operation-protocol composition root turns this into one `board.order`
+   * record on the account room; nothing else in the product may react to it,
+   * and neither `applyProjectOrder` nor `applyRealtimeProjectOrder` fires it —
+   * an order received from a peer must never be published again, or the
+   * realtime path would echo indefinitely and the Drive poll would become the
+   * realtime carrier by round trip.
+   */
+  projectOrderChanged?: (order: { account: string | null; ids: string[]; updatedAt: number }) => void | Promise<void>;
 };
 
 export const EMPTY_STATE: AppState = {

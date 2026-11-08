@@ -1,3 +1,19 @@
+> **State at 6 November 2026.** This is the approved sequence, not a status page, and
+> the job order below is unchanged. What each job became in the shipped code, and
+> what is still missing, is recorded in
+> [../REFACTOR_STATE.md](../REFACTOR_STATE.md) and in the gap list at
+> [architecture/websocket-operation-log.md](architecture/websocket-operation-log.md#known-gaps-at-this-revision).
+> The short version, because it changes how several jobs read: the live transport is
+> the multiplexed operation log over one authenticated WebSocket per browser context
+> (job 7's "WebRTC with the same reconciliation behaviour" is Android-only now), the
+> relay that carries it stores sealed operations and never a board content key, and
+> cross-account discovery still runs on Drive polling because the account inbox has
+> no client. Job 11's mode/status surface and job 12's full platform matrix remain
+> incomplete, and no authoritative peer election was built anywhere in the tree —
+> that requirement turned out not to need one. Sections that assume peer election
+> describe a design that was not built; sections that assume a hosted authority
+> describe one that exists only as the relay, whose grants live in its memory.
+
 The work should proceed in this order. Each job should have its own review and passing tests before we start the next. Existing defaults and synchronization paths should remain available until their replacements pass validation.
 
 1. Define the synchronization and authorization rules

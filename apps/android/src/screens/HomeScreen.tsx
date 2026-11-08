@@ -9,12 +9,17 @@ type Props = {
   onCreate: () => void;
   showPreviews?: boolean;
   onNotice: (message: string) => void;
+  cloud?: { connected: boolean; error: string; lastSynced: string } | null;
 };
-export function HomeScreen({ boards, onOpen, onSettings, onNotice, onCreate, showPreviews = true }: Props) {
+export function HomeScreen({ boards, onOpen, onSettings, onCreate, showPreviews = true, onNotice, cloud }: Props) {
+  const driveNotice = !cloud?.connected
+    ? 'Google Drive is not connected. Open Settings to connect it.'
+    : cloud.error ? `Google Drive: ${cloud.error}`
+      : `Google Drive connected. Boards and photos sync while the app is open.${cloud.lastSynced ? ` Last synced: ${cloud.lastSynced}.` : ''}`;
   return <>
     <header className="toolbar">
       <h1>pboard</h1>
-      <button className="icon-button" aria-label="Google Drive integration" onClick={() => onNotice('Google Drive integration is not yet configured.')}><Icon name="cloud" /></button>
+      <button className="icon-button" aria-label="Google Drive integration" onClick={() => onNotice(driveNotice)}><Icon name="cloud" /></button>
       <button className="icon-button" aria-label="Settings" onClick={onSettings}><Icon name="settings" /></button>
     </header>
     <main className="home-content" aria-label="Boards">

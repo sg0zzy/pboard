@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
 import { createRxRepository, type RxRepository } from "../src/storage/rxdbRepository";
 import { createIndexedDbBlobStore } from "../src/storage/blobStore";
-import { compareOrdered, initialOrderKeys, orderKeyBetween } from "../src/storage/orderKey";
+import { compareOrdered, initialOrderKeys, orderKeyBetween, safeOrderKeyBetween } from "../src/storage/orderKey";
 import { createBackendProjectSnapshotStore, deserializeProjectSnapshot, serializeProjectSnapshot } from "../src/sync/snapshot";
 import { createRepository, STORAGE_KEY, type KeyValueStorage } from "../src/storage/repository";
 import type { AppState } from "../src/types";
@@ -35,6 +35,18 @@ describe("fractional order keys", () => {
 
   it("uses card ID as deterministic tie breaker", () => {
     expect([{ id: "b", orderKey: "a0" }, { id: "a", orderKey: "a0" }].sort(compareOrdered).map((card) => card.id)).toEqual(["a", "b"]);
+  });
+
+  it("answers degenerate slots with null instead of a comparator failure", () => {
+    // Two devices minting the same midpoint concurrently (or a stale view)
+    // leave equal or inverted neighbours; the reorder path must be able to
+    // ask "does a rank fit here?" without fractional-indexing throwing
+    // `Error: "a >= b"` mid-drag.
+    expect(safeOrderKeyBetween("a0", "a1")).toEqual(expect.stringMatching(/^a/));
+    expect(safeOrderKeyBetween("a0", "a0")).toBeNull();
+    expect(safeOrderKeyBetween("a1", "a0")).toBeNull();
+    expect(safeOrderKeyBetween(null, "a0")! < "a0").toBe(true);
+    expect(safeOrderKeyBetween("a0", null)! > "a0").toBe(true);
   });
 });
 

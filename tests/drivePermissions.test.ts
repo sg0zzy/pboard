@@ -268,6 +268,67 @@ describe("createDrivePermissionService", () => {
     expect(fake.state.folders.size).toBe(folderCount);
   });
 
+  it("adopts the presence folder another browser created instead of adding a second one", async () => {
+    // Presence is only found by browsers looking in the same folder. The folder
+    // used to be resolved by a Drive name search whose index can lag by minutes,
+    // so a browser joining a board set up minutes earlier could miss the folder
+    // that existed, create its own, cache that id forever — and then hold a room
+    // nobody else could ever see while the board still synced through Drive.
+    const fake = makeFakeTransport();
+    const readSnapshot = async (projectId: string) => JSON.stringify({ projectId });
+    const first = createDrivePermissionService({ transport: fake.transport, sharedProjects: makeFakeStore(), readSnapshot });
+    const folderId = await first.ensureSharedProject("proj1");
+    const existing = [...fake.state.folders.values()].filter((entry) => entry.name === "realtime" && entry.parents.includes(folderId));
+    expect(existing).toHaveLength(1);
+
+    // A second browser of the same account: same Drive, nothing in its local
+    // cache, resolving against the operations folder both agree on.
+    const second = createDrivePermissionService({ transport: fake.transport, sharedProjects: makeFakeStore(), readSnapshot });
+    expect(await second.realtimeFolderId("proj1", folderId)).toBe(existing[0]!.id);
+    expect([...fake.state.folders.values()].filter((entry) => entry.name === "realtime" && entry.parents.includes(folderId))).toHaveLength(1);
+  });
+
+  it("keeps the room's existing presence folder when Drive refuses the convergence listing", async () => {
+    // Convergence runs while the realtime session joins, and a session whose join
+    // rejects closes with no peer and no retry — so a refused listing (the quota
+    // ledger deferring, a 500) must degrade to the folder already in hand rather
+    // than take the room down.
+    const fake = makeFakeTransport();
+    const store = makeFakeStore();
+    const service = createDrivePermissionService({ transport: fake.transport, sharedProjects: store, readSnapshot: async (projectId) => JSON.stringify({ projectId }) });
+    await fake.transport.createFolder("Pboard", "").catch(() => undefined);
+    const board = await fake.transport.createFolder("proj1", "unused");
+    const existing = await fake.transport.createFolder("realtime", board.id);
+    await store.set("proj1", { folderId: board.id, projectFileId: "project", realtimeFolderId: existing.id });
+
+    const listFiles = fake.transport.listFiles;
+    fake.transport.listFiles = async () => { throw new Error("Google Drive request failed (403): rateLimitExceeded"); };
+    expect(await service.realtimeFolderId("proj1", board.id)).toBe(existing.id);
+    // The refusal is not remembered as an answer: a lower-id folder that appears
+    // afterwards is adopted on the next resolution, which only happens because the
+    // listing was tried again.
+    fake.state.folders.set("a0-later", { id: "a0-later", name: "realtime", parents: [board.id] });
+    fake.transport.listFiles = listFiles;
+    expect(await service.realtimeFolderId("proj1", board.id)).toBe("a0-later");
+  });
+
+  it("moves a browser off a duplicate presence folder onto the one every listing sees", async () => {
+    // The aftermath of that bug: two `realtime` folders under one board, each
+    // browser keeping its own id. Preferring the browser's own cached id is what
+    // kept the rooms apart, so the listing wins and the cache follows it.
+    const { service, fake, store } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    const canonical = [...fake.state.folders.values()].find((entry) => entry.name === "realtime" && entry.parents.includes(folderId))!;
+    const duplicate = await fake.transport.createFolder("realtime", folderId);
+    await store.set("proj1", { realtimeFolderId: duplicate.id });
+
+    expect(await service.realtimeFolderId("proj1", folderId)).toBe(canonical.id);
+    expect(store.records.get("proj1")!.realtimeFolderId).toBe(canonical.id);
+    // Converged once per board per session: the answer is now cached, not re-listed.
+    const listings = await service.realtimeFolderId("proj1", folderId);
+    expect(listings).toBe(canonical.id);
+  });
+
   it("reads and writes the shared snapshot", async () => {
     const { service } = makeService();
     await service.ensureSharedProject("proj1");

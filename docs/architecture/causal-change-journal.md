@@ -3,14 +3,117 @@
 Jobs 3 and 4, 19 October 2026. This implements the local history and reconciliation
 foundation of the approved [synchronization contract](synchronization-contract.md).
 [Job 6](private-drive-history.md) now persists and reconciles private Drive history;
-[Job 7](peer-causal-history.md) now exchanges authenticated peer history. [Job 5](conflict-resolution.md) now adds local conflict UI, durable drafts
+[Job 5](conflict-resolution.md) now adds local conflict UI, durable drafts
 and authorized authored resolutions.
+
+> **State at 6 November 2026.** The journal, its stores and the reconciliation rules
+> below are current and still the merge model the operation engine implements. Two
+> links in the introduction are historical: [Job 7](peer-causal-history.md) exchanged
+> authenticated history over WebRTC, which the extension no longer runs
+> (`src/sync/browser.ts:17`; Android does), and the real-time path is now the
+> multiplexed operation log ([websocket-operation-log.md](websocket-operation-log.md)).
+> The journal database is at **schema 11** (`src/storage/changeJournal.ts`, the
+> in-place `onupgradeneeded` that adds each store only when absent), not the
+> schema-2 or schema-3 states described in the job sequence; it now also carries the
+> operation WAL stores
+> (`operations`, `operationStreams`, `operationOutbox`, `operationSegments`,
+> `operationCheckpoints`), `publicGrants`, `boardFlags`, `authorityTransitions`,
+> `permissions`, `pendingEdits`, `admissions` and the v11 `boardTombstones` store.
+
+## Board-deletion tombstones (`boardTombstones`, schema 11)
+
+A deletion used to exist only as `deletedProjectIds` inside the account-scoped
+preference document. That field is mutable: a preference merge, a `board.order`
+record (which carries only ids), a Drive pull or a session that never saw the delete
+can drop it, after which discovery or import re-creates the board as an ordinary new
+import. The tombstone is the durable record that closes that hole
+(`src/storage/boardTombstone.ts`).
+
+**Record.** One IndexedDB row per board id (`boardTombstones`, `keyPath: "boardId"`)
+holding an append-only list of facts. A fact is
+`{ kind: "deleted" | "restored", accountId, opId, actorId, seq, clock, context,
+deviceId, role, at, evidence }`. `opId` is `actorId:seq`, allocated inside the same
+strict transaction as the row, so it is globally unique and replaying a fact is
+idempotent. `context` is the operation vector the writer had observed. `at` is
+informational only — the re-share check reads it; ordering never does.
+`accountId` scopes facts to one account list, exactly like the preference document:
+a collaborator's leave must not hide the owner's copy on a device holding both.
+
+**Ordering two tombstones.** Causal dominance first: fact *b* is later than fact *a*
+when `b.context[a.actorId] >= a.seq`. Concurrent facts (neither dominates) are
+ordered by `clock` (a Lamport clock, `1 + max(observed clock, prior fact clocks)`),
+then `actorId`, then `seq` — a total, antisymmetric order every receiver computes
+from the same bytes, so no two devices pick different winners.
+
+**Ordering a tombstone against a creation.** A creation or any copy of the board is
+admissible only when its context dominates the latest tombstone fact. Every copy in
+this build — a Drive snapshot, a legacy `AppState` row, a `board.created` record, a
+replayed segment — carries no context (`{}`), and an absent context dominates
+nothing, so every such copy is ordered *before* the tombstone and refused. No wall
+clock is consulted: an old creation with a future timestamp still loses. The only
+supported resurrection is an explicit `restored` fact, written by `unhideProject`,
+which folds the prior facts into its context and therefore dominates the deletion it
+reverses.
+
+**Write ordering.** `deleteProject` writes the tombstone before any destructive work
+(`eraseProjectDocument`, the card tombstones, the list-hide projection, publication),
+so a crash between the two leaves the decision and an untouched board rather than the
+reverse. A handled erase failure writes a `restored` fact: the rollback is itself a
+decision, and the history shows both.
+
+**Consulted by.** `isDeletedProject` (plus the legacy preference fallback for a
+marker this build has not adopted yet), `allProjectRecords`/`hiddenBoardIds`,
+`importProjectData` (and therefore shared discovery, Drive listing adoption,
+snapshot/segment recovery, `importState` and every collaboration copy),
+`privateRecovery.apply`, `projectOperations`, `applyProjectOrder`,
+`applyRealtimeProjectOrder`, and `withTombstoneProjection`, which keeps the legacy
+`deletedProjectIds` field consistent with the facts on every preference write.
+
+**Migration.** `migrateLegacyDeletions` adopts a `deletedProjectIds` entry only when
+the preference document carries the field and names the board; a
+`restoreEvents` timestamp at or after the preference's `updatedAt` cancels it. A
+board absent from every preference with no fact is **unknown** — reported in
+`legacyDeletionDiagnostic()` and left listed. Nothing in migration touches Drive.
+
+**Retention.** No compaction or GC. Facts are retained indefinitely until a safe
+rule is proven (for example a provable "every device that ever held this board is
+gone"); snapshot/log gardening only trashes Drive objects and never reads or writes
+this store, and its stated policy says so.
+
+**The Drive half (`cleanup`, same v11 row).** A deletion is two steps: the fact
+(the decision) and moving the board's Drive folder to Trash (Drive's half). The
+second step is device-local — one device acting on one Drive account — so it is
+stored on the same row as `cleanup`, beside the facts and never among them: it
+never participates in the causal ordering, and `restored` clears it. The stage
+moves `pending → trashed` (terminal) or `pending → failed → …`, and a failed
+record keeps the reason and a bounded retry ladder (30 s doubling to one hour,
+`src/storage/boardCleanup.ts`). `recordBoardDeletion` writes no cleanup;
+`beginBoardCleanup` mints it after the fact resolves and only on the path that
+destroys a board's content, so a collaborator's leave and a migration adoption
+(which touches no Drive) owe nothing. `deleteProject` calls it before the erase,
+so a crash anywhere leaves the intent durable.
+
+The executor (`src/sync/boardCleanup.ts`) addresses the folder by a verified id:
+one kept from a previous attempt, otherwise `boardFolderCandidates` (a create-free
+listing, never `boardFolder`/`existingBoardFolder`). Before writing it re-reads
+that id and refuses unless the folder is named after the board, is a child of this
+account's `/pboard` root, and Drive reports this account as its owner; a board
+that is not tombstoned is refused first. It moves the folder to **Trash** (never
+permanently), then confirms by re-reading `trashed`, and treats an id Drive no
+longer serves as confirmed rather than failed. **Resumption seam:** the reconcile
+round runs `runPendingBoardCleanups` before any discovery work — never startup,
+never a board open — which is the one cadence that finishes a cleanup left behind
+by a closed browser. The pending question reads the same one-row-per-deleted-board
+store the tombstone cache already reads, so it is bounded by how many boards this
+device deleted rather than by how many boards exist. The result surfaces beside the
+board's sync status (`BoardDeletionStatus`), with `pending` and `failed`+reason
+stated and `trashed` silent.
 
 ## Durable writes (Job 3)
 
 Every repository instance opens `<RxDB database name>-change-journal-v1`, a local
 IndexedDB database with `entries` and `receipts` stores (Job 5 adds `drafts` through
-an additive schema-2 upgrade). Native IndexedDB avoids
+an additive upgrade). Native IndexedDB avoids
 loading a second, incompatible Dexie runtime alongside RxDB's adapter. No new
 dependency, RxDB collection/schema, board ID or snapshot format is introduced.
 The journal is recovery metadata/history; live RxDB documents remain authoritative.

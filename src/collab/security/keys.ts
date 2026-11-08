@@ -32,8 +32,23 @@ export type StoredDeviceKey = {
 
 const ALGORITHM = { name: "ECDSA", namedCurve: "P-256" } as const;
 const SIGN_ALGORITHM = { name: "ECDSA", hash: "SHA-256" } as const;
+const WRAP_ALGORITHM = { name: "ECDH", namedCurve: "P-256" } as const;
 const DATABASE_NAME = "pboard-security-keys";
 const STORE_NAME = "device-keys";
+
+/**
+ * ECDH P-256 wrap identity for the key courier (Sync v3). A separate pair
+ * from the signing identity above — a signing key must never feed a key
+ * derivation — but the same device, the same store and the same slot rules,
+ * so device identity stays this module's single answer. The persisted shape
+ * is structurally identical to `StoredDeviceKey` because a P-256 JWK has the
+ * same fields whatever algorithm it serves; the slot id is what distinguishes
+ * them. Older devices simply have no wrap slot and keep working — they cannot
+ * receive courier grants until one is published — which is why creation is
+ * lazy and never happens on the signing path.
+ */
+export type StoredWrapKey = StoredDeviceKey;
+const WRAP_SLOT = "wrap:device";
 
 function textBytes(text: string): Uint8Array {
   return new TextEncoder().encode(text);
@@ -81,6 +96,32 @@ export async function importSigningKey(privateJwk: JsonWebKey): Promise<CryptoKe
 
 export async function importVerifyingKey(publicJwk: DevicePublicKey): Promise<CryptoKey> {
   return crypto.subtle.importKey("jwk", { ...publicJwk, key_ops: ["verify"] }, ALGORITHM, false, ["verify"]);
+}
+
+/**
+ * Generates the device's ECDH wrap pair. The private scalar is exported once,
+ * at generation, exactly like `generateDeviceKey`; use is always through
+ * `importWrapKey`, which imports it non-extractable.
+ */
+export async function generateWrapKey(): Promise<StoredWrapKey> {
+  const pair = await crypto.subtle.generateKey(WRAP_ALGORITHM, true, ["deriveBits"]);
+  const exported = await crypto.subtle.exportKey("jwk", pair.privateKey) as JsonWebKey & { kty: "EC"; crv: "P-256" };
+  const publicExported = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const publicJwk: DevicePublicKey = {
+    kty: "EC", crv: "P-256",
+    x: String(publicExported.x), y: String(publicExported.y)
+  };
+  return {
+    keyId: await publicKeyFingerprint(publicJwk),
+    privateJwk: exported,
+    publicJwk,
+    createdAt: Date.now()
+  };
+}
+
+/** Imports the stored wrap key for one derivation; non-extractable at use, as the signing import is. */
+export async function importWrapKey(privateJwk: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey("jwk", { ...privateJwk, key_ops: ["deriveBits"] }, WRAP_ALGORITHM, false, ["deriveBits"]);
 }
 
 /** Signs bytes; returns base64url of the raw 64-byte r||s signature. */
@@ -240,4 +281,28 @@ export async function saveRecoveredPurposeKey(purpose: string, key: StoredDevice
     transaction.oncomplete = () => { database.close(); resolve(); };
     transaction.onerror = transaction.onabort = () => { database.close(); reject(new Error('Recovered authority could not be stored without replacing existing keys')); };
   });
+}
+
+/** Reads the device wrap key without creating one; a device may simply not have it yet. */
+export async function loadWrapKey(): Promise<StoredWrapKey | null> {
+  return (await idbGet(WRAP_SLOT)) ?? lsGet(WRAP_SLOT);
+}
+
+/**
+ * Returns this device's courier wrap key, creating and persisting it on first
+ * use. One pair for the whole device (boards address the device, not the
+ * board), and the same cross-tab lock the purpose slots use, so two windows
+ * cannot race two pairs into the slot — the first one stored wins.
+ */
+export async function ensureWrapKey(): Promise<StoredWrapKey> {
+  const obtain = async () => {
+    const existing = await loadWrapKey();
+    if (existing) return existing;
+    const created = await generateWrapKey();
+    if (indexedDbLike) await idbPut(WRAP_SLOT, created); else lsPut(WRAP_SLOT, created);
+    return created;
+  };
+  return globalThis.navigator?.locks
+    ? navigator.locks.request(`pboard-key:${WRAP_SLOT}`, obtain)
+    : obtain();
 }

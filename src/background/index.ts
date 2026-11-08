@@ -2,6 +2,8 @@ import type { CaptureSelectionResponse } from "../messaging/messages";
 import { isCaptureRegionMessage, isToolbarPinMessage } from "../messaging/messages";
 import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
+import { exposeDriveQuotaDiagnostics } from "../sync/driveQuota";
+import { exposeCollaborationDiagnostics, roomSnapshots } from "../sync/realtimeDiagnostics";
 import type { BoardImage } from "../types";
 import { PINNED_CARD_FOCUS_KEY } from "../types";
 import { pinImage, pinSelection, pinWebResource } from "./handlers";
@@ -41,6 +43,17 @@ registerDriveAccountPolling();
 if (collaborationCounters.enabled) {
   globalThis.pboardCounters = collaborationCounters;
 }
+// The Drive quota ledger is collected in every build, so a rate limit can be
+// watched here (`pboardDriveQuota()`) and not only when a denial prints itself.
+exposeDriveQuotaDiagnostics();
+// Rooms live in the context that opened the board, which is normally the sidebar;
+// this answers from here too, so the same command works in either console and
+// says which one it answered from instead of failing as an unknown name.
+exposeCollaborationDiagnostics("background", () => ({
+  rooms: roomSnapshots(),
+  connectedPeers: [],
+  note: "no realtime room in this context; run pboardCollaboration() in the sidebar console",
+}));
 
 if (browser.sidePanel?.setPanelBehavior) {
   void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -240,3 +253,20 @@ function setPinnedCardFocus(cardId: string | undefined) {
   if (!cardId) return;
   void browser.storage.local.set({ [PINNED_CARD_FOCUS_KEY]: cardId });
 }
+
+// Worker lifecycle keep-alive. Firefox terminates an idle MV3 background
+// worker well under a minute, and this worker owns the collaboration sockets:
+// when it dies, the relay lane dies with it (every socket closes at once) and
+// profile B's edits reach profile A only when some event wakes A again. An
+// open runtime port is the documented way to declare "a UI of mine is alive",
+// and the sidebar window is that UI — so while any pboard sidebar lives, the
+// worker, its account channel and its operation-log session must live too.
+// No UI connected means no port means termination is correct: an unfocused
+// app keeps no lane open.
+type KeepAlivePort = { name?: string; onDisconnect: { addListener: (callback: () => void) => void } };
+const workerKeepAlives = new Set<KeepAlivePort>();
+browser.runtime.onConnect.addListener((port: KeepAlivePort) => {
+  if (port.name !== "pboard-worker-keepalive") return;
+  workerKeepAlives.add(port);
+  port.onDisconnect.addListener(() => { workerKeepAlives.delete(port); });
+});

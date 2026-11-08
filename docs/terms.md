@@ -6,7 +6,7 @@ permalink: /terms/
 
 # Pboard Terms of Service
 
-Last updated 12 October 2026
+Last updated 6 November 2026
 
 Publisher: Stefano Gozzi
 
@@ -40,11 +40,13 @@ Google, GitHub, browser vendors, extension stores, and other services used with 
 
 Integration availability depends on third-party APIs, permissions, quotas, network conditions, and browser support. Changes or outages in those services can interrupt backup, discovery, or live collaboration. The publisher does not guarantee their continued availability.
 
+The collaboration relay is a service the publisher operates for the project. It relays sealed operations and does not hold your board content in readable form; it is not a storage or backup service for your boards, and no uptime, retention or recovery commitment attaches to it. If it is unavailable, boards continue to synchronize through Google Drive, more slowly. The publisher may change or withdraw it; the software remains usable locally and through Drive.
+
 ## Sharing and collaboration
 
-Sharing a board allows recipients to access its content and images according to the permissions you grant. Owners manage board membership; editors can change board content, and viewers have read-only controls in the standard Pboard client. Live collaboration uses peer connections and Drive signaling.
+Sharing a board allows recipients to access its content and images according to the permissions you grant. Owners manage board membership; editors can change board content, and viewers have read-only controls in the standard Pboard client. Live collaboration in the browser extension runs over an authenticated WebSocket to a relay operated for the project; the Android app can also use direct peer connections. Boards that are not set up for live collaboration synchronize through Google Drive.
 
-Drive permissions control access to Drive files. The current WebRTC implementation does not independently authenticate each remote peer or provide signed authorization for every incoming change. Use collaboration with people and devices you trust, considering the sensitivity of your content.
+Drive permissions control access to Drive files. Live access is additionally authorized by signed board manifests: the relay admits a room only on a current manifest for that device, and operations are sealed with the board's content key before they leave a device, so the relay stores ciphertext it cannot read. Boards with no pinned authority, and the direct peer path where the Android app uses it, do not have that device-level authentication for every incoming change. Use collaboration with people and devices you trust, considering the sensitivity of your content.
 
 Removing access does not erase copies already downloaded, exported, or saved by recipients, and may not immediately terminate an existing peer connection. Removing another person's shared board from your account list does not delete that person's board. Disconnecting Drive or uninstalling Pboard does not delete existing Drive backups or shared files.
 

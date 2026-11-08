@@ -9,6 +9,7 @@
 import 'fake-indexeddb/auto';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createBoardGrantService } from '../../src/collab/boardGrants';
+import { instantAuthBudget } from '../helpers/authBudget';
 import { generateDeviceKey, type StoredDeviceKey } from '../../src/collab/security/keys';
 import { openDevice, DriveFixture } from './harness';
 
@@ -27,7 +28,7 @@ function setup() {
     const values: Record<string, unknown> = {}, keys = new Map<string, StoredDeviceKey>();
     const storage = { get: async (id: string) => ({ [id]: structuredClone(values[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(values, structuredClone(patch)); } };
     const getKey = async (purpose: string) => { if (!keys.has(purpose)) keys.set(purpose, await generateDeviceKey()); return keys.get(purpose)!; };
-    const make = () => createBoardGrantService({ storage, fetcher, getKey, peekKey: async purpose => keys.get(purpose) ?? null });
+    const make = () => createBoardGrantService({ storage, fetcher, getKey, authBudget: instantAuthBudget(), peekKey: async purpose => keys.get(purpose) ?? null });
     return {
       service: make(), make, keys, values,
       async enable() { await this.service.configure({ provider: 'websocket', url: 'wss://relay.example.test/ws' }); },

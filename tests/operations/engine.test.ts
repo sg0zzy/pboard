@@ -123,8 +123,13 @@ describe('transport-independent operation engine', () => {
     expect(new Set(canonical).size).toBe(1);
   });
   it('rejects unknown versions, malformed payloads and invalid identities or dependencies', () => {
+    // An unknown field name in a known collection is no longer in this list:
+    // structurally valid vocabulary the build does not know is skipped, not
+    // rejected (see the unknown-vocabulary suite); every case here stays
+    // structurally invalid — bad version, forged identity, foreign board,
+    // broken dependencies, fractional sequence.
     for (const op of [{ ...creation, schemaVersion: 2 }, { ...creation, actorId: '__proto__' }, { ...creation, boardId: 'other' },
-      { ...creation, fields: { framework: 'unexpected' } }, { ...creation, deps: {} }, { ...creation, seq: 1.5 }])
+      { ...creation, deps: {} }, { ...creation, seq: 1.5 }])
       expect(() => validateOperation(op as Operation, 'board')).toThrow();
   });
 });
@@ -170,6 +175,33 @@ describe('immutable operation snapshots and conservative retention', () => {
   });
 });
 
+it('keeps a contest-retired edit timestamp as provenance through checkpoint, join and restore', async () => {
+  // The concurrent contest the projection guard must never mistake for an
+  // unshown local change: equal logical clocks, the actor-id tie-break retires
+  // the later wall clock from the register while its provenance stays known.
+  const e = await engine();
+  const retired = operation('aaa', 1, patch({ title: 'mine', updatedAt: '2026-06-01T00:00:00.000Z' }), { base: 2 }, 3);
+  const winner = operation('zzz', 1, patch({ content: 'theirs', updatedAt: '2026-05-01T00:00:00.000Z' }), { base: 2 }, 3);
+  await e.receive([retired, winner]);
+  expect(e.entity('cards', 'card')).toMatchObject({ title: 'mine', content: 'theirs', updatedAt: '2026-05-01T00:00:00.000Z' });
+  expect(e.seenUpdatedAt('cards', 'card')).toBe('2026-06-01T00:00:00.000Z');
+  expect(OperationEngine.restore(e.checkpoint()).seenUpdatedAt('cards', 'card')).toBe('2026-06-01T00:00:00.000Z');
+  // Provenance one branch has is provenance the join has.
+  const other = await engine();
+  await other.receive([operation('mmm', 1, patch({ content: 'newer', updatedAt: '2026-07-01T00:00:00.000Z' }), { base: 2 }, 4)]);
+  expect(OperationEngine.join([e.checkpoint(), other.checkpoint()]).seenUpdatedAt('cards', 'card')).toBe('2026-07-01T00:00:00.000Z');
+  // The accessor never reads below what the checkpoint itself materializes, so
+  // a tracker cannot be lowered past its own register by hand.
+  const stripped = structuredClone(e.checkpoint());
+  Object.assign(stripped.entities.find(entity => entity.id === 'card') ?? {}, { seenUpdatedAt: undefined });
+  expect(OperationEngine.restore(stripped).seenUpdatedAt('cards', 'card')).toBe('2026-05-01T00:00:00.000Z');
+  // And restore refuses a tracker that is not a timestamp string. A forged one
+  // that *is* a string could only weaken the projection guard, never pin a row:
+  // the guard skips solely when the stored document is newer than it.
+  const forged = structuredClone(e.checkpoint());
+  Object.assign(forged.entities.find(entity => entity.id === 'card') ?? {}, { seenUpdatedAt: 5 });
+  expect(() => OperationEngine.restore(forged)).toThrow(/Invalid checkpoint entity/);
+});
 it('uses the same locale-independent tie order in RxDB and the canonical engine', async () => {
   const { compareOrdered } = await import('../../src/storage/orderKey');
   const e = new OperationEngine('board');

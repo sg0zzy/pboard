@@ -1,13 +1,23 @@
 import { createDriveRuntime } from '../../../../src/sync/runtime';
 import { createProjectDeletionRoleResolver } from '../../../../src/sync/projectDeletion';
+import { setWebRtcDisabled } from '../../../../src/collab/liveTransport';
 import { createAndroidGoogleAuth } from './auth';
 import { createSyncStorage } from './storage';
 import type { RepositoryEvents } from '../../../../src/storage/repository';
 import type { RxRepository } from '../storage/repository';
 import { dirtyFlushAt, drivePollDelay } from '../../../../src/sync/syncPolicy';
 
+// Same posture as the extension's composition root (src/sync/browser.ts): in
+// the operation-protocol build the board's live channel is the operation log,
+// and only the websocket posture resolves the relay rendezvous that the
+// account channel needs. Without it Android never announces its boards on the
+// account room, and other devices discover them only by Drive listing.
+setWebRtcDisabled(true);
+
 export function createAndroidSync(getRepository: () => Promise<RxRepository>, auth = createAndroidGoogleAuth(createSyncStorage()), storage = createSyncStorage()) {
   const runtime = createDriveRuntime({ auth, storage, getRepository });
+  // Account-channel status changes repaint the stated cause in CloudSettings.
+  runtime.accountChannel?.subscribe?.(() => emit({}));
   let timer: ReturnType<typeof setTimeout> | undefined;
   let foreground = false;
   let selected: string | null = null;
@@ -157,6 +167,11 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       await runtime.driveSyncState.markDirty(projectId);
       await restartLive();
       await scheduleBoard(projectId);
+    },
+    accountStatus() {
+      // Stated-cause diagnostics: the account channel reports exactly why it is
+      // not dialing (absent-pin plus its authority report) instead of silence.
+      return runtime.accountChannel?.status?.() ?? { state: 'disabled' as const };
     },
     async dispose() { disposed = true; ++generation; foreground = false; clearTimeout(timer); clearFlushTimers(); await running; await restartLive(); listeners.clear(); },
   };

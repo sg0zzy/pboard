@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ImmutableDriveFake } from './driveFake';
 import { canonical, digest, type Segment } from '../../src/sync/operations/protocol';
+import { clearDriveResourceGoneMemory, isDriveGone } from '../../src/sync/driveHttp';
 const op = { schemaVersion: 1 as const, boardId: 'board', actorId: 'actor', seq: 1, opId: 'actor:1', clock: 1, deps: {}, collection: 'projects' as const, entityId: 'board', kind: 'create' as const,
   fields: { name: 'Board', template: 'project', createdAt: '2026-01-01', updatedAt: '2026-01-01' }, unset: [] };
 const segment: Segment = { protocol: 'pboard-operations-v1', boardId: 'board', segmentId: 'segment', operations: [op] };
@@ -30,6 +31,40 @@ describe('regular Drive immutable operation storage', () => {
   it('checks actual parent membership and size before reading a same-named file', async () => {
     const fake = new ImmutableDriveFake(), store = fake.store(), id = await store.allocateId(); await store.publishSegment(id, segment);
     fake.files.get(id)!.parents = ['elsewhere']; await expect(store.readSegment(id)).rejects.toThrow(/location/);
+  });
+  it('adopts a board whose legacy copies were deleted or belong to another account', async () => {
+    // A second device opening boards the first one migrated meets legacy files it
+    // did not create — some of them deleted since. Neither may stop the board
+    // opening: a deleted file cannot be written by anybody, and a file owned by
+    // another account can only be locked by that owner.
+    const fake = new ImmutableDriveFake(), store = fake.store();
+    const seed = (id: string, ownedByMe: boolean) => fake.files.set(id, { id, name: 'project.json', parents: ['folder'], body: '{}', createdTime: '2026-01-01T00:00:00.000Z', ownedByMe });
+
+    await store.protectLegacy('adopt-deleted'); // never readable: metadata 404
+    await store.protectLegacy('adopt-deleted');
+    expect(fake.requests.filter(request => request.url.includes('adopt-deleted'))).toHaveLength(1);
+
+    seed('adopt-theirs', false);
+    fake.refusePatch = true;
+    await store.protectLegacy('adopt-theirs');
+    expect(fake.files.get('adopt-theirs')!.contentRestrictions).toBeUndefined();
+
+    // A file this account owns and Drive still refuses to restrict is a real
+    // failure, and says so instead of failing as a storage error.
+    seed('adopt-mine', true);
+    await expect(store.protectLegacy('adopt-mine')).rejects.toThrow(/owns the file/);
+  });
+  it('reports a file Drive deleted as gone, separately from every other failure', async () => {
+    // A peer's presence file is deleted the moment its session leaves, so a
+    // read of it races the deletion; the caller has to be able to tell "gone"
+    // (the peer is no longer there) from a storage failure (retry, report).
+    const fake = new ImmutableDriveFake(), store = fake.store(), id = await store.allocateId();
+    clearDriveResourceGoneMemory();
+    await store.publishSegment(id, segment);
+    fake.files.delete(id);
+    await expect(store.metadata(id)).rejects.toSatisfy(isDriveGone);
+    fake.role = 'revoked';
+    await expect(store.inventory()).rejects.not.toSatisfy(isDriveGone);
   });
   it('revalidates permissions on each action and prevents writes after revocation', async () => {
     const fake = new ImmutableDriveFake(), store = fake.store(), id = await store.allocateId();

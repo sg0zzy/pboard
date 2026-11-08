@@ -80,9 +80,14 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
       const result = await requestProjectSync(projectId);
       // An explicit sync is the moment the user expects everything Drive has:
       // reconcile now, so boards other accounts shared surface immediately
-      // instead of on the sidebar's next discovery tick. Fire-and-forget;
-      // the reactive project list picks up any import.
-      void requestDriveReconciliation();
+      // instead of on the sidebar's next discovery tick. The reactive project
+      // list picks up any import; when the round answers, its relay leg for
+      // THIS board is reported too — the person just asked "is everything I
+      // have on the relay?", and `reconciled` alone never answered that.
+      void Promise.resolve(requestDriveReconciliation()).then((reply) => {
+        const outcome = reply?.result?.relay?.[projectId];
+        if (selectedProject.current === projectId && outcome) setSyncFeedback(`Relay: ${outcome}`);
+      });
       if (selectedProject.current !== projectId) return;
       if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
       else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Sync OK');

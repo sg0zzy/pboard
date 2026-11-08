@@ -1,8 +1,10 @@
 import 'fake-indexeddb/auto';
 import { describe, expect, it, vi } from "vitest";
 import {
+  DRIVE_CONTEXT_COST_BUDGET,
   DRIVE_COST_WINDOW_MS,
   DRIVE_DEFAULT_COST_PER_MINUTE,
+  DRIVE_MIN_COST_PER_MINUTE,
   DRIVE_UNIT_DOWNLOAD,
   DRIVE_UNIT_LIST,
   DriveQuotaExceededError,
@@ -10,6 +12,7 @@ import {
   defaultDriveQuotaThrottle,
   driveQuotaError,
   driveRequestCost,
+  driveRequestSignature,
   isDriveQuotaFailure,
   parseQuotaFailure,
   type DriveQuotaEvent,
@@ -328,6 +331,124 @@ describe("never waits on Infinity", () => {
     expect(driveQuotaError(429, "RESOURCE_EXHAUSTED: Too Many Requests", throttle)).not.toBeInstanceOf(DriveQuotaExceededError);
     expect(waits).toEqual([]);
     expect(events.every((event) => Number.isFinite(event.cost) && Number.isFinite(event.waitMs))).toBe(true);
+  });
+});
+
+// 7. Attribution: a denial has to name what spent the window.
+describe("spend attribution", () => {
+  const folder = (id: string) => `https://www.googleapis.com/drive/v3/files?q=%27${id}%27+in+parents+and+trashed+%3D+false&fields=nextPageToken,files(id,name,mimeType,modifiedTime,parents)&pageSize=1000`;
+  const media = "https://www.googleapis.com/drive/v3/files/1111111111111111111111AAAAAAAAAAAAAA?alt=media";
+
+  it("groups a loop's requests by shape and names the largest one in the denial", async () => {
+    const { throttle } = makeThrottle(100_000);
+    // Three polls that list two board folders and download one snapshot.
+    for (let poll = 0; poll < 3; poll++) {
+      for (const id of ["1111111111111111111111AAAAAAAAAAAAAA", "2222222222222222222222BBBBBBBBBBBBBB"]) {
+        const url = folder(id);
+        await throttle.acquire(DRIVE_UNIT_LIST);
+        throttle.observe(DRIVE_UNIT_LIST, null, driveRequestSignature(url, "GET"));
+      }
+    }
+    await throttle.acquire(DRIVE_UNIT_DOWNLOAD);
+    throttle.observe(DRIVE_UNIT_DOWNLOAD, null, driveRequestSignature(media, "GET"));
+
+    const snapshot = throttle.snapshot();
+    // Two folders are one loop, so they must not be reported as two spends: the
+    // folder id is not what a reader needs, the request shape is.
+    expect(snapshot.spend).toHaveLength(2);
+    expect(snapshot.spend[0].units).toBe(6 * DRIVE_UNIT_LIST);
+    expect(snapshot.spend[0].requests).toBe(6);
+    expect(snapshot.spend[0].signature).toContain("in parents");
+    expect(snapshot.spend[1].signature).toBe("GET files/* media");
+    expect(snapshot.spend[1].units).toBe(DRIVE_UNIT_DOWNLOAD);
+
+    const detail = "rateLimitExceeded: PERMISSION_DENIED: Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' for consumer 'project_number:337977813621'.";
+    const message = (driveQuotaError(403, detail, throttle, 0) as DriveQuotaExceededError).message;
+    // The report a user pastes has to be enough to go and find the loop.
+    expect(message).toContain(`largest: ${snapshot.spend[0].signature} ${6 * DRIVE_UNIT_LIST}u/6req`);
+    expect(message).toContain("7 requests in");
+    expect(message).toContain(`assumed account figure ${DRIVE_DEFAULT_COST_PER_MINUTE}`);
+  });
+
+  it("attributes only what it charged, and clears with the window it describes", async () => {
+    const { throttle, advance } = makeThrottle(10_000);
+    await throttle.acquire(DRIVE_UNIT_LIST);
+    throttle.observe(DRIVE_UNIT_LIST, null, "GET files?q=list");
+    // A report with no booked request is not a charge and must not appear as spend.
+    throttle.observe(DRIVE_UNIT_DOWNLOAD, null, "GET files/* media");
+    expect(throttle.snapshot().spend).toEqual([{ signature: "GET files?q=list", units: DRIVE_UNIT_LIST, requests: 1 }]);
+    advance(WINDOW);
+    throttle.reserve(0); // the window rolls on the next accounting touch
+    expect(throttle.snapshot().spend).toEqual([]);
+  });
+
+  it("charges one response once, however many times it is accounted for", async () => {
+    const { throttle } = makeThrottle(10_000);
+    await throttle.acquire(DRIVE_UNIT_LIST);
+    expect(throttle.observe(DRIVE_UNIT_LIST, new Headers({ "X-Drive-Request-Cost": "900" }), "GET files?q=one")).toBe(900);
+    // The same response accounted for a second time — a wrapper that observes an
+    // attempt and its replay as one — must not top the window up again, even when
+    // the two readings disagree: only an `acquire` opens a charge to correct.
+    expect(throttle.observe(DRIVE_UNIT_LIST, new Headers({ "X-Drive-Request-Cost": "1000" }), "GET files?q=one")).toBe(1000);
+    expect(throttle.snapshot().charged).toBe(900);
+    expect(throttle.snapshot().spend).toEqual([{ signature: "GET files?q=one", units: 900, requests: 1 }]);
+  });
+
+  it("corrects each overlapping request against its own booking", async () => {
+    const { throttle } = makeThrottle(10_000);
+    // A roster read overlaps a listing: two bookings are open at once, and each
+    // response reports its own cost.
+    await throttle.acquire(DRIVE_UNIT_LIST);
+    await throttle.acquire(DRIVE_UNIT_DOWNLOAD);
+    expect(throttle.observe(DRIVE_UNIT_LIST, new Headers({ "X-Drive-Request-Cost": "150" }), "GET files?q=list")).toBe(150);
+    expect(throttle.observe(DRIVE_UNIT_DOWNLOAD, new Headers({ "X-Drive-Request-Cost": "250" }), "GET files/* media")).toBe(250);
+    expect(throttle.snapshot().charged).toBe(150 + 250);
+  });
+
+  it("halves what it defers at when Google denies, and earns the budget back a window at a time", async () => {
+    const { throttle, advance } = makeThrottle(100_000);
+    const denial = new DriveQuotaExceededError("quota", { reason: "rateLimitExceeded" }, 31_310, 0);
+
+    // A denial is evidence the assumed figure is not this project's: spend less.
+    throttle.cooldown(denial);
+    expect(throttle.snapshot().limit).toBe(50_000);
+    expect(throttle.snapshot().configuredLimit).toBe(100_000);
+    throttle.cooldown(denial);
+    expect(throttle.snapshot().limit).toBe(25_000);
+    // The deferral threshold follows the ceiling, not the budget it started with.
+    expect(throttle.reserve(30_000).waitMs).toBeGreaterThan(0);
+
+    // Clean windows walk it back: a quarter of the gap (never less than 1,000)
+    // per window, so a smaller real quota trips the backoff again instead of
+    // being overrun.
+    advance(WINDOW);
+    expect(throttle.snapshot().limit).toBeGreaterThan(25_000);
+    for (let window = 0; window < 20 && throttle.snapshot().limit < 100_000; window++) advance(WINDOW);
+    expect(throttle.snapshot().limit).toBe(100_000);
+  });
+
+  it("never backs off below the usable floor however many denials arrive", () => {
+    const { throttle } = makeThrottle(100_000);
+    const denial = new DriveQuotaExceededError("quota", { reason: "rateLimitExceeded" }, 1_000, 0);
+    for (let attempt = 0; attempt < 12; attempt++) throttle.cooldown(denial);
+    expect(throttle.snapshot().limit).toBe(DRIVE_MIN_COST_PER_MINUTE);
+    // A budget smaller than the floor is respected: the ceiling never rises above
+    // what the context was configured with.
+    const tiny = makeThrottle(500).throttle;
+    tiny.cooldown(denial);
+    expect(tiny.snapshot().limit).toBeLessThanOrEqual(500);
+  });
+
+  it("bounds the default ledger to a share of the per-user budget and still reports Google's figure", () => {
+    // Two JS contexts plus every other device act as the same user, so a context
+    // allowed to spend the whole per-user budget guarantees the account is denied.
+    const snapshot = defaultDriveQuotaThrottle().snapshot();
+    // `configuredLimit` is the budget the ledger started with; `limit` is the live
+    // ceiling, which this file's denial tests have already backed off.
+    expect(snapshot.configuredLimit).toBe(DRIVE_CONTEXT_COST_BUDGET);
+    expect(snapshot.limit).toBeLessThanOrEqual(snapshot.configuredLimit);
+    expect(snapshot.accountLimit).toBe(DRIVE_DEFAULT_COST_PER_MINUTE);
+    expect(DRIVE_CONTEXT_COST_BUDGET * 3).toBeLessThan(DRIVE_DEFAULT_COST_PER_MINUTE);
   });
 });
 

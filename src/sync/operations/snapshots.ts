@@ -41,7 +41,7 @@ export async function planGardening(options: {
 }): Promise<GardeningPlan> {
   const { snapshots, boardId } = options;
   for (const snapshot of snapshots) await validateSnapshot(snapshot, boardId);
-  const policy = 'Retain at least three verified snapshots, every incomparable branch, and snapshots/segments newer than 90 days. Delete only history covered by every retained recovery checkpoint.';
+  const policy = 'Retain at least three verified snapshots, every incomparable branch, and snapshots/segments newer than 90 days. Delete only history covered by every retained recovery checkpoint. Board-deletion tombstones are never gardened: they live in the local journal, outside every board folder, and are retained indefinitely until a safe rule is proven.';
   const date = (snapshot: OperationSnapshot) => Date.parse(options.snapshotDates?.[snapshot.snapshotId] ?? snapshot.createdAt);
   const ordered = [...snapshots].sort((a, b) => date(b) - date(a) || (a.snapshotId < b.snapshotId ? -1 : 1));
   const covers = (a: OperationSnapshot, b: OperationSnapshot) => Object.entries(b.checkpoint.frontier).every(([actor, seq]) => (a.checkpoint.frontier[actor] ?? 0) >= seq)

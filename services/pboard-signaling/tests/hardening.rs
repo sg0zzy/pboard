@@ -342,3 +342,72 @@ async fn abrupt_pre_auth_disconnect_releases_the_reserved_socket_slot() {
     assert_eq!(value["type"], "welcome");
     task.abort();
 }
+
+#[tokio::test]
+async fn browser_control_pings_keep_the_connection_and_binary_still_closes_it() {
+    // A backgrounded worker cannot stop its browser from keep-alive pinging an
+    // idle socket, and those pings arrive whatever the application protocol
+    // says. A control frame must never end the session: the browser answers it
+    // at the protocol layer, and it spends neither the message-rate nor the
+    // byte budget charged to application frames. Binary is not a keep-alive,
+    // so it stays fatal exactly as the deployed protocol documents. The
+    // one-message-per-second window below is the discriminating budget: on the
+    // old read, the first ping closed the socket as invalid_frame; a fix that
+    // merely moved the accounting would die on the rate limit instead.
+    let (base, task) = server(
+        Limits { messages_per_second: 1, ..Limits::default() },
+        TransportPolicy::default(),
+    )
+    .await;
+    let url = base.replace("http:", "ws:") + "/ws";
+    let (mut ws, _) = connect_async(&url).await.unwrap();
+    let welcome = ws.next().await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(welcome.to_text().unwrap()).unwrap()["type"],
+        "welcome"
+    );
+    // Ping and pong in both directions, past the rate window's capacity.
+    for _ in 0..3 {
+        ws.send(Message::Ping(vec![7].into())).await.unwrap();
+        ws.send(Message::Pong(vec![7].into())).await.unwrap();
+    }
+    // Every client ping was answered with a pong at the protocol layer...
+    let mut answered = false;
+    for _ in 0..3 {
+        if matches!(ws.next().await.unwrap().unwrap(), Message::Pong(_)) {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "a protocol ping must be answered with a pong");
+    // ...and the first application frame still gets its normal answer: the
+    // six control frames spent none of this connection's one message. A
+    // pre-authentication join is answered with `invalid_state` and closes.
+    ws.send(Message::Text("{\"type\":\"join\"}".into())).await.unwrap();
+    loop {
+        // Control frames (answered pings, echoed pongs) also surface here and
+        // their payloads are text-decodable; only a Text frame is an answer.
+        let Message::Text(text) = ws.next().await.unwrap().unwrap() else { continue };
+        let reply: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(reply["code"], "invalid_state", "unauthenticated join: {reply}");
+        break;
+    }
+    ws.close(None).await.ok();
+    // Binary frames remain an invalid frame: the session ends as it did before.
+    let (mut ws, _) = connect_async(&url).await.unwrap();
+    ws.next().await.unwrap().unwrap();
+    ws.send(Message::Binary(vec![1, 2, 3].into())).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                // The teardown names the reason in an error frame before the
+                // close handshake; either way the stream must end.
+                None | Some(Err(_)) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "a binary frame must end the connection promptly");
+    task.abort();
+}

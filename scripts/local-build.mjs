@@ -1,5 +1,5 @@
 // Build an immutable private copy of dirty inputs, using only this repository's tools.
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, copyFileSync, cpSync, rmSync, symlinkSync, lstatSync, existsSync } from 'node:fs';
 import { tmpdir, platform, arch, release } from 'node:os';
 import { dirname, resolve, join, basename } from 'node:path';
@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { validateConfig } from './release-policy.mjs';
 import { parseEnv } from 'node:util';
 import { createBuild, updateBuild, runRetention, withArtifactLock, ARTIFACTS_DIR } from './artifact-retention.mjs';
+import { resolveAndroidSdk, resolveJava } from './android-toolchain.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -110,26 +111,31 @@ export function buildLocal(targets, options = {}) {
       try {
         if (target === 'android') {
           if (!existsSync(join(root, 'apps/android/node_modules'))) throw Error('Run npm ci in apps/android');
-          const sdk = process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT;
-          if (!sdk || !existsSync(sdk)) throw Error('Android requires ANDROID_HOME and JDK 21');
-          const java = spawnSync(process.env.JAVA_HOME ? join(process.env.JAVA_HOME, 'bin/java') : 'java', ['-version'], { encoding: 'utf8' });
-          if (java.status !== 0 || !/version "(?:2[1-9]|[3-9]\d)/.test(java.stderr)) throw Error('JDK 21 or newer is required');
-          info.environment.java = java.stderr.split('\n')[0].trim();
+          // Resolve the installed SDK/JDK instead of demanding exported variables; the resolver
+          // validates the platform and build-tools that this branch actually invokes. The developer
+          // environment is consulted, not the build env, which also carries the private OAuth input.
+          const { sdk, buildTools, source: sdkSource } = resolveAndroidSdk({ projectRoot: root, env: process.env });
+          const jdk = resolveJava({ env: process.env });
+          info.environment.java = jdk.version;
+          info.environment.javaSource = jdk.source;
+          info.environment.androidSdkSource = sdkSource;
           info.environment.gradleWrapper = hash(readFileSync(join(snapshot, 'apps/android/android/gradle/wrapper/gradle-wrapper.properties')));
           info.environment.androidPlatform = '36';
+          // The private snapshot excludes local.properties, so Gradle must learn the SDK from the
+          // environment; this also makes discovery sources other than ANDROID_HOME authoritative.
+          const androidEnv = { ...env, ANDROID_HOME: sdk, ANDROID_SDK_ROOT: sdk };
           const gradle = join(snapshot, 'apps/android/android/app/build.gradle');
           const code = Number(readFileSync(gradle, 'utf8').match(/versionCode\s+(\d+)/)[1]);
           writeFileSync(gradle, readFileSync(gradle, 'utf8').replace(/versionName\s+"[^"]*"/, `versionName "${id}"`));
           const app = join(snapshot, 'apps/android');
-          run('npm', ['run', 'build'], app, env);
-          run(process.execPath, [join(app, 'node_modules/@capacitor/cli/bin/capacitor'), 'sync', 'android'], app, env);
+          run('npm', ['run', 'build'], app, androidEnv);
+          run(process.execPath, [join(app, 'node_modules/@capacitor/cli/bin/capacitor'), 'sync', 'android'], app, androidEnv);
           const native = join(app, 'android');
-          run(join(native, 'gradlew'), ['assembleDebug', '--console=plain', '--no-daemon'], native, env);
+          run(join(native, 'gradlew'), ['assembleDebug', '--console=plain', '--no-daemon'], native, androidEnv);
           const apk = join(native, 'app/build/outputs/apk/debug/app-debug.apk');
-          const tools = execFileSync('bash', ['-c', 'ls -d "$1"/build-tools/* | sort -V | tail -1', 'bash', sdk], { encoding: 'utf8' }).trim();
-          const badging = execFileSync(join(tools, 'aapt'), ['dump', 'badging', apk], { encoding: 'utf8' });
+          const badging = execFileSync(join(buildTools, 'aapt'), ['dump', 'badging', apk], { encoding: 'utf8' });
           if (!badging.includes(`versionName='${id}'`) || !badging.includes(`versionCode='${code}'`) || !badging.includes("name='it.stefanogozzi.pboard'")) throw Error('APK identity mismatch');
-          const signature = execFileSync(join(tools, 'apksigner'), ['verify', '--print-certs', apk], { encoding: 'utf8' });
+          const signature = execFileSync(join(buildTools, 'apksigner'), ['verify', '--print-certs', apk], { encoding: 'utf8' });
           const signer = signature.match(/certificate SHA-256 digest: ([a-f0-9]+)/i)?.[1];
           if (!signer) throw Error('APK signer unavailable');
           archive(apk, target, 'apk', id, { versionCode: code, signing: 'debug-test-only', certificateSha256: signer });

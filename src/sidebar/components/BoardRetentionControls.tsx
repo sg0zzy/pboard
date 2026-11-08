@@ -1,13 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
-import { googleDrive, operationService } from '../../sync/browser';
+import { googleDrive, operationService, type GardeningPreview } from '../../sync/browser';
 
-type Plan = Awaited<ReturnType<typeof operationService.previewGardening>>;
-/** Owner maintenance lives in a compact disclosure, with an explicit deletion
- * preview/confirmation. Compaction never implicitly gardens history. */
-export function BoardMaintenanceControls({ projectId }: { projectId: string; revision: number }) {
+/** Durable-log snapshots now publish themselves — the consolidation cycle
+ * writes them on a schedule, on tab-hide and on board close, for every board
+ * including ones whose history predates its log. What deliberately does NOT
+ * happen automatically is deletion: moving eligible segments and superseded
+ * snapshots to Google Drive Trash is destructive history retention, and it is
+ * preview-plus-confirm by design. This is that gate, and it is the reason a
+ * single automatic-snapshot path needs an owner-only control to exist at all.
+ * It lives inside the collaboration disclosure because it is a collaboration
+ * lifecycle control, and it hides itself for everyone but the Drive owner. */
+export function BoardRetentionControls({ projectId }: { projectId: string }) {
   const [owner, setOwner] = useState(false), [busy, setBusy] = useState(''), [feedback, setFeedback] = useState('');
   const cancel = useRef<HTMLButtonElement>(null);
-  const [plan, setPlan] = useState<Plan | null>(null), running = useRef(false), alive = useRef(true);
+  const [plan, setPlan] = useState<GardeningPreview | null>(null), running = useRef(false), alive = useRef(true);
   useEffect(() => { if (plan) cancel.current?.focus(); }, [plan]);
   useEffect(() => { let active = true, stop = () => {}; void operationService.subscribeRole(projectId, value => { if (active) setOwner(value); }).then(next => { if (active) stop = next; else next(); }).catch(() => { if (active) setOwner(false); }); return () => { active = false; stop(); }; }, [projectId]);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
@@ -21,20 +27,19 @@ export function BoardMaintenanceControls({ projectId }: { projectId: string; rev
     if (running.current) return;
     running.current = true; setBusy(label); setFeedback('');
     try { const result = await action(); if (alive.current) setFeedback(result); }
-    catch (error) { if (alive.current) setFeedback(error instanceof Error ? error.message : 'Maintenance failed. Your local work is retained.'); }
+    catch (error) { if (alive.current) setFeedback(error instanceof Error ? error.message : 'Retention review failed. Nothing was deleted.'); }
     finally { running.current = false; if (alive.current) setBusy(''); }
   }
   if (!owner) return null;
-  return <details className="board-maintenance">
-    <summary title="Owner snapshot and history maintenance">Maintenance</summary>
-    <div className="board-maintenance-panel">
-      <button type="button" disabled={!!busy} title="Create an immutable snapshot without deleting history"
-        onClick={() => void run('Compacting…', async () => { await operationService.compact(projectId); if (alive.current) setPlan(null); return 'Snapshot complete. Previous snapshots and logs were retained.'; })}>Compact</button>
+  return <details className="board-retention">
+    <summary title="Owner-controlled deletion of history that newer snapshots already cover">History retention</summary>
+    <div className="board-retention-panel">
+      <p>Snapshots publish themselves. Deleting the history they cover never happens on its own: review a fresh preview, then confirm the exact file set.</p>
       <button type="button" disabled={!!busy} onClick={() => void run('Checking history…', async () => {
         const preview = await operationService.previewGardening(projectId); if (alive.current) setPlan(preview);
         return 'Review the retention policy before deleting eligible history.';
       })}>Review old history</button>
-      {plan && <div className="board-maintenance-preview">
+      {plan && <div className="board-retention-preview">
         <p>{plan.eligibleSnapshots} snapshots and {plan.eligibleSegmentIds.length} operation segments eligible. Approximately {Math.ceil(plan.bytes / 1024)} KiB recoverable.</p>
         <p>{plan.policy}</p>
         <button type="button" ref={cancel} disabled={!!busy} onClick={() => setPlan(null)}>Cancel</button>

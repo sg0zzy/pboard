@@ -7,6 +7,15 @@ import type { RxRepository } from "../storage/rxdbRepository";
 import { createDriveRuntime } from "./runtime";
 import { PENDING_BOARD_LEAVES_KEY } from "./drivePermissions";
 import { clearDriveQuotaCooldown } from "./driveQuota";
+import { setWebRtcDisabled } from "../collab/liveTransport";
+
+// Development posture for evaluating the durable operation log: this process
+// opens no WebRTC peer pools, so a board either uses the log or has no live
+// channel and converges through Drive synchronization. Removing this call
+// restores the shipped transport pair; see src/collab/liveTransport.ts for what
+// the posture does to content keys.
+setWebRtcDisabled(true);
+
 const extensionOrigin = browser.runtime.getURL("");
 const isFirefox = extensionOrigin.startsWith("moz-extension://");
 const browserKey: GoogleDriveBrowser = isFirefox ? "firefox" : "chromium";
@@ -39,7 +48,8 @@ export function registerRxRepositoryResolver(resolver: () => Promise<RxRepositor
 }
 
 export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
-export const { operationService, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, boardCollaboration } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
+export type { GardeningPreview } from "./operations/service";
+export const { operationService, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, healRelay, boardCollaboration, accountChannel } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
   hasSignalingHostPermission: (origin) => browser.permissions.contains({ origins: [origin] }),
   onReconciled: () => retryPendingLeaves() });
 

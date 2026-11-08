@@ -41,6 +41,14 @@ export class DriveStub {
   defaultPermissions: StubPermission[] = [];
   appDataCalls = 0;
   requests: string[] = [];
+  /**
+   * Ids this fixture lists but cannot describe: Drive goes on naming a file in a
+   * folder listing for a while after its metadata stopped being served. A room's
+   * presence folder collects these when a browser dies, and the answer for one is
+   * asked once and then remembered — this knob is what makes "remembered"
+   * testable instead of a comment.
+   */
+  unavailable = new Set<string>();
   /** Hook invoked before every request; may mutate `files` to race the code. */
   onFetch: ((url: string) => void | Promise<void>) | null = null;
   private next = 1;
@@ -123,6 +131,7 @@ export class DriveStub {
       const id = decodeURIComponent(pathParts.at(-1)!);
       if (id !== "files") {
         const file = this.byId(id);
+        if (this.unavailable.has(id)) return json({ error: { message: "missing" } }, 404);
         if (!file || file.trashed) return json({ error: { message: "missing" } }, 404);
         return json({ ...file, size: String(file.bytes.length), ownedByMe: true, owners: [{ emailAddress: 'owner@example.com' }], capabilities: { canAddChildren: true }, version: String(file.version), md5Checksum: "md5" });
       }

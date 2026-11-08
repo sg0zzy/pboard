@@ -9,15 +9,17 @@
  * `PboardSignaling` captures exactly those two needs and nothing more, so the
  * transport is swappable without touching the replication logic:
  *   - `createMemorySignalingScope`  — in-process, for tests and same-tab dev.
- *   - `createWebSocketSignaling`    — speaks the RxDB signaling-server wire
- *                                     protocol over a WebSocket. This is the
- *                                     "simplest temporary mechanism supported by
- *                                     RxDB/simple-peer"; it points at any endpoint
- *                                     running `startSignalingServerSimplePeer`.
- *   - `createDriveSignaling`        — Drive-hosted ephemeral records (Phase 2).
+ *   - `createDriveSignaling`        — Drive-hosted ephemeral records, the
+ *                                     shipped transport for the peer pools.
+ *
+ * The RxDB signaling-server wire protocol (`init` / `join` / `joined` /
+ * `signal` / `ping`) used to have a factory here too. Nothing ever constructed
+ * it — the relay posture carries the durable operation log over its own socket
+ * (`operations/logSync.ts`), and the peer path uses Drive — so it was deleted
+ * rather than kept as a third, untested signaling vocabulary.
  */
-import { validateWebSocketEndpoint } from "./security/endpoint";
 import { collaborationCounters } from "./counters";
+import { DRIVE_PRESENCE_TTL_MS as PRESENCE_TTL_MS } from "./drivePresence";
 import { manifestHash, type BoardPermissionManifest } from "./security/manifest";
 import {
   buildSignedSignal, verifySignedSignal,
@@ -108,104 +110,6 @@ export function createMemorySignalingScope() {
   };
 }
 
-type Resolvers<T> = { resolve(value: T): void; reject(reason?: unknown): void; promise: Promise<T> };
-function createResolvers<T>(): Resolvers<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { resolve, reject, promise };
-}
-
-/**
- * WebSocket signaling that speaks the RxDB signaling-server wire protocol
- * (`init` / `join` / `joined` / `signal` / `ping`). Point `url` at any endpoint
- * running `startSignalingServerSimplePeer`. This is the development and
- * fallback transport; pboard does not ship its own server.
- */
-
-export function createWebSocketSignaling(topic: string, url: string, webSocket: typeof WebSocket = WebSocket): PboardSignaling {
-  // Endpoint policy: network WebSocket signaling must be WSS. An insecure URL is
-  // only accepted for an explicit loopback development endpoint and never by
-  // received data; a plain rejection here cannot be triggered by remote input.
-  const endpoint = validateWebSocketEndpoint(url);
-  if (endpoint.check === "insecure") throw new Error(`Insecure signaling endpoint: ${endpoint.reason}`);
-  let socket: WebSocket | null = null;
-  let ownPeerId: string | null = null;
-  let onSignalHandler: ((from: string, signal: PboardSignal) => void) | null = null;
-  let rosterHandler: ((peerIds: string[]) => void) | null = null;
-  let closed = false;
-  let pingTimer: number | undefined;
-
-  const send = (message: Record<string, unknown>) => {
-    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
-  };
-
-  function connect(): Promise<{ peerId: string; peers: string[] }> {
-    const resolvers = createResolvers<{ peerId: string; peers: string[] }>();
-    const ws = new webSocket(url);
-    socket = ws;
-    ws.onopen = () => {
-      send({ type: "join", room: topic });
-    };
-    ws.onmessage = (event) => {
-      const message = JSON.parse(String(event.data)) as Record<string, unknown>;
-      switch (message.type) {
-        case "init":
-          ownPeerId = String(message.yourPeerId);
-          break;
-        case "joined": {
-          const peers: string[] = (Array.isArray(message.otherPeerIds) ? (message.otherPeerIds as string[]) : []).filter((id) => id !== ownPeerId);
-          resolvers.resolve({ peerId: ownPeerId as string, peers });
-          rosterHandler?.(peers);
-          break;
-        }
-        case "signal":
-          if (message.senderPeerId && message.senderPeerId !== ownPeerId) onSignalHandler?.(String(message.senderPeerId), message.data);
-          break;
-        default:
-          break;
-      }
-    };
-    ws.onerror = () => {
-      resolvers.reject(new Error("pboard signaling WebSocket failed to connect"));
-    };
-    ws.onclose = () => {
-      if (closed) return;
-      resolvers.reject(new Error("pboard signaling WebSocket closed"));
-      // Recreate the socket so an offline/online transition re-joins the room.
-      if (!closed) connect().catch(() => {});
-    };
-    return resolvers.promise;
-  }
-
-  return {
-    join: (onRoster) => {
-      rosterHandler = onRoster;
-      return connect().finally(() => {
-        if (pingTimer) return;
-        pingTimer = window.setInterval(() => {
-          if (!closed) send({ type: "ping" });
-        }, 2 * 60 * 1000);
-      });
-    },
-    sendSignal: async (to, signal) => {
-      if (ownPeerId) send({ type: "signal", senderPeerId: ownPeerId, receiverPeerId: to, room: topic, data: signal });
-    },
-    onSignal: (handler) => {
-      onSignalHandler = handler;
-    },
-    leave: async () => {
-      closed = true;
-      window.clearInterval(pingTimer);
-      socket?.close();
-      socket = null;
-    }
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Drive-hosted signaling (Phase 2).
 //
@@ -262,6 +166,11 @@ export interface PboardDriveSignalStore {
   readPeer(peerId: string): Promise<PboardDriveSignalRecord | null>;
   /** Create or overwrite this peer's own record. */
   writeOwn(record: PboardDriveSignalRecord): Promise<void>;
+  /**
+   * This session's own record as last written, without a Drive round trip.
+   * Optional: a store without a cheap answer omits it and the poll reads Drive.
+   */
+  ownRecord?(): PboardDriveSignalRecord | null;
   /** All peer records in the room (any age); the caller applies the TTL. */
   listPeers(): Promise<Record<string, PboardDriveSignalRecord>>;
   /** Remove this peer's own record (idempotent). */
@@ -304,6 +213,16 @@ export type PboardDriveSignalingOptions = {
 };
 
 /**
+ * How long a presence record claims its session is alive. The poll loop renews
+ * it at a quarter of this interval and the Drive presence store needs the same
+ * number to tell a quiet peer from a session that is gone, so it is exported
+ * rather than being a literal on both sides. The value lives in
+ * `drivePresence.ts` because the runtime's diagnostics read it while the peer
+ * transport is not loaded at all.
+ */
+export const DRIVE_PRESENCE_TTL_MS = PRESENCE_TTL_MS;
+
+/**
  * Drive-backed `PboardSignaling`. One `PboardDriveSignalStore` per shared
  * project; this function owns the poll loop, presence TTL, outbox TTL, and
  * at-least-once signal dedupe. The returned object also exposes `tick()` so
@@ -317,12 +236,27 @@ export type PboardDriveSignaling = PboardSignaling & {
 export function createDriveSignaling(options: PboardDriveSignalingOptions): PboardDriveSignaling {
   const { store } = options;
   const pollMs = options.pollMs ?? 2000;
-  const presenceTtlMs = options.presenceTtlMs ?? 60_000;
+  const presenceTtlMs = options.presenceTtlMs ?? DRIVE_PRESENCE_TTL_MS;
   const signalTtlMs = options.signalTtlMs ?? 240_000;
   // The slow cadence must still rewrite our presence often enough for peers
   // to see it: keep it strictly inside a quarter of the presence TTL.
   const maxPollMs = Math.max(pollMs, options.maxPollMs ?? 15_000, presenceTtlMs / 4);
   const idleSlowMs = options.idleSlowMs ?? presenceTtlMs;
+  /**
+   * A presence record is only a claim of liveness for `presenceTtlMs`, so
+   * rewriting it on every poll bought nothing and cost a Drive write per poll
+   * (a list to find the file, an upload to change it). Heartbeat at a quarter of
+   * the TTL — three times the safety margin a peer needs to keep seeing us — and
+   * write immediately whenever the record's *content* changes instead.
+   */
+  const heartbeatMs = pollMs >= presenceTtlMs ? 0 : Math.max(pollMs, Math.floor(presenceTtlMs / 4));
+  /** When the own record was last written, and what it held apart from `updatedAt`. */
+  let ownWrittenAt = -Infinity;
+  let ownFingerprint = "";
+  const fingerprint = (record: PboardDriveSignalRecord) => {
+    const { updatedAt: _ignoredUpdatedAt, ...body } = record;
+    return JSON.stringify(body);
+  };
   /** When the room last saw a live peer, delivered a signal, or sent one. */
   let lastActivityAt = store.now();
   const me = store.peerId;
@@ -365,8 +299,17 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   const delivered = new Map<string, Set<string>>();
 
   async function readOwn(): Promise<PboardDriveSignalRecord> {
-    const record = await store.readPeer(me);
+    // A store that wrote the record knows it already; asking Drive for our own
+    // presence on every poll cost a name lookup and a download per tick.
+    const record = store.ownRecord?.() ?? await store.readPeer(me);
     return record ?? { updatedAt: store.now(), peers: [], outbox: [] };
+  }
+
+  /** Write the own record and record when/what, so the poll never rewrites it. */
+  async function writeOwnRecord(record: PboardDriveSignalRecord): Promise<void> {
+    ownFingerprint = fingerprint(record);
+    ownWrittenAt = record.updatedAt;
+    await store.writeOwn(record);
   }
 
   /** Recompute the live roster from peer presence and emit it on change. */
@@ -389,10 +332,14 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       await writeExclusive(async () => {
         const own = await readOwn();
         const pruned = own.outbox.filter((s) => now - (s.sentAt ?? own.updatedAt) < signalTtlMs);
-        await store.writeOwn({
+        const record: PboardDriveSignalRecord = {
           updatedAt: now, peers: own.peers, outbox: pruned,
           ...(presenceEnvelope ? { security: presenceEnvelope } : {})
-        });
+        };
+        // Nothing changed and the claim of liveness is still young: the record
+        // on Drive already says exactly this.
+        if (fingerprint(record) === ownFingerprint && now - ownWrittenAt < heartbeatMs) return;
+        await writeOwnRecord(record);
       });
       // (b) Read every peer, deliver new signals, then reconcile presence.
       const all = await store.listPeers();
@@ -476,7 +423,7 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
       own.outbox.push({ id: crypto.randomUUID(), toPeerId: to, payload: signal, sentAt: now, ...(securityEntry ? { security: securityEntry } : {}) });
       own.outbox = own.outbox.slice(-16); // bound the outbox
       own.peers = Array.from(new Set([...own.peers, to]));
-      await store.writeOwn({
+      await writeOwnRecord({
         updatedAt: now, peers: own.peers, outbox: own.outbox,
         ...(presenceEnvelope ? { security: presenceEnvelope } : {})
       });

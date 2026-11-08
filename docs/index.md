@@ -13,7 +13,9 @@ Create a board, organize cards, and pin the text, links, images, or page regions
 
 Your boards save on your device first. You can use Pboard without creating a Pboard account or connecting Google Drive.
 
-Connecting Google Drive enables optional backup and synchronization between your browsers. You can also share boards with collaborators and enable live collaboration. Google authorization is used for these Drive features.
+Connecting Google Drive enables optional backup and synchronization between your browsers. You can also share boards with collaborators. Sharing is authorized by the folder permissions you set in Google Drive, and boards are read and written first on your own device. Live updates between browsers are delivered over an optional relay channel; see the [collaboration guide](https://github.com/sg0zzy/pboard/blob/main/docs/collaboration.md#status-and-known-gaps) for exactly what that channel does today, including its current limitations.
+
+Google authorization is used for these Drive features.
 
 Pboard has no advertising, analytics, or telemetry service. Read the [privacy policy]({{ '/privacy/' | relative_url }}) for details about the information handled by local storage, Google Drive, and sharing.
 

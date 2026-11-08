@@ -65,7 +65,13 @@ export function createPrivateRecovery(options: {
   async function apply(boardId: string, canApply: () => Promise<boolean>) {
     return collaborationCounters.timed("privateRecovery.apply", () => options.locked(async () => {
       if (!await canApply()) return;
-      let entries = (await journal.entries.where("boardId").equals(boardId).toArray()).filter(e => e.state === "committed");
+      // The one materialization funnel for retained history. A tombstoned board
+      // is refused here as well as at every caller: an old private archive, a
+      // peer's replay or a snapshot's receipts must not rebuild a row for a
+      // board this device deleted. An explicit restore writes a `restored` fact,
+      // after which this guard (and every caller's) is false again.
+      if ((await journal.deletedBoards()).has(boardId)) return;
+      const entries = (await journal.entries.where("boardId").equals(boardId).toArray()).filter(e => e.state === "committed");
       const signedBoard = entries.some(e => e.value._sec);
       const groups = new Map<string, Change[]>();
       for (const entry of entries) { const id = scope(entry), group = groups.get(id); if (group) group.push(entry); else groups.set(id, [entry]); }

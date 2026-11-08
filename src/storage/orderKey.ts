@@ -8,6 +8,18 @@ export function orderKeyBetween(before: string | null, after: string | null): st
   return key;
 }
 
+/**
+ * Fractional indexing for callers holding a neighbour pair. Two devices that
+ * minted the same midpoint concurrently leave equal ranks, and a stale list
+ * can even invert them: no key fits strictly between such neighbours, so the
+ * helper answers `null` — the caller's cue to relattice or append — instead
+ * of letting the comparator throw `Error: "a >= b"` mid-interaction.
+ */
+export function safeOrderKeyBetween(before: string | null, after: string | null): string | null {
+  if (before !== null && after !== null && before >= after) return null;
+  return orderKeyBetween(before, after);
+}
+
 export function initialOrderKeys(count: number): string[] {
   return generateNKeysBetween(null, null, count);
 }

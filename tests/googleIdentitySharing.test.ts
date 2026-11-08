@@ -1,6 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { createGoogleIdentitySharing } from '../src/collab/googleIdentitySharing';
 import { createBoardGrantService } from '../src/collab/boardGrants';
+import { instantAuthBudget } from './helpers/authBudget';
 import { generateDeviceKey, publicKeyFingerprint } from '../src/collab/security/keys';
 import { toBase64Url } from '../src/collab/security/canonical';
 
@@ -50,11 +51,20 @@ function fixture(ownerLimit = Number.POSITIVE_INFINITY) {
     const storage = { get: async (id: string) => ({ [id]: structuredClone(state[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(state, structuredClone(patch)); } };
     const keys = new Map<string, Awaited<ReturnType<typeof generateDeviceKey>>>();
     const getKey = async (id: string) => { if (!keys.has(id)) keys.set(id, await generateDeviceKey()); return keys.get(id)!; };
-    const grants = createBoardGrantService({ storage, fetcher, getKey });
+    // `allowInitialize === false` models the trust situation the single
+    // decision point refuses: the deployment oracle reports signed local
+    // history, so `adoptAuthority` refuses with the typed block and
+    // `sharing.sync` surfaces it — exactly what this suite used to force
+    // through the removed `canInitialize` seam.
+    const grants = createBoardGrantService({ storage, fetcher, getKey, authBudget: instantAuthBudget(),
+      authority: allowInitialize ? undefined : {
+        hasSignedHistory: async () => true,
+        async describeSignedDataBlock() { return { message: 'Existing signed data cannot change authority', state: 'authority-foreign' }; },
+      } });
     let connected = true;
-    const sharing = createGoogleIdentitySharing({ storage, fetcher, getKey, grants,
+    const sharing = createGoogleIdentitySharing({ storage, fetcher, getKey, grants, authBudget: instantAuthBudget(),
       auth: { getAccessToken: async () => email, getConnectionState: async () => connected ? 'connected' : 'disconnected', isConfigured: () => true, connect: async () => {}, disconnect: async () => {} },
-      canInitialize: async () => { if (!allowInitialize) throw new Error('Existing signed data cannot change authority'); return true; }, canReceive: async () => true });
+      canReceive: async () => true });
     return { grants, sharing, state, disconnect: () => { connected = false; }, enable: () => grants.configure({ provider: 'websocket', url: 'wss://relay.example.test/ws' }) };
   }
   return { client, policies, pending, bundles, requests: () => requests, calls: () => calls, tamper: () => { tamper = true; } };
@@ -248,6 +258,13 @@ it('polls for grants without resubmitting the same pending request on every five
     expect(f.requests()).toBe(1);
     vi.setSystemTime(Date.now() + 30_000);
     await joining.sharing.sync(); expect(f.requests()).toBe(2);
+    // The re-filing window now covers forced rounds too: the service holds a
+    // filed request for an hour, so a forced refresh seconds after a filing
+    // re-files nothing — that duplicate pair, not the five-second poll, was
+    // the enrollment churn in the service journal. Only the window expiring
+    // files again.
+    await joining.sharing.sync(undefined, true); expect(f.requests()).toBe(2);
+    vi.setSystemTime(Date.now() + 30_000);
     await joining.sharing.sync(undefined, true); expect(f.requests()).toBe(3);
   } finally { vi.useRealTimers(); }
 });

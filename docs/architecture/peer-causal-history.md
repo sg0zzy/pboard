@@ -1,5 +1,31 @@
 # Authenticated peer causal history
 
+> **Historical document — it no longer describes the product.** Job 7 recorded how
+> authenticated causal history was exchanged over WebRTC DataChannels (offer IDs,
+> bounded chunks, a per-peer receipt, `src/collab/peerHistory.ts`). In the extension
+> that transport cannot start: `src/sync/browser.ts:17` calls
+> `setWebRtcDisabled(true)` and both extension bundles resolve
+> `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`, whose exports throw. Android
+> builds the same sources without that call and still runs this code.
+>
+> What replaced it for the default runtime:
+>
+> - **Drive-first operation synchronization** (28 October 2026,
+>   [drive-operation-sync.md](drive-operation-sync.md)) — immutable operation
+>   segments and snapshots on Drive converge the board; there is no authoritative
+>   peer and no peer election.
+> - **The durable operation log** (protocol "Sync v3",
+>   [websocket-operation-log.md](websocket-operation-log.md),
+>   [`PROTOCOL.md`](../../services/pboard-signaling/PROTOCOL.md)) — live delivery
+>   over one multiplexed authenticated WebSocket, with relay replay from a persisted
+>   cursor instead of a peer offering its IDs.
+> - Private history recovery still exists and is current:
+>   [private-drive-history.md](private-drive-history.md).
+>
+> The causal *model* described here (detached author proofs, content identity,
+> conservative unknown ancestry, immutable variants) is still the model the journal
+> and engine implement; only the peer transport that carried it is historical.
+
 Job 7, 20 October 2026. Extends the [local journal](causal-change-journal.md),
 [manual resolutions](conflict-resolution.md) and [private Drive recovery](private-drive-history.md).
 The existing manager, signaling providers, DTLS mutual proof, DataChannels, RxDB

@@ -1,6 +1,7 @@
 import type { PboardSignaling } from '../../collab/signaling';
 import { canonical, validateFrontier, type Frontier, type Operation } from './protocol';
 import { parseStrictJson } from '../../collab/security/canonical';
+import { DriveQuotaExceededError } from '../driveQuota';
 
 /** DataChannel delivery only. SDP initiator ordering does not confer board authority.
  * Drive-backed signaling must verify the record owner against the current folder
@@ -11,6 +12,14 @@ export async function createOperationRealtime(options: {
   state?: (peers: string[], error?: string) => void; config?: RTCConfiguration;
   revalidateMs?: number; createPeer?: (config?: RTCConfiguration) => RTCPeerConnection;
 }) {
+/**
+   * Frame counters, for the diagnostics handle. Whether an edit never reached a
+   * channel, was refused by the reader's permission check, or was applied cannot
+   * be told apart from the sidebar — and the room's peer count says nothing about
+   * any of them, which is how a room with a live channel and no updates looked
+   * identical to one that was working.
+   */
+  const metrics = { broadcasts: 0, sent: 0, blocked: 0, receivedOps: 0, refusedReads: 0, refusedWrites: 0, iceFailed: 0 };
   const peers = new Map<string, { connection: RTCPeerConnection; channel?: RTCDataChannel }>();
   const chunks = new Map<string, { parts: string[]; total: number; peer: string; bytes: number; at: number }>();
   let closed = false, ownId = '', roster: string[] = [];
@@ -25,7 +34,7 @@ export async function createOperationRealtime(options: {
     return true;
   }
   async function receive(peerId: string, text: string) {
-    if (closed || !await options.canRead(peerId)) { drop(peerId); return; }
+    if (closed || !await options.canRead(peerId)) { metrics.refusedReads++; drop(peerId); return; }
     const frame = parseStrictJson(text) as any;
     if (!frame || typeof frame.id !== 'string' || frame.id.length > 100 || !Number.isInteger(frame.index) || frame.index < 0
       || !Number.isInteger(frame.total) || frame.total < 1 || frame.total > 128 || typeof frame.text !== 'string' || frame.text.length > 8000) throw new Error('Invalid realtime frame');
@@ -41,8 +50,9 @@ export async function createOperationRealtime(options: {
     if (value?.protocol !== 'pboard-operations-v1') throw new Error('Upgrade Pboard: unsupported realtime protocol');
     if (value.kind === 'have') { validateFrontier(value.frontier); if (canonical(value.frontier) !== canonical(options.frontier())) void options.recover().catch(error => announce(String(error))); }
     else if (value.kind === 'operations' && Array.isArray(value.operations) && value.operations.length <= 128) {
-      if (!await options.canWrite(peerId)) throw new Error('Peer no longer has Drive editing access');
+      if (!await options.canWrite(peerId)) { metrics.refusedWrites++; throw new Error('Peer no longer has Drive editing access'); }
       await options.receive(value.operations);
+      metrics.receivedOps += value.operations.length;
     } else throw new Error('Invalid realtime message');
   }
   function channel(id: string, connection: RTCPeerConnection, data: RTCDataChannel) {
@@ -61,7 +71,13 @@ export async function createOperationRealtime(options: {
     peers.set(id, { connection: pc });
     pc.ondatachannel = event => channel(id, pc, event.channel);
     pc.onicecandidate = event => { if (!event.candidate && pc.localDescription && !closed) void options.signaling.sendSignal(id, { description: pc.localDescription.toJSON() }).catch(error => announce(String(error))); };
-    pc.onconnectionstatechange = () => { if (['failed', 'closed'].includes(pc.connectionState)) drop(id); };
+    pc.onconnectionstatechange = () => {
+      // Counting a failed negotiation is what lets the diagnostics tell "no candidate
+      // pair ever worked" from "the room never got this far". Both look like
+      // `connected 0` in the roster, and only one of them is a missing relay server.
+      if (pc.connectionState === 'failed') metrics.iceFailed++;
+      if (['failed', 'closed'].includes(pc.connectionState)) drop(id);
+    };
     return pc;
   }
   async function reconcile(next: string[]) {
@@ -100,16 +116,33 @@ export async function createOperationRealtime(options: {
     closed = true; for (const id of [...peers.keys()]) drop(id); await options.signaling.leave().catch(() => undefined); throw error;
   }
   const revalidate = setInterval(() => {
-    for (const id of peers.keys()) void options.canRead(id).then(allowed => { if (!allowed) drop(id); }).catch(() => drop(id));
+    for (const id of peers.keys()) void options.canRead(id).then(allowed => { if (!allowed) drop(id); }).catch(error => {
+      // A failed verification is not a revoked permission. While Drive is
+      // throttling this context every role check rejects, and dropping the whole
+      // room for that emptied live data channels that were working fine — the
+      // peer would have to renegotiate from scratch once the quota cleared. Other
+      // failures stay conservative: an unreadable answer about a peer we cannot
+      // price out is a reason to disconnect.
+      if (!(error instanceof DriveQuotaExceededError)) drop(id);
+    });
     rosterQueue = rosterQueue.then(() => reconcile(roster)).catch(error => announce(String(error)));
     for (const [key, chunk] of chunks) if (Date.now() - chunk.at > 30000) chunks.delete(key);
   }, options.revalidateMs ?? 10000);
   return {
     async broadcast(operations: Operation[]) {
+      metrics.broadcasts++;
       let sent = false;
-      for (const [id, peer] of peers) if (peer.channel && await options.canRead(id)) sent = send(peer.channel, { protocol: 'pboard-operations-v1', kind: 'operations', operations }) || sent;
+      for (const [id, peer] of peers) {
+        if (!peer.channel || !await options.canRead(id)) continue;
+        // The answer the caller acts on is whether a frame left, so counting must
+        // not change it: a blocked channel still reports false.
+        const delivered = send(peer.channel, { protocol: 'pboard-operations-v1', kind: 'operations', operations });
+        if (delivered) metrics.sent += operations.length; else metrics.blocked++;
+        sent = delivered || sent;
+      }
       return sent;
     },
+    metrics,
     async close() { closed = true; clearInterval(revalidate); for (const id of [...peers.keys()]) drop(id); chunks.clear(); await options.signaling.leave(); }
   };
 }

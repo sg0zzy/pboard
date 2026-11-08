@@ -6,13 +6,19 @@ import { createDriveSignaling, type PboardDriveSignaling, type PboardDriveSignal
 // peer's store reads/writes its own record against that shared map.
 type Room = {
   clock: { t: number };
+  polls: () => number;
   records: Map<string, PboardDriveSignalRecord>;
   makeSignaling(peerId: string, overrides?: { presenceTtlMs?: number; signalTtlMs?: number }): { signaling: PboardDriveSignaling; store: PboardDriveSignalStore };
 };
 
+/** When each peer's own presence write landed, per peer id, for cadence tests. */
+const presenceWrites = new Map<string, number[]>();
+
 function makeRoom(): Room {
   const clock = { t: 0 };
   const records = new Map<string, PboardDriveSignalRecord>();
+  let polls = 0;
+  presenceWrites.clear();
   const makeSignaling = (
     peerId: string,
     overrides: { presenceTtlMs?: number; signalTtlMs?: number } = {}
@@ -22,9 +28,13 @@ function makeRoom(): Room {
       now: () => clock.t,
       readPeer: async (id) => structuredClone(records.get(id) ?? null),
       writeOwn: async (record) => {
+        presenceWrites.set(peerId, [...(presenceWrites.get(peerId) ?? []), record.updatedAt]);
         records.set(peerId, structuredClone(record));
       },
-      listPeers: async () => structuredClone(Object.fromEntries(records)),
+      listPeers: async () => {
+        polls += 1;
+        return structuredClone(Object.fromEntries(records));
+      },
       deleteOwn: async () => {
         records.delete(peerId);
       }
@@ -39,7 +49,7 @@ function makeRoom(): Room {
       })
     };
   };
-  return { clock, records, makeSignaling };
+  return { clock, records, makeSignaling, polls: () => polls };
 }
 
 describe("createDriveSignaling", () => {
@@ -191,6 +201,35 @@ describe("createDriveSignaling", () => {
 
     await a.signaling.leave();
     await b.leave();
+  });
+
+  it("heartbeats presence at a quarter of the TTL while reading peers on every poll", async () => {
+    const room = makeRoom();
+    const { signaling } = room.makeSignaling("a", { presenceTtlMs: 60_000 });
+    await signaling.join(() => {});
+    expect(room.polls()).toBe(1);
+    expect(room.records.get("a")!.updatedAt).toBe(0);
+
+    // Polls keep their cadence (signals have to arrive promptly); the rewrite of
+    // an unchanged claim of liveness does not.
+    for (let poll = 0; poll < 4; poll++) {
+      room.clock.t += 10_000;
+      await signaling.tick();
+    }
+    expect(room.polls()).toBe(5);
+    expect(presenceWrites.get("a")).toEqual([0, 20_000, 40_000]);
+    // …and the claim never ages more than a poll interval past a quarter TTL, so
+    // it stays well inside the 60 s peers judge liveness by.
+    const gaps = presenceWrites.get("a")!.slice(1).map((at, index) => at - presenceWrites.get("a")![index]);
+    expect(Math.max(...gaps)).toBeLessThanOrEqual(20_000);
+
+    // An outbound signal is written immediately, and re-arms the heartbeat so the
+    // next poll does not rewrite the very same record a second time.
+    await signaling.sendSignal("b", { type: "offer", payload: "x" } as never);
+    expect(presenceWrites.get("a")!.at(-1)).toBe(40_000);
+    expect(room.records.get("a")!.outbox).toHaveLength(1);
+    await signaling.tick();
+    expect(presenceWrites.get("a")).toEqual([0, 20_000, 40_000, 40_000]);
   });
 
   it("drops a peer from the roster once its presence file is older than the presence TTL", async () => {

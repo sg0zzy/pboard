@@ -119,6 +119,14 @@ it("schedules one alarm per unsettled sync, not two", async () => {
 });
 
 it("backs off between the retries of a board that cannot settle", async () => {
+  // The assertion below is about *scheduled delays*, so the test owns the clock
+  // they are measured with. Real time between the production call and the
+  // fixture's own `Date.now()` read used to shave a millisecond off one sample,
+  // turning a genuine 3,600,000 ms (the cap) into 3,599,999 and failing a
+  // comparison that had nothing to do with drift. Only `Date` is faked: the
+  // waits in this file are real timers, and nothing here needs time to pass.
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
   registerDriveBackgroundSync();
   const projectId = 'board';
   mocks.state.set(key(projectId), { projectId, dirty: true, status: 'pending', changeToken: 1 });
@@ -142,6 +150,7 @@ it("backs off between the retries of a board that cannot settle", async () => {
   // And it never returns to the idle delay or below: the board is retried
   // progressively less often, not at a fixed short period.
   expect(delays[delays.length - 1]).toBeGreaterThan(2_000);
+  } finally { vi.useRealTimers(); }
 });
 
 it("still schedules a board whose local change arrives while it is not retrying", async () => {

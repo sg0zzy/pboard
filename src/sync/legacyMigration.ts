@@ -16,7 +16,7 @@
  *
  * A board whose canonical file already exists is never overwritten.
  */
-import { migratePrivateBoard, type MigrationDeps, type MigrationState } from "./privateMigration";
+import { cleanupDue, migratePrivateBoard, type MigrationDeps, type MigrationState } from "./privateMigration";
 import { deserializeProjectSnapshot, type ProjectSnapshot, type ProjectSnapshotStore } from "./snapshot";
 import { deserializeBoardSnapshotV2 as parseV2, serializeBoardSnapshotV2, v1SnapshotToEntities } from "./snapshotV2";
 import type { DriveBoardStore } from "./driveBoardStore";
@@ -196,7 +196,6 @@ async function findAppDataFile(deps: LegacyMigrationDeps, projectId: string): Pr
  * `cleanupDue` rule owns that ordering; this never guesses.
  */
 export async function cleanupLegacySource(deps: LegacyMigrationDeps, projectId: string): Promise<boolean> {
-  const { cleanupDue } = await import("./privateMigration");
   const state = await deps.migrations.load(projectId);
   if (!state) return false;
   if (!cleanupDue(state, deps.now())) throw new Error("The read-only window has not elapsed");

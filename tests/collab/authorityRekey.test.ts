@@ -8,6 +8,7 @@
 import 'fake-indexeddb/auto';
 import { expect, it } from 'vitest';
 import { createBoardGrantService } from '../../src/collab/boardGrants';
+import { instantAuthBudget } from '../helpers/authBudget';
 import { generateDeviceKey, publicKeyFingerprint, type StoredDeviceKey } from '../../src/collab/security/keys';
 import { sha256Hex, verifyTransition, verifyTransitionOwnership } from '../../src/collab/security/authorityTransition';
 import { ChangeJournal } from '../../src/storage/changeJournal';
@@ -24,7 +25,7 @@ function setup() {
   const storage = { get: async (id: string) => ({ [id]: structuredClone(values[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(values, structuredClone(patch)); } };
   const getKey = async (purpose: string) => { if (!keys.has(purpose)) keys.set(purpose, await generateDeviceKey()); return keys.get(purpose)!; };
   const permissions: Record<string, { id: string; role: string; deviceKeyId?: string; authorityKeyId?: string }> = {};
-  const service = createBoardGrantService({ storage, fetcher, getKey, peekKey: async purpose => keys.get(purpose) ?? null,
+  const service = createBoardGrantService({ storage, fetcher, getKey, authBudget: instantAuthBudget(), peekKey: async purpose => keys.get(purpose) ?? null,
     onAuthorization: async (board, permission, authorityReplacementAuthorized) => {
       // Mirrors the runtime guard: only a Drive-verified transition may replace
       // a locally pinned authority in the journal permission row.

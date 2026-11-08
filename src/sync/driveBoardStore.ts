@@ -17,8 +17,9 @@
  */
 import { getSnapshotMeta, downloadSnapshotBytes, publishSnapshotConditional } from "./drivePublish";
 import type { GoogleAuthProvider } from "./googleAuth";
-import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, driveRequestSignature, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
 import { shareGet } from "./driveSharedRequest";
+import { driveHttpError } from "./driveHttp";
 
 export const BOARD_ROOT_NAME = "pboard";
 export const BOARD_SNAPSHOT_FILENAME = "board.json.gz";
@@ -28,7 +29,14 @@ const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 
 export type DriveBoardFile = { id: string; name: string };
-type DriveNode = { id: string; name: string; parents?: string[]; mimeType?: string; createdTime?: string; modifiedTime?: string };
+export type DriveNode = { id: string; name: string; parents?: string[]; mimeType?: string; createdTime?: string; modifiedTime?: string
+  /** Present on the single-id metadata read; listings omit them. */
+  trashed?: boolean; ownedByMe?: boolean; capabilities?: { canAddChildren?: boolean } };
+/** The Drive name of a board's folder: the board id, sanitized to the id
+ *  charset. Exported because the deletion cleanup verifies a resolved folder's
+ *  *name* against the same function that created it — matching by a second,
+ *  hand-written copy of the rule is how a folder stops being recognised. */
+export const boardFolderName = (boardId: string) => boardId.replace(/[^a-zA-Z0-9_-]/g, "_");
 
 export type DriveBoardStore = {
   rootFolder(): Promise<string>;
@@ -36,6 +44,13 @@ export type DriveBoardStore = {
   boardFolder(boardId: string): Promise<string>;
   /** Fresh, read-only lookup for ownership recovery; never creates or merges folders. */
   existingBoardFolder(boardId: string): Promise<string | null>;
+  /** Create-free *existence* probe for the derived board path: does any visible
+   * `pboard/<boardId>` folder exist, whatever protocol it carries inside?
+   * Deliberately not `existingBoardFolder` — that one is authority recovery's
+   * "one folder with exactly one snapshot" oracle and answers `null` for a
+   * perfectly live operation-protocol folder. A hint from the account room is
+   * verified against this: a record may find a Drive path, never mint one. */
+  boardFolderExists(boardId: string): Promise<boolean>;
   attachmentsFolder(boardId: string): Promise<string>;
   /** Board ids of every child folder of the root (board discovery). */
   listBoards(): Promise<string[]>;
@@ -54,10 +69,28 @@ export type DriveBoardStore = {
   downloadFile(fileId: string): Promise<Uint8Array | null>;
   /** Move one file to Drive trash; 404 counts as success (already gone). */
   trashFile(fileId: string): Promise<void>;
+  /**
+   * Every visible `pboard/<boardId>` folder id, across every root this account
+   * can see, **read-only and create-free**. `boardFolderExists` answers yes/no;
+   * the deletion cleanup needs the ids, and needs them without ever resolving
+   * (which creates). More than one id is a real ambiguity the caller must
+   * refuse rather than pick from.
+   */
+  boardFolderCandidates(boardId: string): Promise<string[]>;
+  /**
+   * One folder's metadata by id, including `trashed`. This is how the cleanup
+   * *confirms* a Trash (and how it recognises a folder that was already in
+   * Trash) without a second write and without a listing of the account.
+   */
+  folderState(folderId: string): Promise<{ id: string; name: string; parents: string[]; trashed: boolean; ownedByMe: boolean;
+    role: "owner" | "editor" | "viewer" | "revoked" }>;
+  /** The root folder id of the unified layout, create-free; null when this
+   *  account has no `pboard` root at all. */
+  existingRootFolder(): Promise<string | null>;
   reset(): void;
 };
 
-const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_");
+const sanitize = boardFolderName;
 
 export function createDriveBoardStore(options: {
   auth: GoogleAuthProvider;
@@ -89,7 +122,7 @@ export function createDriveBoardStore(options: {
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {})
     });
     // Google's reported cost outranks the projection when the header is present.
-    quota.observe(cost, response.headers);
+    quota.observe(cost, response.headers, driveRequestSignature(url, init.method ?? "GET"));
     return response;
   }
   async function call(url: string, init: RequestInit = {}): Promise<Response> {
@@ -106,7 +139,9 @@ export function createDriveBoardStore(options: {
   /** Google's list endpoints need the proven parameter envelope (including
    * `spaces=drive`); hand-built query strings drifted from it once already. */
   const listUrl = (query: string, fields: string) =>
-    `${API}/files?${new URLSearchParams({ spaces: "drive", q: query, fields, pageSize: "20" })}`;
+    // Flat 100 units per listing regardless of page size: a small page would
+    // only multiply the requests when a board has many snapshots.
+    `${API}/files?${new URLSearchParams({ spaces: "drive", q: query, fields, pageSize: "1000" })}`;
   const esc = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
   async function failure(response: Response, what: string): Promise<Error> {
     let detail = "";
@@ -120,7 +155,7 @@ export function createDriveBoardStore(options: {
     // scope hint, so a throttled request is never read as a permission failure.
     if (isDriveQuotaFailure(detail)) return driveQuotaError(response.status, detail, quota);
     if (response.status === 403 && /scope/i.test(detail)) detail += "; reconnect Google Drive and allow Drive access";
-    return new Error(`Drive board store ${what} failed (${response.status})${detail ? `: ${detail}` : ""}`);
+    return driveHttpError(response.status, `Drive board store ${what} failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
   async function json<T>(response: Response, what: string): Promise<T> {
     if (!response.ok) throw await failure(response, what);
@@ -276,6 +311,53 @@ export function createDriveBoardStore(options: {
     if (snapshots.length > 1) throw new Error("Multiple Drive board snapshots found; authority recovery requires an unambiguous snapshot");
     return snapshots.length === 1 ? candidates[0].id : null;
   }
+  async function boardFolderExists(boardId: string): Promise<boolean> {
+    // Two listings, no writes, no cache: the question is what Drive names right
+    // now, and a cached answer is exactly what turns "not yet" into "created
+    // anyway". More than one root or folder still means the folder exists;
+    // ambiguity only matters to the callers that must act on one id.
+    const roots = (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME);
+    for (const root of roots) {
+      if ((await listNodes(root.id, sanitize(boardId))).some(node => node.mimeType === FOLDER_MIME)) return true;
+    }
+    return false;
+  }
+  /**
+   * The same two listings as `boardFolderExists`, answering with the ids. Kept
+   * separate from `existingBoardFolder` on purpose: that one is authority
+   * recovery's "exactly one folder with exactly one snapshot" oracle and
+   * answers `null` for a perfectly live operation-protocol folder, which is the
+   * wrong answer for a deletion cleanup that must act on whatever folder the
+   * board has.
+   */
+  async function boardFolderCandidates(boardId: string): Promise<string[]> {
+    const roots = (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME);
+    const ids: string[] = [];
+    for (const root of roots) {
+      for (const node of await listNodes(root.id, sanitize(boardId))) {
+        if (node.mimeType === FOLDER_MIME && !ids.includes(node.id)) ids.push(node.id);
+      }
+    }
+    return ids;
+  }
+  async function existingRootFolder(): Promise<string | null> {
+    return (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME)[0]?.id ?? null;
+  }
+  /**
+   * One folder's live metadata, by id. A trashed folder is still answered (the
+   * live API keeps it readable for its 30-day window) so the caller can tell
+   * "already in Trash" from "never existed"; a folder this account cannot see
+   * throws the Drive 404, which the caller answers as "there is nothing here to
+   * trash".
+   */
+  async function folderState(folderId: string): Promise<{ id: string; name: string; parents: string[]; trashed: boolean; ownedByMe: boolean;
+    role: "owner" | "editor" | "viewer" | "revoked" }> {
+    const response = await call(`${API}/files/${encodeURIComponent(folderId)}?fields=id,name,parents,trashed,ownedByMe,capabilities(canAddChildren)`);
+    const node = await json<{ id: string; name?: string; parents?: string[]; trashed?: boolean; ownedByMe?: boolean; capabilities?: { canAddChildren?: boolean } }>(response, "folder read");
+    const role = node.trashed ? "revoked" as const : node.ownedByMe ? "owner" as const
+      : node.capabilities?.canAddChildren ? "editor" as const : "viewer" as const;
+    return { id: node.id, name: node.name ?? "", parents: node.parents ?? [], trashed: node.trashed === true, ownedByMe: node.ownedByMe === true, role };
+  }
   async function attachmentsFolder(boardId: string): Promise<string> {
     return await resolveFolder(await boardFolder(boardId), ATTACHMENTS_FOLDER_NAME);
   }
@@ -362,7 +444,7 @@ export function createDriveBoardStore(options: {
     return downloadSnapshotBytes(fetcher(), fileId, await token());
   }
   return {
-    rootFolder, boardFolder, existingBoardFolder, attachmentsFolder, listBoards,
+    rootFolder, boardFolder, existingBoardFolder, boardFolderExists, boardFolderCandidates, existingRootFolder, folderState, attachmentsFolder, listBoards,
     snapshotFileId: snapshotId, ensureSnapshotFile,
     meta, download, publish, listAttachments, findAttachment, uploadAttachment, uploadBoardFile, downloadFile, trashFile,
     reset() { folders.clear(); snapshots.clear(); }
