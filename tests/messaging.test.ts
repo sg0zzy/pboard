@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { pinImage, pinSelection, pinWebResource } from "../src/background/handlers";
 import { captureSelection } from "../src/content/selection";
 import { isCaptureRegionMessage, isRuntimeMessage } from "../src/messaging/messages";
+import { respondWith } from "../src/messaging/respond";
 import { firstCaptureImageRegion } from "../src/background/regionCapture";
 import type { ChatProviderAdapter } from "../src/providers/provider";
 
@@ -12,6 +13,29 @@ describe("selection messaging", () => {
     expect(isRuntimeMessage(null)).toBe(false);
     expect(isCaptureRegionMessage({ type: "CAPTURE_PAGE_REGION" })).toBe(true);
     expect(isCaptureRegionMessage({ type: "CAPTURE_SELECTION" })).toBe(false);
+  });
+
+  it("keeps message ports open only for messages this context answers", async () => {
+    const sendResponse = vi.fn();
+    expect(respondWith(sendResponse, () => Promise.resolve({ ok: true, reason: "done" }))).toBe(true);
+    await Promise.resolve();
+    expect(sendResponse).toHaveBeenCalledWith({ ok: true, reason: "done" });
+
+    const handled = vi.fn();
+    expect(respondWith(handled, () => ({ ok: false, reason: "No text is selected" }))).toBe(true);
+    await Promise.resolve();
+    expect(handled).toHaveBeenCalledWith({ ok: false, reason: "No text is selected" });
+
+    const failed = vi.fn();
+    expect(respondWith(failed, () => Promise.reject(new Error("capture failed")))).toBe(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(failed).toHaveBeenCalledWith({ ok: false, reason: "capture failed" });
+
+    const unhandled = vi.fn();
+    expect(respondWith(unhandled, () => undefined)).toBe(false);
+    await Promise.resolve();
+    expect(unhandled).not.toHaveBeenCalled();
   });
 
   it("captures selected text and source metadata through an adapter", () => {

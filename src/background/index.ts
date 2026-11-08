@@ -1,5 +1,6 @@
 import type { CaptureSelectionResponse } from "../messaging/messages";
 import { isCaptureRegionMessage, isToolbarPinMessage } from "../messaging/messages";
+import { respondWith } from "../messaging/respond";
 import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
 import { exposeDriveQuotaDiagnostics } from "../sync/driveQuota";
@@ -191,16 +192,18 @@ browser.commands.onCommand.addListener(async (command: string, tab: any) => {
   }
 });
 
-browser.runtime.onMessage.addListener((message: unknown) => {
-  if (isCaptureRegionMessage(message)) return capturePageRegion(browser as unknown as PageCaptureApi);
-  if (isToolbarPinMessage(message)) {
-    if (message.type === "GET_TOOLBAR_PIN_CONTEXT") return getToolbarPinContext(browser as unknown as PinApi);
-    return pinFromToolbar(browser as unknown as PinApi, repository, message.kind).then((result) => {
-      setPinnedCardFocus(result.cardId);
-      return result;
-    });
-  }
-  return handleDriveSyncMessage(message);
+browser.runtime.onMessage.addListener((message: unknown, _sender: unknown, sendResponse: (response?: unknown) => void) => {
+  return respondWith(sendResponse, () => {
+    if (isCaptureRegionMessage(message)) return capturePageRegion(browser as unknown as PageCaptureApi);
+    if (isToolbarPinMessage(message)) {
+      if (message.type === "GET_TOOLBAR_PIN_CONTEXT") return getToolbarPinContext(browser as unknown as PinApi);
+      return pinFromToolbar(browser as unknown as PinApi, repository, message.kind).then((result) => {
+        setPinnedCardFocus(result.cardId);
+        return result;
+      });
+    }
+    return handleDriveSyncMessage(message);
+  });
 });
 
 async function captureContextImage(
