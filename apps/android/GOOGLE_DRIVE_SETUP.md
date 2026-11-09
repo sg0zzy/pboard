@@ -22,39 +22,22 @@ Use the **same Google Cloud project as Firefox**, and add a separate OAuth clien
 
 Google's [Android authorization guide](https://developer.android.com/identity/authorization) documents the Android package/SHA-1 registration and `AuthorizationClient` API used here.
 
-## Where to put variables
+## Google Identity and relay configuration
 
-**There are no Android OAuth environment variables to set.** The native Google authorization request uses the installed package name and signing certificate to select the Android OAuth client registered in Google Cloud. Keep the returned client ID in Cloud Console for reference; this integration does not pass it to the SDK.
+Android uses Credential Manager for a Google OpenID Connect ID token and the native Google authorization API for a Drive access token. Create a **Web application** OAuth client in the same Google Cloud project. Its public client ID is the Credential Manager server client ID. Configure the relay's `PBOARD_SIGNALING_GOOGLE_AUDIENCES` to include that exact web client ID; configuring the APK alone does not change the relay. The relay validates the Google identity and matches it to the Drive access token before checking the board folder permissions. An Android package/SHA-1 OAuth client is still required for Drive authorization. A client secret is not embedded in Android.
 
-- No Android client secret or web/server client ID is needed: there is no backend token exchange or offline server access.
-- No redirect URI is used; authorization opens the native Google account/consent UI.
-- No `google-services.json` or Firebase setup is needed.
-- Keep Firefox's existing configuration in the repository-root `.env.local` according to `.env.example`. Do not replace its Firefox client ID/secret with Android credentials.
-- WebRTC uses the existing Drive signaling implementation and browser/WebView data channels. No separate signaling URL or API key is required.
+The project's public Web client ID is configured in `src/sync/googleDriveConfig.ts` and embedded in the APK. To build against another Google Cloud project, override it with `VITE_PBOARD_GOOGLE_WEB_CLIENT_ID` and configure the relay to accept that audience. A client ID is not a secret. The existing Firefox desktop/extension client is not automatically a Web application client.
 
-Only connection metadata, account email and sync state persist locally. Access tokens stay in memory and the Google Identity Services token cache; the app does not persist refresh tokens or secrets. Disconnect clears the local connection/token cache and keeps the account pinned, avoiding accidental merging with another account on reconnect. Account switching is not currently exposed.
+The selected Google identity must match the account used for Drive. Connect from Settings and select that same account in Google sign-in. On resume the app attempts to renew identity without prompting; if Google cannot silently return a credential, reconnect from Settings. No device manifest or online owner is needed for v3 admission.
 
-## Get the signing fingerprint and build
-
-From `apps/android` (with JDK 21 and Android SDK configured):
+## Build and Pixel 8a test
 
 ```bash
-cd android
-./gradlew :app:signingReport
-cd ..
-npm run android:debug
+npm run apk:debug
 ```
 
-Register the `SHA1` from `Variant: debug`, then install `android/app/build/outputs/apk/debug/app-debug.apk` using `adb install -r` on the chosen test device. Ordinary updates preserve existing local boards and photos.
+The command prints the debug APK path. Register its actual debug signing SHA-1 with the Android OAuth client and install it on a Pixel 8a (Android 13 or newer) with `adb install -r <apk>`. Installing over an existing app requires the same signing certificate.
 
-## Verify the integration
+With the app open, connect Drive with the same account as Firefox. Create a board in Firefox, wait for Android discovery, open it, create a card in Firefox and check that it arrives on Android. Edit it on Android and check Firefox. Background Android, edit the card in Firefox, then foreground Android and check it catches up. Repeat while offline, after process termination, and with another Google account granted editor access to the board folder; verify a non-member is denied and a removed editor loses access after renewal. Confirm local pending edits survive the offline and restart cases.
 
-1. Open Settings → Google Drive → Connect Google Drive. Choose the same account as Firefox and grant both permissions. Cancellation leaves local data unchanged.
-2. Tap Sync now. A private board created in Firefox should appear on Android, including its photo. Edit it on Android and sync; reconcile in Firefox to verify the update.
-3. Open a shared board on both devices. Invite a second test account as Editor (or use an existing browser invitation). With the board open on both devices, verify the peer count becomes nonzero and text/status changes propagate through WebRTC.
-4. Repeat as Viewer: editing controls should be disabled; changing permissions and waiting for the next role refresh should update access.
-5. Background/resume the Android app, interrupt/restore network access, then disconnect/reconnect. Confirm saved local content survives and sync errors can be retried.
-
-Both peers need to be open for live replication. Networks that require a TURN relay have the same connectivity limitations as the extension. Shared Drive backup handling uses the existing policy: missing boards are bootstrapped from Drive, while newer text on an existing shared board merges through a live peer. This change does not add headless background sync or a TURN service.
-
-If Google reports a developer/configuration error, check the project, exact package, signing SHA-1, enabled Drive API and test-user list. An Android debug build must match its debug key; a release/Play build must match its actual distribution key. Reconnect in Settings if authorization expires or permissions are removed.
+The shared v3 operation log multiplexes board and account rooms on one WebSocket. Backgrounding closes the live rooms and stops the Android polling timers; no foreground service is used. On foreground the app reconnects, resumes persisted cursors, reconciles Drive and sends pending operations. Drive snapshots are the recovery source if relay history is unavailable. Actual device and cross-account verification is still required for this integration.

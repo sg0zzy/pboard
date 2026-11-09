@@ -2697,3 +2697,7 @@ watch for: while an authority browser holds a board open, the journal shows a
 `board_grant_published` epoch increment every few minutes and no attached
 room ever says `grant_expired`; a second browser can then open the same board
 at any moment, not only within five minutes of the first.
+
+### Manual Drive folder review
+
+In Android Settings → Google Drive or below the Firefox collaboration panels, **Review Drive folders** lists direct board-folder candidates under every `pboard` root. The scan is read-only and compares folder names with the boards and deletion facts available on this device. An unidentified folder may be a live board or its only recovery copy on another device; absence from the local list is not proof of deletion. The report shows the newest modification date among direct files, excluding subfolders; expand a folder to see its ID and direct contents before deciding. An owned, non-active folder may be moved to Google Drive Trash only after an explicit per-folder confirmation and exact-name entry. The app rechecks the account, root, folder ownership, local board list and direct contents before the move. Unidentified folders containing subfolders are excluded. No permanent deletion is performed, and this does not garden operation history within a live board.

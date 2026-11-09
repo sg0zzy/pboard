@@ -39,6 +39,9 @@ import { trackTransportSocket, type TransportDial, type TransportTrigger } from 
 import { automaticAuthBudget, type AuthBudget } from '../../collab/authBudget';
 import type { ServiceAdmissionRequest } from '../../collab/experimentalWebSocketSignaling';
 import type { Operation } from './protocol';
+import { readLegacyMigrationWindow } from './legacyMigrationWindow';
+import { createGoogleDriveRoomProof, type GoogleDriveCredentials } from './googleDriveAdmission';
+import type { LegacyRelayRow } from './legacyRelayRecovery';
 import { clearReconnectLedger as clearPolicyLedger, reconnectDelay, reconnectLedger, terminalRefusal, ServiceAdmissionUnavailable } from './logPolicy';
 import {
   aBoolean, aNumber, aString, createRoomCore, frames, proveRoom, type Frame, type LogMetrics, type RoomCore
@@ -125,9 +128,12 @@ export type LogSyncOptions = {
   getKey: () => Promise<StoredDeviceKey>;
   getAuthorization: () => Promise<RelayAuthorization>;
   getServiceAdmission?: (request: ServiceAdmissionRequest) => Promise<string>;
+  /** Drive authorization replaces manifest admission on the v3 path. */
+  googleDrive?: { folderId: string; accountRoom?: boolean; actorId: string; getCredentials(): Promise<GoogleDriveCredentials>; fetcher?: typeof fetch };
   seal: (operation: Operation) => Promise<string>;
   open: (payload: string, opId: string) => Promise<Operation>;
   receive: (operations: Operation[]) => Promise<void>;
+  onAccountHint?: (hint: Frame) => void;
   /**
    * Called for every log row this device could not open — a seal from a key
    * the board no longer carries, or (the designed case) the handoff beacon of
@@ -185,9 +191,14 @@ export type OperationLogSync = {
   status(): LogSyncStatus;
   reconnectNow(opts?: { userInitiated?: boolean }): boolean;
   broadcast(operations: Operation[]): Promise<boolean>;
+  publishAccountHint(to: string, hintId: string, payload: string): Promise<void>;
+  replayAccountHints(afterSeq: number): Promise<Frame>;
   lease(leaseMs?: number): Promise<LogLease>;
   release(): Promise<void>;
   commit(lease: LogLease, sequence: number, snapshotSequence: number, driveEtag: string): Promise<LogCommit>;
+  beginMigration(generation: string): Promise<number>;
+  cancelMigration(generation: string): Promise<void>;
+  readMigrationWindow(after: number, through: number): Promise<LegacyRelayRow[]>;
   diagnose(): Promise<Frame>;
   catchUpTo(sequence: number): Promise<'ready' | 'gap'>;
   resend(): Promise<boolean>;
@@ -244,7 +255,7 @@ export async function createOperationLogSync(options: LogSyncOptions): Promise<O
   // `deviceKeyId` per attach, so each room is admitted under its own device. It
   // is passed to the session for diagnostics only — the session is keyed by the
   // relay URL, and one socket holds rooms of many devices.
-  const identity = (await options.getKey()).keyId;
+  const identity = options.googleDrive?.actorId ?? (await options.getKey()).keyId;
   const claim = relaySessions.claim({
     url: options.url, Socket, topic: options.topic, identity, authBudget: budget,
     reconnectBaseMs: options.reconnectBaseMs, connectTimeoutMs: options.connectTimeoutMs,
@@ -273,6 +284,7 @@ export async function createOperationLogSync(options: LogSyncOptions): Promise<O
     // The context already decided. A shared context multiplexes; a legacy one
     // (or one whose probe is still in flight) keeps the deployed behaviour.
     const mode = await relaySessions.mode(options.url);
+    if (mode !== 'multiplexed' && options.googleDrive) throw new Error('Drive authorization requires relay protocol 3');
     return mode === 'multiplexed'
       ? await openSharedRoom(options, claim.session, room)
       : await openPrivateRoom(options, Socket, budget, room, identity);
@@ -299,6 +311,11 @@ export async function createOperationLogSync(options: LogSyncOptions): Promise<O
   }
   relaySessions.settle(options.url, 'legacy');
   relaySessions.relinquish(options.url);
+  if (options.googleDrive) {
+    probe.release();
+    probe.socket.close();
+    throw new Error('Drive authorization requires relay protocol 3');
+  }
   // The socket tracked by the probe turned out to be a private per-room
   // connection, not the context's shared one: the ledger says so rather than
   // leaving the dial attributed to the transport it never became.
@@ -366,10 +383,18 @@ async function openSharedRoom(options: LogSyncOptions, session: RelaySession, ro
     async prepare() {
       // Re-resolve the admission now, so an expired manifest is reported (and
       // retried on backoff) without a socket or a dial attempt being spent.
-      await options.getKey();
-      await options.getAuthorization();
+      if (!options.googleDrive) {
+        await options.getKey();
+        await options.getAuthorization();
+      }
     },
     async prove(welcome: SessionWelcome) {
+      if (options.googleDrive) {
+        const proof = await createGoogleDriveRoomProof({ relayUrl: options.url, boardId: options.boardId,
+          ...options.googleDrive, welcome });
+        roomId = proof.room;
+        return proof;
+      }
       const key = await options.getKey();
       const proof = await proveRoom({
         topic: options.topic,
@@ -424,6 +449,7 @@ async function openSharedRoom(options: LogSyncOptions, session: RelaySession, ro
       announce();
       refuseStart(new Error(`Operation log refused: ${code}`));
     },
+    accountHint: frame => { if (!stopped) options.onAccountHint?.(frame); },
     deliver: frame => {
       if (stopped) return;
       void request(() => core.apply([frame])).catch(cause => {
@@ -500,6 +526,8 @@ async function openSharedRoom(options: LogSyncOptions, session: RelaySession, ro
       try { return await request(() => core.publish(operations)); }
       catch (cause) { room.error = cause instanceof Error ? cause.message : String(cause); announce(); return false; }
     },
+    async publishAccountHint(to: string, hintId: string, payload: string) { await ask('publishAccountHint', { to, hintId, payload }); },
+    async replayAccountHints(afterSeq: number) { return await ask('replayAccountHints', { afterSeq }); },
     async lease(leaseMs?: number) {
       const reply = await ask('lease', leaseMs ? { leaseMs } : {});
       const lease = { holder: aString(reply.holder) ?? '', epoch: aNumber(reply.epoch) ?? 0, expiresAt: aNumber(reply.expiresAt) ?? 0 };
@@ -517,6 +545,19 @@ async function openSharedRoom(options: LogSyncOptions, session: RelaySession, ro
       if (commit.stale) collaborationDiagnostic('logsync.stale_commit');
       announce();
       return commit;
+    },
+    async beginMigration(generation: string) {
+      const reply = await ask('beginMigration', { generation });
+      if (reply.action !== 'migrationFenced' || reply.generation !== generation || !Number.isSafeInteger(reply.throughSeq) || Number(reply.throughSeq) < 0)
+        throw new Error('Invalid migration fence reply');
+      return Number(reply.throughSeq);
+    },
+    async cancelMigration(generation: string) {
+      const reply = await ask('cancelMigration', { generation });
+      if (reply.action !== 'migrationCancelled' || reply.generation !== generation) throw new Error('Invalid migration cancellation reply');
+    },
+    async readMigrationWindow(after: number, through: number) {
+      return await request(() => readLegacyMigrationWindow(afterSeq => ask('subscribe', { afterSeq }), after, through));
     },
     async diagnose() { return await ask('status'); },
     async catchUpTo(sequence: number) { return await request(() => core.catchUpTo(sequence)); },
@@ -946,6 +987,8 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
       try { return await request(() => core.publish(operations)); }
       catch (cause) { fail(cause); return false; }
     },
+    async publishAccountHint(to: string, hintId: string, payload: string) { await request(() => ask('publishAccountHint', { to, hintId, payload })); },
+    async replayAccountHints(afterSeq: number) { return await request(() => ask('replayAccountHints', { afterSeq })); },
     async lease(leaseMs?: number): Promise<LogLease> {
       const reply = await request(() => ask('lease', leaseMs ? { leaseMs } : {}));
       const lease = { holder: aString(reply.holder) ?? '', epoch: aNumber(reply.epoch) ?? 0, expiresAt: aNumber(reply.expiresAt) ?? 0 };
@@ -963,6 +1006,19 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
       if (commit.stale) debug('logsync.stale_commit');
       announce();
       return commit;
+    },
+    async beginMigration(generation: string) {
+      const reply = await request(() => ask('beginMigration', { generation }));
+      if (reply.action !== 'migrationFenced' || reply.generation !== generation || !Number.isSafeInteger(reply.throughSeq) || Number(reply.throughSeq) < 0)
+        throw new Error('Invalid migration fence reply');
+      return Number(reply.throughSeq);
+    },
+    async cancelMigration(generation: string) {
+      const reply = await request(() => ask('cancelMigration', { generation }));
+      if (reply.action !== 'migrationCancelled' || reply.generation !== generation) throw new Error('Invalid migration cancellation reply');
+    },
+    async readMigrationWindow(after: number, through: number) {
+      return await request(() => readLegacyMigrationWindow(afterSeq => ask('subscribe', { afterSeq }), after, through));
     },
     async diagnose() { return await request(() => ask('status')); },
     async catchUpTo(sequence: number) { return await request(() => core.catchUpTo(sequence)); },

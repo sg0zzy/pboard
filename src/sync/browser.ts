@@ -49,7 +49,7 @@ export function registerRxRepositoryResolver(resolver: () => Promise<RxRepositor
 
 export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
 export type { GardeningPreview } from "./operations/service";
-export const { operationService, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, healRelay, boardCollaboration, accountChannel } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
+export const { operationService, driveFolderGardener, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, healRelay, boardCollaboration, accountChannel } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
   hasSignalingHostPermission: (origin) => browser.permissions.contains({ origins: [origin] }),
   onReconciled: () => retryPendingLeaves() });
 

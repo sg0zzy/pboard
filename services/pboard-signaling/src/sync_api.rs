@@ -88,6 +88,12 @@ pub enum Request {
         snapshot_seq: u64,
         drive_etag: String,
     },
+    /// Freeze new legacy writes and capture the last accepted sequence.
+    #[serde(rename_all = "camelCase")]
+    BeginMigration { board: String, generation: String },
+    /// Resume legacy writes after an abandoned, uncommitted migration.
+    #[serde(rename_all = "camelCase")]
+    CancelMigration { board: String, generation: String },
     /// Per-board diagnostics for the console surface.
     Status { board: String },
     /// Hand this device's wrap key to the board's roster; see [`crate::key_courier`].
@@ -166,6 +172,8 @@ impl Request {
             | Self::Lease { board, .. }
             | Self::Release { board }
             | Self::Commit { board, .. }
+            | Self::BeginMigration { board, .. }
+            | Self::CancelMigration { board, .. }
             | Self::Status { board }
             | Self::PublishDeviceKey { board, .. }
             | Self::ListDeviceKeys { board }
@@ -188,13 +196,17 @@ impl Request {
 pub struct RoomAccess {
     /// False for a read-only admission: it may subscribe, never submit.
     pub editor: bool,
+    /// Only an established owner can advance a durable checkpoint.
+    pub owner: bool,
 }
 
 impl RoomAccess {
     /// Owner or editor admission: may publish mutations.
-    pub const WRITER: Self = Self { editor: true };
+    pub const WRITER: Self = Self { editor: true, owner: false };
+    /// Owner admission: may also consolidate durable history.
+    pub const OWNER: Self = Self { editor: true, owner: true };
     /// Viewer admission: receives the stream, is refused every write.
-    pub const READER: Self = Self { editor: false };
+    pub const READER: Self = Self { editor: false, owner: false };
 }
 
 /// The verified identity of the connection issuing a request.
@@ -364,6 +376,7 @@ fn code_for(error: &SyncLogError) -> &'static str {
         SyncLogError::CheckpointRejected(_) => "checkpoint_rejected",
         SyncLogError::EvidenceRejected(_) => "evidence_rejected",
         SyncLogError::Full => "log_full",
+        SyncLogError::MigrationFenced => "migration_fenced",
         SyncLogError::Io(_) | SyncLogError::Sqlite(_) => "server_error",
     }
 }
@@ -433,6 +446,26 @@ pub fn handle(
     // the frame. Taken from the attachment, never from the request.
     let actor = identity.actor_for(board);
     match request {
+        Request::BeginMigration { generation, .. } => {
+            // The legacy operator-grant path has no independently verified
+            // owner or board identity. Never grant migration authority to it.
+            if !access.owner || !identity.board_ids.get(board).is_some_and(|id| !id.starts_with("account:")) {
+                return Outcome::only(error(board, "owner_required"));
+            }
+            match log.fence_migration(board, &generation) {
+                Ok(through) => Outcome::only(frame("migrationFenced", board, vec![("generation", json!(generation)), ("throughSeq", json!(through))])),
+                Err(failure) => Outcome::only(error(board, code_for(&failure))),
+            }
+        }
+        Request::CancelMigration { generation, .. } => {
+            if !access.owner || !identity.board_ids.get(board).is_some_and(|id| !id.starts_with("account:")) {
+                return Outcome::only(error(board, "owner_required"));
+            }
+            match log.cancel_migration(board, &generation) {
+                Ok(()) => Outcome::only(frame("migrationCancelled", board, vec![("generation", json!(generation))])),
+                Err(failure) => Outcome::only(error(board, code_for(&failure))),
+            }
+        }
         Request::Subscribe { after_seq, .. } => match log.sync_from(board, after_seq, limits.replay_batch) {
             Err(failure) => Outcome::only(error(board, code_for(&failure))),
             Ok(window) => {
@@ -532,8 +565,8 @@ pub fn handle(
             Outcome { replies: vec![frame("accepted", board, fields)], broadcast: published, inbox_broadcast: Vec::new() }
         }
         Request::Lease { lease_ms, .. } => {
-            if !editor {
-                return Outcome::only(error(board, "read_only"));
+            if !access.owner {
+                return Outcome::only(error(board, if editor { "owner_required" } else { "read_only" }));
             }
             let lease_ms = lease_ms.unwrap_or(limits.lease_ms).clamp(1_000, limits.lease_max_ms);
             match log.acquire_lease(board, actor, lease_ms) {
@@ -550,8 +583,8 @@ pub fn handle(
             Err(failure) => Outcome::only(error(board, code_for(&failure))),
         },
         Request::Commit { epoch, seq, snapshot_seq, drive_etag, .. } => {
-            if !editor {
-                return Outcome::only(error(board, "read_only"));
+            if !access.owner {
+                return Outcome::only(error(board, if editor { "owner_required" } else { "read_only" }));
             }
             if drive_etag.len() > limits.etag_bytes {
                 return Outcome::only(error(board, "invalid_request"));
@@ -785,6 +818,17 @@ pub struct Hub {
 struct Subscriber {
     session: String,
     sender: tokio::sync::mpsc::Sender<Value>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Subscriber {
+    fn deliver(&self, value: &Value) -> bool {
+        if self.sender.try_send(value.clone()).is_ok() { return true; }
+        // An overflowing queue has lost a durable event. A live socket must
+        // reconnect and replay rather than remain silently unsubscribed.
+        if let Some(cancel) = &self.cancel { let _ = cancel.send(true); }
+        false
+    }
 }
 
 impl Hub {
@@ -797,7 +841,13 @@ impl Hub {
     pub fn subscribe(&mut self, board: &str, session: &str, sender: tokio::sync::mpsc::Sender<Value>) {
         let entries = self.by_board.entry(board.to_string()).or_default();
         entries.retain(|subscriber| subscriber.session != session);
-        entries.push(Subscriber { session: session.to_string(), sender });
+        entries.push(Subscriber { session: session.to_string(), sender, cancel: None });
+    }
+
+    pub fn subscribe_controlled(&mut self, board: &str, session: &str, sender: tokio::sync::mpsc::Sender<Value>, cancel: tokio::sync::watch::Sender<bool>) {
+        let entries = self.by_board.entry(board.to_string()).or_default();
+        entries.retain(|subscriber| subscriber.session != session);
+        entries.push(Subscriber { session: session.to_string(), sender, cancel: Some(cancel) });
     }
 
     pub fn unsubscribe_session(&mut self, session: &str) {
@@ -842,7 +892,14 @@ impl Hub {
         }
         let entries = self.by_inbox.entry(inbox.to_string()).or_default();
         entries.retain(|subscriber| subscriber.session != session);
-        entries.push(Subscriber { session: session.to_string(), sender });
+        entries.push(Subscriber { session: session.to_string(), sender, cancel: None });
+    }
+
+    pub fn subscribe_inbox_controlled(&mut self, inbox: &str, session: &str, sender: tokio::sync::mpsc::Sender<Value>, cancel: tokio::sync::watch::Sender<bool>) {
+        self.subscribe_inbox(inbox, session, sender);
+        if let Some(subscriber) = self.by_inbox.get_mut(inbox).and_then(|entries| entries.iter_mut().find(|entry| entry.session == session)) {
+            subscriber.cancel = Some(cancel);
+        }
     }
 
     /// Drops one session from one inbox, and from the owner map that makes a
@@ -868,7 +925,7 @@ impl Hub {
     /// reconnect replays it.
     pub fn publish_inbox(&mut self, inbox: &str, value: &Value) {
         if let Some(subscribers) = self.by_inbox.get_mut(inbox) {
-            subscribers.retain(|subscriber| subscriber.sender.try_send(value.clone()).is_ok());
+            subscribers.retain(|subscriber| subscriber.deliver(value));
         }
     }
 
@@ -878,7 +935,7 @@ impl Hub {
     /// a board.
     pub fn publish(&mut self, board: &str, value: &Value) {
         if let Some(subscribers) = self.by_board.get_mut(board) {
-            subscribers.retain(|subscriber| subscriber.sender.try_send(value.clone()).is_ok());
+            subscribers.retain(|subscriber| subscriber.deliver(value));
         }
     }
 
@@ -921,7 +978,7 @@ mod tests {
         super::handle(log, courier, Some(&inbox), identity, request, limits)
     }
     fn identity(board: &str, actor: &str) -> Identity {
-        Identity::new(actor, "session-1").with_room(board, RoomAccess::WRITER)
+        Identity::new(actor, "session-1").with_room(board, RoomAccess::OWNER)
     }
     fn reader(board: &str, actor: &str) -> Identity {
         Identity::new(actor, "session-1").with_room(board, RoomAccess::READER)
@@ -1022,6 +1079,44 @@ mod tests {
     }
 
     #[test]
+    fn editor_can_submit_but_cannot_consolidate() {
+        let (log, courier) = store();
+        let editor = Identity::new("editor", "session").with_room("board", RoomAccess::WRITER);
+        let limits = Limits::default();
+        assert_eq!(handle(&log, &courier, &editor, submit("board", vec![submitted("op-1")]), &limits).replies[0]["action"], "accepted");
+        for request in [
+            Request::Lease { board: "board".into(), lease_ms: None },
+            Request::Commit { board: "board".into(), epoch: 1, seq: 1, snapshot_seq: 1, drive_etag: "etag".into() },
+        ] {
+            assert_eq!(handle(&log, &courier, &editor, request, &limits).replies[0]["code"], "owner_required");
+        }
+    }
+
+    #[test]
+    fn migration_fence_requires_an_owner_with_a_verified_board_and_is_cancellable() {
+        let (log, courier) = store();
+        let limits = Limits::default();
+        let owner = identity("room", "owner").with_board_id("room", "board");
+        let editor = Identity::new("editor", "session").with_room("room", RoomAccess::WRITER).with_board_id("room", "board");
+        let legacy = identity("room", "legacy");
+        let account = identity("room", "account").with_board_id("room", "account:account-id");
+        let begin = || Request::BeginMigration { board: "room".into(), generation: "attempt-1".into() };
+        for denied in [&editor, &legacy, &account] {
+            assert_eq!(handle(&log, &courier, denied, begin(), &limits).replies[0]["code"], "owner_required");
+        }
+        handle(&log, &courier, &owner, submit("room", vec![submitted("op-1")]), &limits);
+        let fenced = handle(&log, &courier, &owner, begin(), &limits);
+        assert_eq!(fenced.replies[0]["action"], "migrationFenced");
+        assert_eq!(fenced.replies[0]["throughSeq"], 1);
+        assert_eq!(handle(&log, &courier, &editor, submit("room", vec![submitted("op-2")]), &limits).replies[0]["code"], "migration_fenced");
+        let cancel = |generation: &str| Request::CancelMigration { board: "room".into(), generation: generation.into() };
+        assert_eq!(handle(&log, &courier, &editor, cancel("attempt-1"), &limits).replies[0]["code"], "owner_required");
+        assert_eq!(handle(&log, &courier, &owner, cancel("other"), &limits).replies[0]["code"], "migration_fenced");
+        assert_eq!(handle(&log, &courier, &owner, cancel("attempt-1"), &limits).replies[0]["action"], "migrationCancelled");
+        assert_eq!(handle(&log, &courier, &editor, submit("room", vec![submitted("op-2")]), &limits).replies[0]["action"], "accepted");
+    }
+
+    #[test]
     fn asks_for_a_snapshot_when_the_history_a_client_needs_is_gone() {
         let (log, courier) = store();
         let writer = identity("board", "device-a");
@@ -1119,6 +1214,19 @@ mod tests {
         hub.unsubscribe_session("fast");
         assert_eq!(hub.subscribers("board"), 0);
         assert_eq!(hub.subscribers("other"), 0);
+    }
+
+    #[test]
+    fn overflowing_a_live_subscriber_signals_its_connection_to_replay() {
+        let mut hub = Hub::default();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        hub.subscribe_controlled("board", "session", sender, cancel);
+        hub.publish("board", &json!({"seq":1}));
+        assert!(!*cancelled.borrow());
+        hub.publish("board", &json!({"seq":2}));
+        assert!(*cancelled.borrow());
+        assert_eq!(hub.subscribers("board"), 0);
     }
 
     #[test]

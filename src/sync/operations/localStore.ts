@@ -1,5 +1,6 @@
 import type { ChangeJournal } from '../../storage/changeJournal';
 import { canonical, validateCommand, validateOperation, validateSegment, MAX_SEGMENT_BYTES, MAX_SEGMENT_OPERATIONS, PROTOCOL, type Command, type Frontier, type Operation, type Segment } from './protocol';
+import type { LegacyMigrationIntent } from './legacyMigrationPreparation';
 
 export type SnapshotIntent = { id: string; kind: 'snapshot-intent'; boardId: string; fileId: string; snapshot: import('./snapshots').OperationSnapshot; published: boolean };
 type Stream = { id: string; boardId: string; actorId: string; seq: number; clock: number; frontier: Frontier; seen?: Frontier };
@@ -186,6 +187,46 @@ export class LocalOperationStore {
   async checkpoint(boardId: string): Promise<import('./engine').EngineCheckpoint | null> {
     const row = await this.journal.read<{ checkpoint: import('./engine').EngineCheckpoint } | undefined>('operationCheckpoints', store => store.get(boardId));
     return row?.checkpoint ?? null;
+  }
+  /** IndexedDB serializes reservations across extension contexts. This record
+   * remains until explicit recovery/cutover; retries cannot replace its identity
+   * or the exact snapshot bytes prepared by an earlier attempt. */
+  legacyMigrationJournal(boardId: string) {
+    const id = `legacy-migration:${boardId}`;
+    type Row = { id: string; kind: 'legacy-migration'; boardId: string; generation: string; intent?: LegacyMigrationIntent };
+    return {
+      reserve: async (requestedBoard: string, generation: string): Promise<void> => {
+        if (requestedBoard !== boardId || !/^[A-Za-z0-9_-]{1,100}$/.test(generation)) throw new Error('Invalid migration reservation');
+        await this.journal.operationTransaction<void>(boardId, ['operationCheckpoints'], (tx, result) => {
+          const store = tx.objectStore('operationCheckpoints'), request = store.get(id);
+          request.onsuccess = () => {
+            const existing = request.result as Row | undefined;
+            if (existing && (existing.kind !== 'legacy-migration' || existing.boardId !== boardId || existing.generation !== generation)) { tx.abort(); return; }
+            if (!existing) store.add({ id, kind: 'legacy-migration', boardId, generation } satisfies Row);
+            result(undefined);
+          };
+        });
+      },
+      load: async (): Promise<LegacyMigrationIntent | null> => {
+        const row = await this.journal.read<Row | undefined>('operationCheckpoints', store => store.get(id));
+        if (row && (row.kind !== 'legacy-migration' || row.boardId !== boardId)) throw new Error('Invalid migration journal record');
+        return row?.intent ?? null;
+      },
+      save: async (intent: LegacyMigrationIntent): Promise<void> => {
+        const saved = structuredClone(intent);
+        if (saved.boardId !== boardId) throw new Error('Migration intent belongs to a different board');
+        await this.journal.operationTransaction<void>(boardId, ['operationCheckpoints'], (tx, result) => {
+          const store = tx.objectStore('operationCheckpoints'), request = store.get(id);
+          request.onsuccess = () => {
+            const existing = request.result as Row | undefined;
+            if (!existing || existing.kind !== 'legacy-migration' || existing.boardId !== boardId || existing.generation !== saved.generation
+              || (existing.intent && canonical(existing.intent) !== canonical(saved))) { tx.abort(); return; }
+            if (!existing.intent) store.put({ ...existing, intent: saved });
+            result(undefined);
+          };
+        });
+      }
+    };
   }
   async snapshotIntents(boardId: string): Promise<SnapshotIntent[]> {
     const rows = await this.journal.read<any[]>('operationCheckpoints', store => store.index('boardId').getAll(boardId));

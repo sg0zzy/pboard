@@ -26,6 +26,7 @@ pub mod admission;
 pub mod board_grants;
 pub mod buffer_api;
 pub mod google_enrollment;
+pub mod google_identity;
 pub mod identity_enrollment;
 pub mod key_courier;
 pub mod leader;
@@ -38,7 +39,10 @@ mod strict_json;
 use admission::{AdmissionProof, VerifiedAdmission};
 
 pub const MAX_MESSAGE: usize = 96 * 1024;
-const QUEUE: usize = 4;
+// One client submits up to 64 operations per batch. A batch must fit in the
+// recipient queue before the publishing task yields; overflow still cancels
+// the slow session so it reconnects and replays from its cursor.
+const QUEUE: usize = 64;
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -279,12 +283,14 @@ pub struct App {
     identity_enrollment: bool,
     identity_directory: Arc<Mutex<identity_enrollment::Directory>>,
     pub(crate) google_enrollment: Option<Arc<google_enrollment::GoogleEnrollment>>,
+    pub(crate) google_drive_verifier: Option<Arc<google_identity::GoogleDriveVerifier>>,
+    pub(crate) google_drive_tickets: Arc<Mutex<google_identity::DriveTickets>>,
 }
 impl App {
     /// Public binary startup must never silently enable Google-free admission.
     pub fn validate_service_policy(&self) -> Result<(), &'static str> {
         if self.policy.require_tls_proxy
-            && (self.google_enrollment.is_none()
+            && ((self.google_enrollment.is_none() && self.google_drive_verifier.is_none())
                 || (self.board_grants && !self.identity_enrollment))
         {
             return Err("public_service_requires_google_admission");
@@ -327,6 +333,8 @@ impl App {
             identity_enrollment: false,
             identity_directory: Arc::new(Mutex::new(identity_enrollment::Directory::default())),
             google_enrollment: None,
+            google_drive_verifier: None,
+            google_drive_tickets: Arc::new(Mutex::new(google_identity::DriveTickets::default())),
         })
     }
     pub fn with_automatic_admission(mut self, enabled: bool) -> Self {
@@ -430,6 +438,12 @@ impl App {
         enrollment: google_enrollment::GoogleEnrollment,
     ) -> Self {
         self.google_enrollment = Some(Arc::new(enrollment));
+        self.automatic_admission = true;
+        self
+    }
+    /// Opt-in during the coordinated Google/Drive protocol rollout only.
+    pub fn with_google_drive_verifier(mut self, verifier: google_identity::GoogleDriveVerifier) -> Self {
+        self.google_drive_verifier = Some(Arc::new(verifier));
         self.automatic_admission = true;
         self
     }
@@ -558,6 +572,8 @@ impl App {
             let board_id = context.board_id.clone();
             Ok(Attached {
                 editor: role.can_write(),
+                owner: role == admission::Role::Owner,
+                google_subject: None,
                 // The device *this* proof verified, which is the frame's
                 // `deviceKeyId` on an attach and the connection's device on
                 // `authenticate`. Recorded from the admission, never from a
@@ -606,6 +622,10 @@ impl App {
             };
             Ok(Attached {
                 editor: true,
+                // Legacy operator grants have no roles; preserve their
+                // historical consolidation behavior until this mode retires.
+                owner: true,
+                google_subject: None,
                 device: device.to_owned(),
                 expires_at: grant.expires_at.min(service_expiry),
                 authorization: None,
@@ -614,9 +634,28 @@ impl App {
             })
         }
     }
+    fn admit_google_room(&self, ticket: &str, challenge: &str, session: &str, room: &str, actor: &str) -> Result<Attached, &'static str> {
+        if self.google_drive_verifier.is_none() || !valid_room(actor) || actor.len() > 200 {
+            return Err("unauthorized");
+        }
+        let record = self.google_drive_tickets.lock().unwrap().consume(ticket, challenge, session, room, now_ms() / 1000)?;
+        let role = record.access.role;
+        Ok(Attached {
+            editor: role != google_identity::DriveRole::Viewer,
+            owner: role == google_identity::DriveRole::Owner,
+            google_subject: Some(record.access.subject),
+            device: actor.into(),
+            expires_at: record.expires_at.saturating_mul(1000),
+            authorization: None,
+            context: None,
+            board_id: Some(record.access.board_id),
+        })
+    }
     pub fn router(self) -> Router {
         let bundle_limit = self.limits.grant_bundle_bytes;
         Router::new()
+            .route("/drive/admit", axum::routing::post(google_identity::admit)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024)))
             .route(
                 "/identity/challenge",
                 axum::routing::post(identity_enrollment::challenge),
@@ -759,6 +798,10 @@ async fn upgrade(State(app): State<App>, ws: WebSocketUpgrade) -> impl IntoRespo
 struct Attached {
     /// False for a read-only admission: it may subscribe, never submit.
     editor: bool,
+    /// Owner capability; role-less legacy operator grants retain their old access.
+    owner: bool,
+    /// Google subject for Drive-verified rooms; never read from a client frame.
+    google_subject: Option<String>,
     /// The device key id this room's admission verified, for *this* room.
     ///
     /// Since a v3 `attach` may present its own device key, this is not
@@ -806,6 +849,13 @@ struct AttachFrame {
     authorization: Option<AdmissionProof>,
     #[serde(default)]
     service_admission: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewGoogleFrame {
+    room: String,
+    service_admission: String,
 }
 
 /// A v3 `detach` frame. Unknown fields tolerated for the same reason.
@@ -897,6 +947,8 @@ async fn session(mut socket: WebSocket, app: App) {
     // watch. This is the whole of "multiple rooms per connection": the hub, the
     // sync log and the roster were already keyed by room.
     let mut attachments = HashMap::<String, Attached>::new();
+    // A multiplexed Google connection may attach only the same verified user.
+    let mut connection_google_subject: Option<String> = None;
     // The room the legacy `join`/`signal` surface speaks for: the first room this
     // connection authenticated, so a v1/v2 client's peer roster means exactly
     // what it always did. Other rooms are sync-only and have no roster.
@@ -1040,6 +1092,47 @@ async fn session(mut socket: WebSocket, app: App) {
                 // an evolving frame should inherit from the version that has no
                 // way to evolve.
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
+                if kind == "renewGoogle" && negotiated >= 3 {
+                    let Ok(frame) = serde_json::from_value::<RenewGoogleFrame>(value.clone()) else {
+                        if !send(&mut socket, json!({"type":"refused","code":"invalid_request"})).await { reason="slow_consumer"; break; }
+                        continue;
+                    };
+                    let Some(current) = attachments.get(&frame.room) else {
+                        if !send(&mut socket, json!({"type":"refused","code":"room_not_attached","room":frame.room})).await { reason="slow_consumer"; break; }
+                        continue;
+                    };
+                    // Never let a new ticket change this session's identity or
+                    // upgrade a legacy room into a Google room in place.
+                    if current.google_subject.is_none() || !app.permit_automatic_auth() {
+                        if !send(&mut socket, json!({"type":"refused","code":"unauthorized","room":frame.room})).await { reason="slow_consumer"; break; }
+                        continue;
+                    }
+                    let renewed = app.admit_google_room(&frame.service_admission, &challenge, &connection, &frame.room, &current.device);
+                    match renewed {
+                        // An account routing identity may change when Google
+                        // changes its primary address. Do not keep an old inbox
+                        // attached under a fresh grant; force re-admission.
+                        Ok(next) if next.google_subject == connection_google_subject && next.board_id == current.board_id => {
+                            let role = role_name(Some(&next));
+                            // The signaling roster is a separate view of the primary
+                            // room. Keep its expiry in step with the verified room grant;
+                            // otherwise peers stop reaching a successfully renewed member.
+                            if joined && primary.as_deref() == Some(frame.room.as_str()) {
+                                let mut rooms = app.rooms.lock().unwrap();
+                                if let Some(member) = rooms.get_mut(&frame.room).and_then(|members| members.get_mut(&next.device))
+                                    && member.session == connection {
+                                    member.expires_at = next.expires_at;
+                                }
+                            }
+                            attachments.insert(frame.room.clone(), next);
+                            if !send(&mut socket, json!({"type":"renewedGoogle","room":frame.room,"role":role})).await { reason="slow_consumer"; break; }
+                        }
+                        _ => {
+                            if !send(&mut socket, json!({"type":"refused","code":"unauthorized","room":frame.room})).await { reason="slow_consumer"; break; }
+                        }
+                    }
+                    continue;
+                }
                 if (kind == "attach" || kind == "detach") && negotiated >= 3 {
                     if !authenticated {
                         // Attaching is an authenticated act: a pre-auth socket
@@ -1094,35 +1187,24 @@ async fn session(mut socket: WebSocket, app: App) {
                             if !send(&mut socket, json!({"type":"refused","code":"server_busy","room":frame.room})).await { reason="slow_consumer"; break; }
                             continue;
                         }
-                        let service_expiry = if app.google_enrollment.is_some() && app.board_grants {
-                            let Some(ticket) = frame.service_admission else {
-                                // Refused, not fatal: the other rooms are fine.
-                                if !send(&mut socket, json!({"type":"refused","code":"service_auth_required","room":frame.room})).await { reason="slow_consumer"; break; }
-                                continue;
-                            };
-                            // The receipt is bound to the device the attach
-                            // *presents*, not the connection's: a receipt minted
-                            // for `board-device:<board>` is exactly the proof
-                            // that this connection may act for that board's
-                            // device, and a receipt for another device would let
-                            // one connection borrow an admission it never
-                            // obtained. `admit_room` below then checks that the
-                            // presented device is the one the room's manifest
-                            // authorizes.
-                            // The guard is dropped before the await: a std mutex
-                            // held across a yield point is the one thing that
-                            // cannot be in a `Send` future, and this future is
-                            // driven by the runtime.
-                            let consumed = app.identity_directory.lock().unwrap().consume(&ticket, &challenge, &connection, &frame.room, &peer);
-                            match consumed {
-                                Ok(expiry) => expiry,
-                                Err(code) => {
-                                    if !send(&mut socket, json!({"type":"refused","code":code,"room":frame.room})).await { reason="slow_consumer"; break; }
-                                    continue;
-                                }
+                        let admitted_result = if app.google_drive_verifier.is_some() && frame.authorization.is_none() {
+                            match frame.service_admission.as_deref() {
+                                Some(ticket) => app.admit_google_room(ticket, &challenge, &connection, &frame.room, &peer),
+                                None => Err("service_auth_required"),
                             }
-                        } else { u64::MAX };
-                        let admitted = match app.admit_room(&frame.room, &peer, &challenge, &connection, negotiated, frame.authorization.as_ref(), &frame.signature, service_expiry) {
+                        } else {
+                            let service_expiry = if app.google_enrollment.is_some() && app.board_grants {
+                                match frame.service_admission.as_deref() {
+                                    Some(ticket) => app.identity_directory.lock().unwrap().consume(ticket, &challenge, &connection, &frame.room, &peer),
+                                    None => Err("service_auth_required"),
+                                }
+                            } else { Ok(u64::MAX) };
+                            match service_expiry {
+                                Ok(expiry) => app.admit_room(&frame.room, &peer, &challenge, &connection, negotiated, frame.authorization.as_ref(), &frame.signature, expiry),
+                                Err(code) => Err(code),
+                            }
+                        };
+                        let admitted = match admitted_result {
                             Ok(admitted) => admitted,
                             Err(code) => {
                                 // Refused without closing the socket and without
@@ -1133,6 +1215,10 @@ async fn session(mut socket: WebSocket, app: App) {
                                 continue;
                             }
                         };
+                        if admitted.google_subject != connection_google_subject {
+                            if !send(&mut socket, json!({"type":"refused","code":"identity_mismatch","room":frame.room})).await { reason="slow_consumer"; break; }
+                            continue;
+                        }
                         let role = role_name(Some(&admitted));
                         // A connection whose primary room was detached can
                         // regain the legacy roster by attaching a room again;
@@ -1157,14 +1243,14 @@ async fn session(mut socket: WebSocket, app: App) {
                         attachments.insert(frame.room.clone(), admitted);
                         if app.sync.is_some() {
                             let mut hub = app.sync_hub.lock().unwrap();
-                            hub.subscribe(&frame.room, &connection, tx.clone());
+                            hub.subscribe_controlled(&frame.room, &connection, tx.clone(), cancel.clone());
                             // An account room is also an inbox. Registering the
                             // connection here is what makes "every session of
                             // this account" a set the relay can fan out to at
                             // all — the account hash comes from the room's own
                             // verified manifest, never from a frame.
                             if let Some(hash) = inbox {
-                                hub.subscribe_inbox(&hash, &connection, tx.clone());
+                                hub.subscribe_inbox_controlled(&hash, &connection, tx.clone(), cancel.clone());
                             }
                         }
                         tracing::info!(event = "room_attached", session = session_id, role, "room attachment accepted");
@@ -1218,17 +1304,26 @@ async fn session(mut socket: WebSocket, app: App) {
                         // of bad proofs must cost the flooder the permit, not
                         // cost the service the work of verifying them.
                         if !app.permit_automatic_auth() { reason="server_busy"; break; }
-                        let service_expiry = if app.google_enrollment.is_some() && app.board_grants {
-                            let Some(ticket) = service_admission else { reason="service_auth_required"; break; };
-                            match app.identity_directory.lock().unwrap().consume(&ticket, &challenge, &connection, &room, &device_key_id) {
-                                Ok(expiry) => expiry,
-                                Err(code) => { reason=code; break; }
+                        let admitted_result = if app.google_drive_verifier.is_some() && proof.is_none() && version == 3 {
+                            match service_admission.as_deref() {
+                                Some(ticket) => app.admit_google_room(ticket, &challenge, &connection, &room, &device_key_id),
+                                None => Err("service_auth_required"),
                             }
-                        } else { u64::MAX };
-                        let admitted = match app.admit_room(&room, &device_key_id, &challenge, &connection, version, proof.as_ref(), &signature, service_expiry) {
+                        } else {
+                            let service_expiry = if app.google_enrollment.is_some() && app.board_grants {
+                                let Some(ticket) = service_admission.as_deref() else { reason="service_auth_required"; break; };
+                                match app.identity_directory.lock().unwrap().consume(ticket, &challenge, &connection, &room, &device_key_id) {
+                                    Ok(expiry) => expiry,
+                                    Err(code) => { reason=code; break; }
+                                }
+                            } else { u64::MAX };
+                            app.admit_room(&room, &device_key_id, &challenge, &connection, version, proof.as_ref(), &signature, service_expiry)
+                        };
+                        let admitted = match admitted_result {
                             Ok(admitted) => admitted,
                             Err(code) => { reason=code; break; }
                         };
+                        connection_google_subject = admitted.google_subject.clone();
                         negotiated = version;
                         // Correlation metadata only; never log proofs or signal payloads.
                         let room_hash = B64.encode(Sha256::digest(room.as_bytes()));
@@ -1242,14 +1337,14 @@ async fn session(mut socket: WebSocket, app: App) {
                             .map(str::to_owned);
                         if app.sync.is_some() {
                             let mut hub = app.sync_hub.lock().unwrap();
-                            hub.subscribe(&room, &connection, tx.clone());
+                            hub.subscribe_controlled(&room, &connection, tx.clone(), cancel.clone());
                             // The first room may itself be the account room, in
                             // which case this connection is in the inbox fan-out
                             // from the first frame: a single-room client that
                             // dials the account channel directly is a receiver
                             // exactly like one that attached it.
                             if let Some(hash) = inbox {
-                                hub.subscribe_inbox(&hash, &connection, tx.clone());
+                                hub.subscribe_inbox_controlled(&hash, &connection, tx.clone(), cancel.clone());
                             }
                         }
                         attachments.insert(room.clone(), admitted);
@@ -1261,7 +1356,14 @@ async fn session(mut socket: WebSocket, app: App) {
                             // that is the only frame that sets this field.
                             room_devices: std::collections::HashMap::from([(room.clone(), device_key_id.clone())]),
                         });
-                        if !send(&mut socket,json!({"type":"authenticated","peerId":device_key_id,"session":connection,"version":negotiated})).await { break; }
+                        // V3 room handles use this role to initialize write permissions.
+                        // Preserve the legacy response for older clients.
+                        let response = if negotiated >= 3 {
+                            json!({"type":"authenticated","peerId":device_key_id,"session":connection,"version":negotiated,"role":role_name(attachments.get(&room))})
+                        } else {
+                            json!({"type":"authenticated","peerId":device_key_id,"session":connection,"version":negotiated})
+                        };
+                        if !send(&mut socket, response).await { break; }
                     }
                     Client::Authenticate { .. } => { reason="invalid_state"; break; }
                     Client::Join {} if authenticated && !joined => {
@@ -1354,7 +1456,7 @@ async fn session(mut socket: WebSocket, app: App) {
                         // room absent from this map is refused by the protocol.
                         let rooms = attachments
                             .iter()
-                            .map(|(room, attached)| (room.clone(), sync_api::RoomAccess { editor: attached.editor }))
+                            .map(|(room, attached)| (room.clone(), sync_api::RoomAccess { editor: attached.editor, owner: attached.owner }))
                             .collect();
                         // The verified board id of each room, from the manifest
                         // the admission proved. A hint names this, not a string

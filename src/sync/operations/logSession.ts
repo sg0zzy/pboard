@@ -60,6 +60,8 @@ export type RoomProof = {
   signature: string;
   authorization: unknown;
   serviceAdmission?: string;
+  /** Present only for Drive-authorized rooms; expiry is Unix seconds. */
+  google?: { expiresAt: number; renew(welcome: SessionWelcome): Promise<{ ticket: string; room: string; expiresAt: number }> };
 };
 
 /** What a room hands the session. */
@@ -87,6 +89,9 @@ export type SessionAttachment = {
   lost(reason: string, delayMs: number, cause?: string): void;
   /** The room's own stated cause: a refusal, a per-room detach, the ceiling. */
   failed(code: string): void;
+  /** A renewed Drive grant may change the effective role without reconnecting. */
+  roleChanged?(role: string): void;
+  accountHint?(frame: Frame): void;
   /** A frame the server addressed to this room. */
   deliver(frame: Frame): void;
   /** Which subsystem this room belongs to, for the connection diagnostics when
@@ -151,6 +156,7 @@ export class RelaySession {
    * the socket died, which is the whole point of the set. */
   private readonly wanted = new Map<string, SessionAttachment>();
   private readonly replies: PendingReply[] = [];
+  private readonly googleRenewals = new Map<string, { timer: ReturnType<typeof setTimeout>; pending: boolean; expiresAt: number; proof: NonNullable<RoomProof['google']> }>();
   private readonly pending = new Map<string, PendingAttach>();
   /** One room's own retry, for a cause that is the room's alone — an admission
    * receipt it could not obtain. Kept apart from the connection's ladder
@@ -374,6 +380,7 @@ export class RelaySession {
     this.wanted.delete(this.roomKey(attachment));
     if (held) {
       this.wanted.set(proof.room, attachment);
+      held.attachment = attachment;
       attachment.attached({ role: held.role, reattached: true });
       return { room: proof.room, role: held.role };
     }
@@ -409,6 +416,7 @@ export class RelaySession {
       this.wanted.delete(key);
     }
     this.wanted.delete(room);
+    this.clearGoogleRenewal(room);
     if (!this.live.delete(room)) return;
     if (!this.connected()) return;
     try { this.transmit({ type: 'detach', room }); } catch { /* the close path owns a dead socket */ }
@@ -834,6 +842,10 @@ export class RelaySession {
       case 'refused': {
         const room = aString(message.room);
         const code = aString(message.code) ?? 'refused';
+        if (room && this.googleRenewals.get(room)?.pending) {
+          this.failGoogleRenewal(room, code);
+          break;
+        }
         collaborationDiagnostic('logsync.session_refused');
         const pending = room ? this.takePending(room) : undefined;
         if (pending) {
@@ -875,6 +887,7 @@ export class RelaySession {
         // the pending map nor (yet) `live`, the handler had no state to route
         // to, and the room went on reporting `synced` with its cursor frozen.
         const state = this.live.get(room);
+        this.clearGoogleRenewal(room);
         this.live.delete(room);
         // A room is filed under its proof's key once it is live, but under
         // `pending:<topic>` before that (see `roomKey`); the detach has to clear
@@ -917,6 +930,24 @@ export class RelaySession {
         if (code === 'not_attached') break;
         for (const key of wantedKeys) this.wanted.delete(key);
         state.attachment.failed(code);
+        break;
+      }
+      case 'accountHint': {
+        for (const state of this.live.values()) state.attachment.accountHint?.(message);
+        break;
+      }
+      case 'renewedGoogle': {
+        const room = aString(message.room);
+        const renewal = room ? this.googleRenewals.get(room) : undefined;
+        const state = room ? this.live.get(room) : undefined;
+        const role = aString(message.role);
+        if (!room || !renewal?.pending || !state || (role !== 'editor' && role !== 'viewer')) {
+          this.breakConnection('correlation');
+          break;
+        }
+        state.role = role;
+        state.attachment.roleChanged?.(role);
+        this.scheduleGoogleRenewal(room, renewal.proof, renewal.expiresAt);
         break;
       }
       case 'sync': {
@@ -974,8 +1005,51 @@ export class RelaySession {
     // not the ceiling it earned while it was failing.
     this.roomAttempts.delete(pending.attachment);
     this.live.set(pending.proof.room, { attachment: pending.attachment, role: resolved });
+    if (pending.proof.google) this.scheduleGoogleRenewal(pending.proof.room, pending.proof.google, pending.proof.google.expiresAt);
     clearTimeout(pending.timer);
     pending.resolve({ room: pending.proof.room, role: resolved });
+  }
+
+  private clearGoogleRenewal(room: string): void {
+    const state = this.googleRenewals.get(room);
+    if (state) clearTimeout(state.timer);
+    this.googleRenewals.delete(room);
+  }
+
+  private failGoogleRenewal(room: string, code: string): void {
+    const state = this.live.get(room);
+    this.clearGoogleRenewal(room);
+    if (!state) return;
+    this.detach(room, state.attachment);
+    state.attachment.failed(code);
+  }
+
+  private scheduleGoogleRenewal(room: string, proof: NonNullable<RoomProof['google']>, expiresAt: number): void {
+    this.clearGoogleRenewal(room);
+    const remaining = expiresAt * 1000 - Date.now();
+    if (!Number.isSafeInteger(expiresAt) || remaining <= 0) { this.failGoogleRenewal(room, 'grant_expired'); return; }
+    const timer = setTimeout(() => { void this.renewGoogle(room); }, Math.max(0, remaining - Math.min(30_000, remaining / 2)));
+    this.googleRenewals.set(room, { timer, pending: false, expiresAt, proof });
+  }
+
+  private async renewGoogle(room: string): Promise<void> {
+    const state = this.googleRenewals.get(room);
+    if (!state || !this.live.has(room) || !this.connected()) return;
+    state.pending = true;
+    // Bound both the HTTP request and the server reply by the existing grant.
+    const timeout = Math.min(this.options.requestTimeoutMs ?? LOG_REQUEST_TIMEOUT_MS, Math.max(0, state.expiresAt * 1000 - Date.now()));
+    state.timer = setTimeout(() => this.failGoogleRenewal(room, 'service_auth_required'), timeout);
+    try {
+      const next = await state.proof.renew(this.requireWelcome());
+      if (this.googleRenewals.get(room) !== state) return;
+      if (next.room !== room || !/^[A-Za-z0-9_-]{43}$/.test(next.ticket) || !Number.isSafeInteger(next.expiresAt) || next.expiresAt * 1000 <= Date.now()) {
+        throw new Error('Invalid Google renewal');
+      }
+      state.expiresAt = next.expiresAt;
+      this.transmit({ type: 'renewGoogle', room, serviceAdmission: next.ticket });
+    } catch {
+      if (this.googleRenewals.get(room) === state) this.failGoogleRenewal(room, 'service_auth_required');
+    }
   }
 
   private send(proof: RoomProof, attachment: SessionAttachment): Promise<{ room: string; role: string }> {
@@ -1050,6 +1124,7 @@ export class RelaySession {
     this.primaryPending = undefined;
     // A new socket is a new identity: it authenticates before it attaches.
     this.authenticated = false;
+    for (const room of this.googleRenewals.keys()) this.clearGoogleRenewal(room);
     this.live.clear();
     // A room's ticket retry is bound to *this* socket's welcome: the receipt it
     // would mint is worthless on the next one. The connection's own recovery

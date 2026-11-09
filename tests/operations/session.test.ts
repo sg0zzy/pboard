@@ -29,6 +29,22 @@ async function publishLogSnapshot(session: OperationSession) {
 }
 
 describe('operation session integration against simulated regular Drive', () => {
+  it('drains more than one journal page after an offline period and stops on refusal', async () => {
+    const fake = new ImmutableDriveFake();
+    let accept = false, delivered = 0;
+    const { local, session } = await client(fake, crypto.randomUUID(), { realtime: true, broadcast: async operations => {
+      if (!accept) return false;
+      delivered += operations.length; return true;
+    } });
+    for (let i = 0; i < 520; i++) await local.append('board', board, { frontier: {}, clock: 0 });
+    await session.broadcastUnsent();
+    expect((await local.unsent('board')).length).toBe(512);
+    expect(delivered).toBe(0);
+    accept = true;
+    await session.broadcastUnsent();
+    expect(delivered).toBe(520);
+    expect(await local.unsent('board')).toEqual([]);
+  });
   it('manual sync discovers remote segments while realtime is connected and keeps unpublished edits', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake);
     await b.session.sync(); await b.session.edit(patch({ title: 'Local pending' }));
@@ -143,6 +159,23 @@ describe('operation session integration against simulated regular Drive', () => 
     await b.session.sync(); await a.session.sync(); await b.session.sync();
     expect(a.session.state()).toEqual(b.session.state());
     expect(a.session.state().cards[0]).toMatchObject({ title: 'A', status: 'done' });
+  });
+  it('rejects delivery interrupted while a Drive role check is pending', async () => {
+    const fake = new ImmutableDriveFake(), a = await seeded(fake);
+    let finish!: (role: 'editor') => void;
+    const pending = new Promise<'editor'>(resolve => { finish = resolve; });
+    const b = await client(fake, crypto.randomUUID(), { realtimeRole: () => pending });
+    await b.session.sync();
+    const operation = await a.session.edit(patch({ content: 'Retry me' }));
+    const delivery = b.session.receiveRealtime([operation]);
+    await b.session.setRealtime(false);
+    finish('editor');
+    await expect(delivery).rejects.toThrow(/interrupted/);
+    await expect(b.session.receiveRealtime([operation])).rejects.toThrow(/no longer active/);
+    expect(b.session.state().cards[0].content).not.toBe('Retry me');
+    await b.session.setRealtime(true);
+    await b.session.receiveRealtime([operation]);
+    expect(b.session.state().cards[0].content).toBe('Retry me');
   });
   it('deduplicates realtime followed by Drive, repeated sync and reconnection', async () => {
     const fake = new ImmutableDriveFake(), a = await seeded(fake), b = await client(fake); await b.session.sync();

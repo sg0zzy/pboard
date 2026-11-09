@@ -259,14 +259,15 @@ fn check_config_leaves_an_old_schema_untouched() {
     // And a control on the fixture itself: the hand-written v1 DDL above must
     // still be what this build's v1 step creates, or the test would be proving
     // that a check leaves an imaginary database alone. Opening added exactly the
-    // v3 table, so the v1 table set came from the fixture, not from drift.
+    // v3 and v4 tables, so the v1 table set came from the fixture, not from drift.
     let mut expected = tables_before.clone();
     expected.push("coverage".into());
+    expected.push("migration_fence".into());
     expected.sort();
     assert_eq!(
         tables(&database),
         expected,
-        "control: opening a v1 file adds exactly the v3 table"
+        "control: opening a v1 file adds the v3 and v4 tables"
     );
 }
 

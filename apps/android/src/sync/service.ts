@@ -14,12 +14,13 @@ import { dirtyFlushAt, drivePollDelay } from '../../../../src/sync/syncPolicy';
 // account room, and other devices discover them only by Drive listing.
 setWebRtcDisabled(true);
 
-export function createAndroidSync(getRepository: () => Promise<RxRepository>, auth = createAndroidGoogleAuth(createSyncStorage()), storage = createSyncStorage()) {
-  const runtime = createDriveRuntime({ auth, storage, getRepository });
+export function createAndroidSync(getRepository: () => Promise<RxRepository>, auth = createAndroidGoogleAuth(createSyncStorage()), storage = createSyncStorage(),
+  runtimeFactory: typeof createDriveRuntime = createDriveRuntime) {
+  let foreground = false;
+  const runtime = runtimeFactory({ auth, storage, getRepository, allowRealtime: () => foreground });
   // Account-channel status changes repaint the stated cause in CloudSettings.
   runtime.accountChannel?.subscribe?.(() => emit({}));
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let foreground = false;
   let selected: string | null = null;
   let liveProject: string | null = null;
   let running: Promise<void> | undefined;
@@ -57,6 +58,9 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       const shouldStart = foreground && state.connected && !disposed;
       if (shouldStart && liveProject === projectId && projectId) {
         await runtime.collaborationManager.refreshRole();
+      } else if (shouldStart && !liveProject && !projectId) {
+        // There is no board room to stop. stop() also releases the shared
+        // socket, which would disconnect the account discovery room on Home.
       } else {
         // Retain viewer protection after leaving a room or disconnecting.
         const previousId = liveProject;
@@ -106,6 +110,17 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
   }
   const events: RepositoryEvents = {
     async projectChanged(id) { await runtime.driveSyncState.markDirty(id); await scheduleBoard(id); },
+    projectCreated(id) {
+      if (foreground && state.connected && !disposed) void runtime.googleDrive.syncProject(id, { force: true }).catch(() => undefined);
+    },
+    projectOrderChanged(order) { if (foreground) void runtime.accountChannel?.publishLocalOrder(order); },
+    projectTombstoned(boardId, fact) {
+      if (!foreground || fact.accountId === null) return;
+      void runtime.accountChannel?.publishTombstone(boardId, {
+        kind: fact.kind, opId: fact.opId, actorId: fact.actorId, seq: fact.seq,
+        clock: fact.clock, context: fact.context, role: fact.role
+      }).catch(() => undefined);
+    },
     async projectDeleting(project) {
       const saved = await runtime.driveSyncState.get(project.id);
       await runtime.driveTombstones.add({ projectId: project.id, remoteFileId: saved.remoteFileId,
@@ -134,6 +149,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       // Finish any current backup before disconnect returns.
       await running;
       await restartLive();
+      await runtime.accountChannel?.close();
       await auth.disconnect();
       emit({ role: previousRole === 'viewer' ? 'viewer' : 'private' });
     },
@@ -151,9 +167,22 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       catch (error) { emit({ error: error instanceof Error ? error.message : String(error), resolving: false }); }
     },
     async setForeground(active: boolean) {
+      if (foreground === active) return;
       foreground = active; ++generation;
-      if (active) { try { await restartLive(); } catch { /* sync retries with a visible error */ } await sync(); }
-      else { clearTimeout(timer); clearFlushTimers(); await restartLive(); }
+      if (active) {
+        // A credential chooser or background transition can close the account
+        // room while a prior Drive reconciliation is still in progress.
+        // Resume it independently of the selected board and of that round.
+        if (state.connected) void runtime.accountChannel?.start();
+        try { await restartLive(); } catch { /* sync retries with a visible error */ }
+        await sync();
+      }
+      else {
+        clearTimeout(timer); clearFlushTimers();
+        await restartLive(); await runtime.accountChannel?.close();
+        // A reconciliation already in flight may have started the account room.
+        void running?.finally(() => { if (!foreground) void runtime.accountChannel?.close(); });
+      }
     },
     pollLive() {
       const live = runtime.collaborationManager.state();
@@ -173,7 +202,7 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
       // not dialing (absent-pin plus its authority report) instead of silence.
       return runtime.accountChannel?.status?.() ?? { state: 'disabled' as const };
     },
-    async dispose() { disposed = true; ++generation; foreground = false; clearTimeout(timer); clearFlushTimers(); await running; await restartLive(); listeners.clear(); },
+    async dispose() { disposed = true; ++generation; foreground = false; clearTimeout(timer); clearFlushTimers(); await running; await restartLive(); await runtime.accountChannel?.close(); listeners.clear(); },
   };
 }
 export type AndroidSync = ReturnType<typeof createAndroidSync>;

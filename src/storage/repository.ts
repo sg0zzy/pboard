@@ -14,6 +14,8 @@ export type RepositoryEvents = {
   /** Local legacy-copy cleanup; must not perform network I/O. */
   projectErased?: (projectId: string) => void | Promise<void>;
   projectChanged?: (projectId: string) => void | Promise<void>;
+  /** A locally created board needs an initial Drive publication for discovery. */
+  projectCreated?: (projectId: string) => void | Promise<void>;
   projectDeleting?: (project: Project) => void | Promise<void>;
   projectDeleted?: (projectId: string) => void | Promise<void>;
   projectHidden?: (projectId: string) => void | Promise<void>;
@@ -110,6 +112,7 @@ export function createRepository(storage: KeyValueStorage, events: RepositoryEve
       state.currentProjectId = project.id;
       await save(state);
       await changed(project.id);
+      void Promise.resolve().then(() => events.projectCreated?.(project.id)).catch(() => undefined);
       return project;
     });
   }

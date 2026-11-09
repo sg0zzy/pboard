@@ -7,6 +7,17 @@ const store = (stub: DriveStub) => createDriveBoardStore({ auth, fetcher: stub.f
 const bytes = (text: string) => new TextEncoder().encode(text);
 
 describe('driveBoardStore', () => {
+  it('inventories every pboard root without creating or changing files', async () => {
+    const stub = new DriveStub();
+    const first = stub.addFolder('pboard', 'root'), second = stub.addFolder('pboard', 'root');
+    const one = stub.addFolder('one', first.id), two = stub.addFolder('two', second.id);
+    const file = stub.addFile('old.json.gz', one.id, 'data');
+    const before = structuredClone(stub.files);
+    const rows = await store(stub).inspectBoardFolders();
+    expect(rows.map(row => row.folderId)).toEqual([one.id, two.id]);
+    expect(rows[0].children.map(child => child.id)).toEqual([file.id]);
+    expect(stub.files).toEqual(before);
+  });
   it('looks up recovery folders without creating data, and requires an existing snapshot', async () => {
     const stub = new DriveStub();
     const boards = store(stub);

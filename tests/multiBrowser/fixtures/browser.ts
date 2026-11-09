@@ -72,6 +72,29 @@ export function createCloud(): Cloud {
     fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.startsWith('https://www.googleapis.com/')) return await drive.fetch(url, init);
+      if (url === 'https://relay.invalid/drive/admit') {
+        const body = JSON.parse(String(init?.body));
+        const email = accounts.get(body.accessToken);
+        if (!email || body.idToken !== `id:${body.accessToken}`) return new Response('', { status: 403 });
+        if (body.boardId === '' && body.folderId === '') {
+          const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`account:${email}`)));
+          const room = `pboard-drive-${btoa(String.fromCharCode(...digest)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')}`;
+          const ticket = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+          const emailHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(email.trim().toLowerCase()))), byte => byte.toString(16).padStart(2, '0')).join('');
+          cloud.signaling.driveTickets.set(ticket, { room, board: `account:${emailHash}`, challenge: body.challenge, session: body.session, email, role: 'editor' });
+          return new Response(JSON.stringify({ room, ticket, expiresAt: Math.floor(Date.now() / 1000) + 120 }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        const metadata = await drive.fetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(body.folderId)}`, { headers: { authorization: `Bearer ${body.accessToken}` } });
+        if (!metadata.ok) return new Response('', { status: 403 });
+        const folder = await metadata.json() as { name: string; ownedByMe: boolean; capabilities: { canAddChildren: boolean } };
+        if (folder.name !== body.boardId) return new Response('', { status: 403 });
+        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${body.boardId}:${body.folderId}`)));
+        const room = `pboard-drive-${btoa(String.fromCharCode(...digest)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')}`;
+        const ticket = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+        cloud.signaling.driveTickets.set(ticket, { room, board: body.boardId, challenge: body.challenge, session: body.session, email,
+          role: folder.ownedByMe ? 'owner' : folder.capabilities.canAddChildren ? 'editor' : 'viewer' });
+        return new Response(JSON.stringify({ room, ticket, expiresAt: Math.floor(Date.now() / 1000) + 120 }), { headers: { 'Content-Type': 'application/json' } });
+      }
       const response = await cloud.signaling.handleHttp(url, init ?? {});
       if (response) return response;
       throw new Error(`multi-browser harness: unexpected fetch ${url}`);
@@ -120,6 +143,7 @@ export type BrowserRuntime = {
   driveSyncState: DriveSyncStateStore;
   driveTombstones: DriveTombstoneStore;
   drivePermissions: DrivePermissionService;
+  sharePermissions: { invite(board: string, email: string, role: 'editor' | 'viewer'): Promise<void> };
   collaborationManager: CollaborationManager;
   operationService: { close(boardId: string): Promise<void>; role(boardId: string): Promise<string>; previewGardening(boardId: string): Promise<unknown> };
   boardCollaboration: {
@@ -209,6 +233,8 @@ export async function createBrowser(options: {
    * bucket's own bounds are pinned by `tests/collab/authBudget.test.ts`; pass
    * `automaticAuthBudget` here to exercise the pacing end-to-end. */
   authBudget?: AuthBudget;
+  driveAuthority?: boolean;
+  publishCreated?: boolean;
 }): Promise<BrowserHandle> {
   ensureSharedIndexedDb();
   const { label, email, cloud } = options;
@@ -312,6 +338,7 @@ export async function createBrowser(options: {
     offlineDrafts: false,
     events: {
       projectChanged: projectId => { void runtimeRef?.driveSyncState.markDirty(projectId); },
+      projectCreated: projectId => { if (options.publishCreated) void runtimeRef?.googleDrive.syncProject(projectId, { force: true }).catch(() => undefined); },
       // The composition root's order publication (`src/storage/browser.ts`):
       // one `board.order` record per settling reorder, on the account room.
       projectOrderChanged: order => { void runtimeRef?.accountChannel.publishLocalOrder(order); },
@@ -346,6 +373,7 @@ export async function createBrowser(options: {
     isConfigured: () => true,
     connect: async () => {},
     disconnect: async () => {},
+    ...(options.driveAuthority ? { getDriveIdentityCredentials: async () => ({ accessToken: token, idToken: `id:${token}` }) } : {}),
   };
   const runtime = createDriveRuntime({ auth, storage, getRepository: async () => rx, fetcher: cloud.fetch, authBudget: options.authBudget ?? instantAuthBudget() }) as unknown as BrowserRuntime;
   runtimeRef = runtime;

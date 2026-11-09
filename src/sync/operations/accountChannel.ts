@@ -58,6 +58,9 @@
  * orders for the same rename.
  */
 import { collaborationDiagnostic } from '../../collab/diagnostics';
+import { createPlaintextOperationCodec } from './plaintextCodec';
+import { OperationBindingError } from './logRoom';
+import type { GoogleDriveCredentials } from './googleDriveAdmission';
 import type { RelayAuthorization } from '../../collab/security/relayAdmission';
 import type { ServiceAdmissionRequest } from '../../collab/experimentalWebSocketSignaling';
 import type { StoredDeviceKey } from '../../collab/security/keys';
@@ -289,6 +292,7 @@ const MAX_DEFERRED = 128;
 
 export type AccountChannelOptions = {
   storage: KeyValueStorage;
+  googleDrive?: { getCredentials(): Promise<GoogleDriveCredentials>; fetcher?: typeof fetch; onHint?: (boardId: string) => void };
   /** The connected account's hash, or null when Drive is disconnected. Resolved
    * on every `start()` so a sign-out or account switch cannot leave a channel
    * attached to the previous account's room. */
@@ -409,7 +413,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
    * the reconnect flush, so a hundred heartbeats do not mean a hundred passes. */
   let wasSynced = false;
 
-  const stateKey = (scope: string) => `${STATE_KEY}:${scope}`;
+  const stateKey = (scope: string) => `${STATE_KEY}${options.googleDrive ? ':google-v1' : ''}:${scope}`;
 
   const report = (cause: unknown, context: string) => {
     error = cause instanceof Error ? cause.message : String(cause);
@@ -421,7 +425,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
 
   const status = (): AccountChannelStatus => ({
     account, state, reason, appliedSeq, lastKind,
-    ...(options.authority ? { authority: options.authority(account) } : {}),
+    ...(!options.googleDrive && options.authority ? { authority: options.authority(account) } : {}),
     outbox: durable?.outbox.length ?? 0,
     deferred: deferredRecords.size,
     deferredBoards: [...deferredRecords.keys()],
@@ -683,6 +687,17 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
     return flushing;
   }
 
+  function replayHints(scope: string, handle: OperationLogSync): void {
+    if (!options.googleDrive?.onHint) return;
+    void handle.replayAccountHints(0).then(reply => {
+      if (!Array.isArray(reply.hints)) return;
+      for (const hint of reply.hints) if (hint && typeof hint === 'object') {
+        const row = hint as Record<string, unknown>;
+        if (row.inbox === scope && typeof row.board === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(row.board)) options.googleDrive?.onHint?.(row.board);
+      }
+    }).catch(() => undefined);
+  }
+
   /** Reflects the transport's own status into the channel's report, persists
    * the cursor so a restart resumes instead of re-reading retained history,
    * and flushes the queue on the transition into `synced` — the edge that
@@ -695,6 +710,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
     appliedSeq = next.appliedSeq;
     if (next.phase === 'synced') {
       if (!wasSynced && durable?.outbox.length) void flush();
+      if (!wasSynced && account && log) replayHints(account, log);
       // A reconnect is also a fresh chance for Drive to have caught up with a
       // record that arrived before its board did. The channel's own contract
       // says deferred records are re-verified on every reconcile round *and*
@@ -745,24 +761,24 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
         // The shared state and the outbox are loaded before anything network
         // related is attempted: a record made while the relay is unreachable has
         // to have somewhere to go, or "background retry" is a lie.
-        const device = await options.getKey(scope);
-        sendActor = `${device.keyId}-${contextNonce}`;
+        const device = options.googleDrive ? undefined : await options.getKey(scope);
+        sendActor = device ? `${device.keyId}-${contextNonce}` : `account-${crypto.randomUUID()}-${contextNonce}`;
         durable = normalize((await options.storage.get(stateKey(scope)))[stateKey(scope)]);
         appliedSeq = durable.cursor;
-        const security = await options.authorization(scope).catch(() => null);
-        if (!security) {
+        const security = options.googleDrive ? null : await options.authorization(scope).catch(() => null);
+        if (!options.googleDrive && !security) {
           // Fail closed and quietly. No pin means this browser was never
           // enrolled in the account room: a configuration fact to be read in the
           // console, not a transport fault to be retried into a reconnect storm.
           state = 'absent-pin'; reason = 'no account pin'; error = null; announce(); return;
         }
-        const key = await options.acquireKey(scope).catch(() => undefined);
-        if (!key) {
+        const key = options.googleDrive ? undefined : await options.acquireKey(scope).catch(() => undefined);
+        if (!options.googleDrive && !key) {
           // Records are queued locally and go out once a key arrives through the
           // courier; nothing here can or should block a board opening.
           state = 'failed'; reason = 'no account content key'; announce(); return;
         }
-        const codec = createOperationLogCodec(key);
+        const codec = options.googleDrive ? createPlaintextOperationCodec(scope) : createOperationLogCodec(key!);
         const reconnects: { reason: string; delayMs: number }[] = [];
         log = await createOperationLogSync({
           boardId: scope,
@@ -772,7 +788,8 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
           // routinely the room whose attach dials the context's one socket; the
           // console must say that rather than attributing it to a board.
           dialTrigger: 'account:attach',
-          getKey: () => Promise.resolve(device),
+          getKey: async () => { if (!device) throw new Error('Device authority is unavailable'); return device; },
+          ...(options.googleDrive ? { googleDrive: { ...options.googleDrive, folderId: '', accountRoom: true, actorId: sendActor } } : {}),
           // Re-resolved for every connection, as this option's contract demands:
           // the manifest captured here is valid for five minutes, a backgrounded
           // tab outlives it routinely, and re-presenting it at every admission
@@ -781,12 +798,22 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
           // manifest rather than failing the dial — a transient Drive error
           // must not strand a still-valid manifest, and a genuinely expired
           // one is refused at admission either way.
-          getAuthorization: async () => await options.authorization(scope).catch(() => null) ?? security,
+          getAuthorization: async () => {
+            const current = await options.authorization(scope).catch(() => null) ?? security;
+            if (!current) throw new Error('Account authority is unavailable');
+            return current;
+          },
           getServiceAdmission: options.getServiceAdmission,
           isTerminalAdmissionError: options.isTerminalAdmissionError,
           seal: codec.seal,
-          open: codec.open,
+          open: options.googleDrive ? async (payload, opId) => {
+            try { return await codec.open(payload, opId); }
+            catch { throw new OperationBindingError('Invalid account operation'); }
+          } : codec.open,
           receive,
+          onAccountHint: frame => {
+            if (frame.inbox === scope && typeof frame.board === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(frame.board)) options.googleDrive?.onHint?.(frame.board);
+          },
           // A row sealed with a key this device does not hold is inert wire:
           // skip forward exactly as the board log does, so one unreadable record
           // cannot wedge the cursor below it forever.
@@ -810,6 +837,9 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
           loopbackDevelopment: import.meta.env.DEV
         });
         state = 'connected'; reason = 'ready'; announce();
+        // Initial synchronization can finish before `log` is assigned;
+        // subsequent reconnects replay on the synced edge above.
+        replayHints(scope, log);
         // Anything queued while the channel was down goes out now, including a
         // `board.created` made while the relay was unreachable — and on every
         // later reconnect the `synced` edge in `onLogStatus` flushes again,

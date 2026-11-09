@@ -62,10 +62,11 @@ pub const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
 /// one connection and one `BEGIN IMMEDIATE` still serialise every writer in the
 /// service; version 3 is the retention schema — the typed publication receipt
 /// on each checkpoint and the per-segment coverage times that
-/// [`SyncLog::prune`] measures retention from. Opening a file with a newer
+/// [`SyncLog::prune`] measures retention from; version 4 records migration
+/// fences. Opening a file with a newer
 /// version than this is refused rather than guessed at, which is why the
 /// number is one shared constant and not one per module.
-pub const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 
 /// Longest publication evidence a commit may carry, matching the service-side
 /// frame limit. Evidence is a file id, never free-form text.
@@ -94,6 +95,8 @@ pub enum SyncLogError {
     EvidenceRejected(&'static str),
     /// Configured capacity for one board or for the whole log is exhausted.
     Full,
+    /// A migration has fenced new writes while retaining the old relay log.
+    MigrationFenced,
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
 }
@@ -108,6 +111,7 @@ impl fmt::Display for SyncLogError {
             Self::CheckpointRejected(reason) => write!(f, "checkpoint rejected: {reason}"),
             Self::EvidenceRejected(reason) => write!(f, "publication evidence rejected: {reason}"),
             Self::Full => f.write_str("operation log capacity exhausted"),
+            Self::MigrationFenced => f.write_str("board migration has fenced new writes"),
             Self::Io(error) => write!(f, "io: {error}"),
             Self::Sqlite(error) => write!(f, "sqlite: {error}"),
         }
@@ -517,6 +521,16 @@ impl SyncLog {
             )?;
             transaction.execute("INSERT INTO sync_schema (version) VALUES (3)", [])?;
         }
+        if version < 4 {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS migration_fence (
+                     board_id TEXT PRIMARY KEY,
+                     through_seq INTEGER NOT NULL,
+                     generation TEXT NOT NULL
+                 );",
+            )?;
+            transaction.execute("INSERT INTO sync_schema (version) VALUES (4)", [])?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -572,6 +586,10 @@ impl SyncLog {
             params![board],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let fenced: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM migration_fence WHERE board_id = ?1)",
+            params![board], |row| row.get(0),
+        )?;
         let total_bytes: i64 = connection.query_row(
             "SELECT COALESCE(SUM(retained_bytes), 0) FROM board",
             [],
@@ -592,6 +610,9 @@ impl SyncLog {
             if let Some(seq) = existing {
                 receipts.push(AppendReceipt::Duplicate { seq: seq as u64 });
                 continue;
+            }
+            if fenced {
+                return Err(SyncLogError::MigrationFenced);
             }
             if (retained_ops + inserted_ops) as u64 >= self.limits.max_ops_per_board
                 || (retained_bytes + inserted_bytes) as u64 >= self.limits.max_bytes_per_board
@@ -622,6 +643,55 @@ impl SyncLog {
         }
         connection.commit()?;
         Ok(receipts)
+    }
+
+    /// Atomically fence new writes and capture the last accepted sequence.
+    /// This storage primitive is intentionally not exposed as a wire request:
+    /// the caller must first establish an authenticated owner and a safe resume
+    /// and cutover protocol. Repeating the same generation is idempotent.
+    pub fn fence_migration(&self, board: &str, generation: &str) -> Result<u64, SyncLogError> {
+        if !valid_id(board, self.limits.max_id_bytes) || !valid_id(generation, self.limits.max_id_bytes) {
+            return Err(SyncLogError::Invalid("migration fence identity"));
+        }
+        let mut guard = self.connection.lock().expect("sync log mutex");
+        let transaction = guard.transaction()?;
+        if let Some((existing, through)) = transaction.query_row(
+            "SELECT generation, through_seq FROM migration_fence WHERE board_id = ?1",
+            params![board], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()? {
+            if existing != generation { return Err(SyncLogError::MigrationFenced); }
+            return Ok(through as u64);
+        }
+        let next: Option<i64> = transaction.query_row(
+            "SELECT next_seq FROM board WHERE board_id = ?1", params![board], |row| row.get(0),
+        ).optional()?;
+        let through = next.unwrap_or(1) - 1;
+        transaction.execute("INSERT INTO migration_fence (board_id, through_seq, generation) VALUES (?1, ?2, ?3)",
+            params![board, through, generation])?;
+        transaction.commit()?;
+        Ok(through as u64)
+    }
+
+    /// Abort a still-uncommitted migration. A different generation cannot
+    /// release the fence; repeating an abort after it succeeded is harmless.
+    /// There is deliberately no cutover transition in this primitive yet.
+    pub fn cancel_migration(&self, board: &str, generation: &str) -> Result<(), SyncLogError> {
+        if !valid_id(board, self.limits.max_id_bytes) || !valid_id(generation, self.limits.max_id_bytes) {
+            return Err(SyncLogError::Invalid("migration fence identity"));
+        }
+        let mut guard = self.connection.lock().expect("sync log mutex");
+        let transaction = guard.transaction()?;
+        let existing: Option<String> = transaction.query_row(
+            "SELECT generation FROM migration_fence WHERE board_id = ?1",
+            params![board], |row| row.get(0),
+        ).optional()?;
+        match existing {
+            Some(ref current) if current != generation => return Err(SyncLogError::MigrationFenced),
+            Some(_) => { transaction.execute("DELETE FROM migration_fence WHERE board_id = ?1 AND generation = ?2", params![board, generation])?; }
+            None => {}
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// The read side of synchronization: everything after `after_seq`, plus the
@@ -988,6 +1058,11 @@ impl SyncLog {
         let now = (self.limits.now_ms)();
         let mut guard = self.connection.lock().expect("sync log mutex");
         let transaction = guard.transaction()?;
+        let fenced: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM migration_fence WHERE board_id = ?1)",
+            params![board], |row| row.get(0),
+        )?;
+        if fenced { return Ok(0); }
         // Condition 1: the board's own checkpoint, as this service recorded it.
         let checkpoint: Option<(i64, i64, String, u64, i64)> = transaction
             .query_row(
@@ -1268,6 +1343,45 @@ mod tests {
     }
     fn log() -> SyncLog {
         SyncLog::in_memory(limits()).expect("open")
+    }
+
+    #[test]
+    fn migration_fence_survives_restart_and_blocks_new_writes_and_pruning() {
+        let directory = std::env::temp_dir().join(format!("pboard-migration-fence-{}", uuid()));
+        {
+            let log = SyncLog::open(&directory, limits()).expect("open");
+            log.append("board", &[op("op-1")]).expect("append");
+            log.acquire_lease("board", "writer", 1_000).expect("lease");
+            log.commit_checkpoint("board", 1, 1, 1, "driveFileId0001", "writer").expect("commit");
+            assert_eq!(log.fence_migration("board", "generation-1").expect("fence"), 1);
+            assert_eq!(log.fence_migration("board", "generation-1").expect("retry"), 1);
+            assert!(matches!(log.fence_migration("board", "generation-2"), Err(SyncLogError::MigrationFenced)));
+            assert_eq!(log.append("board", &[op("op-1")]).expect("duplicate"), vec![AppendReceipt::Duplicate { seq: 1 }]);
+            assert!(matches!(log.append("board", &[op("op-1"), op("op-2")]), Err(SyncLogError::MigrationFenced)));
+            advance_now(120_000);
+            assert_eq!(log.prune("board").expect("prune"), 0);
+        }
+        {
+            let reopened = SyncLog::open(&directory, limits()).expect("reopen");
+            assert_eq!(reopened.fence_migration("board", "generation-1").expect("retry"), 1);
+            assert!(matches!(reopened.append("board", &[op("op-2")]), Err(SyncLogError::MigrationFenced)));
+            assert_eq!(reopened.sync_from("board", 0, 10).expect("replay").ops.len(), 1);
+            assert!(reopened.append("other", &[op("op-2")]).is_ok());
+        }
+        std::fs::remove_file(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn only_the_matching_generation_can_cancel_a_fence() {
+        let log = log();
+        assert_eq!(log.fence_migration("board", "first").expect("fence"), 0);
+        assert!(matches!(log.cancel_migration("board", "other"), Err(SyncLogError::MigrationFenced)));
+        assert!(matches!(log.append("board", &[op("op-1")]), Err(SyncLogError::MigrationFenced)));
+        log.cancel_migration("board", "first").expect("cancel");
+        log.cancel_migration("board", "first").expect("idempotent cancel");
+        assert_eq!(log.append("board", &[op("op-1")]).expect("append"), vec![AppendReceipt::Accepted { seq: 1 }]);
+        assert_eq!(log.fence_migration("board", "second").expect("new fence"), 1);
+        assert!(matches!(log.cancel_migration("board", "first"), Err(SyncLogError::MigrationFenced)));
     }
 
     #[test]

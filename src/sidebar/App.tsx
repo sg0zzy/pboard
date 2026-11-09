@@ -24,6 +24,7 @@ import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/Term
 import { DriveSyncControls } from "./components/DriveSyncControls";
 import { BoardDeletionStatus } from "./components/BoardDeletionStatus";
 import { BoardCollaborationControls } from "./components/BoardCollaborationControls";
+import { DriveFolderGardening } from "./components/DriveFolderGardening";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
@@ -35,7 +36,7 @@ import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
-import { collaborationManager, drivePermissions, healRelay, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
+import { collaborationManager, driveFolderGardener, drivePermissions, healRelay, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
 import { WORKER_EPOCH_KEY } from "../sync/messages";
 import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
@@ -1070,6 +1071,7 @@ export function App() {
           grant, pair a device or read why live collaboration is refusing, and a
           refactor once unmounted it while leaving the code behind. */}
       <BoardCollaborationControls projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />
+      <DriveFolderGardening gardener={driveFolderGardener} />
       {/* Last, deliberately: the diagnostics disclosure is for reading while
           something else misbehaves, not a control anyone reaches for first. It
           used to sit in the title row, competing with share and Drive status. */}

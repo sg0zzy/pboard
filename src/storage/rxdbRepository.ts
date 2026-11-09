@@ -973,6 +973,7 @@ export async function createRxRepository(options: {
     await projects.insert({ ...project, orderKey: orderKeyBetween((await allProjectRecords()).at(-1)?.orderKey ?? null, null) });
     await settings.upsert({ id: "currentProjectId", value: project.id });
     await changed(project.id);
+    void Promise.resolve().then(() => events.projectCreated?.(project.id)).catch(() => undefined);
     return project;
   }); }
   async function selectProject(projectId: string) {

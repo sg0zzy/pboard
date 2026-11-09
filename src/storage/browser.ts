@@ -54,6 +54,7 @@ async function openRxRepository(): Promise<RxRepository> {
       void leaveSharedBoard(projectId).catch(() => undefined);
     },
     projectChanged: (projectId) => driveSyncState.markDirty(projectId),
+    projectCreated: projectId => { void googleDrive.syncProject(projectId, { force: true }).catch(() => undefined); },
     // The account list order is a property of the account, not of a board: it
     // travels as one `board.order` record on the account room
     // (`runtime.ts:publishProjectOrder`). Fire-and-forget — the reorder has

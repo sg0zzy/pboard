@@ -189,12 +189,12 @@ export class OperationSession {
   }
 
   async receiveRealtime(operations: Operation[]): Promise<void> {
-    if (!this.realtime || this.stopped) return;
+    if (!this.realtime || this.stopped) throw new Error('Realtime delivery is no longer active');
     const epoch = this.epoch, inputs = structuredClone(operations);
     const role = await this.roleOrKeepRealtime(() => (this.options.realtimeRole ?? this.options.role)());
     if (role === 'revoked') { await this.setRealtime(false); throw new Error('Google Drive access was revoked'); }
     await this.locked(async () => {
-      if (!this.realtime || this.stopped || this.epoch !== epoch) return;
+      if (!this.realtime || this.stopped || this.epoch !== epoch) throw new Error('Realtime delivery was interrupted');
       // Validate before persistence. Persist before projecting so a crash cannot
       // leave a received operation visible but absent from the local WAL.
       await this.engine.validate(inputs);
@@ -427,9 +427,19 @@ export class OperationSession {
     if (!this.realtime || this.stopped || this.relaying) return;
     this.relaying = true;
     try {
-      const operations = (await this.options.local.unsent(this.options.boardId))
-        .filter(operation => this.options.local.isOwn(this.options.boardId, operation));
-      if (operations.length) await this.broadcastLocal(operations);
+      // The journal reads at most 512 rows at a time. Drain successive
+      // batches after reconnect, stopping if the channel did not acknowledge
+      // anything so a failed or read-only connection cannot spin.
+      let previous = '';
+      while (this.realtime && !this.stopped) {
+        const operations = (await this.options.local.unsent(this.options.boardId))
+          .filter(operation => this.options.local.isOwn(this.options.boardId, operation));
+        if (!operations.length) break;
+        const batch = operations.map(operation => operation.opId).join('\n');
+        if (batch === previous) break;
+        previous = batch;
+        await this.broadcastLocal(operations);
+      }
     } finally { this.relaying = false; }
   }
   async close(): Promise<void> {

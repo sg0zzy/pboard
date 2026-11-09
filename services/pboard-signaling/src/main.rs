@@ -1,4 +1,5 @@
 use pboard_signaling::google_enrollment::GoogleEnrollment;
+use pboard_signaling::google_identity::GoogleDriveVerifier;
 use pboard_signaling::{App, Config, Limits};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -284,6 +285,13 @@ fn google_enrollment() -> Result<Option<GoogleEnrollment>, String> {
     Ok(Some(enrollment))
 }
 
+/// Explicit opt-in; public OAuth client IDs are configuration, not secrets.
+fn google_drive_verifier() -> Result<Option<GoogleDriveVerifier>, String> {
+    let Ok(audiences) = std::env::var("PBOARD_SIGNALING_GOOGLE_AUDIENCES") else { return Ok(None) };
+    let ids = audiences.split(',').map(|id| id.trim().to_owned()).collect();
+    GoogleDriveVerifier::new(ids).map(Some).map_err(str::to_string)
+}
+
 fn bind_address() -> Result<SocketAddr, String> {
     let raw = std::env::var("PBOARD_SIGNALING_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
     let bind: SocketAddr = raw
@@ -305,6 +313,7 @@ struct Settings {
     board_grants: bool,
     identity: bool,
     google: Option<GoogleEnrollment>,
+    google_drive: Option<GoogleDriveVerifier>,
     sync_dir: Option<PathBuf>,
     buffer_dir: Option<PathBuf>,
     /// Defaulted when unusable; the `bind address` check reports that
@@ -321,6 +330,7 @@ impl Settings {
             pboard_signaling::policy::TransportPolicy::from_env().map_err(str::to_string)?;
         let board_grants = env_flag("PBOARD_SIGNALING_BOARD_GRANTS")?;
         let google = google_enrollment()?;
+        let google_drive = google_drive_verifier()?;
         let identity = env_flag("PBOARD_SIGNALING_GOOGLE_IDENTITIES")?;
         if identity && (!board_grants || google.is_none()) {
             return Err(
@@ -336,6 +346,7 @@ impl Settings {
             board_grants,
             identity,
             google,
+            google_drive,
             sync_dir: std::env::var("PBOARD_SIGNALING_SYNC_DIR").ok().map(PathBuf::from),
             buffer_dir: std::env::var("PBOARD_SIGNALING_BUFFER_DIR").ok().map(PathBuf::from),
             bind: bind_address().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8787))),
@@ -358,6 +369,10 @@ impl Settings {
             .with_identity_enrollment(self.identity);
         let app = match self.google.take() {
             Some(enrollment) => app.with_google_enrollment(enrollment),
+            None => app,
+        };
+        let app = match self.google_drive.take() {
+            Some(verifier) => app.with_google_drive_verifier(verifier),
             None => app,
         };
         app.validate_service_policy().map_err(str::to_string)?;
@@ -499,6 +514,9 @@ fn check_config() -> Result<(), Box<dyn std::error::Error>> {
             None => "not configured".to_string(),
         }
     });
+    let google_drive = checks.record("google drive verifier", google_drive_verifier(), |verifier| {
+        if verifier.is_some() { "configured".to_string() } else { "not configured".to_string() }
+    });
     let identity = checks.record(
         "google identities",
         env_flag("PBOARD_SIGNALING_GOOGLE_IDENTITIES"),
@@ -565,6 +583,7 @@ fn check_config() -> Result<(), Box<dyn std::error::Error>> {
             board_grants: board_grants.unwrap_or(false),
             identity: identity.unwrap_or(false),
             google: google.unwrap_or(None),
+            google_drive: google_drive.unwrap_or(None),
             sync_dir: None,
             buffer_dir: None,
             bind,

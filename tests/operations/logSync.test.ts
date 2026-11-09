@@ -57,6 +57,8 @@ class Relay {
     if (request.action === 'lease') this.push(this.frame('lease', Relay.lease));
     if (request.action === 'commit') this.push(this.frame('committed', { ...Relay.commit,
       checkpointSeq: request.seq, epoch: request.epoch, snapshotSeq: request.snapshotSeq }));
+    if (request.action === 'beginMigration') this.push(this.frame('migrationFenced', { generation: request.generation, throughSeq: 7 }));
+    if (request.action === 'cancelMigration') this.push(this.frame('migrationCancelled', { generation: request.generation }));
   }
   close() { this.readyState = 3; this.onclose?.({ code: 1000 }); }
 }
@@ -109,6 +111,30 @@ beforeEach(async () => {
 afterEach(() => { vi.useRealTimers(); Relay.instances = []; });
 
 describe('operation log transport', () => {
+  it('sends migration fence and cancellation over the existing connection', async () => {
+    const sync = await start();
+    try {
+      expect(await sync.beginMigration('generation-1')).toBe(7);
+      await sync.cancelMigration('generation-1');
+      expect(Relay.instances).toHaveLength(1);
+      expect(Relay.instances[0].requests.slice(-2)).toEqual([
+        { action: 'beginMigration', board: room, generation: 'generation-1' },
+        { action: 'cancelMigration', board: room, generation: 'generation-1' }
+      ]);
+    } finally { await sync.close(); }
+  });
+
+  it('reads migration history without applying it or moving the live cursor', async () => {
+    const sync = await start();
+    try {
+      Relay.window = { operations: [row(1), row(2)], checkpointSeq: 0, synced: true };
+      const before = sync.status().appliedSeq;
+      expect(await sync.readMigrationWindow(0, 2)).toEqual([row(1), row(2)].map(({ seq, opId, payload }) => ({ seq, opId, payload })));
+      expect(sync.status().appliedSeq).toBe(before);
+      expect(received).toEqual([]);
+      expect(Relay.instances).toHaveLength(1);
+    } finally { await sync.close(); }
+  });
   it('authenticates to the admitted room and resumes from the stored cursor', async () => {
     const sync = await start({ cursor: { load: async () => 7, save: async () => {} } });
     try {

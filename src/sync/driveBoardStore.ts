@@ -54,6 +54,10 @@ export type DriveBoardStore = {
   attachmentsFolder(boardId: string): Promise<string>;
   /** Board ids of every child folder of the root (board discovery). */
   listBoards(): Promise<string[]>;
+  /** Read-only inventory of every direct board folder under every pboard root. */
+  inspectBoardFolders(): Promise<{ rootId: string; folderId: string; name: string; children: { id: string; name: string; mimeType: string; modifiedTime?: string }[] }[]>;
+  inspectFolderChildren(folderId: string): Promise<{ id: string; name: string; mimeType: string; modifiedTime?: string }[]>;
+  inspectBoardRoots(): Promise<string[]>;
   /** Snapshot file id, or null when the board has no snapshot yet. */
   snapshotFileId(boardId: string): Promise<string | null>;
   ensureSnapshotFile(boardId: string): Promise<string>;
@@ -365,6 +369,21 @@ export function createDriveBoardStore(options: {
     const nodes = await listNodes(await rootFolder());
     return nodes.filter(node => node.mimeType === FOLDER_MIME).map(node => node.name);
   }
+  async function inspectFolderChildren(folderId: string) {
+    return (await listNodes(folderId)).map(({ id, name, mimeType, modifiedTime }) => ({ id, name, mimeType: mimeType ?? '', modifiedTime }));
+  }
+  async function inspectBoardRoots() {
+    return (await listNodes('root', rootName)).filter(node => node.mimeType === FOLDER_MIME).map(node => node.id);
+  }
+  async function inspectBoardFolders() {
+    const result: { rootId: string; folderId: string; name: string; children: { id: string; name: string; mimeType: string; modifiedTime?: string }[] }[] = [];
+    const roots = await inspectBoardRoots();
+    for (const root of roots) for (const folder of (await listNodes(root)).filter(node => node.mimeType === FOLDER_MIME)) {
+      const children = await inspectFolderChildren(folder.id);
+      result.push({ rootId: root, folderId: folder.id, name: folder.name, children });
+    }
+    return result;
+  }
   /** Snapshot file id; a vanished (e.g. merged-away) cached id is evicted
    * and re-resolved instead of being published into. */
   async function snapshotId(boardId: string): Promise<string | null> {
@@ -444,7 +463,7 @@ export function createDriveBoardStore(options: {
     return downloadSnapshotBytes(fetcher(), fileId, await token());
   }
   return {
-    rootFolder, boardFolder, existingBoardFolder, boardFolderExists, boardFolderCandidates, existingRootFolder, folderState, attachmentsFolder, listBoards,
+    rootFolder, boardFolder, existingBoardFolder, boardFolderExists, boardFolderCandidates, existingRootFolder, folderState, attachmentsFolder, listBoards, inspectBoardFolders, inspectFolderChildren, inspectBoardRoots,
     snapshotFileId: snapshotId, ensureSnapshotFile,
     meta, download, publish, listAttachments, findAttachment, uploadAttachment, uploadBoardFile, downloadFile, trashFile,
     reset() { folders.clear(); snapshots.clear(); }

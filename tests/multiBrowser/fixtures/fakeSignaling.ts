@@ -148,6 +148,7 @@ export class FakeSocketImpl {
   challenge = random43();
   session = random43();
   deviceKeyId = '';
+  private googleEmail?: string;
   /** The negotiated protocol. 2 keeps this handle exactly as it always was — one
    * admitted room, every frame measured against it. 3 adds `attach`/`detach`,
    * per-room refusals and per-room detaches on one authenticated socket, which
@@ -196,6 +197,15 @@ export class FakeSocketImpl {
     if (message.type === 'authenticate') { await this.authenticate(message); return; }
     if (message.type === 'attach') { await this.attach(message); return; }
     if (message.type === 'detach') { this.detach(message); return; }
+    if (message.type === 'renewGoogle') {
+      const room = String(message.room ?? ''), ticket = this.service.driveTickets.get(String(message.serviceAdmission ?? ''));
+      this.service.driveTickets.delete(String(message.serviceAdmission ?? ''));
+      if (!ticket || ticket.room !== room || ticket.session !== this.session || ticket.challenge !== this.challenge || ticket.email !== this.googleEmail || !this.rooms.has(room)) {
+        this.push({ type: 'refused', room, code: 'unauthorized' }); return;
+      }
+      this.service.roles.set(`${this.deviceForRoom.get(room)}|${ticket.board}`, ticket.role);
+      this.push({ type: 'renewedGoogle', room, role: ticket.role === 'owner' ? 'editor' : ticket.role }); return;
+    }
     if (message.type === 'ping') { this.push({ type: 'pong' }); return; }
     if (message.type === 'leave') { this.drop(); return; }
     if (message.type === 'sync') await this.syncRequest(message.request as Frame);
@@ -242,7 +252,7 @@ export class FakeSocketImpl {
     this.rooms.set(admitted.room.room, admitted.room);
     this.deviceForRoom.set(admitted.room.room, admitted.deviceKeyId);
     queueMicrotask(() => this.push({ type: 'authenticated', peerId: admitted.deviceKeyId, session: this.session,
-      ...(this.version >= 3 ? { version: this.version } : {}) }));
+      ...(this.version >= 3 ? { version: this.version, role: this.roleFor(admitted.room) } : {}) }));
   }
 
   /** The v3 `attach`: one more room with its own complete authorization, on the
@@ -316,6 +326,16 @@ export class FakeSocketImpl {
       ? String(message.deviceKeyId ?? '')
       : String(message.deviceKeyId ?? this.deviceKeyId);
     const authorization = message.authorization as { topic?: string; authority?: Record<string, unknown>; manifestPayload?: string; manifestSignature?: string } | undefined;
+    if (!authorization) {
+      const ticketId = String(message.serviceAdmission ?? '');
+      const ticket = this.service.driveTickets.get(ticketId);
+      this.service.driveTickets.delete(ticketId);
+      if (!ticket || ticket.room !== room || ticket.session !== this.session || ticket.challenge !== this.challenge || (this.googleEmail && this.googleEmail !== ticket.email)) return 'unauthorized';
+      this.googleEmail = ticket.email;
+      this.service.roles.set(`${deviceKeyId}|${ticket.board}`, ticket.role);
+      this.service.admitted.push({ room, deviceKeyId, email: ticket.email, kind });
+      return { room: this.service.roomFor(room, ticket.board), deviceKeyId };
+    }
     if (!authorization?.manifestPayload || !authorization.manifestSignature || !authorization.topic) return 'unauthorized';
     const receipt = this.service.receipts.get(String(message.serviceAdmission ?? ''));
     // The receipt is consumed for this exact (challenge, session, room, device)
@@ -402,6 +422,22 @@ export class FakeSocketImpl {
     const reply = (action: string, fields: Record<string, unknown> = {}) => this.push({ type: 'sync', action, board: room.room, ...fields });
     const refuse = (code: string) => this.push({ type: 'sync', action: 'error', board: room.room, code });
     switch (request.action) {
+      case 'publishAccountHint': {
+        if (room.board.startsWith('account:') || this.roleFor(room) === 'viewer') return refuse('unauthorized');
+        const to = String(request.to ?? '');
+        const entries = this.service.accountHints.get(to) ?? [];
+        const hint = { type: 'accountHint', inbox: to, board: room.board, seq: entries.length + 1, hintId: request.hintId, payload: request.payload };
+        entries.push(hint); this.service.accountHints.set(to, entries);
+        reply('accountHintStored', { to, seq: hint.seq, duplicate: false });
+        for (const socket of this.service.sockets) if ([...socket.rooms.values()].some(held => held.board === `account:${to}`)) socket.push(hint);
+        return;
+      }
+      case 'replayAccountHints': {
+        if (!room.board.startsWith('account:')) return refuse('unauthorized');
+        const inbox = room.board.slice('account:'.length);
+        const hints = (this.service.accountHints.get(inbox) ?? []).filter(hint => Number(hint.seq) > Number(request.afterSeq ?? 0));
+        reply('accountHints', { inbox, hints, highest: hints.length }); return;
+      }
       case 'subscribe': {
         // An armed insufficient-history fault (`insufficientHistory`) is the
         // service's own gap answer (`sync_api.rs:257-283`): a `window` with
@@ -536,6 +572,8 @@ export class FakeSignaling {
   /** Volatile: the identity directory is process RAM in the real service. */
   readonly directory = new Map<string, DirectoryEntry>();
   /** Volatile: short-lived admission tickets. */
+  readonly accountHints = new Map<string, Frame[]>();
+  readonly driveTickets = new Map<string, { room: string; board: string; challenge: string; session: string; email: string; role: string }>();
   readonly receipts = new Map<string, { challenge: string; session: string; room: string; deviceKeyId: string; email: string; expiresAt: number }>();
   get courierKeys(): Map<string, Map<string, string>> { return this.store.courierKeys; }
   get courierGrants(): Map<string, CourierGrant[]> { return this.store.courierGrants; }

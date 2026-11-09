@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ChangeJournal } from '../../src/storage/changeJournal';
 import { LocalOperationStore } from '../../src/sync/operations/localStore';
 import { OperationEngine } from '../../src/sync/operations/engine';
+import { createSnapshot } from '../../src/sync/operations/snapshots';
 import type { Command } from '../../src/sync/operations/protocol';
 const journals: ChangeJournal[] = [];
 const command: Command = { collection: 'projects', entityId: 'board', kind: 'create', fields: { name: 'Board', template: 'project', createdAt: '2026-01-01', updatedAt: '2026-01-01' }, unset: [] };
@@ -10,6 +11,24 @@ async function open(name = crypto.randomUUID()) { const journal = new ChangeJour
 afterEach(() => { for (const journal of journals.splice(0)) journal.close(); });
 
 describe('atomic local operation WAL and durable outbox', () => {
+  it('reserves a migration generation atomically across contexts and recovers its exact intent', async () => {
+    const a = await open(), b = await open(a.name);
+    const one = a.store.legacyMigrationJournal('board'), two = b.store.legacyMigrationJournal('board');
+    const attempts = await Promise.allSettled([one.reserve('board', 'first'), two.reserve('board', 'second')]);
+    expect(attempts.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const generation = attempts[0].status === 'fulfilled' ? 'first' : 'second';
+    const journal = generation === 'first' ? one : two;
+    const engine = new OperationEngine('board');
+    const snapshot = await createSnapshot(engine);
+    const intent = { boardId: 'board', generation, after: 0, through: 0, baseline: engine.checkpoint(), snapshot };
+    await journal.save(intent);
+    await journal.save(intent);
+    await expect(journal.save({ ...intent, through: 1 })).rejects.toThrow();
+    a.journal.close(); b.journal.close();
+    const reopened = await open(a.name);
+    expect(await reopened.store.legacyMigrationJournal('board').load()).toEqual(intent);
+    await expect(reopened.store.legacyMigrationJournal('board').reserve('board', 'different')).rejects.toThrow();
+  });
   it('serializes concurrent browser contexts into unique monotonic IDs', async () => {
     const a = await open(), b = await open(a.name);
     const operations = await Promise.all(Array.from({ length: 20 }, (_, n) => (n % 2 ? a : b).store.append('board', command, { frontier: {}, clock: 0 })));
