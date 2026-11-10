@@ -45,6 +45,9 @@ const driveStub = httpServer(async (req, res) => {
     res.setHeader("Content-Type", "application/json");
     if (url.pathname.endsWith("/about")) { res.end(JSON.stringify({ user: { emailAddress: email, displayName: "E2E fixture" } })); return; }
     if (url.pathname.endsWith("/permissions")) { res.end(JSON.stringify({ permissions: [{ id: "owner", type: "user", role: "owner", emailAddress: email }] })); return; }
+    if (url.pathname.endsWith("/changes/startPageToken")) { res.end(JSON.stringify({ startPageToken: "1" })); return; }
+    if (url.pathname.endsWith("/changes")) { res.end(JSON.stringify({ newStartPageToken: "2", changes: [] })); return; }
+    if (url.pathname.endsWith("/files/generateIds")) { res.end(JSON.stringify({ ids: Array.from({ length: Number(url.searchParams.get("count") ?? 1) }, () => `reserved-${++driveSequence}`) })); return; }
     if (url.pathname.endsWith("/files") && req.method === "GET") {
       const query = url.searchParams.get("q") ?? "";
       const name = query.match(/name = '([^']+)'/)?.[1];
@@ -63,17 +66,27 @@ const driveStub = httpServer(async (req, res) => {
         metadata = JSON.parse(parts[0]);
         contents = parts[1];
       } else metadata = JSON.parse(text);
-      const file = { ...metadata, id: `file-${++driveSequence}`, parents: metadata.parents ?? ["root"], ownerEmail: email, contents };
+      // A real Drive accepts the client-reserved id from generateIds.
+      const file = { ...metadata, id: metadata.id ?? `file-${++driveSequence}`, parents: metadata.parents ?? ["root"], ownerEmail: email, contents };
       driveFiles.set(file.id, file);
       res.end(JSON.stringify(file));
       return;
     }
     const id = url.pathname.split("/").at(-1);
     const file = driveFiles.get(id);
-    if (!file || (file.parents.includes("appDataFolder") && file.ownerEmail !== email)) { res.statusCode = 404; res.end("{}"); return; }
+    if (!file || (file.parents.includes("appDataFolder") && file.ownerEmail !== email)) {
+      res.statusCode = 404;
+      console.error(`[drive-stub] 404 ${req.method} ${url.pathname}${url.search} (have=${driveFiles.size})`);
+      res.end("{}");
+      return;
+    }
     if (req.method === "DELETE") { driveFiles.delete(id); res.end("{}"); return; }
     if (req.method === "PATCH") file.contents = text;
-    res.end(url.searchParams.get("alt") === "media" ? file.contents : JSON.stringify(file));
+    if (url.searchParams.get("alt") === "media") { res.end(file.contents); return; }
+    // Fixture posture: the stub account owns everything it sees (the real
+    // folderRole() reads ownedByMe/canAddChildren to pick owner/editor).
+    const { contents, ...metadata } = file;
+    res.end(JSON.stringify({ trashed: false, ownedByMe: metadata.ownerEmail === email, capabilities: { canAddChildren: metadata.ownerEmail === email }, ...metadata }));
   } catch (error) {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: String(error) }));
@@ -227,12 +240,24 @@ try {
     host_permissions: ["http://127.0.0.1/*", "ws://127.0.0.1/*"],
     browser_specific_settings: { gecko: { id, strict_min_version: "142.0" } },
   };
-  const addon = zipSync({
+  const addonFiles = {
     "manifest.json": Buffer.from(JSON.stringify(manifest)),
     "e2e.html": Buffer.from("<script type=\"module\" src=\"probe.js\"></script>"),
-    "probe.js": await readFile(join(work, "extension/probe.js")),
     "e2e-config.json": Buffer.from(JSON.stringify({ driveUrl })),
-  });
+  };
+  // The probe builds a snapshot worker chunk under assets/; MV3 needs every
+  // emitted file in the package, not just the entry.
+  const { readdirSync, statSync } = await import("node:fs");
+  const walk = (dir, prefix = "") => {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) walk(full, `${prefix}${entry}/`);
+      else addonFiles[`${prefix}${entry}`] = Buffer.from(readFileSync(full));
+    }
+  };
+  const { readFileSync } = await import("node:fs");
+  walk(join(work, "extension"));
+  const addon = zipSync(addonFiles);
 
   // 4. Two profiles, bridge enabled per profile with distinct client ids.
   const a = await browser(addon, uuidA);
@@ -253,6 +278,7 @@ try {
   await a(`e2e.configure(${JSON.stringify(relayUrl)})`);
   await b(`e2e.configure(${JSON.stringify(relayUrl)})`);
   await a("e2e.create()");
+  await b("e2e.create()");
   // Drive-connected fixture (stubbed, loopback): the operation-log path the
   // runtime drives opens with this posture (secure-smoke pattern). The
   // grant-mirror check during initialize is therefore examinable too.

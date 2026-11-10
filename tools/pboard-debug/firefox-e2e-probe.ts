@@ -27,6 +27,13 @@ const runtime = createDriveRuntime({
       if (!connected) throw Error("No Google credential is available");
       return identity;
     },
+    // The operation-sync build opens its relay room only with Drive identity
+    // credentials; the fixture returns the same stub token (the loopback
+    // relay admits by board grant, and no real Google is contacted).
+    getDriveIdentityCredentials: async () => {
+      if (!connected) throw Error("No Google credential is available");
+      return { accessToken: identity, idToken: `fixture-id-token-for-${identity}` };
+    },
     getConnectionState: async () => (connected ? "connected" : "disconnected"),
     isConfigured: () => true,
     connect: async () => {
