@@ -16,7 +16,7 @@
  *
  * A board whose canonical file already exists is never overwritten.
  */
-import { migratePrivateBoard, type MigrationDeps, type MigrationState } from "./privateMigration";
+import { cleanupDue, migratePrivateBoard, type MigrationDeps, type MigrationState } from "./privateMigration";
 import { deserializeProjectSnapshot, type ProjectSnapshot, type ProjectSnapshotStore } from "./snapshot";
 import { deserializeBoardSnapshotV2 as parseV2, serializeBoardSnapshotV2, v1SnapshotToEntities } from "./snapshotV2";
 import type { DriveBoardStore } from "./driveBoardStore";
@@ -25,6 +25,7 @@ import type { RxRepository } from "../storage/rxdbRepository";
 export type LegacySharedBoard = { projectId: string; folderId: string; projectFileId: string };
 
 export type LegacyMigrationDeps = {
+  skipBoard?: (boardId: string) => Promise<boolean>;
   store: DriveBoardStore;
   /** AppData board snapshots (`project-…`) and history archives (`history-…`). */
   listAppDataBoards(): Promise<{ id: string; name: string }[]>;
@@ -98,7 +99,7 @@ export async function migrateLegacyBoards(deps: LegacyMigrationDeps): Promise<Le
     const projectId = boardIdFromLegacyName(file.name);
     if (!projectId) continue;
     try {
-      if (await deps.tombstones.get(projectId) || await rx.isDeletedProject(projectId)) { result.skipped.push(projectId); continue; }
+      if (await deps.skipBoard?.(projectId) || await deps.tombstones.get(projectId) || await rx.isDeletedProject(projectId)) { result.skipped.push(projectId); continue; }
       const state = await deps.migrations.load(projectId);
       // Probe by name so a skipped board leaves no folder behind
       // (`snapshotFileId` find-or-creates the board folder).
@@ -148,7 +149,7 @@ export async function migrateLegacyBoards(deps: LegacyMigrationDeps): Promise<Le
 
   for (const shared of await deps.sharedLegacy()) {
     try {
-      if (await deps.tombstones.get(shared.projectId) || await rx.isDeletedProject(shared.projectId)) { result.skipped.push(shared.projectId); continue; }
+      if (await deps.skipBoard?.(shared.projectId) || await deps.tombstones.get(shared.projectId) || await rx.isDeletedProject(shared.projectId)) { result.skipped.push(shared.projectId); continue; }
       // Probe the canonical location by name so a skipped board leaves no
       // folder behind (`snapshotFileId` would create the folder).
       if (await findCanonicalFileId(deps.store, shared.projectId)) { result.skipped.push(shared.projectId); continue; }
@@ -195,7 +196,6 @@ async function findAppDataFile(deps: LegacyMigrationDeps, projectId: string): Pr
  * `cleanupDue` rule owns that ordering; this never guesses.
  */
 export async function cleanupLegacySource(deps: LegacyMigrationDeps, projectId: string): Promise<boolean> {
-  const { cleanupDue } = await import("./privateMigration");
   const state = await deps.migrations.load(projectId);
   if (!state) return false;
   if (!cleanupDue(state, deps.now())) throw new Error("The read-only window has not elapsed");

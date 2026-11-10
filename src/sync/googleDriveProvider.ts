@@ -17,6 +17,13 @@ export type DriveReconcileResult = {
   pulled: number;
   pushed: number;
   deleted: number;
+  /** What the relay heal leg did per board (`healed:<steps>`, `idle:<reason>`,
+   * `failed:<reason>`), the operation-protocol loop's answer to "and what about
+   * the live channel?" — present only when the round actually ran the loop.
+   * A board whose Drive sync failed still has an entry: the legs are isolated
+   * per board, and the round must say what the relay did instead of silently
+   * returning `reconciled`. */
+  relay?: Record<string, string>;
 };
 
 export interface GoogleDriveProvider {
@@ -26,7 +33,12 @@ export interface GoogleDriveProvider {
   pullProject(projectId: string): Promise<ProjectSnapshot | null>;
   pushProject(projectId: string): Promise<DriveAppDataFile>;
   syncProject(projectId: string, options?: { force?: boolean }): Promise<ProjectSyncResult>;
-  reconcileAll(): Promise<DriveReconcileResult>;
+  /**
+   * One reconciliation round. `force` (connect, the periodic alarm, an explicit
+   * "sync now") always runs; without it a round that just completed in this
+   * context, or in the other context sharing this storage, is coalesced.
+   */
+  reconcileAll(options?: { force?: boolean }): Promise<DriveReconcileResult>;
   deleteProject(projectId: string): Promise<"deleted" | "pending">;
 }
 

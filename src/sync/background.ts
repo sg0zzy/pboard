@@ -1,11 +1,11 @@
 import { browser } from "../platform/browser";
 import { drivePermissions, googleDrive, driveSyncState } from "./browser";
-import { isDriveReconcileMessage, isDriveSyncProjectMessage } from "./messages";
+import { isDriveClearErrorMessage, isDriveReconcileMessage, isDriveSyncProjectMessage, WORKER_EPOCH_KEY } from "./messages";
+import { clearDriveQuotaCooldown } from "./driveQuota";
 import { DRIVE_PROJECT_STATE_PREFIX, type DriveProjectSyncState } from "./state";
-import { recoveryDelayMs } from "./recoveryScheduler";
+import { dirtyFlushAt, drivePollDelay } from "./syncPolicy";
 import { collaborationCounters } from "../collab/counters";
 
-const IDLE_SYNC_DELAY_MS = 25_000;
 const ALARM_PREFIX = "pboard-drive-sync:";
 
 export function registerDriveBackgroundSync() {
@@ -29,16 +29,21 @@ export function registerDriveBackgroundSync() {
    * which is why the sync itself is not delayed by reading the attempt count.
    */
   const retrying = new Set<string>();
-  const schedule = async (projectId: string, delayMs = IDLE_SYNC_DELAY_MS) => {
-    if (await googleDrive.getConnectionState() !== "connected" && !(await driveSyncState.get(projectId)).permanentDeletion) return;
+  const schedule = async (projectId: string, delayMs?: number) => {
+    const state = await driveSyncState.get(projectId);
+    if (await googleDrive.getConnectionState() !== "connected" && !state.permanentDeletion) return;
     scheduled.add(projectId);
-    await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: Date.now() + delayMs });
+    await browser.alarms.create(`${ALARM_PREFIX}${projectId}`, { when: delayMs === undefined ? Math.max(Date.now(), dirtyFlushAt(state)) : Date.now() + delayMs });
   };
   browser.storage.onChanged.addListener((changes: Record<string, { newValue?: unknown }>, area: string) => {
     if (area !== "local") return;
     for (const [key, change] of Object.entries(changes)) {
       if (!key.startsWith(DRIVE_PROJECT_STATE_PREFIX)) continue;
       const next = change.newValue as DriveProjectSyncState | undefined;
+      if (next && !next.dirty) {
+        scheduled.delete(next.projectId);
+        void browser.alarms.clear?.(`${ALARM_PREFIX}${next.projectId}`);
+      }
       if (!next?.dirty || next.status !== "pending") continue;
       // A board that is already scheduled must not get another one: the sync
       // that is already pending is the one that will pick this change up.
@@ -72,24 +77,45 @@ export function registerDriveBackgroundSync() {
           const attempt = await attempts.get(projectId);
           await attempts.set(projectId, attempt + 1);
           collaborationCounters.countBackgroundSync("unsettled");
-          await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+          await schedule(projectId, drivePollDelay(attempt));
           return;
         }
         await attempts.clear(projectId);
         retrying.delete(projectId);
         collaborationCounters.countBackgroundSync("settled");
         collaborationCounters.setRetryingBoards(retrying.size);
-      } catch {
+      } catch (error) {
         // Bounded exponential backoff; the durable attempt count survives restart.
         const attempt = await attempts.get(projectId);
         await attempts.set(projectId, attempt + 1);
         collaborationCounters.countBackgroundSync("failed");
-        await schedule(projectId, recoveryDelayMs({ attempt, random: Math.random }, Date.now()));
+        const cooldown = error instanceof Error && 'waitMs' in error ? Number(error.waitMs) || 0 : 0;
+        await schedule(projectId, Math.max(drivePollDelay(attempt), cooldown));
       }
     })();
   });
 
-  void googleDrive.reconcileAll().catch(() => undefined);
+  // A worker cold start is a fact worth recording durably: the sidebar watches
+  // this stamp and runs the conditional relay heal leg for its open board.
+  // The leg is a no-op for a healthy board — the MV3 worker restarts routinely
+  // on idle, and unconditional reconnecting would be churn wearing the costume
+  // of robustness.
+  void browser.storage.local.set({ [WORKER_EPOCH_KEY]: Date.now() }).catch(() => undefined);
+  void googleDrive.reconcileAll({ force: true }).catch(() => undefined);
+  // Alarms may be lost on browser restart. Restore their absolute deadlines
+  // from durable dirty state, including while no sidebar is open.
+  void browser.storage.local.get(null).then((saved: Record<string, unknown>) => {
+    for (const [key, value] of Object.entries(saved)) {
+      const state = value as DriveProjectSyncState | undefined;
+      if (key.startsWith(DRIVE_PROJECT_STATE_PREFIX) && state?.dirty && !scheduled.has(state.projectId)) {
+        void (async () => {
+          if (await browser.alarms.get?.(`${ALARM_PREFIX}${state.projectId}`)) { scheduled.add(state.projectId); return; }
+          const attempt = await attempts.get(state.projectId);
+          await schedule(state.projectId, attempt ? drivePollDelay(attempt) : undefined);
+        })();
+      }
+    }
+  });
 }
 
 type RecoveryAttempts = { get(projectId: string): Promise<number>; set(projectId: string, attempt: number): Promise<void>; clear(projectId: string): Promise<void> };
@@ -109,10 +135,25 @@ function recoveryAttempts(): RecoveryAttempts {
 }
 
 export function handleDriveSyncMessage(message: unknown): Promise<unknown> | undefined {
+  if (isDriveClearErrorMessage(message)) {
+    // The failed request and the quota denial it recorded live in this context,
+    // so this is where dismissing them has to happen. The charged unit window is
+    // not touched: the next attempt really goes to Drive, and a still-exhausted
+    // limit is reported again.
+    clearDriveQuotaCooldown();
+    return driveSyncState.clearError(message.projectId)
+      .then(() => ({ ok: true }))
+      .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive error could not be cleared" }));
+  }
   if (isDriveReconcileMessage(message)) {
     // An explicit user action must not serve the 60-second discovery cache.
-    drivePermissions.invalidateSharedDiscovery();
-    return googleDrive.reconcileAll()
+    // A background refresh (`force: false`, the sidebar's startup discovery)
+    // answers from the round the worker just ran instead of repeating it: the
+    // two contexts share this account and this local database, so a second
+    // round over the same facts can only cost time.
+    const force = message.force !== false;
+    if (force) drivePermissions.invalidateSharedDiscovery();
+    return googleDrive.reconcileAll({ force })
       .then((result) => ({ ok: true, result }))
       .catch((error) => ({ ok: false, reason: error instanceof Error ? error.message : "Google Drive reconciliation failed" }));
   }

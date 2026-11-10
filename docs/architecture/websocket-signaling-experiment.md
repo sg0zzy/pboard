@@ -1,5 +1,36 @@
 # WebSocket signaling — independent board grants (milestone 0.5)
 
+> **Historical document — it no longer describes the product.** This records the
+> 0.5 experiment in which the relay carried only *signaling* for peer-to-peer
+> board grants, devices exchanged codes manually, and the owner's browser had to be
+> online to enrol or renew anyone. It is kept as history and must not be read as a
+> description of current behaviour.
+>
+> What superseded it, in order:
+>
+> 1. **Automatic Google identity enrollment** (19 October 2026) replaced manual
+>    code exchange as the Google-connected onboarding path. That work is itself
+>    superseded in the default runtime.
+> 2. **Drive-first operation synchronization** (28 October 2026,
+>    [drive-operation-sync.md](drive-operation-sync.md)) replaced peer authority,
+>    device-grant gating and mutable board snapshots for normal use; membership is
+>    the Drive folder ACL and no authoritative peer election exists.
+> 3. **The durable operation log over the same authenticated `/ws`** — protocol
+>    "Sync v3", [websocket-operation-log.md](websocket-operation-log.md) and
+>    [`services/pboard-signaling/PROTOCOL.md`](../../services/pboard-signaling/PROTOCOL.md)
+>    — is the current real-time transport, one multiplexed socket per browser
+>    context with per-room admission, per-room role and a per-account inbox.
+> 4. The WebRTC peer stack this experiment fed is switched off outright on both
+>    platforms (`src/sync/browser.ts:17` and `apps/android/src/sync/service.ts:15`,
+>    plus a build-time stub of `src/collab/peerRuntime.ts` in the extension).
+>
+> Two specific claims below are no longer true and are called out so a reader does
+> not carry them forward: the owner's browser is **not** required to be online for a
+> peer to keep working (grants renew through the relay, and the log needs no peer at
+> all), and room admission is **not** grant-only — a public deployment refuses to
+> start without a Google verifier (`App::validate_service_policy`,
+> `services/pboard-signaling/src/lib.rs:287`).
+
 
 
 ## Automatic Google identity enrollment — 19 October 2026
@@ -314,7 +345,7 @@ issues. No updated load/CPU/peer-capacity measurements are claimed;
 historical benchmark results do not establish capacity of this new grant path.
 
 Implementation files added: `collab/boardGrants.ts`,
-`sidebar/components/BoardCollaborationControls.tsx`, server `src/board_grants.rs`,
+`sidebar/components/BoardCollaborationControls.tsx`, server `services/pboard-signaling/src/board_grants.rs`,
 `build-local-release.mjs`, `board-grants-probe.ts`, and the board-grant client/UI
 tests. Integration changes are in runtime/browser wiring, signaling selection,
 manager image gating, manifest/relay-admission validation, initial mutation
@@ -679,7 +710,7 @@ an official app: headers/extension IDs/shared bundled keys are insufficient. Any
 client can establish its own cryptographic namespace, but cannot join another
 pinned authority's room without its signed membership and a device private key.
 
-Added `security/relayAdmission.ts` and Rust `src/admission.rs`. The runtime attaches
+Added `security/relayAdmission.ts` and Rust `services/pboard-signaling/src/admission.rs`. The runtime attaches
 its already-verified signed manifest and independently pinned public authority to
 the existing collaboration context; the manager passes that context to the selected
 provider. Drive ignores the additional context and remains the production default.
@@ -865,7 +896,7 @@ flowchart LR
 ```
 
 Added `src/collab/googleBrokerEnrollment.ts` and server
-`src/google_enrollment.rs`; reused `CollaborationSecurityOptions`, device keys,
+`services/pboard-signaling/src/google_enrollment.rs`; reused `CollaborationSecurityOptions`, device keys,
 manifest signatures, relay challenge-response, collection scoping, WebRTC mutual
 proofs, RxDB storage guards and existing role refresh lifecycle. The runtime selects
 this path only with the explicit experimental build flag and an independently

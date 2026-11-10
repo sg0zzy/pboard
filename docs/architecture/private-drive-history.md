@@ -5,6 +5,26 @@ the [journal](causal-change-journal.md) and [manual resolutions](conflict-resolu
 RxDB remains the local data store. Drive/WebRTC can operate independently; signaling
 selection and defaults are unchanged. [Job 7](peer-causal-history.md) adds authenticated peer history exchange.
 
+> **State at 6 November 2026.** The private-history path itself is current and is
+> still what restores an account's boards on a fresh device. Three qualifiers:
+>
+> - **The peer exchange this document points at is historical** —
+>   [peer-causal-history](peer-causal-history.md) is a banner-marked record, because
+>   neither platform opens WebRTC peer pools (`src/sync/browser.ts:17` and
+>   `apps/android/src/sync/service.ts:15`).
+> - **The mechanism changed shape, not purpose.** Under `operationSync` (the
+>   default) a board's own folder holds immutable operation segments, snapshots and
+>   `image-<sha256>.json` assets; the private-history engine is still the
+>   account-scoped recovery path, with its `history-`/`snapshot-`/`erased-`/`image-`
+>   transports wired in `src/sync/runtime.ts:748-762`. AppData is the *legacy*
+>   provider's location, as the note below states, and the image file it writes
+>   there is `image-<hash>.pboard`
+>   (`src/sync/privateDriveHistory.ts:382`), not `image-<hash>.json`.
+> - The independent-collaboration section below predates the multiplexed operation
+>   log: the relay path now shares one socket per browser context
+>   ([operation log](websocket-operation-log.md)). Its substantive claim — the
+>   relay receives no history, documents, images or Drive tokens — is still true.
+
 > **Scope note (24 October 2026):** this AppDataFolder-based design describes
 > the legacy Drive-provider mode only. Under Sync v2 (websocket provider) no
 > board data touches AppData; every board persists to the unified visible

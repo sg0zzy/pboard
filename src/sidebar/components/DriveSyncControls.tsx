@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { browser } from "../../platform/browser";
-import { driveSyncState, googleAuth, googleDrive, authorizePrivatePersistence } from "../../sync/browser";
-import { requestDriveReconciliation, requestProjectSync } from "../../sync/client";
+import { clearDriveSyncError, driveSyncState, googleAuth, googleDrive, authorizePrivatePersistence } from "../../sync/browser";
+import { requestDriveErrorClear, requestDriveReconciliation, requestProjectSync } from "../../sync/client";
 import {
   DRIVE_AUTH_STORAGE_KEY,
   projectSyncStorageKey,
   type DriveProjectSyncState
 } from "../../sync/state";
-import { ChevronDownIcon, ChevronUpIcon, CloudIcon, SyncIcon } from "../components/icons";
+import { ChevronDownIcon, ChevronUpIcon, CloudIcon, CloseIcon, SyncIcon } from "../components/icons";
 
 type Props = { projectId: string | null; onConnectionChanged?: () => void };
 
@@ -80,15 +80,39 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
       const result = await requestProjectSync(projectId);
       // An explicit sync is the moment the user expects everything Drive has:
       // reconcile now, so boards other accounts shared surface immediately
-      // instead of on the sidebar's next discovery tick. Fire-and-forget;
-      // the reactive project list picks up any import.
-      void requestDriveReconciliation();
+      // instead of on the sidebar's next discovery tick. The reactive project
+      // list picks up any import; when the round answers, its relay leg for
+      // THIS board is reported too — the person just asked "is everything I
+      // have on the relay?", and `reconciled` alone never answered that.
+      void Promise.resolve(requestDriveReconciliation()).then((reply) => {
+        const outcome = reply?.result?.relay?.[projectId];
+        if (selectedProject.current === projectId && outcome) setSyncFeedback(`Relay: ${outcome}`);
+      });
       if (selectedProject.current !== projectId) return;
       if (!result.ok) setLocalError(result.reason ?? "Google Drive sync failed");
-      else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Drive sync complete.');
+      else setSyncFeedback(result.pending ? 'Saved locally; Drive synchronization is still pending.' : 'Sync OK');
       await refresh();
     } catch (error) { if (selectedProject.current === projectId) setLocalError(error instanceof Error ? error.message : "Google Drive sync failed"); }
     finally { syncing.current.delete(projectId); setSyncingProjects(new Set(syncing.current)); }
+  }
+
+  /**
+   * Dismiss the failure notice in both contexts that can hold one, without
+   * spending a Drive request. The board stays pending, so the next attempt is a
+   * real one and reports the failure again if Google still refuses — which is
+   * how a one-off rate window is told apart from a limit that is really spent.
+   */
+  async function clearError() {
+    if (!projectId) return;
+    setLocalError("");
+    setSyncFeedback("");
+    await clearDriveSyncError(projectId);
+    const result = await requestDriveErrorClear(projectId);
+    if (selectedProject.current !== projectId) return;
+    setSyncFeedback(result.ok
+      ? "Error cleared. The next sync asks Drive again and reports the failure if it happens again."
+      : result.reason || "The Drive error could not be cleared.");
+    await refresh();
   }
 
   if (!connected) {
@@ -138,6 +162,14 @@ export function DriveSyncControls({ projectId, onConnectionChanged }: Props) {
         disabled={!projectId || syncBusy || authBusy}
         onClick={() => void syncNow()}
       ><SyncIcon /></button>
+      {(currentState?.error || localError) && <button
+        type="button"
+        className="drive-icon-button"
+        aria-label="Clear the Drive error message"
+        title="Clear this Drive error and stop holding the local retry delay, so the next sync is a real request. The board stays pending, so the message returns if Drive refuses again."
+        disabled={authBusy}
+        onClick={() => void clearError()}
+      ><CloseIcon /></button>}
       {(syncBusy || localError || syncFeedback) && <span className="drive-sync-feedback" role="status">{syncBusy ? 'Syncing…' : localError || syncFeedback}</span>}
       <span className="visually-hidden" role="status">{statusText}</span>
     </div>

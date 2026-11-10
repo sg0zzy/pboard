@@ -1,3 +1,21 @@
+> **State at 6 November 2026.** This is the approved sequence, not a status page, and
+> the job order below is unchanged. What each job became in the shipped code, and
+> what is still missing, is recorded in
+> [../REFACTOR_STATE.md](../REFACTOR_STATE.md) and in the gap list at
+> [architecture/websocket-operation-log.md](architecture/websocket-operation-log.md#known-gaps-at-this-revision).
+> The short version, because it changes how several jobs read: the live transport is
+> the multiplexed operation log over one authenticated WebSocket per browser context.
+> It is reachable on Firefox and Android, since only those auth providers supply the
+> Google identity credentials a Drive-authorized room needs; Chromium falls back to
+> Drive synchronization. Job 7's "WebRTC with the same reconciliation behaviour" is
+> not run by any composition root, on either platform. The relay stores sealed
+> operations and never a board content key, and cross-account invitations travel the
+> per-account inbox to buy the recipient a Drive read. Job 11's mode/status surface and
+> job 12's full platform matrix remain incomplete, and no authoritative peer election
+> was built anywhere in the tree — that requirement turned out not to need one. Sections that assume peer election
+> describe a design that was not built; sections that assume a hosted authority
+> describe one that exists only as the relay, whose grants live in its memory.
+
 The work should proceed in this order. Each job should have its own review and passing tests before we start the next. Existing defaults and synchronization paths should remain available until their replacements pass validation.
 
 1. Define the synchronization and authorization rules

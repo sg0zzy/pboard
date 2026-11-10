@@ -17,6 +17,10 @@ export function openRepository(): Promise<RxRepository> {
   const sync = getAndroidSync(openRepository);
   return opening ??= createRxRepository({
     events: sync.events, resolveDeletionRole: sync.resolveDeletionRole,
+    // Same rule as the extension root: the Android app is an
+    // operation-protocol build with no live board role, so drafts could never
+    // be admitted. Drive-first synchronization delivers ordinary writes.
+    offlineDrafts: false,
     name: 'pboardandroidv1',
     blobs: createIndexedDbBlobStore('pboard-android-images-v1'),
   }).catch(error => { opening = undefined; throw error; });

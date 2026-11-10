@@ -94,7 +94,12 @@ describe("card display controls", () => {
       expect(container.textContent).not.toContain("Image unavailable");
       act(() => root.unmount());
       expect(stop).toHaveBeenCalled();
-      expect(revokeObjectURL).toHaveBeenCalledWith("blob:downloaded-image");
+      expect(revokeObjectURL).not.toHaveBeenCalled(); // The refcounted cache holds the URL for immediate reuse.
+      const remount = vi.fn();
+      act(() => { root = createRoot(container); });
+      await act(async () => renderCard({ item: { ...item, imageId: "image-id" }, getImage, subscribeImage: async () => remount }));
+      expect(container.querySelector<HTMLImageElement>(".card-image")?.getAttribute("src")).toBe("blob:downloaded-image");
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
     } finally { act(() => root.unmount()); vi.unstubAllGlobals(); }
   });
 

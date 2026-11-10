@@ -1,4 +1,3 @@
-import { ExperimentalEnrollment } from "./components/ExperimentalEnrollment";
 import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
@@ -18,10 +17,14 @@ import { ConflictResolutionControls } from "./components/ConflictResolutionContr
 import { dedupe } from "./minWidth";
 import { MinWidthMeasurer } from "./components/MinWidthMeasurer";
 import { BoardConfetti } from "./components/BoardConfetti";
-import { CloseIcon, CopyIcon, DebugIcon, DownloadIcon, EditIcon, NewProjectIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
+import { CloseIcon, CopyIcon, DebugIcon, DownloadIcon, EditIcon, NewProjectIcon, PeopleIcon, ZoomInIcon, ZoomOutIcon } from "./components/icons";
 import { CaptureToolbar } from "./components/CaptureToolbar";
+import { IdleActivityPanel } from "./components/IdleActivityPanel";
 import { TERMINAL_SECTION_DEFINITIONS, TerminalSection } from "./components/TerminalSection";
 import { DriveSyncControls } from "./components/DriveSyncControls";
+import { BoardDeletionStatus } from "./components/BoardDeletionStatus";
+import { BoardCollaborationControls } from "./components/BoardCollaborationControls";
+import { DriveFolderGardening } from "./components/DriveFolderGardening";
 import { ProjectFingerprint, type FingerprintTransition } from "./components/ProjectFingerprint";
 import { ProjectPicker } from "./components/ProjectPicker";
 import { adjacentItemId, reorderAtTarget, type DropPosition } from "./reorder";
@@ -33,8 +36,8 @@ import { browser } from "../platform/browser";
 import { requestPageCaptureAccess, requestPagePinAccess } from "../platform/capturePermission";
 import { requestDriveReconciliation, requestProjectSync } from "../sync/client";
 import { StatusCommitScheduler } from "./statusCommitScheduler";
-import { collaborationManager, drivePermissions, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
-import { BoardCollaborationControls } from "./components/BoardCollaborationControls";
+import { collaborationManager, driveFolderGardener, drivePermissions, healRelay, sharePermissions, discoverSharedBoards, renewBoardAuthorization, SHARED_PROJECTS_KEY } from "../sync/browser";
+import { WORKER_EPOCH_KEY } from "../sync/messages";
 import { DRIVE_AUTH_STORAGE_KEY } from "../sync/state";
 import { ShareControls } from "./components/ShareControls";
 import { focusTargetAfterStatusMove, shouldRestoreStatusFocus } from "./statusFocus";
@@ -43,6 +46,7 @@ import { collaborationCounters } from "../collab/counters";
 
 const STATUS_MOVE_DELAY_MS = 800;
 const DEBUG_SECTION_STORAGE_KEY = "pboardDebugSection";
+const LIVE_COLLABORATION_STORAGE_KEY = "pboardLiveCollaboration";
 
 export function App() {
   // The recurring-work counters, so a sustained CPU load can be attributed to a
@@ -67,6 +71,9 @@ export function App() {
   const [mergeTargetId, setMergeTargetId] = useState<string | null>(null);
   const [uiScale, setUiScale] = useState(DEFAULT_UI_SCALE);
   const [debugSection, setDebugSection] = useState(import.meta.env.DEV && import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket");
+  const [collabEnabled, setCollabEnabled] = useState(true);
+  const [rtcIndicator, setRtcIndicator] = useState('connecting');
+  const [collabPrefLoaded, setCollabPrefLoaded] = useState(false);
   const [notice, setNotice] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<{ kind: "project"; id: string } | null>(null);
@@ -110,8 +117,6 @@ export function App() {
   const itemsRef = useRef<BoardItem[]>([]);
   const fingerprintTimer = useRef<number | null>(null);
   const fingerprintRevision = useRef(0);
-  const visibilitySyncTimer = useRef<number | null>(null);
-  const currentProjectIdRef = useRef<string | null>(null);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -125,12 +130,18 @@ export function App() {
     void repository.subscribeCurrentProject((value) => { if (active) { collaborationCounters.countEmission("currentProject"); setCurrentProject(value); } }).then((stop) => {
       if (active) stopCurrent = stop; else stop();
     });
-    void requestDriveReconciliation();
+    // The startup round is requested once, by the discovery effect below: it
+    // runs at mount and on every account change, and asking here as well made
+    // every startup send the worker the same round twice.
     void browser.storage.local.get(UI_SCALE_STORAGE_KEY).then((result: Record<string, unknown>) => {
       setUiScale(normalizeUiScale(result[UI_SCALE_STORAGE_KEY]));
     });
     void browser.storage.local.get(DEBUG_SECTION_STORAGE_KEY).then((result: Record<string, unknown>) => {
       if (typeof result[DEBUG_SECTION_STORAGE_KEY] === "boolean") setDebugSection(result[DEBUG_SECTION_STORAGE_KEY] as boolean);
+    });
+    void browser.storage.local.get(LIVE_COLLABORATION_STORAGE_KEY).then((result: Record<string, unknown>) => {
+      if (typeof result[LIVE_COLLABORATION_STORAGE_KEY] === "boolean") setCollabEnabled(result[LIVE_COLLABORATION_STORAGE_KEY] as boolean);
+      setCollabPrefLoaded(true);
     });
     void browser.storage.local.get(PINNED_CARD_FOCUS_KEY).then((result: Record<string, unknown>) => {
       const cardId = result[PINNED_CARD_FOCUS_KEY] as string | null | undefined;
@@ -146,12 +157,26 @@ export function App() {
       if (area === "local" && typeof changes[DEBUG_SECTION_STORAGE_KEY]?.newValue === "boolean") {
         setDebugSection(changes[DEBUG_SECTION_STORAGE_KEY].newValue as boolean);
       }
+      if (area === "local" && typeof changes[LIVE_COLLABORATION_STORAGE_KEY]?.newValue === "boolean") {
+        setCollabEnabled(changes[LIVE_COLLABORATION_STORAGE_KEY].newValue as boolean);
+      }
       if (area === "local" && changes[PINNED_CARD_FOCUS_KEY]) {
         const cardId = changes[PINNED_CARD_FOCUS_KEY].newValue as string | null | undefined;
         if (cardId) void consumePinnedCardFocus(cardId);
       }
       if (area === "local" && changes[RXDB_MIGRATION_ERROR_KEY]?.newValue) {
         setNotice(`RxDB migration failed; legacy data is in use: ${changes[RXDB_MIGRATION_ERROR_KEY].newValue}`);
+      }
+      // The background worker started over — MV3 does that routinely on idle —
+      // or answered again after refusing to answer. Either way, run the
+      // conditional relay heal leg for the board the person is actually
+      // looking at: a healthy board answers it with no relay traffic at all,
+      // a wedged room gets its channel back without waiting for a throttled
+      // backoff timer, a page reload, or a second sign-in.
+      if (area === "local" && changes[WORKER_EPOCH_KEY]) {
+        void repository.getCurrentProject().then((project) => {
+          if (project) void healRelay(project.id);
+        }).catch(() => undefined);
       }
     };
     browser.storage.onChanged.addListener(listener);
@@ -162,32 +187,38 @@ export function App() {
     collaborationCounters.countEffect("discovery");
     let active = true;
     let discoveryNotice: string | null = null;
-    const discover = () => { void discoverSharedBoards().then(() => {
-      if (!active || !discoveryNotice) return;
-      const previous = discoveryNotice; discoveryNotice = null;
-      setNotice(current => current === previous ? "" : current);
-    }).catch((error) => {
-      if (active) {
-        discoveryNotice = error instanceof Error ? error.message : "Could not refresh boards from Google Drive";
-        setNotice(discoveryNotice);
-      }
-    }); };
-    // A new collaboration revision means the Drive state changed, so the
-    // boards are discovered again. The interval and the event listeners stay
-    // in place: rebuilding them on every revision would drop and re-arm the
-    // 30-second timer each time the collaboration state changed.
-    discover();
-    const timer = window.setInterval(discover, 30_000);
-    const onVisible = () => { if (document.visibilityState === "visible") discover(); };
-    window.addEventListener("focus", discover);
-    window.addEventListener("online", discover);
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      active = false; window.clearInterval(timer);
-      window.removeEventListener("focus", discover);
-      window.removeEventListener("online", discover);
-      document.removeEventListener("visibilitychange", onVisible);
+    const discover = () => {
+      // The account-wide round belongs to the worker, and it runs off this
+      // thread. This context used to run its own full round here, which is the
+      // one place a round can hold the thread the person is typing into: the
+      // worker's round yields at every Drive await (measured at 3 ms of
+      // blocking work for a one-board startup), while the same round inside the
+      // page blocked it for 86 ms. It was also the same round the worker had
+      // just been asked for, over the same account and the same local database.
+      //
+      // So ask the worker, as a *background* refresh: `force: false` lets the
+      // worker answer from the cold-start round it is already running instead
+      // of repeating it. Only a worker that cannot answer at all leaves the
+      // local round as the fallback — that is the recovery path this effect
+      // existed for, and it stays for exactly the case it covers.
+      void requestDriveReconciliation({ force: false })
+        .then((reply) => reply.ok ? undefined : discoverSharedBoards())
+        .then(() => {
+          if (!active || !discoveryNotice) return;
+          const previous = discoveryNotice; discoveryNotice = null;
+          setNotice(current => current === previous ? "" : current);
+        })
+        .catch((error) => {
+          if (active) {
+            discoveryNotice = error instanceof Error ? error.message : "Could not refresh boards from Google Drive";
+            setNotice(discoveryNotice);
+          }
+        });
     };
+    // Startup/account changes restore remote boards. The background account
+    // alarm owns recurring discovery; focus and visibility do not flush edits.
+    discover();
+    return () => { active = false; };
   }, [collaborationRevision]);
 
   useEffect(() => {
@@ -205,11 +236,16 @@ export function App() {
   useEffect(() => {
     collaborationCounters.countEffect("collaboration");
     const projectId = currentProject?.id;
+    if (!collabPrefLoaded) return;
+    void collaborationManager.setEnabled(collabEnabled).catch(console.error);
+    if (!collabEnabled) setLiveStatus("WebRTC is disabled. Google Drive synchronization remains available.");
     if (!projectId) { void collaborationManager.stop().catch(console.error); return; }
     let active = true;
     const updateStatus = () => {
       if (!active) return;
       const state = collaborationManager.state();
+      setRtcIndicator(state.error ? 'error' : !state.ready ? 'connecting' : state.connectedPeers.length ? 'connected' : 'enabled');
+      if (!collabEnabled) { setLiveStatus("WebRTC is disabled. Google Drive synchronization remains available."); return; }
       setLiveStatus(state.error ? `Live collaboration: ${state.error}`
         : !state.ready ? "Checking live collaboration…"
         : state.role === "private" ? "Live collaboration is not enabled for this project."
@@ -217,10 +253,15 @@ export function App() {
         : "Live collaboration: waiting for another browser with this board open.");
     };
     void collaborationManager.start(projectId).catch(() => {}).finally(updateStatus);
-    const statusTimer = window.setInterval(updateStatus, 1000);
+    // Counted so the sidebar's own timers are comparable at one board and at
+    // many: these three are per *component*, not per board, and a refactor that
+    // arms one per board shows up as `timer.sidebar.*` climbing with the board
+    // count. The handle is the platform's own, so the teardown stays a plain
+    // `clearCountedTimer` on it.
+    const statusTimer = collaborationCounters.countedInterval("sidebar.status", updateStatus, 1000);
     // A second browser can enable this project remotely while this view stays
     // open. Re-resolve its role without recreating healthy WebRTC pools.
-    const accessTimer = window.setInterval(() => {
+    const accessTimer = collaborationCounters.countedInterval("sidebar.role", () => {
       collaborationCounters.countEffect("refreshRole");
       void collaborationManager.refreshRole().catch((error) => {
         if (active) setLiveStatus(`Live collaboration: ${error instanceof Error ? error.message : String(error)}`);
@@ -240,15 +281,15 @@ export function App() {
     browser.storage.onChanged.addListener(onStorage);
     return () => {
       active = false;
-      window.clearInterval(statusTimer);
-      window.clearInterval(accessTimer);
+      collaborationCounters.clearCountedTimer(statusTimer);
+      collaborationCounters.clearCountedTimer(accessTimer);
       browser.storage.onChanged.removeListener(onStorage);
       // A board switch does not stop the live session here: the next start()
       // retires it and opens the new board's rooms on their own channels. The
       // teardown would otherwise delay the new board until the old transports
       // had closed. The unmount effect below stops the session for good.
     };
-  }, [currentProject?.id, collaborationRevision]);
+  }, [currentProject?.id, collaborationRevision, collabEnabled, collabPrefLoaded]);
 
   // Closing the sidebar ends live collaboration for the browser. A board switch
   // does not reach this effect, so it keeps the old board's channels open until
@@ -260,10 +301,9 @@ export function App() {
     const refresh = async () => {
       try {
         const context = await browser.runtime.sendMessage({ type: "GET_TOOLBAR_PIN_CONTEXT" }) as ToolbarPinContext;
-        // The poll runs every 1.5 seconds and the answer is a fresh object
-        // every time. Storing it unchanged re-rendered the whole board, and
-        // every card re-parsed its markdown. Only a changed answer is a
-        // change the user can see.
+        // The answer is a fresh object every time and storing it unchanged
+        // re-rendered the whole board, with every card re-parsing its markdown.
+        // Only a changed answer is a change the user can see.
         if (mounted) setPinContext((current) => samePinContext(current, context) ? current : context);
       } catch {
         if (mounted) setPinContext((current) => samePinContext(current, { page: false, selection: false, link: false, accessible: false })
@@ -272,13 +312,37 @@ export function App() {
       }
     };
     void refresh();
-    const timer = window.setInterval(() => { if (!document.hidden) void refresh(); }, 1500);
+    // Event-driven, not polled. The pin context was refreshed every 1.5
+    // seconds, and every refresh is a message to the background plus an
+    // `executeScript` injection into *every frame* of the active tab, to answer
+    // a question that only changes when the user does something: switches tab,
+    // selects text, moves focus to a link, or comes back to the window. Those
+    // are exactly the events below, and the tab API reports them without
+    // touching the page. A slow backstop (one minute, only while the sidebar is
+    // visible) covers the events the platform does not report — a selection
+    // change inside a same-page navigation, or a page script that changed the
+    // URL — so a stale pin can never outlive a minute of use, while the steady
+    // cost falls from 40 injections a minute to none.
+    const timer = collaborationCounters.countedInterval("sidebar.toolbarPin", () => { if (!document.hidden) void refresh(); }, 60_000);
     const onFocus = () => { void refresh(); };
     window.addEventListener("focus", onFocus);
+    const tabs = browser.tabs as {
+      onActivated?: { addListener(listener: () => void): void; removeListener(listener: () => void): void };
+      onUpdated?: { addListener(listener: (tabId: number, change: { url?: string; status?: string }) => void): void; removeListener(listener: (tabId: number, change: { url?: string; status?: string }) => void): void };
+    } | undefined;
+    // One listener for "the active tab changed", one for "the page it shows
+    // finished loading". Neither reads the page: the refresh that follows does,
+    // once, for a reason the user just produced.
+    const onActivated = () => { void refresh(); };
+    const onUpdated = (_tabId: number, change: { url?: string; status?: string }) => { if (change.url || change.status === "complete") void refresh(); };
+    tabs?.onActivated?.addListener(onActivated);
+    tabs?.onUpdated?.addListener(onUpdated);
     return () => {
       mounted = false;
-      window.clearInterval(timer);
+      collaborationCounters.clearCountedTimer(timer);
       window.removeEventListener("focus", onFocus);
+      tabs?.onActivated?.removeListener(onActivated);
+      tabs?.onUpdated?.removeListener(onUpdated);
     };
   }, []);
 
@@ -305,41 +369,6 @@ export function App() {
   const rejectedItems = items.filter((item) => item.status === "rejected");
   const doneItems = items.filter((item) => item.status === "done");
   const trashItems = items.filter((item) => item.status === "trash");
-
-  useEffect(() => {
-    currentProjectIdRef.current = currentProject?.id ?? null;
-  }, [currentProject?.id]);
-
-  useEffect(() => {
-    const cancel = () => {
-      if (visibilitySyncTimer.current !== null) window.clearTimeout(visibilitySyncTimer.current);
-      visibilitySyncTimer.current = null;
-    };
-    const schedule = () => {
-      cancel();
-      visibilitySyncTimer.current = window.setTimeout(() => {
-        visibilitySyncTimer.current = null;
-        const projectId = currentProjectIdRef.current;
-        if (projectId) void requestProjectSync(projectId);
-      }, 3000);
-    };
-    const onVisibility = () => document.visibilityState === "hidden" ? schedule() : cancel();
-    const onPageHide = () => {
-      const projectId = currentProjectIdRef.current;
-      if (projectId) void requestProjectSync(projectId);
-    };
-    window.addEventListener("blur", schedule);
-    window.addEventListener("focus", cancel);
-    window.addEventListener("pagehide", onPageHide);
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      cancel();
-      window.removeEventListener("blur", schedule);
-      window.removeEventListener("focus", cancel);
-      window.removeEventListener("pagehide", onPageHide);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, []);
 
   useEffect(() => {
     if (selectedCardId && !items.some((item) => item.id === selectedCardId)) setSelectedCardId(null);
@@ -875,8 +904,11 @@ export function App() {
         <div className="app-title-row">
           <p className="eyebrow"><img src="icons/logo-32.png" alt="" width={16} height={16} className="app-logo" /> Pboard</p>
           <ShareControls projectId={currentProject?.id ?? null} permissions={sharePermissions} onAccessChanged={refreshCollaboration} liveStatus={liveStatus} />
-          {debugSection && <ExperimentalEnrollment projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />}
           <DriveSyncControls projectId={currentProject?.id ?? null} onConnectionChanged={refreshCollaboration} />
+          {/* Deleted boards have no panel of their own, so their Drive cleanup
+              is reported where their sync status was last seen. Renders
+              nothing when nothing is owed. */}
+          <BoardDeletionStatus />
           {import.meta.env.VITE_PBOARD_SIGNALING_PROVIDER === "websocket" && (
             <button
               type="button"
@@ -891,6 +923,22 @@ export function App() {
               }}
             ><DebugIcon /></button>
           )}
+          <button
+            type="button"
+            className="scale-button webrtc-toggle"
+            aria-label="Toggle WebRTC collaboration"
+            data-state={collabEnabled ? rtcIndicator : "disabled"}
+            aria-description={liveStatus}
+            title={collabEnabled ? `${liveStatus} Disable WebRTC. Google Drive synchronization remains available.` : "WebRTC is disabled. Enable realtime collaboration."}
+            aria-pressed={collabEnabled}
+            disabled={!collabPrefLoaded}
+            onClick={() => {
+              const next = !collabEnabled;
+              setCollabEnabled(next);
+              void browser.storage.local.set({ [LIVE_COLLABORATION_STORAGE_KEY]: next })
+                .catch(() => setNotice("WebRTC preference could not be saved. Try again."));
+            }}
+          ><PeopleIcon /></button>
           <div className="font-scale-controls" aria-label="Board font size">
             <button
               className="scale-button"
@@ -1019,8 +1067,15 @@ export function App() {
           </form>
         )}
       </header>
+      {/* Reachability matters here: this panel is the only way to see a board's
+          grant, pair a device or read why live collaboration is refusing, and a
+          refactor once unmounted it while leaving the code behind. */}
       <BoardCollaborationControls projectId={currentProject?.id ?? null} onChanged={refreshCollaboration} />
-
+      <DriveFolderGardening gardener={driveFolderGardener} />
+      {/* Last, deliberately: the diagnostics disclosure is for reading while
+          something else misbehaves, not a control anyone reaches for first. It
+          used to sit in the title row, competing with share and Drive status. */}
+      {debugSection && <IdleActivityPanel />}
       {!currentProject ? (
         <section className="empty-state">
           <h2>No project yet</h2>

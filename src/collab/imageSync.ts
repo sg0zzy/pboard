@@ -1,4 +1,5 @@
 import { blobToDataUrl } from "../storage/blobStore";
+import { collaborationCounters } from "./counters";
 import type { RxRepository } from "../storage/rxdbRepository";
 import type { BoardImage } from "../types";
 import { verifyImageAsset, SUPPORTED_IMAGE_MIME } from "./security/imageAsset";
@@ -99,7 +100,7 @@ export function createProjectImageSync(options: {
     const delay = failedPasses === 0
       ? baseDelay
       : Math.min(60_000, baseDelay * 2 ** Math.min(failedPasses, 5));
-    timer = setTimeout(() => { timer = undefined; void tick(); }, delay);
+    timer = setTimeout(() => { timer = undefined; collaborationCounters.countEvent("imageSync.tick"); void tick(); }, delay);
   }
 
   function tick(): Promise<void> {

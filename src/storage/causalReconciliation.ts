@@ -30,9 +30,14 @@ export function reconcile(changes: Change[]): Reconciliation {
   const aliases = new Map<string, string>();
   const provenValues = new Map(changes.filter(c => c.ancestry === "known" && (c as JournalEntry).proof && c.value._sec)
     .map(c => [canonicalize(c.value), c.id]));
-  for (const change of changes) if (change.ancestry === "unknown" && !change.parents.length && change.value._sec) {
+  for (const change of changes) {
+    // The same signed operation can also arrive as the ancestry another device was
+    // allowed to present: exact bytes, re-anchored parents. It is one operation, so
+    // the fold-back echo of a presentation must not become a second head beside the
+    // record it was presented from. Self-aliasing would drop the change from its own
+    // graph, so a change never aliases onto itself.
     const proven = provenValues.get(canonicalize(change.value));
-    if (proven) aliases.set(change.id, proven);
+    if (proven && proven !== change.id) aliases.set(change.id, proven);
   }
   changes = changes.filter(c => !aliases.has(c.id));
   const graph = new Map(changes.map(c => [c.id, c]));
@@ -161,7 +166,7 @@ export function createCausalReconciliation(journal: ChangeJournal) {
         const { version, id, boardId, collection, documentId, parents, ancestry, value } = change;
         accepted.push({ version, id, boardId, collection, documentId, parents, ancestry, value, state: "committed", origin: "observed" });
       }
-      await journal.accept(accepted);
+      await journal.accept(accepted, true);
     }
   };
 }

@@ -229,6 +229,20 @@ Stable notes use the previous **successfully published stable** from the API at 
 - Android ID: `it.stefanogozzi.pboard`, API 33+, compile/target 36. `release-signing` requires references `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`; the expected public certificate SHA-256 and highest historical/submitted code belong in `project-standards.json`. `scripts/sign-android.mjs` aligns/signs/verifies the final APK and certificate plus package version/code. There is no debug/unsigned fallback. These references do not create or rotate any key.
 - Existing Android encoded codes are retained within documented bounds. No GitHub↔Play or beta/stable update edge is promised until production certificates, existing installs, numeric history and device data-preservation checks have been verified. Local debug uses the production app ID for compatibility with existing development installs and the tracked code without allocating production codes. A different signer or code can block updates: use a dedicated emulator/test profile, back up valuable data, and never treat uninstalling as upgrade evidence. No AAB/Play signing profile is configured.
 
+## Relay service releases
+
+The collaboration relay (`services/pboard-signaling`) is **not** a release target in the browser/Android matrix above. It has no entry in `project-standards.json`, is not built by `build-targets.yml`, and is not attached to a GitHub Release. Deploying it is a separate, explicitly authorized host operation against the operator's own server; this repository contains no automation for it, and the repository build never reaches a host.
+
+What a product release must respect, because the two artifacts talk to each other:
+
+- **Server before client.** A client activates protocol v3 only when the relay's welcome lists 3 in `supportedVersions` (`src/sync/operations/logSync.ts:283-285`); a v3 relay serves a v2 client unchanged. So a new client may ship to a v2 relay and simply stay on the v2 path, but a client that *requires* v3 cannot work ahead of its server. Deploy the relay first.
+- **Schema version is one-way.** The relay's operation log carries a single `sync_schema` version and a binary refuses a file newer than it knows (`services/pboard-signaling/src/sync_log.rs:68`, `:422-424`). Activating a v3 build migrates the database, after which the previously deployed binary exits at startup. Rollback therefore needs a **v3-aware binary**, which must be built and kept from the earlier release, or the archived database plus the old binary. A v3-aware binary is the rollback artifact of record for the release that follows it.
+- **The account inbox is additive.** Its three tables deliberately do not raise the shared schema version (`services/pboard-signaling/src/account_inbox.rs:83-84`), so a v3-aware build from before the inbox opens the same file and ignores them. That is the one rollback direction that does not need a database restore.
+
+Build and verify a relay release with the commands in [BUILD.md](BUILD.md#relay-service-servicespboard-signaling): `cargo test`, `cargo clippy --all-targets`, and a `--release --locked` build. `--check-config` is the pre-flight: it validates the environment and the filesystems it will need and **never opens, creates or migrates the database** (`services/pboard-signaling/src/main.rs:449-455`). `--help` exists, and exit codes are 0 (success), 1 (configuration or runtime failure) and 2 (usage error) (`main.rs:185`).
+
+**Status at 6 November 2026:** implemented and tested in this repository and **not deployed**. A product release of this repository has never carried a relay deployment with it, and should not start doing so implicitly: the ordering and schema rules above are the reason.
+
 ## Distribution
 
 | Destination / platform | Beta | Stable | Package, required evidence and retry identity |

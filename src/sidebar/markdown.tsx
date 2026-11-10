@@ -1,4 +1,4 @@
-import { Fragment } from "react";
+import { Fragment, useMemo, memo } from "react";
 import { toSafeWebHref, tokenizeLinks } from "./linkify";
 
 export type InlineMarkdownToken =
@@ -104,7 +104,7 @@ export function setTaskCheckedAtLine(text: string, lineIndex: number, checked: b
   return lines.join("\n");
 }
 
-export function MarkdownInline({ text }: { text: string }) {
+export const MarkdownInline = memo(function MarkdownInline({ text }: { text: string }) {
   return tokenizeInlineMarkdown(text).map((token, index) => {
     const key = `${index}-${token.type}`;
     switch (token.type) {
@@ -119,7 +119,7 @@ export function MarkdownInline({ text }: { text: string }) {
       default: return <Fragment key={key}>{token.text}</Fragment>;
     }
   });
-}
+});
 
 export function MarkdownContent({
   text,
@@ -128,9 +128,10 @@ export function MarkdownContent({
   text: string;
   onTaskToggle?: (lineIndex: number, checked: boolean) => void;
 }) {
+  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
   return (
     <div className="card-content">
-      {parseMarkdownBlocks(text).map((block, index) => {
+      {blocks.map((block, index) => {
         if (block.type === "unordered-list") {
           return <ul key={index}>{block.items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} /></li>)}</ul>;
         }

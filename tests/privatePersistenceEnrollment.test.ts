@@ -23,7 +23,7 @@ it('a connected Drive enrolls every local board automatically â€” no disclosure 
   const rx = await createRxRepository({ name: `autoen${crypto.randomUUID().replaceAll('-', '')}`, blobs: createIndexedDbBlobStore(`autoenblobs${crypto.randomUUID()}`) });
   repositories.push(rx);
   const board = await rx.createProject('First board', 'project');
-  const runtime = createDriveRuntime({ storage, getRepository: async () => rx,
+  const runtime = createDriveRuntime({ operationSync: false, storage, getRepository: async () => rx,
     auth: { getAccessToken: async () => state.email, getConnectionState: async () => state.connected ? 'connected' : 'disconnected',
       connect: async () => {}, disconnect: async () => {}, isConfigured: () => true },
     fetcher: async (input, init) => {
@@ -54,7 +54,7 @@ it('connecting reconciles immediately so a fresh profile restores this accountâ€
   const rx = await createRxRepository({ name: `autocon${crypto.randomUUID().replaceAll('-', '')}`, blobs: createIndexedDbBlobStore(`autoconblobs${crypto.randomUUID()}`) });
   repositories.push(rx);
   let reconciled = 0;
-  const runtime = createDriveRuntime({ storage, getRepository: async () => rx,
+  const runtime = createDriveRuntime({ operationSync: false, storage, getRepository: async () => rx,
     auth: { getAccessToken: async () => 'synthetic-token', getConnectionState: async () => 'connected',
       connect: async () => {}, disconnect: async () => {}, isConfigured: () => true },
     // One listing round is enough: the imported board set is empty either way.
@@ -74,7 +74,7 @@ it('authorizePrivatePersistence still records the account-scoped disclosure', as
   const rx = await createRxRepository({ name: `discl${crypto.randomUUID().replaceAll('-', '')}`, blobs: createIndexedDbBlobStore(`disclblobs${crypto.randomUUID()}`) });
   repositories.push(rx);
   const board = await rx.createProject('Disclosed board', 'project');
-  const runtime = createDriveRuntime({ storage, getRepository: async () => rx,
+  const runtime = createDriveRuntime({ operationSync: false, storage, getRepository: async () => rx,
     auth: { getAccessToken: async () => state.email, getConnectionState: async () => state.connected ? 'connected' : 'disconnected',
       connect: async () => {}, disconnect: async () => {}, isConfigured: () => true },
     fetcher: async (input) => {
@@ -99,7 +99,7 @@ it('retains both board enrollments when sync is requested concurrently after a b
     if ('pboardBindingDisclosure' in patch && first) { first = false; started(); await gate; }
     await set(patch);
   };
-  const runtime = createDriveRuntime({ storage,
+  const runtime = createDriveRuntime({ operationSync: false, storage,
     getRepository: async () => ({ listProjects: async () => [{ id: 'board-a' }, { id: 'board-b' }] }) as unknown as RxRepository,
     auth: { getAccessToken: async () => 'synthetic-token', getConnectionState: async () => 'connected',
       connect: async () => {}, disconnect: async () => {}, isConfigured: () => true },

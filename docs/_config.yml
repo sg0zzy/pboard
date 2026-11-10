@@ -8,9 +8,20 @@ defaults:
       path: ""
     values:
       layout: default
+# Only the public homepage, privacy policy and Terms of Service are published.
+# Every technical guide is excluded by name *and* by directory: the security and
+# architecture documents record deployment hosts, a deployed-binary digest and
+# local file paths that must not reach the public site.
 exclude:
   - collaboration.md
   - collaboration-security-plan.md
   - README.md
   - archive
+  - architecture
+  - testing
+  - JOBS.md
   - rxdb-storage-refactor.md
+  - security-refactor-audit.md
+  - security-refactor-progress.md
+  - _layouts
+  - assets

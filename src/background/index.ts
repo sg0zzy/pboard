@@ -1,7 +1,10 @@
 import type { CaptureSelectionResponse } from "../messaging/messages";
 import { isCaptureRegionMessage, isToolbarPinMessage } from "../messaging/messages";
+import { respondWith } from "../messaging/respond";
 import { cropCapturedImage } from "../images/processing";
 import { repository } from "../storage/browser";
+import { exposeDriveQuotaDiagnostics } from "../sync/driveQuota";
+import { exposeCollaborationDiagnostics, roomSnapshots } from "../sync/realtimeDiagnostics";
 import type { BoardImage } from "../types";
 import { PINNED_CARD_FOCUS_KEY } from "../types";
 import { pinImage, pinSelection, pinWebResource } from "./handlers";
@@ -18,6 +21,7 @@ import { getToolbarPinContext, pinFromToolbar, type PinApi } from "./toolbarPins
 import { togglePboardSidebar } from "./sidebar";
 import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
+import { registerDriveAccountPolling } from '../sync/drivePolling';
 import { collaborationCounters } from "../collab/counters";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
@@ -29,6 +33,7 @@ const WEB_PAGES = ["http://*/*", "https://*/*"];
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();
 registerDriveBackgroundSync();
+registerDriveAccountPolling();
 
 /**
  * The recurring work counters, for a development build. A developer can read
@@ -39,6 +44,17 @@ registerDriveBackgroundSync();
 if (collaborationCounters.enabled) {
   globalThis.pboardCounters = collaborationCounters;
 }
+// The Drive quota ledger is collected in every build, so a rate limit can be
+// watched here (`pboardDriveQuota()`) and not only when a denial prints itself.
+exposeDriveQuotaDiagnostics();
+// Rooms live in the context that opened the board, which is normally the sidebar;
+// this answers from here too, so the same command works in either console and
+// says which one it answered from instead of failing as an unknown name.
+exposeCollaborationDiagnostics("background", () => ({
+  rooms: roomSnapshots(),
+  connectedPeers: [],
+  note: "no realtime room in this context; run pboardCollaboration() in the sidebar console",
+}));
 
 if (browser.sidePanel?.setPanelBehavior) {
   void browser.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -176,16 +192,18 @@ browser.commands.onCommand.addListener(async (command: string, tab: any) => {
   }
 });
 
-browser.runtime.onMessage.addListener((message: unknown) => {
-  if (isCaptureRegionMessage(message)) return capturePageRegion(browser as unknown as PageCaptureApi);
-  if (isToolbarPinMessage(message)) {
-    if (message.type === "GET_TOOLBAR_PIN_CONTEXT") return getToolbarPinContext(browser as unknown as PinApi);
-    return pinFromToolbar(browser as unknown as PinApi, repository, message.kind).then((result) => {
-      setPinnedCardFocus(result.cardId);
-      return result;
-    });
-  }
-  return handleDriveSyncMessage(message);
+browser.runtime.onMessage.addListener((message: unknown, _sender: unknown, sendResponse: (response?: unknown) => void) => {
+  return respondWith(sendResponse, () => {
+    if (isCaptureRegionMessage(message)) return capturePageRegion(browser as unknown as PageCaptureApi);
+    if (isToolbarPinMessage(message)) {
+      if (message.type === "GET_TOOLBAR_PIN_CONTEXT") return getToolbarPinContext(browser as unknown as PinApi);
+      return pinFromToolbar(browser as unknown as PinApi, repository, message.kind).then((result) => {
+        setPinnedCardFocus(result.cardId);
+        return result;
+      });
+    }
+    return handleDriveSyncMessage(message);
+  });
 });
 
 async function captureContextImage(
@@ -238,3 +256,20 @@ function setPinnedCardFocus(cardId: string | undefined) {
   if (!cardId) return;
   void browser.storage.local.set({ [PINNED_CARD_FOCUS_KEY]: cardId });
 }
+
+// Worker lifecycle keep-alive. Firefox terminates an idle MV3 background
+// worker well under a minute, and this worker owns the collaboration sockets:
+// when it dies, the relay lane dies with it (every socket closes at once) and
+// profile B's edits reach profile A only when some event wakes A again. An
+// open runtime port is the documented way to declare "a UI of mine is alive",
+// and the sidebar window is that UI — so while any pboard sidebar lives, the
+// worker, its account channel and its operation-log session must live too.
+// No UI connected means no port means termination is correct: an unfocused
+// app keeps no lane open.
+type KeepAlivePort = { name?: string; onDisconnect: { addListener: (callback: () => void) => void } };
+const workerKeepAlives = new Set<KeepAlivePort>();
+browser.runtime.onConnect.addListener((port: KeepAlivePort) => {
+  if (port.name !== "pboard-worker-keepalive") return;
+  workerKeepAlives.add(port);
+  port.onDisconnect.addListener(() => { workerKeepAlives.delete(port); });
+});

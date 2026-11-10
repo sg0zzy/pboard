@@ -7,6 +7,14 @@ explicit gaps; it does not certify that the target architecture is implemented.
 The application defaults, OAuth configuration, existing data and authority keys
 are unchanged. No service is deployed, tagged or released by these checks.
 
+> **State at 6 November 2026.** The harness, its fail-closed inventory and the
+> evidence rules below are unchanged and still current: 55 scenarios, 45 partial,
+> 10 gap, 0 known-gap, `--strict` exits 1 as designed. The *figures* recorded at the
+> end of this document are the 19 October ones (609 tests, 36 Rust tests) and are
+> explicitly historical; the tree now measures 1 870 client tests in 257 files, 106
+> Android checks and 169 Rust tests. Jobs 3–12 landed after this document was written, so its
+> "Job 3 must…" planning sentences are a record of the sequence, not open work.
+
 Jobs 3/4 add the [durable journal and causal reconciliation foundation](causal-change-journal.md),
 including incremental tests in this runner. [Job 6](private-drive-history.md) adds
 private Drive history persistence/recovery; [Job 7](peer-causal-history.md) adds authenticated peer history and native
@@ -155,14 +163,22 @@ that gap. The public service was not flooded or modified by Job 2.
 
 ## Coverage and evidence rules
 
-`scripts/recovery/scenarios.json` maps all 53 approved scenario IDs plus PR01/PR02
-to an owning job, evidence files and a precise remaining gap. Its status is either
-partial, known-gap or gap. It intentionally contains no full-acceptance claims.
+`scripts/recovery/scenarios.json` maps all approved scenario IDs — **55 of them,
+the contract's M/S/C/D/A/R rows plus PR01/PR02** — to an owning job, evidence files
+and a precise remaining gap. Its status is one of partial, known-gap or gap. It
+intentionally contains no full-acceptance claims.
 The runner validates the exact ID sequence against the approved contract; tests
-also ensure expected failures and inventory entries cannot silently diverge.
+also ensure expected failures and inventory entries cannot silently diverge
+(`tests/recovery/recoveryInventory.test.mjs` asserts 55 rows, unique, in contract
+order, and that every evidence path in the inventory exists).
 Coverage is a source-controlled assessment, not an inference from subprocess exit
 codes. The final JSON records which groups actually ran in that invocation and
 always reports `fullAcceptance: false` at this stage.
+
+Current inventory (6 November 2026): **55 scenarios — 45 partial, 10 gap,
+0 known-gap**. The earlier record of "20 partial, 5 known gaps, 30 gaps" below is
+the 19 October baseline and is retained as such; the expected-failure table above is
+now empty because each converted failure became an ordinary passing test.
 
 Private bytes stay in synthetic fixture storage or disposable browser profiles.
 No current user data, account credentials, source-device authority keys or live

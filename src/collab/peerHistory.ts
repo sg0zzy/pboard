@@ -1,5 +1,5 @@
 import { canonicalize, parseStrictJson } from "./security/canonical";
-import { portableJournalChanges, verifyJournalChange, certifyHistory, type HistoryAdmission, type JournalProof } from "./security/journalProof";
+import { verifyJournalChange, certifyHistory, provePresentedChange, type HistoryAdmission, type JournalProof } from "./security/journalProof";
 import { manifestIsCurrent, manifestHash } from "./security/manifest";
 import { validateChange, validateRecord } from "../storage/causalReconciliation";
 import { makeChange, type Change, type JournalEntry } from "../storage/changeJournal";
@@ -151,30 +151,81 @@ export function createPeerHistorySession(options: {
       }
     } finally { requestingImages = false; requestedImages.clear(); imageAssembly = null; clearTimeout(imageTimer); }
   }
+  /**
+   * Present the ancestry this device can actually attest. Pre-enrollment private
+   * history is never disclosed, so a disclosed change cannot claim parents that
+   * stayed private: it is offered as the unknown-ancestry root its own bytes prove.
+   * Its disclosed descendants are then anchored onto the record the peer is
+   * actually given, so one serialized history arrives as one chain. Presenting
+   * each of them as its own root instead made the peer reconcile a fork that
+   * nobody created - the failure mode behind a document that stays conflicted
+   * forever after a delete on the other side.
+   *
+   * A proof binds the identity it was signed for, so a re-anchored record carries
+   * its proof only when the presented identity is the recorded identity; otherwise
+   * the author re-attests the identity it is claiming. Content this device did not
+   * author is never attested, and an ancestry claim the author cannot sign is
+   * presented without the claim.
+   */
   async function records(collection = context.collection): Promise<Record[]> {
     const entries = (await rx.journal.entries.where("boardId").equals(security.boardId).toArray()).filter(e => e.state === "committed" && e.collection === collection);
     if (entries.length > MAX_RECORDS) throw new Error("Peer history exceeds this client's 10000-record window; local history is retained");
+    const disclosed = entries.filter(e => e.value._sec);
+    const byId = new Map(disclosed.map(e => [e.id, e]));
+    // A presented identity depends on the presented identities of its disclosed
+    // parents, so a record is presented after them. Recorded parents are strictly
+    // ascending ids, so the disclosed graph is acyclic and this closure stays
+    // iterative: a long history cannot overflow the call stack.
+    const openParents = new Map<string, number>();
+    const childrenOf = new Map<string, string[]>();
+    const ready: string[] = [];
+    for (const entry of disclosed) {
+      const parents = entry.parents.filter(id => byId.has(id));
+      if (!parents.length) { ready.push(entry.id); continue; }
+      openParents.set(entry.id, parents.length);
+      for (const parent of parents) childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), entry.id]);
+    }
+    const presented = new Map<string, string>();
     const result = new Map<string, Record>();
-    const portable = portableJournalChanges(entries);
-    for (const entry of entries) {
-      if (!entry.value._sec) continue; // Pre-enrollment private history is never disclosed.
-      // A committed entry that was already verified for this board does not
-      // need its signature checked again: the journal is append-only for
-      // committed rows, and a cached verification stays valid until the
-      // board's authorization changes.
+    async function present(entry: JournalEntry): Promise<void> {
       const cached = verifiedRecords.get(entry.id);
-      if (cached) { result.set(entry.id, cached); continue; }
-      const proof = portable.has(entry.id) ? entry.proof : undefined;
-      const change = proof ? clean(entry) : await makeChange({ ...clean(entry), parents: [], ancestry: "unknown" });
+      if (cached) { result.set(cached.change.id, cached); presented.set(entry.id, cached.change.id); return; }
+      // A partially disclosed ancestry is not an ancestry claim: an entry whose
+      // recorded parents stayed private is offered as the root its own bytes prove.
+      const presentedParents = entry.parents.map(id => presented.get(id));
+      const dropped = presentedParents.some(id => id === undefined);
+      const parents = dropped ? [] : entry.parents.map(id => presented.get(id)!);
+      // A change presented under the identities its parents actually received is a
+      // different change, so it cannot carry the proof signed for the recorded one.
+      const claim = dropped || parents.some((id, index) => id !== entry.parents[index])
+        ? await makeChange({ ...clean(entry), parents, ancestry: dropped ? "unknown" : "known" })
+        : clean(entry);
       try {
-        await validateChange(change); validateRecord(change); await verifyJournalChange(change, proof, security, (change.id === entry.id ? entry.admission : entries.find(e => e.id === change.id)?.admission));
-        const admission = ((change.id === entry.id ? entry.admission : entries.find(e => e.id === change.id)?.admission)) ?? await certifyHistory(change, proof, security);
+        // Re-attesting a re-anchored claim is part of the same authorization check, so
+        // a record whose proof cannot be produced is retained locally instead of ending the pass.
+        const proof = claim.id === entry.id ? entry.proof : entry.origin === "local" ? await provePresentedChange(claim, security) : undefined;
+        // A known-ancestry record is presentable only with an author proof; without
+        // one it stays an unattested root instead of an unverifiable claim.
+        const change = proof ? claim : await makeChange({ ...clean(entry), parents: [], ancestry: "unknown" });
+        const admission = (change.id === entry.id ? entry.admission : entries.find(e => e.id === change.id)?.admission) ?? await certifyHistory(change, proof, security);
+        await validateChange(change); validateRecord(change); await verifyJournalChange(change, proof, security, admission);
         if (admission && change.id === entry.id && !entry.admission) await rx.journal.entries.update(entry.id, { admission });
         if (admission && change.id !== entry.id && !entries.some(e => e.id === change.id && e.admission)) await rx.journal.accept([{ ...change, admission, state: 'committed', origin: 'observed' }]);
         const record: Record = { change, ...(proof ? { proof } : {}), ...(admission ? { admission } : {}) };
+        // Committed rows are immutable, so a cached presentation stays valid while
+        // the board's authorization stands.
         verifiedRecords.set(entry.id, record);
         result.set(change.id, record);
+        presented.set(entry.id, change.id);
       } catch { /* Historical authorization unavailable: retain locally, never attest it as a relay. */ }
+    }
+    while (ready.length) {
+      const entry = byId.get(ready.shift()!)!;
+      await present(entry);
+      for (const child of childrenOf.get(entry.id) ?? []) {
+        const remaining = (openParents.get(child) ?? 1) - 1;
+        if (remaining) openParents.set(child, remaining); else ready.push(child);
+      }
     }
     return [...result.values()].sort((a, b) => a.change.id.localeCompare(b.change.id));
   }

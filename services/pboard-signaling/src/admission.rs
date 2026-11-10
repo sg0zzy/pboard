@@ -44,6 +44,15 @@ pub enum Role {
     Viewer,
 }
 
+impl Role {
+    /// Whether this role may publish mutations. Viewer is admitted to *receive*:
+    /// read-only clients get the live stream and are refused every write path,
+    /// which is why the check lives on the role rather than at each call site.
+    pub fn can_write(&self) -> bool {
+        matches!(self, Self::Owner | Self::Editor)
+    }
+}
+
 pub struct VerifiedAdmission {
     pub scope: String,
     pub digest: String,

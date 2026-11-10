@@ -1,4 +1,5 @@
 import type { AndroidSync } from '../sync/service';
+import { DriveFolderGardening } from '../../../../src/sidebar/components/DriveFolderGardening';
 export function CloudSettings({ service, state }: { service: AndroidSync | null; state?: ReturnType<AndroidSync['state']> }) {
   if (!service || !state) return <p>Google Drive is available in the installed Android app.</p>;
   return <section aria-label="Google Drive">
@@ -10,6 +11,13 @@ export function CloudSettings({ service, state }: { service: AndroidSync | null;
     </div>
     {state.busy && <p role="status">Syncing…</p>}
     {state.lastSynced && <p>Last synced: {state.lastSynced}</p>}
+    {state.connected && (() => {
+      const channel = service.accountStatus();
+      const cause = channel.reason || channel.error || '';
+      const authority = channel.authority ? ` · authority ${channel.authority.state}${channel.authority.reason ? `: ${channel.authority.reason}` : ''}` : '';
+      return <p>Account sync: {channel.state}{cause ? ` — ${cause}` : ''}{authority}</p>;
+    })()}
+    {state.connected && <DriveFolderGardening gardener={service.driveFolderGardener} />}
     {state.error && <p role="alert">{state.error}</p>}
   </section>;
 }

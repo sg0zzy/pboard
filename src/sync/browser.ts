@@ -6,6 +6,16 @@ import { googleDriveConfig, type GoogleDriveBrowser, type GoogleDriveStage } fro
 import type { RxRepository } from "../storage/rxdbRepository";
 import { createDriveRuntime } from "./runtime";
 import { PENDING_BOARD_LEAVES_KEY } from "./drivePermissions";
+import { clearDriveQuotaCooldown } from "./driveQuota";
+import { setWebRtcDisabled } from "../collab/liveTransport";
+
+// Development posture for evaluating the durable operation log: this process
+// opens no WebRTC peer pools, so a board either uses the log or has no live
+// channel and converges through Drive synchronization. Removing this call
+// restores the shipped transport pair; see src/collab/liveTransport.ts for what
+// the posture does to content keys.
+setWebRtcDisabled(true);
+
 const extensionOrigin = browser.runtime.getURL("");
 const isFirefox = extensionOrigin.startsWith("moz-extension://");
 const browserKey: GoogleDriveBrowser = isFirefox ? "firefox" : "chromium";
@@ -38,7 +48,8 @@ export function registerRxRepositoryResolver(resolver: () => Promise<RxRepositor
 }
 
 export const SHARED_PROJECTS_KEY = "pboardDriveSharedProjects";
-export const { driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, boardCollaboration } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
+export type { GardeningPreview } from "./operations/service";
+export const { operationService, driveFolderGardener, driveSyncState, driveTombstones, projectSnapshots, driveTransport, googleDrive, authorizePrivatePersistence, privateErasureAccount, sharedProjects, drivePermissions, sharePermissions, discoverSharedBoards, syncAccountPreferences, collaborationManager, experimentalEnrollment, renewBoardAuthorization, healRelay, boardCollaboration, accountChannel } = createDriveRuntime({ auth: googleAuth, storage: browser.storage.local, getRepository: () => rxRepositoryResolver(),
   hasSignalingHostPermission: (origin) => browser.permissions.contains({ origins: [origin] }),
   onReconciled: () => retryPendingLeaves() });
 
@@ -72,4 +83,17 @@ export async function retryPendingLeaves(): Promise<void> {
     }
   }
   if (changed) await browser.storage.local.set({ [PENDING_BOARD_LEAVES_KEY]: pending });
+}
+
+/**
+ * Dismiss a Drive failure in this page's own context: the stored board failure
+ * (shared with the worker through storage) and the quota cooldown this context
+ * recorded. Pair it with `requestDriveErrorClear`, which does the same in the
+ * background worker — the request that failed usually ran there. Neither call
+ * spends quota or forgives a pending change: the board stays dirty, so the next
+ * attempt is a real Drive request that reports the failure again if it recurs.
+ */
+export async function clearDriveSyncError(projectId: string): Promise<void> {
+  clearDriveQuotaCooldown();
+  await driveSyncState.clearError(projectId);
 }

@@ -1,12 +1,18 @@
 # Pboard — Product Specification
 
-**Package version at review:** 0.9.4
+**Package version at review:** 0.11.0 (`VERSION`)
 
-**Reviewed:** 2026-10-14
+**Reviewed:** 2026-11-06
 
-**Status:** Implemented local-first extension with optional Drive sync and collaboration
+**Status:** Implemented local-first extension with optional Drive sync, and
+operation-log collaboration that is wired but not activated in a normal install
 
-This document records the behavior currently implemented in the repository. It is a baseline for development and debugging, not a description of unbuilt future features.
+This document records the behavior currently implemented in the repository. It is
+a baseline for development and debugging, not a description of unbuilt future
+features. Where behavior is absent or unreachable, it is marked **not
+implemented** or **inert** rather than described as working; the collaboration
+gaps are enumerated in [docs/collaboration.md](docs/collaboration.md#status-and-known-gaps)
+and summarized in §7.4 below.
 
 ## 1. Product purpose
 
@@ -58,7 +64,7 @@ Implemented behavior:
 - A user can switch projects with a custom dropdown selector styled like the previous compact project control.
 - Projects can be dragged directly inside the open dropdown to change their persistent order; an insertion line previews the destination.
 - The dropdown supports Up/Down and Home/End navigation, Enter selection, Escape dismissal, and closing by clicking outside it.
-- Reordering does not change the current project or board content. The RxDB repository stores an account-specific project-order preference, synchronized through private Drive app data and a dedicated WebRTC settings pool when connected. Selection stays local.
+- Reordering does not change the current project or board content. The RxDB repository stores an account-specific project-order preference, persisted as a Drive preference file and applied during reconciliation (`src/sync/accountPreferences.ts`). A settling reorder also publishes one `board.order` record on the account room, so another browser of the account applies the new order without waiting for a round; the Drive file remains the durable record and the fallback where the account room is unreachable. Selection stays local.
 - A folder-plus icon in the project-title row opens and closes the New Project form, replacing the previous separate text action.
 - A pencil icon replaces the project selector with a focused inline name field; Enter persists a non-empty trimmed name and Escape cancels without changes.
 - The selected project is global to the extension; it is not tied to the current ChatGPT conversation.
@@ -68,6 +74,7 @@ Implemented behavior:
 - Owners delete project content and tombstone its cards. Editors and viewers can remove shared projects from their own account list without deleting the owner's content. If ownership of a known shared project cannot be verified, removal affects only the account list.
 - When the selected project is deleted, the first remaining project becomes current; otherwise no project is selected.
 - Ownership verification and the per-card tombstone pass continue in the background; a failure there is reported as a notice and does not undo the committed account removal.
+- An owner deletion also moves the board's Drive folder (`pboard/<boardId>`, addressed by its verified folder id, never by name) to Google Drive Trash. This is a separate, device-local step from the deletion record: it happens only for the owner, only after the deletion record is durable, is never a permanent delete and never touches the `pboard` root or another board's folder, and is retried on the normal Drive reconcile cadence with bounded backoff if it fails. While it is pending or has failed, the board's cleanup status is shown next to the board's Drive sync status with the reason; a confirmed move is silent.
 - A project's template can be changed after creation without deleting any cards.
 - Changing a template remaps cards whose type the new template does not support to `note`.
 
@@ -217,7 +224,7 @@ Implemented behavior:
 - Trash cards are placed in a collapsed **Trash** container, unique per project; a trash-can icon in the section title row opens the empty-trash confirmation panel, which permanently removes all trash cards of that project.
 - The terminal containers are presented as **Done**, **Rejected**, then **Trash**. This visual order is independent from the canonical status-menu and keyboard-cycling order.
 - Card changes update the card's `updatedAt` timestamp.
-- Card creation, deletion, status and category changes replicate live between two sessions of the same account over WebRTC, in both directions; see `docs/collaboration.md`.
+- Card and board changes are recorded as operations in the local journal and submitted to the relay when the board has a live channel; they converge deterministically on the other device through the operation log plus Drive. In a normal install that live channel is usually absent (see §7.4), so changes reach a second browser through the Drive path — at the next reconcile round, or when the board is reopened. There is no peer-to-peer replication path in the extension build.
 
 Supported card types are supplied by the selected board template rather than a global UI list. The storage union includes the current template types plus the legacy `idea` value so older data can be preserved.
 
@@ -391,15 +398,40 @@ Copying is currently the only implemented board-to-chat workflow. The user must 
 
 ## 7. Persistence and synchronization
 
+### 7.1 Local state
+
 The default repository stores projects, cards, and settings in RxDB using the free Dexie/IndexedDB backend. Images are hash-addressed Blobs in the separate `pboard-images-v1` IndexedDB database. The sidebar subscribes to project lists, current selection, and the active project's cards rather than reloading the entire application state.
 
-The legacy `browser.storage.local` repository remains available for fallback and rollback. Its `projectBoardState` key contains AppState version 3 (`projects`, `boardItems`, and `currentProjectId`). First opening RxDB imports and verifies that state without deleting the original. Migration failure falls back to legacy storage. See [local storage architecture](docs/rxdb-storage-refactor.md) for migration, ordering, rollback, and retained deletion records.
+Every edit is a committed local operation before anything is sent, and the UI reads only local state. The legacy `browser.storage.local` repository remains available for fallback and rollback. Its `projectBoardState` key contains AppState version 3 (`projects`, `boardItems`, and `currentProjectId`). First opening RxDB imports and verifies that state without deleting the original. Migration failure falls back to legacy storage. See [local storage architecture](docs/rxdb-storage-refactor.md) for migration, ordering, rollback, and retained deletion records.
 
-Projects belong to Pboard; conversation URLs are optional source metadata. Local writes complete before Drive requests, and synchronization failures preserve dirty local data. Private projects use versioned per-project snapshots in Drive's hidden `appDataFolder`, with whole-project timestamp conflict resolution. Dirty projects sync manually, when leaving a project, after debounced visibility loss, or after roughly 25 seconds of inactivity.
+Projects belong to Pboard; conversation URLs are optional source metadata.
 
-Shared boards use a visible owner-managed Drive folder with `project.json`, image assets, and signaling records. Drive folder permissions define owner/editor/viewer roles. Invited boards are discovered and imported while connected. Owners and editors back up pending shared changes without importing a whole remote snapshot over existing live documents; viewers can restore matching image bytes. A newer remote shared backup is reported as a conflict instead of overwritten.
+### 7.2 Durable state: Google Drive
 
-Live collaboration replicates project and card documents through separate WebRTC pools for the active shared board. Document conflicts use last write wins on `max(updatedAt, deletedAt)`, with master state winning ties. Account project order and permanent removal markers synchronize separately, both over WebRTC and private Drive preferences; current selection stays local. See [collaboration architecture](docs/collaboration.md) for scoping, role enforcement, signaling, and security limits.
+Drive is the durable store and the **ACL authority**. Membership is the board folder's Drive permission set (`src/sync/drivePermissions.ts:720-738`); viewers get `reader`, editors `writer`, the folder owner is the board owner. The board folder is `My Drive/pboard/<boardId>/` holding an immutable `board.json.gz` snapshot, immutable `operations-<id>.json` segments, `attachments/`, and the migrated legacy `project.json` (`src/sync/driveBoardStore.ts:4`).
+
+Local writes complete before Drive requests, and synchronization failures preserve dirty local data. Dirty boards flush on the existing triggers — manual sync, leaving the board, debounced visibility loss, and the idle flush — with `DRIVE_EDIT_IDLE_MS` at 30 minutes and `DRIVE_MAX_UNPUBLISHED_MS` at 25 minutes (`src/sync/syncPolicy.ts:3-4`).
+
+Invited boards are discovered from Drive while connected. A newer remote snapshot is reported as a conflict rather than overwriting an older local board. Account project order and removal markers are Drive preference records applied during reconcile.
+
+### 7.3 Live collaboration: the operation-log relay
+
+The live transport is an authenticated WebSocket to the Pboard relay (`services/pboard-signaling`), which keeps a **bounded, durable operation log per board** and replays it. It is used on Firefox and Android; the Chromium side panel has no credential to admit a room (see §7.4) and uses Drive synchronization alone. Protocol 3 multiplexes rooms on one connection: the client holds **one socket per browser context per relay URL** regardless of board count, authenticates once, and attaches/detaches rooms on it. Board switching is attach/detach — no reconnect, no re-authentication, no new socket. If the relay does not advertise version 3, the client falls back to one socket per room, which is the deployed v2 behaviour.
+
+The relay is not a board-state engine: it stores opaque operations, assigns per-board sequences, deduplicates by `(board_id, op_id)`, enforces order and durability, and holds no Drive credential. Acknowledgment means the relay's own write landed, never that Drive has the data.
+
+Convergence is deterministic in the client: `src/sync/operations/engine.ts` merges per-field registers by `(clock, actorId, seq)` and keeps an applied frontier, so duplicate delivery is a no-op. There is no character-level CRDT — concurrent edits to the same field converge on one value and the other keystrokes are lost.
+
+### 7.4 What live collaboration does not do
+
+Stated here because the rest of this document would otherwise imply more than the code delivers. The full list, with file references, is [the collaboration gaps](docs/collaboration.md#status-and-known-gaps).
+
+- **Live collaboration is a Firefox-and-Android path.** A Drive-authorized room needs the auth provider to supply paired Google ID/access credentials. Firefox and Android do; the Chromium side panel's provider supplies only a Drive access token, so a Chromium board opens no live channel and converges through Drive synchronization and polling. Drive persistence, discovery and sharing still work on Chromium.
+- **"Sync now" does not rediscover.** It forces a reconcile over boards the client already knows about.
+- **Edits to a board this context does not have open are not delivered passively.** Exactly one board is attached — the one on screen — so a background board converges on its next Drive round or when it is reopened.
+- **Add and delete are not atomic in the UI**: an entity is published when created, so a peer renders it empty and fills it as keystrokes arrive.
+- **Account board order is realtime over the account room, with the Drive preference file as the durable record and the poll as backstop.** A reorder made where the account room cannot be reached — Chromium, or an unadmitted device — still converges on the next reconcile.
+- **Cross-account realtime board traffic does not exist.** An invitation to another Google account travels the per-account inbox and buys that account a Drive read; the shared board's own operations never cross accounts, so its changes reach the other account through Drive synchronization.
 
 ## 8. Extension architecture
 
@@ -409,8 +441,10 @@ Page capture / ChatGPT selection adapter
                               ⇅ repository selector
 React sidebar subscriptions ⇄ RxDB + IndexedDB image Blobs (default)
                               └─ browser.storage.local AppState (legacy fallback)
-                              ├─ private Drive snapshots + account preferences
-                              └─ shared Drive folders + WebRTC document replication
+                              ├─ Google Drive: board folders, immutable snapshots,
+                              │  operation segments, attachments, and the ACL
+                              └─ Pboard relay: one WebSocket per context,
+                                 bounded per-board operation log with replay
 ```
 
 Code boundaries:
@@ -422,8 +456,8 @@ Code boundaries:
 - `src/providers/`: provider-specific page access behind a shared adapter.
 - `src/sidebar/`: React UI, card component, styling, and prompt serialization.
 - `src/storage/`: RxDB repository, legacy adapter, migration, ordering, and image Blob store.
-- `src/collab/`: WebRTC lifecycle, signaling, project scoping, and shared image sync.
-- `src/sync/`: Google OAuth/PKCE, Drive transport, snapshot serialization, and sync state.
+- `src/collab/`: board grants and device keys, relay authorization, and the peer-transport code the extension build stubs out.
+- `src/sync/`: Google OAuth/PKCE, Drive transport, the operation log (`operations/`), snapshots, and sync state.
 - `src/templates/`: declarative template, type-label, and semantic-color configuration.
 - `src/types/`: shared domain types.
 
@@ -445,7 +479,7 @@ Privacy properties:
 
 - Google authentication and Drive synchronization are optional and user-initiated.
 - Google scopes are `drive.appdata` for private backups/preferences and full `drive` for incoming shared-board discovery, shared files, and permissions. Shared content lives in visible Drive folders.
-- WebRTC connection setup uses Drive signaling and Google/Twilio STUN services. See the [privacy policy](docs/privacy.md) for data handling and deletion controls.
+- Live collaboration connects only to the configured Pboard relay over HTTPS/WSS. Neither shipped platform sets a WebRTC peer connection up — the extension and the Android application both disable the peer pools — so no STUN or TURN service is contacted and no Drive signaling room or peer DataChannel exists. See the [privacy policy](docs/privacy.md) for data handling and deletion controls.
 - No telemetry.
 - No AI API request.
 - No conversation scraping.
@@ -512,8 +546,8 @@ The current extension does not implement:
 - a general-purpose user-facing file import/export workflow beyond clipboard copy and Drive snapshot restore;
 - automatic summarization;
 - custom user-defined templates or card types;
-- comments or a publisher-operated synchronization server;
-- character-level collaborative text editing, automatic TURN relay configuration, or cryptographically authenticated per-peer writes (see [collaboration limits](docs/collaboration.md#authorization-and-security-limits));
+- comments or a publisher-operated synchronization server; the Pboard relay is a bounded operation log and event relay under the operator's control, not a board-state authority (§7.3);
+- character-level collaborative text editing (concurrent edits to the same field converge on one value; see §7.3), peer-to-peer transport in the extension build, or cross-account realtime discovery (§7.4, [collaboration gaps](docs/collaboration.md#status-and-known-gaps));
 - AI APIs, billing, or telemetry.
 
 Any future ChatGPT-to-board writing flow should preserve the safety rule:

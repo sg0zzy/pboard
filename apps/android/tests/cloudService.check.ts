@@ -3,12 +3,13 @@ import type { RxRepository } from '../src/storage/repository';
 import { createSyncStorage } from '../src/sync/storage';
 const mocks = vi.hoisted(() => {
   const live = { role: 'editor', connectedPeers: ['peer'], error: null as string | null };
-  return { reconcile: vi.fn(), start: vi.fn(), stop: vi.fn(), refresh: vi.fn(), live, dirty: vi.fn(), tombstone: vi.fn(), invite: vi.fn() };
+  return { reconcile: vi.fn(), publishBoard: vi.fn(async () => 'pulled'), start: vi.fn(), stop: vi.fn(), startAccount: vi.fn(), closeAccount: vi.fn(), refresh: vi.fn(), live, dirty: vi.fn(), tombstone: vi.fn(), invite: vi.fn() };
 });
 vi.mock('../../../src/sync/runtime', () => ({
   createDriveRuntime: () => ({
-    googleDrive: { reconcileAll: mocks.reconcile },
+    googleDrive: { reconcileAll: mocks.reconcile, syncProject: mocks.publishBoard },
     authorizePrivatePersistence: vi.fn(async () => {}),
+    accountChannel: { start: mocks.startAccount, close: mocks.closeAccount },
     collaborationManager: { start: mocks.start, stop: mocks.stop, refreshRole: mocks.refresh, state: () => mocks.live },
     driveSyncState: { markDirty: mocks.dirty, get: async () => ({ remoteFileId: 'backup' }) },
     driveTombstones: { add: mocks.tombstone },
@@ -19,7 +20,7 @@ vi.mock('../../../src/sync/runtime', () => ({
 import { createAndroidSync, type AndroidSync } from '../src/sync/service';
 let service: AndroidSync;
 let connected: boolean;
-const repository = { setMutatorRole: vi.fn() } as unknown as RxRepository;
+const repository = { setMutatorRole: vi.fn(), listProjects: vi.fn(async () => []) } as unknown as RxRepository;
 beforeEach(() => {
   vi.useFakeTimers(); vi.clearAllMocks(); localStorage.clear(); connected = true;
   mocks.live.role = 'editor'; mocks.live.error = null;
@@ -32,6 +33,26 @@ beforeEach(() => {
 });
 afterEach(async () => { await service.dispose(); vi.useRealTimers(); });
 describe('Android foreground sync lifecycle', () => {
+  it('publishes a new board promptly when connected and foregrounded', async () => {
+    await service.initialize(); await service.setForeground(true);
+    service.events.projectCreated?.('new-board');
+    expect(mocks.publishBoard).toHaveBeenCalledWith('new-board', { force: true });
+    await service.setForeground(false);
+    service.events.projectCreated?.('offline-board');
+    expect(mocks.publishBoard).toHaveBeenCalledTimes(1);
+  });
+  it('keeps the account connection when foreground reconciliation runs without a selected board', async () => {
+    await service.initialize();
+    await service.setForeground(true);
+    expect(mocks.reconcile).toHaveBeenCalled();
+    expect(mocks.startAccount).toHaveBeenCalledTimes(1);
+    expect(mocks.stop).not.toHaveBeenCalled();
+    await service.setForeground(false);
+    expect(mocks.stop).toHaveBeenCalled();
+    expect(mocks.closeAccount).toHaveBeenCalled();
+    await service.setForeground(true);
+    expect(mocks.startAccount).toHaveBeenCalledTimes(2);
+  });
   it('stays offline until connected and foreground, coalesces edits and stops timers/pools when backgrounded', async () => {
     connected = false;
     await service.initialize(); await service.setForeground(true); await service.selectProject('board');
@@ -40,9 +61,12 @@ describe('Android foreground sync lifecycle', () => {
     expect(mocks.reconcile).toHaveBeenCalledTimes(1); expect(mocks.start).toHaveBeenCalledWith('board');
     await service.events.projectChanged?.('board'); await service.events.projectChanged?.('board');
     await vi.advanceTimersByTimeAsync(2_000);
+    expect(mocks.reconcile).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(12 * 60_000);
     expect(mocks.reconcile).toHaveBeenCalledTimes(2); expect(mocks.start).toHaveBeenCalledTimes(1);
     expect(mocks.refresh).toHaveBeenCalled();
     await service.setForeground(false);
+    expect(mocks.closeAccount).toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(mocks.reconcile).toHaveBeenCalledTimes(2); expect(mocks.stop).toHaveBeenCalled();
   });
@@ -50,7 +74,7 @@ describe('Android foreground sync lifecycle', () => {
     await service.initialize(); mocks.reconcile.mockRejectedValueOnce(new Error('Network unavailable'));
     await service.setForeground(true);
     expect(service.state().error).toBe('Network unavailable');
-    await vi.advanceTimersByTimeAsync(25_000);
+    await vi.advanceTimersByTimeAsync(24 * 60_000);
     expect(mocks.reconcile).toHaveBeenCalledTimes(2);
     expect(service.state().error).toBe(''); expect(service.state().lastSynced).not.toBe('');
   });

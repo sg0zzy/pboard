@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { expect, it, vi } from 'vitest';
 import { createBoardGrantService } from '../src/collab/boardGrants';
+import { instantAuthBudget } from './helpers/authBudget';
 import { generateDeviceKey, type StoredDeviceKey } from '../src/collab/security/keys';
 import { openAuthorityRecovery } from '../src/collab/security/authorityRecovery';
 const passphrase = 'synthetic recovery phrase for automated tests';
@@ -17,7 +18,7 @@ function setup() {
     const values: Record<string, unknown> = {}, keys = new Map<string, StoredDeviceKey>(), recovered = new Map<string, StoredDeviceKey>();
     const storage = { get: async (id: string) => ({ [id]: structuredClone(values[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(values, structuredClone(patch)); } };
     const getKey = async (purpose: string) => { if (!keys.has(purpose)) keys.set(purpose, await generateDeviceKey()); return keys.get(purpose)!; };
-    const make = () => createBoardGrantService({ storage, fetcher, getKey, recoveryKeys: { load: async purpose => recovered.get(purpose) ?? null, save: async (purpose, key) => { if (recovered.has(purpose) && recovered.get(purpose)!.keyId !== key.keyId) throw new Error('refuse replacement'); recovered.set(purpose, structuredClone(key)); } } });
+    const make = () => createBoardGrantService({ storage, fetcher, getKey, authBudget: instantAuthBudget(), recoveryKeys: { load: async purpose => recovered.get(purpose) ?? null, save: async (purpose, key) => { if (recovered.has(purpose) && recovered.get(purpose)!.keyId !== key.keyId) throw new Error('refuse replacement'); recovered.set(purpose, structuredClone(key)); } } });
     return { service: make(), make, keys, recovered, values, async enable() { await this.service.configure({ provider: 'websocket', url: 'wss://relay.example.test/ws' }); }, destroy() { keys.clear(); for (const name of Object.keys(values)) delete values[name]; } };
   }
   return { client, restart: () => { published = undefined; }, down: () => { unavailable = true; } };

@@ -3,12 +3,41 @@
 20 October 2026. Local implementation and validation; no deployment or release.
 The [approved behavior contract](synchronization-contract.md) remains the target.
 
+> **State at 6 November 2026 — this document describes code that only one platform
+> now runs.** Every mechanism below hangs off the WebRTC collaboration manager
+> (`src/collab/manager.ts`), and in the extension that manager's `doStart()` returns
+> before it opens a pool, a signaling room or an image sync
+> (`manager.ts:504-513`, gated by `setWebRtcDisabled(true)` in
+> `src/sync/browser.ts:17`). Both extension bundles also replace
+> `src/collab/peerRuntime.ts` with `peerRuntime.stub.ts`, whose
+> `createProjectImageSync` and `createPboardWebRTCConnectionHandler` throw. So the
+> peer `image-want`/`image-put`/`image-part` exchange described here **cannot run in
+> the extension**. Android cannot reach it either: `apps/android/src/sync/service.ts:15`
+> calls `setWebRtcDisabled(true)` too, so no peer pool or DataChannel starts there.
+> The path is retained as source only.
+>
+> What replaced it in the extension is not a new image protocol: image bytes remain
+> immutable, content-addressed Drive files referenced from card operations, written
+> to the board's own folder as `image-<sha256>.json`
+> (`src/sync/operations/driveStore.ts:191-203`) and uploaded **once per content hash**
+> under a device-local receipt rather than on every publish
+> ([drive-operation-sync](drive-operation-sync.md), "Images are uploaded once, by
+> content"). Peer transfer is therefore not a latency path on any shipped platform:
+> Android disables the peer pools as well.
+>
+> One detail below is also obsolete on its own terms: the account-private asset
+> store is no longer a module called `privateImageTransport.ts` (that file does not
+> exist in this tree). Private image persistence is the `imageTransport` the private
+> history engine uses, writing `image-<hash>.pboard` in the account's AppData
+> (`src/sync/runtime.ts:750`, `src/sync/privateDriveHistory.ts:382`).
+
 ## What is implemented
 
 The independent WebSocket/WebRTC path now transfers and recovers attachment bytes
 using the existing blob storage, content hashes and private Drive persistence:
 
-- **Account-private asset store** ([privateImageTransport.ts](../../src/sync/privateImageTransport.ts)):
+- **Account-private asset store** (the `imageTransport` of
+  [`privateDriveHistory.ts`](../../src/sync/privateDriveHistory.ts)):
   immutable, content-addressed `image-<hash>.json` records in this account's own
   `appDataFolder`, reusing the existing `DriveTransport` (bounded transient
   retry, no-store reads, immutable create; identical bytes are a no-op).

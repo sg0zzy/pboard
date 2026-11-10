@@ -6,6 +6,19 @@ This adds local conflict review and authorized authored resolutions. [Job 7](pee
 WebRTC history exchange; [Job 6](private-drive-history.md) now adds
 private Drive persistence and fresh-device recovery of history and drafts.
 
+> **State at 6 November 2026.** The review flow, the `listConflicts` /
+> `saveConflictDraft` / `resolveConflict` API and the write/authorization boundaries
+> below are current: the panel is mounted in the sidebar
+> (`src/sidebar/App.tsx:872`, `ConflictResolutionControls`) and the API is
+> `src/storage/conflictResolution.ts`. Two pointers are stale. [Job 7](peer-causal-history.md)
+> is now a banner-marked historical record — the extension runs no WebRTC peer
+> history (`src/sync/browser.ts:17`), Android still does — and the journal's schema
+> is **11** (the v11 bump adds the `boardTombstones` store; see
+> [causal-change-journal.md](causal-change-journal.md)), not "1 to 2" as the
+> boundaries section states, so the "additive schema-1-to-2 upgrade"
+> paragraph describes an upgrade that has since been superseded by larger additive
+> ones. Neither change affects the semantics of a resolution.
+
 ## User flow
 
 The sidebar shows a collapsed **Conflict requires resolution** panel when the

@@ -59,6 +59,14 @@ describe("isDriveReconcileMessage", () => {
     expect(isDriveReconcileMessage({ type: DRIVE_RECONCILE_MESSAGE, extra: "x" })).toBe(true);
   });
 
+  it("accepts the force flag in both directions, and refuses a non-boolean one", () => {
+    // A pressed control forces a round; startup discovery does not, so the
+    // worker may answer from the round it is already running.
+    expect(isDriveReconcileMessage({ type: DRIVE_RECONCILE_MESSAGE, force: true })).toBe(true);
+    expect(isDriveReconcileMessage({ type: DRIVE_RECONCILE_MESSAGE, force: false })).toBe(true);
+    expect(isDriveReconcileMessage({ type: DRIVE_RECONCILE_MESSAGE, force: "yes" })).toBe(false);
+  });
+
   it("rejects null, undefined, and non-object values", () => {
     for (const value of [null, undefined, 0, 42, "DRIVE_RECONCILE_ALL", true, []] as const) {
       expect(isDriveReconcileMessage(value), `rejects ${String(value)}`).toBe(false);

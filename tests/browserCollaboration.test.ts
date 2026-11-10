@@ -6,6 +6,13 @@ import { createRxRepository } from "../src/storage/rxdbRepository";
 import { serializeProjectSnapshot } from "../src/sync/snapshot";
 import type { BoardItem, Project } from "../src/types";
 
+// These fixtures cover the retained legacy discovery path; the operation runtime
+// has dedicated migration/Drive-only integration coverage.
+vi.mock('../src/sync/runtime', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/sync/runtime')>();
+  return { ...actual, createDriveRuntime: (options: Parameters<typeof actual.createDriveRuntime>[0]) => actual.createDriveRuntime({ ...options, operationSync: false }) };
+});
+
 // Stub the extension `browser` API so the real src/sync/browser can be imported
 // without a Chromium/extension context. vi.mock is hoisted above the static
 // import of src/sync/browser below, so the stub is in place when that module
@@ -17,6 +24,10 @@ vi.mock("../src/platform/browser", () => {
       Promise.resolve(key in data ? { [key]: structuredClone(data[key]) } : {}),
     set: (values: Record<string, unknown>) => {
       Object.assign(data, structuredClone(values));
+      return Promise.resolve();
+    },
+    remove: (key: string) => {
+      delete data[key];
       return Promise.resolve();
     },
   };
@@ -61,10 +72,16 @@ import {
   discoverSharedBoards,
   registerRxRepositoryResolver,
 } from "../src/sync/browser";
+import { DRIVE_LAST_RECONCILED_AT_KEY } from "../src/sync/runtime";
+import { browser } from "../src/platform/browser";
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.spyOn(googleAuth, "getConnectionState").mockResolvedValue("connected");
   vi.spyOn(drivePermissions, "myRole").mockResolvedValue("editor");
+  // The cases share one stubbed extension storage, and a completed reconcile
+  // round is what tells the next caller it need not repeat the sweep. Each case
+  // is its own browser session, so start it with no reconcile history.
+  await browser.storage.local.remove(DRIVE_LAST_RECONCILED_AT_KEY);
 });
 
 afterEach(() => {

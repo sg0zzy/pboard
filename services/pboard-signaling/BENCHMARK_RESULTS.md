@@ -112,4 +112,11 @@ PBOARD_BENCH_BINARY="$PWD/services/pboard-signaling/target/quota-production/rele
 
 Raw results for both current profiles: [benchmark-results-2026-10-21.jsonl](benchmark-results-2026-10-21.jsonl).
 
-Measured here: up to 256 authenticated synthetic sockets on the actual VPS and 2,000 on local loopback. Not established: 2,000 production clients on the VPS, Google identity polling capacity, realistic negotiation bursts, public TLS saturation, long-term reliability or browser/WebRTC replication at that scale. An active independent board normally uses two sockets per browser; HTTP/control requests share the proxy backend capacity. Stored board count is not concurrent socket count.
+Measured here: up to 256 authenticated synthetic sockets on the actual VPS and 2,000 on local loopback. Not established: 2,000 production clients on the VPS, Google identity polling capacity, realistic negotiation bursts, public TLS saturation, long-term reliability or browser/WebRTC replication at that scale. A v3 client holds **one socket per browser context** whatever
+the board count, because rooms are multiplexed on it (`attach`/`detach`); the account
+channel is one more room on that same connection, not a second socket. Two sockets
+appear only against a v2 relay, where each room gets its own connection, and
+transiently during a key-courier exchange. HTTP/control requests share the proxy
+backend capacity. Stored board count is not concurrent socket count, and none of
+these measurements used the v3 multiplexed path: they are per-socket capacity
+figures, not per-browser ones.

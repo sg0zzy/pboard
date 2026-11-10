@@ -7,6 +7,23 @@ admission evidence remain open below. Owner-authorized authority recovery is now
 implemented and natively tested (A09 partial); roster revocation/rollback and
 legacy-client treatment for the restored roster remain.
 
+> **State at 6 November 2026.** The local boundary described here — durable
+> device-local `permissions`/`pendingEdits`/`admissions` records, pending card work
+> outside replicated documents, admission only under a renewed grant — is current.
+> Two things around it moved:
+>
+> - **The transport does not.** In the extension no WebRTC peer pool opens
+>   (`src/sync/browser.ts:17`), so the manager/grant vocabulary below authorizes a
+>   relay room and an operation log, not a DataChannel. The relay connection is one
+>   multiplexed socket per browser context with per-room admission
+>   ([operation log](websocket-operation-log.md)).
+> - **Grant lifetime is capped at 360 s by the protocol** (`services/pboard-signaling/src/admission.rs:113`), not
+>   the five minutes this document describes as normal: a 300 s manifest
+>   (`src/collab/boardGrants.ts:50`) with a 120 s renew window fits under it, but an
+>   owner-chosen 15-minute grant does not, and would need a coordinated client+server
+>   change. Service-admission receipts are still consumed within 30 s and cap the
+>   socket to 300 s (`services/pboard-signaling/src/identity_enrollment.rs:307-317`).
+
 ## Audit and implemented changes
 
 | Boundary | Before this job | Current implementation |
@@ -117,7 +134,11 @@ server stores no token or new persistent user record.
 
 The receipt is bound to the actual socket challenge, connection ID, derived room
 and device fingerprint. It is consumed once within 30 seconds and caps the admitted
-socket to five minutes. Authentication still independently verifies the original
+socket to 300 s (`services/pboard-signaling/src/identity_enrollment.rs:307-317`). In v3 the tuple includes the
+attach's own `deviceKeyId`, so a multiplexed connection needs one receipt per device
+it speaks for; a receipt minted for the connection's device is refused
+`service_binding_invalid` when presented on an attach naming another.
+Authentication still independently verifies the original
 board grant, root, device possession, current cache and room binding. A receipt
 for another socket, room or device fails; a successful Google check with no board
 grant fails. Challenges/receipts are volatile and disappear on restart.

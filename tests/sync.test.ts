@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { KeyValueStorage } from "../src/storage/repository";
-import { createGoogleAuthProvider, DRIVE_SCOPE } from "../src/sync/googleAuth";
+import { createGoogleAuthProvider, DRIVE_SCOPE, DRIVE_IDENTITY_SCOPE } from "../src/sync/googleAuth";
 import { createChromiumGoogleAuthProvider } from "../src/sync/googleChromeAuth";
 import { createDriveTransport } from "../src/sync/driveTransport";
 import { driveRetryDelayMs, isDriveReplayableMethod } from "../src/sync/driveRetry";
@@ -108,11 +108,44 @@ describe("Google OAuth", () => {
     const params = new URL(authorizationUrl).searchParams;
     expect(params.get("prompt")).toBe("consent select_account");
     expect(params.get("include_granted_scopes")).toBe("true");
-    expect(params.get("scope")).toBe(DRIVE_SCOPE);
+    expect(params.get("scope")).toBe(DRIVE_IDENTITY_SCOPE);
     expect(params.get("code_challenge_method")).toBe("S256");
     expect(params.get("code_challenge")).toBeTruthy();
     expect((fetchMock.mock.calls[0][1]?.body as URLSearchParams).get("client_secret")).toBe("desktop-secret");
     expect(storage.data[DRIVE_AUTH_STORAGE_KEY]).toMatchObject({ accessToken: "access", refreshToken: "refresh" });
+  });
+
+  it("returns matching Firefox identity and Drive credentials and refreshes them together", async () => {
+    const storage = new MemoryStorage();
+    let requests = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      requests++;
+      return new Response(JSON.stringify({ access_token: `access-${requests}`, id_token: `identity-${requests}`,
+        refresh_token: "refresh", expires_in: 3600, scope: DRIVE_IDENTITY_SCOPE }));
+    });
+    let now = 0;
+    const auth = createGoogleAuthProvider({ clientId: "client", storage, fetch: fetcher, now: () => now, identity: {
+      getRedirectURL: () => "https://extension.example/auth",
+      launchWebAuthFlow: async ({ url }) => `https://extension.example/auth?code=code&state=${new URL(url).searchParams.get("state")}`
+    } });
+    await auth.connect();
+    expect(await auth.getDriveIdentityCredentials()).toEqual({ accessToken: "access-1", idToken: "identity-1" });
+    now = 3_600_000;
+    expect(await Promise.all([auth.getDriveIdentityCredentials(), auth.getAccessToken()])).toEqual([
+      { accessToken: "access-2", idToken: "identity-2" }, "access-2"
+    ]);
+    expect(requests).toBe(2);
+  });
+
+  it("does not reuse an old identity token if refresh omits it", async () => {
+    const storage = new MemoryStorage();
+    await storage.set({ [DRIVE_AUTH_STORAGE_KEY]: { accessToken: "old", idToken: "old-id", refreshToken: "refresh", expiresAt: 1, scope: DRIVE_IDENTITY_SCOPE } });
+    const auth = createGoogleAuthProvider({ clientId: "client", storage, now: () => 100,
+      fetch: async () => new Response(JSON.stringify({ access_token: "new", expires_in: 3600 })),
+      identity: { getRedirectURL: () => "https://extension.example", launchWebAuthFlow: async () => undefined }
+    });
+    await expect(auth.getDriveIdentityCredentials()).rejects.toThrow(/Reconnect/);
+    expect(await auth.getAccessToken()).toBe("new");
   });
 
   it("uses Chrome's native token flow for a Chrome Extension OAuth client", async () => {

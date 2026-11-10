@@ -1,6 +1,9 @@
 export type GoogleDriveBrowser = "chromium" | "firefox";
 export type GoogleDriveStage = "dev" | "production";
 
+/** Public Web OAuth client used by Android Credential Manager and the relay. */
+export const ANDROID_GOOGLE_WEB_CLIENT_ID = "337977813621-fc6r0gocufe4508epeqevkpt2uf3ccdt.apps.googleusercontent.com";
+
 /**
  * Google Drive OAuth client IDs, versioned per browser and per build stage.
  *

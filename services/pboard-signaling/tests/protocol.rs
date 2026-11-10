@@ -389,7 +389,8 @@ async fn enforces_total_room_and_cumulative_byte_quotas() {
     let (app, url, task) = server(
         &[&a, &b],
         Limits {
-            session_bytes: 1024,
+            bytes_per_window: 1024,
+            room_bytes_per_window: 1024,
             ..Limits::default()
         },
     )

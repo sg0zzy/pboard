@@ -15,4 +15,13 @@ The [standards adoption](DEVELOPMENT_STANDARDS.md) pins the authoritative centra
 
 ## Compatibility surface
 
-Pboard is in version zero. User board/card/image data, IndexedDB/RxDB schemas and migrations, text/image exports, browser extension IDs, Android ID/signing/update history, and Drive/WebRTC formats are compatibility surfaces. There is no public stable API promise; changes may occur during initial development, but data loss or incompatible migrations require a recovery path and explicit disclosure. Synchronization is not a historical backup. Existing export/restore gaps are recorded in the adoption declaration and are not waived by version zero.
+Pboard is in version zero. User board/card/image data, IndexedDB/RxDB schemas and migrations, text/image exports, browser extension IDs, Android ID/signing/update history, Drive snapshot and operation-log formats, and the relay's storage schema and wire protocol are compatibility surfaces. There is no public stable API promise; changes may occur during initial development, but data loss or incompatible migrations require a recovery path and explicit disclosure. Synchronization is not a historical backup. Existing export/restore gaps are recorded in the adoption declaration and are not waived by version zero.
+
+## Relay protocol and storage versions
+
+The relay is versioned separately from the product, and neither number implies the other. Two version lines exist and they move independently:
+
+- **Wire protocol** — 1, 2 and 3 are all served by the same relay. A connection negotiates by capability: the welcome lists the supported versions, and the client multiplexes rooms on one socket only for v3. A v2 client and a v3 client reach the same service, and a v3 client falls back to one socket per room against a v2 relay.
+- **Storage schema** — one shared `sync_schema` number for the operation log's SQLite file (`services/pboard-signaling/src/sync_log.rs:68`). Version 2 is the key courier's tables; version 3 is the retention schema (typed publication receipt plus per-segment coverage). The account-inbox tables are additive and deliberately do not raise it.
+
+The consequence that belongs next to the version rules: **a storage schema number is a one-way door.** A binary refuses a file newer than the constant it was built with (`sync_log.rs:422-424`), so activating a build that migrates the database removes the previously deployed binary as a rollback target. Keep a build that understands the current schema as the rollback artifact, and see [relay service releases](RELEASE.md#relay-service-releases). Nothing about this couples to the product `VERSION`; a product bump neither requires nor performs a relay deployment.

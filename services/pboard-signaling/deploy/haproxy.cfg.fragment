@@ -16,6 +16,7 @@ backend pboard_signaling
     acl allowed_signaling_path path /ws /healthz /experiment/challenge /experiment/enroll
     acl allowed_signaling_path path /grants/challenge /grants/publish
     acl allowed_signaling_path path /identity/challenge /identity/exchange
+    acl allowed_signaling_path path /drive/admit
     acl allowed_signaling_path path_reg ^/grants/[A-Za-z0-9_-]{43}$
     http-request return status 404 unless allowed_signaling_path
     # This backend is reached only from the HTTPS frontend. Never trust an
@@ -25,6 +26,14 @@ backend pboard_signaling
     stick-table type ip size 10k expire 1m store http_req_rate(10s)
     http-request track-sc0 src
     http-request deny deny_status 429 if { sc_http_req_rate(0) gt 60 }
+    # Capacitor's Android WebView runs at https://localhost. Allow only this
+    # origin and this endpoint; Drive admission still verifies both tokens.
+    acl android_origin req.hdr(Origin) -m str https://localhost
+    acl drive_admission path /drive/admit
+    http-request set-var(txn.android_drive) str(yes) if android_origin drive_admission
+    http-request return status 204 hdr Access-Control-Allow-Origin https://localhost hdr Access-Control-Allow-Methods POST,OPTIONS hdr Access-Control-Allow-Headers content-type hdr Vary Origin if android_origin drive_admission METH_OPTIONS
+    http-response set-header Access-Control-Allow-Origin https://localhost if { var(txn.android_drive) -m str yes }
+    http-response add-header Vary Origin if { var(txn.android_drive) -m str yes }
     timeout connect 5s
     timeout queue 5s
     timeout http-request 10s

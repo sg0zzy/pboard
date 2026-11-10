@@ -1,23 +1,33 @@
-import { replicateWebRTC } from "rxdb/plugins/replication-webrtc";
 import type { RxWebRTCReplicationPool } from "rxdb/plugins/replication-webrtc";
 import type { RxCollection, WithDeleted } from "rxdb";
 import type { PboardRole } from "../sync/drivePermissions";
 import type { BoardPermissionManifest } from "./security/manifest";
+import { BoardExistingSignedDataError } from "./authorityErrors";
 import { manifestHash, manifestIsCurrent, roleForDevice, validateManifest } from "./security/manifest";
 import type { VerifiedSessionContext } from "./security/session";
 import type { MutationGuardInstall } from "./security/mutation";
 import type { RelayAuthorization } from "./security/relayAdmission";
+import { webrtcDisabledForTesting } from "./liveTransport";
 import type { RxRepository } from "../storage/rxdbRepository";
 import { createContentKeyStore } from "../storage/contentKeyStore";
 const contentKeyStore = createContentKeyStore();
 import type { CardRecord, ProjectRecord, SettingRecord } from "../storage/rxdbSchemas";
 import type { PboardSignaling } from "./signaling";
-import { createPboardWebRTCConnectionHandler } from "./webrtcHandler";
 import type { PboardPeer, PboardWrtc } from "./webrtcHandler";
-import { scopeMasterChanges } from "./scopedPull";
 import { collaborationCounters } from "./counters";
-import { createProjectImageSync, type ProjectImageSync, type SharedImageTransport } from "./imageSync";
+import type { ProjectImageSync, SharedImageTransport } from "./imageSync";
 import type { PeerHistorySession } from "./peerHistory";
+import { createPboardWebRTCConnectionHandler, createProjectImageSync, replicateWebRTC, scopeMasterChanges } from "./peerRuntime";
+
+/**
+ * Every WebRTC module this manager needs is imported from `./peerRuntime`, and
+ * nothing else imports it. The extension's build aliases that one path to
+ * `peerRuntime.stub.ts`, so the peer stack — transport, connection handler,
+ * scoped pull, history exchange, image sync — is not in the extension bundle at
+ * all; the Android build has no such alias and gets the real modules. The
+ * manager never reaches them in the extension: `doStart()` returns at the
+ * `webrtcDisabledForTesting()` gate before `openRooms()` is called.
+ */
 
 /**
  * Current project role from the selected collaboration policy. Independent
@@ -36,6 +46,10 @@ export type CollaborationState = {
   sharedFileId: string | null;
   /** Signaling peer ids connected to the current project's shared-content pools. */
   connectedPeers: string[];
+  /** Sidebar sentence for a board whose collaboration is not peer-to-peer. The
+   * peer path leaves it undefined, so "N connected browsers" stays accurate
+   * exactly where it is accurate. */
+  note?: string;
   /** True once the manager has resolved a role for the current start() call. */
   ready: boolean;
   error: string | null;
@@ -62,6 +76,9 @@ export interface CollaborationManagerOptions {
   signalingFor: (topic: string, security?: CollaborationSecurityOptions) => PboardSignaling;
   getRepository: () => Promise<RxRepository | null>;
   wrtc?: PboardWrtc;
+  /** Explicit ICE configuration applied to every room's simple-peer. Absent
+   * keeps the dependency default, which `DEFAULT_ICE_SERVERS` mirrors. */
+  getIceConfiguration?: () => Promise<RTCConfiguration | null>;
   imageTransport?: SharedImageTransport | (() => Promise<SharedImageTransport>);
   /** Some signaling-only boards have no shared image backend; it may also depend on account connectivity. */
   useImageTransport?: () => Promise<boolean> | boolean;
@@ -102,6 +119,8 @@ export type CollaborationSecurityOptions = {
 export interface CollaborationManager {
   start(projectId: string): Promise<void>;
   stop(): Promise<void>;
+  /** Test switch: while disabled, start() does nothing and disabling ends the current session. */
+  setEnabled(enabled: boolean): Promise<void>;
   refreshRole(): Promise<void>;
   /** Writer-only: fetch the board buffer content key from a peer; false = none offered. */
   requestContentKey(): Promise<boolean>;
@@ -177,6 +196,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
 
   let session: BoardSession | null = null;
   let sessionGeneration = 0;
+  let enabled = true;
   let recovery: Promise<void> | null = null;
   /**
    * The board whose session could not be started, and why.
@@ -196,6 +216,8 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     message: string;
     /** Which rooms had no trust at the time of the failed attempt. */
     missing: { board: boolean; account: boolean };
+    /** The failed step was the deterministic signed-history authority block. */
+    blocked?: boolean;
   } | null = null;
   /**
    * The rooms whose trust was missing during the current attempt. The values
@@ -304,6 +326,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // A room may only be opened once the previous session released it: the
     // rendezvous admits one session per device and room.
     await awaitRoomRelease(topic);
+    const ice = await Promise.resolve(options.getIceConfiguration?.() ?? null).catch(() => null);
     const pool = await replicateWebRTC<T, PboardPeer>({
       collection: ref,
       topic,
@@ -316,6 +339,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
           keyExchange: { load: (board: string) => contentKeyStore.loadRaw(board), store: async (board: string, value: { material: string }) => { await contentKeyStore.put(board, value.material); } },
           registry: { add: s => owner.historySessions.add(s), remove: s => owner.historySessions.delete(s), all: () => [...owner.historySessions] } } } : {}),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
+        ...(ice ? { config: ice } : {}),
         security: {
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection,
@@ -362,6 +386,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const topic = `pboard-account-${account}-order`;
     const scoped = (doc: unknown) => !!doc && typeof doc === "object" && "id" in doc && doc.id === id;
     await awaitRoomRelease(topic);
+    const ice = await Promise.resolve(options.getIceConfiguration?.() ?? null).catch(() => null);
     // The account room enforces its own scoped identity: shared-board credentials
     // are rejected by collection binding inside the handler (protocol 2).
     const pool = await replicateWebRTC<SettingRecord, PboardPeer>({
@@ -370,6 +395,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
         signaling: options.signalingFor(topic, securityContext), scopeDocument: scoped,
         existingDocuments: async ids => [...(await rx.db.settings.findByIds(ids).exec()).values()].map(doc => doc.toJSON()),
         ...(options.wrtc ? { wrtc: options.wrtc } : {}),
+        ...(ice ? { config: ice } : {}),
         security: {
           signer: securityContext.signer, manifest: securityContext.manifest,
           boardId: securityContext.boardId, collection: "accountOrder" as const,
@@ -476,6 +502,18 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
   }
 
   async function doStart(projectId: string): Promise<void> {
+    if (webrtcDisabledForTesting()) {
+      // The peer pools this manager owns are switched off in this build; the
+      // board's live channel is the operation log, which the sync runtime opens
+      // directly. Recording the board keeps a later enable/stop pair coherent, and
+      // `ready` is set because there is no transport left to wait for: leaving it
+      // false would advertise "checking live collaboration" forever for a channel
+      // this build does not have.
+      startedProjectId = projectId;
+      ready = true;
+      error = null;
+      return;
+    }
     // Retire the previous board without waiting for its transports to close:
     // the new board opens its own signaling and DataChannel meanwhile.
     const previous = session;
@@ -489,7 +527,21 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // A different board has its own outcome; the previous board's failure no
     // longer applies.
     if (startFailure && startFailure.projectId !== projectId) startFailure = null;
-    await applyRole(projectId);
+    try {
+      await applyRole(projectId);
+    } catch (err) {
+      // A board with signed history but no authority on this device is a
+      // deterministic block: re-resolving the role repeats the identity
+      // round trips and cannot change the answer, so record it like a
+      // room-open failure and let the role refresh answer from the memo.
+      // Other role failures stay unrecorded because they are transient and
+      // must keep retrying every tick.
+      if (err instanceof BoardExistingSignedDataError) startFailure = {
+        projectId, role, sharedFileId, message: err.message, blocked: true,
+        missing: { board: missingTrust.board, account: missingTrust.account }
+      };
+      throw err;
+    }
 
     // A viewer/editor with no local copy pulls the full snapshot (cards + blobs)
     // from the shared Drive file so the board renders before live replication.
@@ -659,6 +711,17 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     const wasReady = ready;
     const previousRole = role;
     const previousFileId = sharedFileId;
+    // A deterministic block (signed history without local authority) was
+    // recorded for this board: repeating the role resolution cannot change
+    // the answer, so answer from the memo until the security poll reports
+    // that authority appeared (pairing, a recovery restore, or the controls'
+    // explicit retry start again on their own). Transient role failures are
+    // deliberately never recorded, so they keep retrying every tick.
+    const blocked = startFailure;
+    if (blocked?.blocked && blocked.projectId === projectId && await options.securityChanged?.(projectId) === false) {
+      error = blocked.message;
+      return;
+    }
     try {
       await applyRole(startedProjectId);
       // A board that already failed to open a room must not be retried on
@@ -704,6 +767,7 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
 
   return {
     start: (projectId) => runExclusive(async () => {
+      if (!enabled) return;
       collaborationCounters.countEffect("collab:start:external");
       try { await collaborationCounters.timed("collab:start", () => doStart(projectId)); }
       catch (err) {
@@ -715,6 +779,10 @@ export function createCollaborationManager(options: CollaborationManagerOptions)
     // A deliberate stop ends the collaboration; the next start must try again
     // regardless of a previous failure.
     stop: () => runExclusive(async () => { startFailure = null; await doStop(); }),
+    setEnabled: (value) => runExclusive(async () => {
+      enabled = value;
+      if (!value) { startFailure = null; await doStop(); ready = false; error = null; }
+    }),
     refreshRole,
     /** Ask one writer peer for the board's buffer content key; false means none was offered. */
     async requestContentKey() {

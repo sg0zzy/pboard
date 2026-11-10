@@ -179,6 +179,7 @@ function makeFakeTransport() {
     createPermission: vi.fn().mockResolvedValue({}),
     updatePermission: vi.fn().mockResolvedValue({}),
     deletePermission: vi.fn().mockResolvedValue(undefined),
+    restrictWriterSharing: vi.fn().mockResolvedValue(undefined),
   };
 
   function lookupBy(fileId: string): FakeFile | null {

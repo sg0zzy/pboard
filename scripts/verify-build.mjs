@@ -6,6 +6,17 @@ const root = resolve(new URL("..", import.meta.url).pathname);
 const requestedVariant = process.argv[2] ?? "all";
 const packageMetadata = await readJson("package.json");
 
+// The startup sandbox deliberately has no IndexedDB, so the legacy Dexie storage
+// rejects with MissingAPIError after evaluation. That is a sandbox artifact, not a
+// startup regression: every real background page/service worker has IndexedDB.
+// Any other unhandled rejection from the evaluated bundle must fail verification.
+let rejectionFailure = false;
+process.on("unhandledRejection", (reason) => {
+  if (reason?.name === "MissingAPIError") return;
+  console.error(`${requestedVariant} background startup produced an unhandled rejection:`, reason);
+  rejectionFailure = true;
+});
+
 async function readJson(path) {
   return JSON.parse(await readFile(resolve(root, path), "utf8"));
 }
@@ -23,7 +34,9 @@ function verifyBackgroundStartup(source, kind) {
   const api = {
     runtime: {
       getURL: () => `${kind === "firefox" ? "moz" : "chrome"}-extension://pboard/`,
-      onInstalled: event("installed"), onMessage: event("message")
+      onInstalled: event("installed"), onMessage: event("message"),
+      onConnect: event("connect"),
+      connect: () => ({ name: "", onDisconnect: { addListener() {} }, disconnect() {} })
     },
     storage: {
       local: { get: async () => ({}), set: async () => {} },
@@ -32,16 +45,43 @@ function verifyBackgroundStartup(source, kind) {
     identity: {},
     menus: { removeAll: async () => {}, create() {}, onClicked: event("menu") },
     commands: { onCommand: event("command") },
-    alarms: { onAlarm: event("alarm") }
+    alarms: {
+      onAlarm: event("alarm"),
+      get: async () => undefined,
+      create: async () => {},
+      clear: async () => true
+    }
   };
   // Evaluate the production bundle without Node's global/process/Buffer.
   // Merely checking that files exist misses browser-incompatible imports.
+  // The sandbox has no storage backend, so the bundle's designed RxDB fallback
+  // logs its warning on every verification. Print one explanatory note instead
+  // of a stack trace that reads like a build failure; other console output,
+  // including real errors, passes through untouched.
+  const fallbackNote = "RxDB unavailable; using untouched legacy storage";
+  let fallbackShown = false;
+  const sandboxConsole = Object.fromEntries(["log", "info", "debug", "warn", "error"].map((method) => [
+    method,
+    (...args) => {
+      if (typeof args[0] === "string" && args[0].startsWith(fallbackNote)) {
+        if (!fallbackShown) {
+          fallbackShown = true;
+          console.warn(`(${kind} startup: RxDB storage fallback logged by the bundle because the verification sandbox has no IndexedDB/localStorage; expected)`);
+        }
+        return;
+      }
+      console[method](...args);
+    }
+  ]));
   runInNewContext(source, {
     [kind === "firefox" ? "browser" : "chrome"]: api,
-    console, crypto: globalThis.crypto, setTimeout, clearTimeout,
+    console: sandboxConsole, crypto: globalThis.crypto, setTimeout, clearTimeout,
     setInterval, clearInterval, queueMicrotask, TextEncoder, TextDecoder,
     URL, URLSearchParams, AbortController, performance, structuredClone,
     Headers, Request, Response, Blob, atob, btoa,
+    // Present in both real background contexts (Firefox page, Chromium service worker);
+    // Dexie dispatches CustomEvent when closing the storage that failed without IndexedDB.
+    Event, CustomEvent, EventTarget, DOMException,
     fetch: async () => { throw new Error("Unexpected network request during startup verification"); }
   }, { filename: `${kind}/background.js`, timeout: 5000 });
   for (const name of ["installed", "message", "menu", "command", "alarm"]) {
@@ -100,4 +140,7 @@ if (requestedVariant === "chromium" || requestedVariant === "all") {
 if (!["firefox", "chromium", "all"].includes(requestedVariant)) {
   throw new Error(`Unknown build variant: ${requestedVariant}`);
 }
+// Let deferred startup continuations reject while this process still owns the outcome.
+await new Promise((done) => setTimeout(done, 250));
+if (rejectionFailure) process.exit(1);
 console.log(`${requestedVariant === "all" ? "Firefox and Chromium" : requestedVariant} build verification passed`);

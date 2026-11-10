@@ -14,6 +14,7 @@ import { signManifest } from "../src/collab/security/manifest";
 import { prepareRelayAdmission, type RelayAuthorization } from "../src/collab/security/relayAdmission";
 import { buildPresence, buildSignedSignal } from "../src/collab/security/session";
 import { SDP } from "./signalingFixtures";
+import { instantAuthBudget } from './helpers/authBudget';
 
 it("keeps Drive default and ignores experimental flags in production", () => {
   const drive = vi.fn(() => ({}) as PboardSignaling);
@@ -41,7 +42,7 @@ describe.skipIf(!existsSync(resolve("services/pboard-signaling/target/debug/pboa
   }
   function provider(key: StoredDeviceKey, credentials = proof) {
     const p = createExperimentalWebSocketSignaling({ topic: "pboard-collab-auto-board-cards", url, getKey: async () => key,
-      getAuthorization: async () => credentials, loopbackDevelopment: true });
+      getAuthorization: async () => credentials, loopbackDevelopment: true, authBudget: instantAuthBudget() });
     providers.push(p); return p;
   }
   beforeAll(async () => {
@@ -109,7 +110,7 @@ describe.skipIf(!existsSync(binary))("TypeScript provider against real Rust serv
   }
   async function stop() { const done = once(child, "exit"); child.kill("SIGTERM"); await done; }
   function provider(key: StoredDeviceKey) {
-    const value = createExperimentalWebSocketSignaling({ topic: "test-room", url, getKey: async () => key, loopbackDevelopment: true });
+    const value = createExperimentalWebSocketSignaling({ topic: "test-room", url, getKey: async () => key, loopbackDevelopment: true, authBudget: instantAuthBudget() });
     providers.push(value); return value;
   }
   beforeAll(async () => {

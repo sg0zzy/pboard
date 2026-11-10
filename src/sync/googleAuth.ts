@@ -16,12 +16,14 @@ export const DRIVE_SCOPE = [
   "https://www.googleapis.com/auth/drive.appdata",
   "https://www.googleapis.com/auth/drive"
 ].join(" ");
+export const DRIVE_IDENTITY_SCOPE = `${DRIVE_SCOPE} openid`;
 const AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 const REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke";
 
 type StoredGoogleAuth = {
   accessToken?: string;
+  idToken?: string;
   refreshToken?: string;
   expiresAt?: number;
   scope?: string;
@@ -29,6 +31,7 @@ type StoredGoogleAuth = {
 
 type TokenResponse = {
   access_token: string;
+  id_token?: string;
   expires_in: number;
   refresh_token?: string;
   scope?: string;
@@ -57,6 +60,7 @@ export interface GoogleAuthProvider {
   disconnect(): Promise<void>;
   getConnectionState(): Promise<GoogleConnectionState>;
   getAccessToken(forceRefresh?: boolean): Promise<string>;
+  getDriveIdentityCredentials?(): Promise<{ accessToken: string; idToken: string }>;
   isConfigured(): boolean;
 }
 
@@ -86,10 +90,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Google Drive authorization failed";
 }
 
-export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
+export function createGoogleAuthProvider(options: Options): GoogleAuthProvider & { getDriveIdentityCredentials(): Promise<{ accessToken: string; idToken: string }> } {
   const fetcher = options.fetch ?? fetch;
   const now = options.now ?? Date.now;
-  let refreshPromise: Promise<string> | null = null;
+  let refreshPromise: Promise<StoredGoogleAuth> | null = null;
 
   async function load(): Promise<StoredGoogleAuth> {
     const result = await options.storage.get(DRIVE_AUTH_STORAGE_KEY);
@@ -146,7 +150,7 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       client_id: options.clientId,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: DRIVE_SCOPE,
+      scope: DRIVE_IDENTITY_SCOPE,
       code_challenge: challenge,
       code_challenge_method: "S256",
       access_type: "offline",
@@ -177,13 +181,14 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
     if (!token.refresh_token) throw new Error("Google did not return a new offline grant. Reconnect Google Drive and approve the consent screen");
     await store({
       accessToken: token.access_token,
+      idToken: token.id_token,
       refreshToken: token.refresh_token,
       expiresAt: now() + token.expires_in * 1000,
-      scope: token.scope ?? DRIVE_SCOPE
+      scope: token.scope ?? DRIVE_IDENTITY_SCOPE
     });
   }
 
-  async function refresh(auth: StoredGoogleAuth): Promise<string> {
+  async function refresh(auth: StoredGoogleAuth): Promise<StoredGoogleAuth> {
     if (!auth.refreshToken) throw new Error("Reconnect Google Drive to continue syncing");
     let token: TokenResponse;
     try {
@@ -197,13 +202,17 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
       throw error;
     }
     assertGrantedScopes(token.scope ?? auth.scope);
-    await store({
+    const next: StoredGoogleAuth = {
       accessToken: token.access_token,
+      // Do not reuse an old ID token after refresh: the access token and ID
+      // token must come from the same refreshed authorization grant.
+      idToken: token.id_token,
       refreshToken: token.refresh_token ?? auth.refreshToken,
       expiresAt: now() + token.expires_in * 1000,
       scope: token.scope ?? auth.scope
-    });
-    return token.access_token;
+    };
+    await store(next);
+    return next;
   }
 
   async function getAccessToken(forceRefresh = false): Promise<string> {
@@ -212,7 +221,22 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
     assertGrantedScopes(auth.scope);
     if (!forceRefresh && auth.accessToken && (auth.expiresAt ?? 0) > now() + 60_000) return auth.accessToken;
     refreshPromise ??= refresh(auth).finally(() => { refreshPromise = null; });
-    return refreshPromise;
+    const refreshed = await refreshPromise;
+    if (!refreshed.accessToken) throw new Error("Google returned no access token");
+    return refreshed.accessToken;
+  }
+
+  async function getDriveIdentityCredentials(): Promise<{ accessToken: string; idToken: string }> {
+    if (!isConfigured()) throw new Error("Google Drive OAuth client ID is not configured");
+    let auth = await load();
+    assertGrantedScopes(auth.scope);
+    // An ID token without the matching current access token must never be sent.
+    if (!auth.idToken || !auth.accessToken || (auth.expiresAt ?? 0) <= now() + 60_000) {
+      refreshPromise ??= refresh(auth).finally(() => { refreshPromise = null; });
+      auth = await refreshPromise;
+    }
+    if (!auth.idToken || !auth.accessToken) throw new Error("Reconnect Google Drive to grant identity access");
+    return { accessToken: auth.accessToken, idToken: auth.idToken };
   }
 
   async function disconnect(): Promise<void> {
@@ -237,7 +261,7 @@ export function createGoogleAuthProvider(options: Options): GoogleAuthProvider {
     return auth.refreshToken || (auth.accessToken && (auth.expiresAt ?? 0) > now()) ? "connected" : "disconnected";
   }
 
-  return { connect, disconnect, getConnectionState, getAccessToken, isConfigured };
+  return { connect, disconnect, getConnectionState, getAccessToken, getDriveIdentityCredentials, isConfigured };
 }
 
 export const describeGoogleAuthError = errorMessage;

@@ -1,5 +1,5 @@
 import type { PendingEdit, ChangeJournal, DocumentValue } from './changeJournal';
-import { makeChange, documentValue } from './changeJournal';
+import { makeChange, documentValue, pendingHeads } from './changeJournal';
 import { validateChange, validateRecord } from './causalReconciliation';
 import { canonicalize } from '../collab/security/canonical';
 import { portableJournalChanges } from '../collab/security/journalProof';
@@ -8,10 +8,6 @@ import { withJournalMaterializations } from './journalMaterialization';
 export const pendingValue = (value: Record<string, unknown>): DocumentValue => {
   const result = documentValue({ ...value, _deleted: value._deleted === true }); delete result._sec; return result;
 };
-export function pendingHeads(edits: PendingEdit[]) {
-  const superseded = new Set(edits.flatMap(e => e.supersedes ?? []));
-  return edits.filter(e => !e.admittedChangeId && !superseded.has(e.id));
-}
 export async function validatePending(edit: PendingEdit, boardId: string) {
   if (!edit || typeof edit.id !== 'string' || edit.id.length > 200 || edit.boardId !== boardId || !/^[A-Za-z0-9_-]{43}$/.test(edit.deviceKeyId)
     || !/^[A-Za-z0-9_-]{43}$/.test(edit.authorityKeyId) || !Array.isArray(edit.supersedes) || edit.supersedes.length > 128

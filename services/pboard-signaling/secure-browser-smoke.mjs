@@ -364,10 +364,11 @@ try {
   await until(async()=> (await b("secureProbe.rx.listCards('standalone-board')")).some(c=>c.content==='PRIVATE_BOARD_TEXT while peer offline'),'Automatic discovery and replication did not resume after restart');
   if(recoveryFaults&&!differentUsers){
     // Exercise the real Rust owner quota, not a synthetic successful identity
-    // response. One advertised board already exists; fill the other fifteen.
-    for(let index=0;index<15;index++) await a(`(async()=>{const project=await secureProbe.rx.createProject('Directory quota fixture '+${index});const result=await secureProbe.runtime.boardCollaboration.identitySharing.sync(project.id,true);if(result.issues.length)throw Error('Directory filled before the documented quota');})()`);
+    // response. One paired board already exists; protect the other fifteen
+    // slots with explicit invitations. Idle private entries are now reusable.
+    for(let index=0;index<15;index++) await a(`(async()=>{const project=await secureProbe.rx.createProject('Directory quota fixture '+${index});const result=await secureProbe.runtime.boardCollaboration.identitySharing.sync(project.id,true);if(result.issues.length)throw Error('Directory filled before the documented quota');await secureProbe.runtime.boardCollaboration.identitySharing.invite(project.id,'quota-invite@example.test','viewer');})()`);
     const rejected=await a("(async()=>{const project=await secureProbe.rx.createProject('Over quota fixture');const result=await secureProbe.runtime.boardCollaboration.identitySharing.sync(project.id,true);return {board:project.id,issues:result.issues};})()");
-    if(!rejected.issues.some(issue=>issue.boardId===rejected.board&&issue.code==='directory_capacity'))throw Error('Real Rust directory did not reject the seventeenth board');
+    if(!rejected.issues.some(issue=>issue.boardId===rejected.board&&issue.code==='directory_capacity'))throw Error('Real Rust directory did not reject a seventeenth board when all sixteen slots are protected');
     const permitted=await b('secureProbe.runtime.boardCollaboration.identitySharing.sync(undefined,true)');
     if(!permitted.ready.includes('standalone-board')||permitted.ready.includes(rejected.board))throw Error('Directory quota bypassed grants or blocked an existing authorized board');
     await b('secureProbe.stop()');
@@ -376,7 +377,7 @@ try {
     await b('secureProbe.runtime.googleDrive.reconcileAll()');
     if((await b(`secureProbe.rx.getCard(${JSON.stringify(card.id)})`))?.content!=='PRIVATE_BOARD_TEXT recovered with directory full')throw Error('Same-account private Drive recovery was blocked by directory capacity');
     if((await b("secureProbe.authorityState('standalone-board')")).ownsAuthority)throw Error('Private recovery granted board ownership');
-    console.log('PASS full-directory recovery: actual Rust sixteen-board owner quota rejects seventeenth publication; existing board grants remain usable; same-account Chromium recovers a signed edit from private Drive while its WebRTC session is stopped. Google HTTP is simulated; quota and grant checks remain enforced.');
+    console.log('PASS full-directory recovery: sixteen protected Rust directory entries reject a seventeenth publication; existing board grants remain usable; same-account Chromium recovers a signed edit from private Drive while its WebRTC session is stopped. Google HTTP is simulated; quota and grant checks remain enforced.');
     await b('secureProbe.start()');
     const selection=await b('secureProbe.rx.getCurrentProject().then(project=>project?.id)');
     await b('window.discoveryLists=[]; window.stopDiscovery=secureProbe.rx.subscribeProjects(projects=>window.discoveryLists.push(projects.map(project=>project.id)))');

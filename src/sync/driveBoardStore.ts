@@ -17,6 +17,9 @@
  */
 import { getSnapshotMeta, downloadSnapshotBytes, publishSnapshotConditional } from "./drivePublish";
 import type { GoogleAuthProvider } from "./googleAuth";
+import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, driveRequestSignature, isDriveQuotaFailure, type DriveQuotaThrottle } from "./driveQuota";
+import { shareGet } from "./driveSharedRequest";
+import { driveHttpError } from "./driveHttp";
 
 export const BOARD_ROOT_NAME = "pboard";
 export const BOARD_SNAPSHOT_FILENAME = "board.json.gz";
@@ -26,15 +29,35 @@ const API = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API = "https://www.googleapis.com/upload/drive/v3/files";
 
 export type DriveBoardFile = { id: string; name: string };
-type DriveNode = { id: string; name: string; parents?: string[]; mimeType?: string; createdTime?: string; modifiedTime?: string };
+export type DriveNode = { id: string; name: string; parents?: string[]; mimeType?: string; createdTime?: string; modifiedTime?: string
+  /** Present on the single-id metadata read; listings omit them. */
+  trashed?: boolean; ownedByMe?: boolean; capabilities?: { canAddChildren?: boolean } };
+/** The Drive name of a board's folder: the board id, sanitized to the id
+ *  charset. Exported because the deletion cleanup verifies a resolved folder's
+ *  *name* against the same function that created it — matching by a second,
+ *  hand-written copy of the rule is how a folder stops being recognised. */
+export const boardFolderName = (boardId: string) => boardId.replace(/[^a-zA-Z0-9_-]/g, "_");
 
 export type DriveBoardStore = {
   rootFolder(): Promise<string>;
   /** Find-or-create `pboard/<boardId>`; returns the folder id. */
   boardFolder(boardId: string): Promise<string>;
+  /** Fresh, read-only lookup for ownership recovery; never creates or merges folders. */
+  existingBoardFolder(boardId: string): Promise<string | null>;
+  /** Create-free *existence* probe for the derived board path: does any visible
+   * `pboard/<boardId>` folder exist, whatever protocol it carries inside?
+   * Deliberately not `existingBoardFolder` — that one is authority recovery's
+   * "one folder with exactly one snapshot" oracle and answers `null` for a
+   * perfectly live operation-protocol folder. A hint from the account room is
+   * verified against this: a record may find a Drive path, never mint one. */
+  boardFolderExists(boardId: string): Promise<boolean>;
   attachmentsFolder(boardId: string): Promise<string>;
   /** Board ids of every child folder of the root (board discovery). */
   listBoards(): Promise<string[]>;
+  /** Read-only inventory of every direct board folder under every pboard root. */
+  inspectBoardFolders(): Promise<{ rootId: string; folderId: string; name: string; children: { id: string; name: string; mimeType: string; modifiedTime?: string }[] }[]>;
+  inspectFolderChildren(folderId: string): Promise<{ id: string; name: string; mimeType: string; modifiedTime?: string }[]>;
+  inspectBoardRoots(): Promise<string[]>;
   /** Snapshot file id, or null when the board has no snapshot yet. */
   snapshotFileId(boardId: string): Promise<string | null>;
   ensureSnapshotFile(boardId: string): Promise<string>;
@@ -50,31 +73,67 @@ export type DriveBoardStore = {
   downloadFile(fileId: string): Promise<Uint8Array | null>;
   /** Move one file to Drive trash; 404 counts as success (already gone). */
   trashFile(fileId: string): Promise<void>;
+  /**
+   * Every visible `pboard/<boardId>` folder id, across every root this account
+   * can see, **read-only and create-free**. `boardFolderExists` answers yes/no;
+   * the deletion cleanup needs the ids, and needs them without ever resolving
+   * (which creates). More than one id is a real ambiguity the caller must
+   * refuse rather than pick from.
+   */
+  boardFolderCandidates(boardId: string): Promise<string[]>;
+  /**
+   * One folder's metadata by id, including `trashed`. This is how the cleanup
+   * *confirms* a Trash (and how it recognises a folder that was already in
+   * Trash) without a second write and without a listing of the account.
+   */
+  folderState(folderId: string): Promise<{ id: string; name: string; parents: string[]; trashed: boolean; ownedByMe: boolean;
+    role: "owner" | "editor" | "viewer" | "revoked" }>;
+  /** The root folder id of the unified layout, create-free; null when this
+   *  account has no `pboard` root at all. */
+  existingRootFolder(): Promise<string | null>;
   reset(): void;
 };
 
-const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_");
+const sanitize = boardFolderName;
 
 export function createDriveBoardStore(options: {
   auth: GoogleAuthProvider;
   fetcher?: typeof fetch;
+  quota?: DriveQuotaThrottle;
   rootName?: string;
 }): DriveBoardStore {
   const fetchRaw = options.fetcher ?? fetch;
+  const quota = options.quota ?? defaultDriveQuotaThrottle();
   const rootName = options.rootName ?? BOARD_ROOT_NAME;
   const token = () => options.auth.getAccessToken();
   const folders = new Map<string, { id: string; at: number }>();
   const snapshots = new Map<string, string | undefined>();
   const pending = new Map<string, Promise<string>>();
 
+  async function sendRaw(url: string, init: RequestInit = {}): Promise<Response> {
+    // Board discovery, per-board inventory and the ownership probe can ask for
+    // the same folder listing inside one startup tick; concurrent identical
+    // reads share the request and its quota charge.
+    const bearer = new Headers(init.headers).get("authorization") ?? "";
+    return await shareGet(init.method, `${bearer}|${url}`, () => issue(url, init));
+  }
+  async function issue(url: string, init: RequestInit = {}): Promise<Response> {
+    const cost = driveRequestCost(url, init.method ?? "GET");
+    // Respect projected budget deferrals and real Google quota cooldowns.
+    await quota.acquire(cost, init.signal);
+    const response = await fetchRaw(url, {
+      ...init,
+      ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {})
+    });
+    // Google's reported cost outranks the projection when the header is present.
+    quota.observe(cost, response.headers, driveRequestSignature(url, init.method ?? "GET"));
+    return response;
+  }
   async function call(url: string, init: RequestInit = {}): Promise<Response> {
     const send = async (bearer: string) => {
       const headers = new Headers(init.headers);
       headers.set("Authorization", `Bearer ${bearer}`);
-      return fetchRaw(url, {
-        ...init, headers,
-        ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {})
-      });
+      return sendRaw(url, { ...init, headers });
     };
     let response = await send(await token());
     // A stale token can survive client-side expiry checks; force-refresh once.
@@ -84,7 +143,9 @@ export function createDriveBoardStore(options: {
   /** Google's list endpoints need the proven parameter envelope (including
    * `spaces=drive`); hand-built query strings drifted from it once already. */
   const listUrl = (query: string, fields: string) =>
-    `${API}/files?${new URLSearchParams({ spaces: "drive", q: query, fields, pageSize: "100" })}`;
+    // Flat 100 units per listing regardless of page size: a small page would
+    // only multiply the requests when a board has many snapshots.
+    `${API}/files?${new URLSearchParams({ spaces: "drive", q: query, fields, pageSize: "1000" })}`;
   const esc = (value: string) => value.replaceAll("\\", "\\\\").replaceAll("'", "\\'");
   async function failure(response: Response, what: string): Promise<Error> {
     let detail = "";
@@ -94,8 +155,11 @@ export function createDriveBoardStore(options: {
     } catch {
       // Non-JSON intermediary failure: status is all we have.
     }
+    // Quota denial is quota, not lost access: it must be classified before the
+    // scope hint, so a throttled request is never read as a permission failure.
+    if (isDriveQuotaFailure(detail)) return driveQuotaError(response.status, detail, quota);
     if (response.status === 403 && /scope/i.test(detail)) detail += "; reconnect Google Drive and allow Drive access";
-    return new Error(`Drive board store ${what} failed (${response.status})${detail ? `: ${detail}` : ""}`);
+    return driveHttpError(response.status, `Drive board store ${what} failed (${response.status})${detail ? `: ${detail}` : ""}`);
   }
   async function json<T>(response: Response, what: string): Promise<T> {
     if (!response.ok) throw await failure(response, what);
@@ -113,13 +177,19 @@ export function createDriveBoardStore(options: {
     const query = name === undefined
       ? `'${esc(parent)}' in parents and trashed = false`
       : `name = '${esc(name)}' and '${esc(parent)}' in parents and trashed = false`;
-    const body = await json<{ files?: DriveNode[] }>(
-      await call(listUrl(query, "files(id,name,parents,mimeType,createdTime,modifiedTime)")), "listing"
-    );
+    const nodes: DriveNode[] = [];
+    let pageToken: string | undefined;
+    do {
+      const url = new URL(listUrl(query, "nextPageToken,files(id,name,parents,mimeType,createdTime,modifiedTime)"));
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+      const body = await json<{ files?: DriveNode[]; nextPageToken?: string }>(await call(url.toString()), "listing");
+      nodes.push(...body.files ?? []);
+      pageToken = body.nextPageToken;
+    } while (pageToken);
     // Exact-match the name client-side (substring `in name` semantics stay
     // irrelevant) and require the parent for non-alias lookups, so a
     // same-named stray file elsewhere can never masquerade as this asset.
-    return (body.files ?? []).filter(node =>
+    return nodes.filter(node =>
       (name === undefined || node.name === name) &&
       (parent === "root" || (node.parents ?? []).includes(parent)));
   };
@@ -153,8 +223,10 @@ export function createDriveBoardStore(options: {
    * the loser goes to trash (30-day recovery); folder/file collisions and
    * same-name folder conflicts are preserved by renaming aside. */
   async function mergeInto(canonicalId: string, doomedId: string, depth = 0): Promise<void> {
-    const byName = new Map((await listNodes(canonicalId)).map(node => [node.name, node] as const));
-    for (const child of await listNodes(doomedId)) {
+    const canonicalChildren = await listNodes(canonicalId), incomingChildren = await listNodes(doomedId);
+    const operationTree = [...canonicalChildren, ...incomingChildren].some(node => /^(operations|snapshot|migration)-/.test(node.name));
+    const byName = new Map(canonicalChildren.map(node => [node.name, node] as const));
+    for (const child of incomingChildren) {
       const twin = byName.get(child.name);
       const isFolder = (node: DriveNode) => node.mimeType === FOLDER_MIME;
       if (!twin) {
@@ -164,6 +236,9 @@ export function createDriveBoardStore(options: {
         if (depth < 3) await mergeInto(twin.id, child.id, depth + 1);
         else await moveNode(child, canonicalId);
       } else if (!isFolder(child) && !isFolder(twin)) {
+        // Operation protocol files are identified by Drive ID, never filename.
+        // Preserve every immutable candidate, including concurrent snapshots.
+        if (operationTree || /^(operations|snapshot|migration|asset|image)-/.test(child.name)) { await moveNode(child, canonicalId); continue; }
         if ((child.modifiedTime ?? "").localeCompare(twin.modifiedTime ?? "") > 0) {
           await trashFile(twin.id);
           await moveNode(child, canonicalId);
@@ -228,12 +303,86 @@ export function createDriveBoardStore(options: {
   async function boardFolder(boardId: string): Promise<string> {
     return await resolveFolder(await rootFolder(), sanitize(boardId));
   }
+  async function existingBoardFolder(boardId: string): Promise<string | null> {
+    const roots = (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME);
+    const candidates: DriveNode[] = [];
+    for (const root of roots) {
+      candidates.push(...(await listNodes(root.id, sanitize(boardId))).filter(node => node.mimeType === FOLDER_MIME));
+    }
+    if (candidates.length > 1) throw new Error("Multiple Drive board folders found; authority recovery requires an unambiguous board folder");
+    if (!candidates.length) return null;
+    const snapshots = (await listNodes(candidates[0].id, BOARD_SNAPSHOT_FILENAME)).filter(node => node.mimeType !== FOLDER_MIME);
+    if (snapshots.length > 1) throw new Error("Multiple Drive board snapshots found; authority recovery requires an unambiguous snapshot");
+    return snapshots.length === 1 ? candidates[0].id : null;
+  }
+  async function boardFolderExists(boardId: string): Promise<boolean> {
+    // Two listings, no writes, no cache: the question is what Drive names right
+    // now, and a cached answer is exactly what turns "not yet" into "created
+    // anyway". More than one root or folder still means the folder exists;
+    // ambiguity only matters to the callers that must act on one id.
+    const roots = (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME);
+    for (const root of roots) {
+      if ((await listNodes(root.id, sanitize(boardId))).some(node => node.mimeType === FOLDER_MIME)) return true;
+    }
+    return false;
+  }
+  /**
+   * The same two listings as `boardFolderExists`, answering with the ids. Kept
+   * separate from `existingBoardFolder` on purpose: that one is authority
+   * recovery's "exactly one folder with exactly one snapshot" oracle and
+   * answers `null` for a perfectly live operation-protocol folder, which is the
+   * wrong answer for a deletion cleanup that must act on whatever folder the
+   * board has.
+   */
+  async function boardFolderCandidates(boardId: string): Promise<string[]> {
+    const roots = (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME);
+    const ids: string[] = [];
+    for (const root of roots) {
+      for (const node of await listNodes(root.id, sanitize(boardId))) {
+        if (node.mimeType === FOLDER_MIME && !ids.includes(node.id)) ids.push(node.id);
+      }
+    }
+    return ids;
+  }
+  async function existingRootFolder(): Promise<string | null> {
+    return (await listNodes("root", rootName)).filter(node => node.mimeType === FOLDER_MIME)[0]?.id ?? null;
+  }
+  /**
+   * One folder's live metadata, by id. A trashed folder is still answered (the
+   * live API keeps it readable for its 30-day window) so the caller can tell
+   * "already in Trash" from "never existed"; a folder this account cannot see
+   * throws the Drive 404, which the caller answers as "there is nothing here to
+   * trash".
+   */
+  async function folderState(folderId: string): Promise<{ id: string; name: string; parents: string[]; trashed: boolean; ownedByMe: boolean;
+    role: "owner" | "editor" | "viewer" | "revoked" }> {
+    const response = await call(`${API}/files/${encodeURIComponent(folderId)}?fields=id,name,parents,trashed,ownedByMe,capabilities(canAddChildren)`);
+    const node = await json<{ id: string; name?: string; parents?: string[]; trashed?: boolean; ownedByMe?: boolean; capabilities?: { canAddChildren?: boolean } }>(response, "folder read");
+    const role = node.trashed ? "revoked" as const : node.ownedByMe ? "owner" as const
+      : node.capabilities?.canAddChildren ? "editor" as const : "viewer" as const;
+    return { id: node.id, name: node.name ?? "", parents: node.parents ?? [], trashed: node.trashed === true, ownedByMe: node.ownedByMe === true, role };
+  }
   async function attachmentsFolder(boardId: string): Promise<string> {
     return await resolveFolder(await boardFolder(boardId), ATTACHMENTS_FOLDER_NAME);
   }
   async function listBoards(): Promise<string[]> {
     const nodes = await listNodes(await rootFolder());
     return nodes.filter(node => node.mimeType === FOLDER_MIME).map(node => node.name);
+  }
+  async function inspectFolderChildren(folderId: string) {
+    return (await listNodes(folderId)).map(({ id, name, mimeType, modifiedTime }) => ({ id, name, mimeType: mimeType ?? '', modifiedTime }));
+  }
+  async function inspectBoardRoots() {
+    return (await listNodes('root', rootName)).filter(node => node.mimeType === FOLDER_MIME).map(node => node.id);
+  }
+  async function inspectBoardFolders() {
+    const result: { rootId: string; folderId: string; name: string; children: { id: string; name: string; mimeType: string; modifiedTime?: string }[] }[] = [];
+    const roots = await inspectBoardRoots();
+    for (const root of roots) for (const folder of (await listNodes(root)).filter(node => node.mimeType === FOLDER_MIME)) {
+      const children = await inspectFolderChildren(folder.id);
+      result.push({ rootId: root, folderId: folder.id, name: folder.name, children });
+    }
+    return result;
   }
   /** Snapshot file id; a vanished (e.g. merged-away) cached id is evicted
    * and re-resolved instead of being published into. */
@@ -269,7 +418,7 @@ export function createDriveBoardStore(options: {
     if (!id) return null;
     return getSnapshotMeta(fetcher(), id, await token());
   }
-  const fetcher = () => ((input: string, init?: Record<string, unknown>) => fetchRaw(input, init as RequestInit)) as Parameters<typeof getSnapshotMeta>[0];
+  const fetcher = () => ((input: string, init?: Record<string, unknown>) => sendRaw(input, init as RequestInit)) as Parameters<typeof getSnapshotMeta>[0];
   async function download(boardId: string) {
     const id = await snapshotId(boardId);
     if (!id) return null;
@@ -314,7 +463,7 @@ export function createDriveBoardStore(options: {
     return downloadSnapshotBytes(fetcher(), fileId, await token());
   }
   return {
-    rootFolder, boardFolder, attachmentsFolder, listBoards,
+    rootFolder, boardFolder, existingBoardFolder, boardFolderExists, boardFolderCandidates, existingRootFolder, folderState, attachmentsFolder, listBoards, inspectBoardFolders, inspectFolderChildren, inspectBoardRoots,
     snapshotFileId: snapshotId, ensureSnapshotFile,
     meta, download, publish, listAttachments, findAttachment, uploadAttachment, uploadBoardFile, downloadFile, trashFile,
     reset() { folders.clear(); snapshots.clear(); }

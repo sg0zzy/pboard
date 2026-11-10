@@ -1,6 +1,19 @@
 # RxDB local storage rollout
 
-Reviewed 12 October 2026. RxDB is the default local repository. The legacy `browser.storage.local` repository remains available for migration, fallback, and rollback. This document covers local storage; the integrated WebRTC and Google-account collaboration layers are described in [collaboration.md](collaboration.md). The RxDB Google Drive plugin and a publisher-operated hosted service are not used.
+Reviewed 12 October 2026; local-storage facts rechecked 6 November 2026. RxDB is the default local repository. The legacy `browser.storage.local` repository remains available for migration, fallback, and rollback. This document covers local storage; the synchronization and collaboration layers are described in [collaboration.md](collaboration.md) and [architecture/websocket-operation-log.md](architecture/websocket-operation-log.md).
+
+> **State at 6 November 2026 — two sentences of the original introduction are no
+> longer accurate.** The collaboration layers are not WebRTC (the extension runs no
+> peer pool; see `src/sync/browser.ts:17`), and a publisher-operated service **is**
+> used for live collaboration: the authenticated relay in
+> `services/pboard-signaling`, which stores sealed operations and never a board's
+> content key. Local storage is unaffected by that: RxDB over Dexie/IndexedDB is
+> still the local store, and the RxDB Google Drive plugin is still not used. The
+> storage facts below — schema versions, indexes, ordering, the Blob store,
+> migration/fallback and the historical measurements — were rechecked and stand.
+> Where this page points at WebRTC replication for shared boards, read
+> [collaboration.md](collaboration.md) instead: shared boards now take the operation
+> log, and the peer path is Android-only.
 
 ## Architecture
 
@@ -55,7 +68,7 @@ On first RxDB opening, migration reads the normalized legacy `AppState`, imports
 
 `src/sync/snapshot.ts` adapts the local repository to the version-1 project snapshot format. RxDB exports project records plus hydrated images; imports separate images back into the Blob store. The legacy adapter remains available. RxDB's Google Drive plugin is not used.
 
-Private backups retain the `project-<id>.pboard` protocol and whole-project timestamp winner. Shared boards use a separate Drive snapshot path, WebRTC pools for project/card documents, and Drive image assets. Shared sync does not replace existing documents with a whole remote snapshot. Account project order/removal preferences have their own settings conflict merge and synchronization path. The complete behavior and security limits are maintained in [collaboration.md](collaboration.md).
+Private backups retain the `project-<id>.pboard` protocol and whole-project timestamp winner. Shared boards use a separate Drive snapshot path, the multiplexed operation log for project/card operations, and Drive image assets. Images never travel through the relay: `src/sync/operations/assets.ts` allocates a Drive file id for the bytes before the operation that references it is written. Shared sync does not replace existing documents with a whole remote snapshot. Account project order/removal preferences have their own settings conflict merge and synchronization path. The complete behavior and security limits are maintained in [collaboration.md](collaboration.md).
 
 ## Validation and known limits
 

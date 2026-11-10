@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createDrivePermissionService,
   createDrivePermissionTransport,
@@ -8,7 +8,14 @@ import {
   type DriveSharedProjectRecord,
   type DriveSharedProjectStore
 } from "../src/sync/drivePermissions";
+import { defaultDriveIdentityCache } from "../src/sync/driveIdentity";
 import type { GoogleAuthProvider } from "../src/sync/googleAuth";
+// Each case below stubs its own `about` endpoint. The account-identity cache
+// lives as long as a JS context — one extension worker or one sidebar page —
+// and a test process runs many fake contexts, so drop it between cases.
+
+beforeEach(() => defaultDriveIdentityCache().invalidate());
+
 
 describe("Drive account identity", () => {
   function auth(): GoogleAuthProvider {
@@ -115,6 +122,7 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
     return state.permissions.get(fileId) ?? [];
   }
 
+  const restricted: string[] = [];
   const transport: DrivePermissionTransport = {
     currentIdentity: async () => identity,
     findSharedRoot: async () => {
@@ -164,13 +172,12 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
       [...state.files.values()].filter((f) => f.name === name && f.mimeType === mimeType).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType })),
     listSharedWithMe: async () => sharedWithMe,
     listPermissions: async (fileId) => permissionsFor(fileId).map((p) => ({ ...p })),
-    createPermission: async (fileId, role, email, createdTime?: string) => {
+    createPermission: async (fileId, role, email) => {
       const permission: DrivePermission = {
         id: nextId("perm"),
         type: "user",
         role: role === "editor" ? "writer" : "reader",
-        emailAddress: email,
-        ...(createdTime ? { createdTime } : {})
+        emailAddress: email
       };
       const list = permissionsFor(fileId);
       list.push(permission);
@@ -182,11 +189,12 @@ function makeFakeTransport(initial: { identity?: string | null } = {}) {
       permission.role = role === "editor" ? "writer" : "reader";
       return { ...permission };
     },
+    restrictWriterSharing: async (fileId) => { restricted.push(fileId); },
     deletePermission: async (fileId, permissionId) => {
       state.permissions.set(fileId, permissionsFor(fileId).filter((p) => p.id !== permissionId));
     }
   };
-  return { transport, state, sharedWithMe, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
+  return { transport, state, sharedWithMe, restricted, setIdentity: (email: string | null) => (identity = email === null ? null : { email }) };
 }
 
 // In-memory fake of the local shared-layout cache (browser.storage.local in the app).
@@ -258,6 +266,67 @@ describe("createDrivePermissionService", () => {
     expect(second).toBe(first);
     expect(fake.state.files.size).toBe(fileCount);
     expect(fake.state.folders.size).toBe(folderCount);
+  });
+
+  it("adopts the presence folder another browser created instead of adding a second one", async () => {
+    // Presence is only found by browsers looking in the same folder. The folder
+    // used to be resolved by a Drive name search whose index can lag by minutes,
+    // so a browser joining a board set up minutes earlier could miss the folder
+    // that existed, create its own, cache that id forever — and then hold a room
+    // nobody else could ever see while the board still synced through Drive.
+    const fake = makeFakeTransport();
+    const readSnapshot = async (projectId: string) => JSON.stringify({ projectId });
+    const first = createDrivePermissionService({ transport: fake.transport, sharedProjects: makeFakeStore(), readSnapshot });
+    const folderId = await first.ensureSharedProject("proj1");
+    const existing = [...fake.state.folders.values()].filter((entry) => entry.name === "realtime" && entry.parents.includes(folderId));
+    expect(existing).toHaveLength(1);
+
+    // A second browser of the same account: same Drive, nothing in its local
+    // cache, resolving against the operations folder both agree on.
+    const second = createDrivePermissionService({ transport: fake.transport, sharedProjects: makeFakeStore(), readSnapshot });
+    expect(await second.realtimeFolderId("proj1", folderId)).toBe(existing[0]!.id);
+    expect([...fake.state.folders.values()].filter((entry) => entry.name === "realtime" && entry.parents.includes(folderId))).toHaveLength(1);
+  });
+
+  it("keeps the room's existing presence folder when Drive refuses the convergence listing", async () => {
+    // Convergence runs while the realtime session joins, and a session whose join
+    // rejects closes with no peer and no retry — so a refused listing (the quota
+    // ledger deferring, a 500) must degrade to the folder already in hand rather
+    // than take the room down.
+    const fake = makeFakeTransport();
+    const store = makeFakeStore();
+    const service = createDrivePermissionService({ transport: fake.transport, sharedProjects: store, readSnapshot: async (projectId) => JSON.stringify({ projectId }) });
+    await fake.transport.createFolder("Pboard", "").catch(() => undefined);
+    const board = await fake.transport.createFolder("proj1", "unused");
+    const existing = await fake.transport.createFolder("realtime", board.id);
+    await store.set("proj1", { folderId: board.id, projectFileId: "project", realtimeFolderId: existing.id });
+
+    const listFiles = fake.transport.listFiles;
+    fake.transport.listFiles = async () => { throw new Error("Google Drive request failed (403): rateLimitExceeded"); };
+    expect(await service.realtimeFolderId("proj1", board.id)).toBe(existing.id);
+    // The refusal is not remembered as an answer: a lower-id folder that appears
+    // afterwards is adopted on the next resolution, which only happens because the
+    // listing was tried again.
+    fake.state.folders.set("a0-later", { id: "a0-later", name: "realtime", parents: [board.id] });
+    fake.transport.listFiles = listFiles;
+    expect(await service.realtimeFolderId("proj1", board.id)).toBe("a0-later");
+  });
+
+  it("moves a browser off a duplicate presence folder onto the one every listing sees", async () => {
+    // The aftermath of that bug: two `realtime` folders under one board, each
+    // browser keeping its own id. Preferring the browser's own cached id is what
+    // kept the rooms apart, so the listing wins and the cache follows it.
+    const { service, fake, store } = makeService();
+    const folderId = await service.ensureSharedProject("proj1");
+    const canonical = [...fake.state.folders.values()].find((entry) => entry.name === "realtime" && entry.parents.includes(folderId))!;
+    const duplicate = await fake.transport.createFolder("realtime", folderId);
+    await store.set("proj1", { realtimeFolderId: duplicate.id });
+
+    expect(await service.realtimeFolderId("proj1", folderId)).toBe(canonical.id);
+    expect(store.records.get("proj1")!.realtimeFolderId).toBe(canonical.id);
+    // Converged once per board per session: the answer is now cached, not re-listed.
+    const listings = await service.realtimeFolderId("proj1", folderId);
+    expect(listings).toBe(canonical.id);
   });
 
   it("reads and writes the shared snapshot", async () => {
@@ -510,25 +579,55 @@ describe("createDrivePermissionService", () => {
     expect((await service.discoverSharedProjects()).map((d) => d.projectId)).toEqual(["indexed"]);
   });
 
-  it("ranks only collaborator grants created clearly after the removal above the deletion marker", async () => {
+  it("restores a left board only when the caller's own grant id changed after a recorded removal", async () => {
     const { service, fake, store } = makeService({ identity: "collab@example.com" });
     const folderId = await service.ensureSharedProject("proj1");
-    fake.state.permissions.set(folderId, [{ id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" }]);
-    const granted = Date.parse("2026-01-02T00:00:00Z");
-    const grant = (createdTime?: string) => {
-      fake.state.permissions.set(folderId, [
-        { id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" },
-        { id: "perm-mine", type: "user", role: "reader", emailAddress: "collab@example.com", ...(createdTime ? { createdTime } : {}) }
-      ]);
-    };
-    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // no collaborator row yet
-    grant();
-    expect(await service.wasReinvitedSince("proj1", 0)).toBe(false); // legacy rows carry no createdTime
-    grant(new Date(granted).toISOString());
-    expect(await service.wasReinvitedSince("proj1", granted - 120_000)).toBe(true);
-    expect(await service.wasReinvitedSince("proj1", granted - 30_000)).toBe(false); // clock-skew margin
-    expect(await service.wasReinvitedSince("proj1", granted + 120_000)).toBe(false); // removal came after the grant
+    const grant = (id: string) => fake.state.permissions.set(folderId, [
+      { id: "perm-owner", type: "user", role: "owner", emailAddress: "owner@example.com" },
+      { id, type: "user", role: "reader", emailAddress: "collab@example.com" }
+    ]);
+    // The first observation of a grant has nothing to order it against, so it
+    // only records the baseline: a grant that predates the leave cannot be
+    // mistaken for a re-invitation.
+    grant("perm-1");
+    expect(await service.wasReinvitedSince("proj1")).toBe(false);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false); // same grant, never revoked
+    // A different id for the same grantee means the old grant was revoked and
+    // re-issued, which is the only ordering signal Drive exposes.
+    grant("perm-2");
+    expect(await service.wasReinvitedSince("proj1")).toBe(true);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false); // baseline advanced
+    // The leave itself is the baseline, so the owner's next grant is a new one.
+    await service.removeSelfFromProject("proj1");
+    grant("perm-3");
+    expect(await service.wasReinvitedSince("proj1")).toBe(true);
+    expect(await service.wasReinvitedSince("proj1")).toBe(false);
     expect(store.records.get("proj1")!.folderId).toBe(folderId);
-    expect(await service.wasReinvitedSince("never-shared", 0)).toBe(false);
+    expect(await service.wasReinvitedSince("never-shared")).toBe(false);
+  });
+});
+
+describe("writersCanShare restriction transport (D2)", () => {
+  const auth = (): GoogleAuthProvider => ({
+    connect: async () => {}, disconnect: async () => {},
+    getConnectionState: async () => "connected",
+    isConfigured: () => true,
+    getAccessToken: vi.fn(async () => "drive-token")
+  });
+
+  it("issues a metadata PATCH setting writersCanShare false", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ id: "f 1", writersCanShare: false })));
+    const transport = createDrivePermissionTransport(auth(), fetcher);
+    await transport.restrictWriterSharing("f 1");
+    const [url, init] = fetcher.mock.calls[0];
+    expect(String(url)).toBe("https://www.googleapis.com/drive/v3/files/f%201?fields=id%2CwritersCanShare");
+    expect(init?.method).toBe("PATCH");
+    expect(init?.body).toBe('{"writersCanShare":false}');
+    expect(new Headers(init?.headers).get("Content-Type")).toBe("application/json");
+  });
+
+  it("rejects when Drive refuses the restriction so callers can degrade", async () => {
+    const transport = createDrivePermissionTransport(auth(), async () => new Response(JSON.stringify({ error: { message: "sharedDrive" } }), { status: 400 }));
+    await expect(transport.restrictWriterSharing("f")).rejects.toThrow("400");
   });
 });

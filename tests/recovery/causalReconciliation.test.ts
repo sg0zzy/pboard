@@ -162,3 +162,48 @@ it('rejects cross-board ancestor references atomically, including out-of-order r
   await expect(engine.receive([foreign], authorized)).rejects.toBeTruthy();
   expect((await engine.inspect(target)).kind).toBe('conflict');
 });
+
+// Failure mode: a queued or stale-UI write claimed a parent the journal had already
+// superseded, so the change became an anonymous fork that only surfaced as a conflict at
+// confirm time. Refusal must land at prepare, before the entry is constructed or written.
+it('refuses a prepare that claims a superseded parent instead of the recorded journal head', async () => {
+  const { engine, journal } = await open(); const a = await root(), b = await edit(a, { content: 'Head' });
+  await engine.receive([a, b], authorized);
+  const stranded = (await journal.pending('drive:own-account')).map(e => e.id).sort();
+  await expect(journal.prepare('cards', { ...b.value, content: 'Stale anchoring' }, a.value, true)).rejects.toThrow();
+  expect(await journal.entries.count()).toBe(2); // refused before anything was constructed or written
+  expect((await journal.entries.where('state').equals('prepared').count())).toBe(0);
+  expect((await engine.inspect(target))).toMatchObject({ kind: 'current', heads: [b.id], preview: { content: 'Head' } });
+  expect((await journal.pending('drive:own-account')).map(e => e.id).sort()).toEqual(stranded); // the refusal strands nothing
+  // An explicit resolution claim naming a superseded entry is the same defect.
+  await expect(journal.prepare('cards', { ...b.value, content: 'Reviewed' }, b.value, true, [a.id])).rejects.toThrow();
+  expect(await journal.entries.count()).toBe(2);
+  // Claiming the recorded head still prepares. Content two candidates could both explain is
+  // not attributed to either branch, so it anchors on the synthesized honest unknown baseline
+  // root instead of silently picking one.
+  const anchored = await journal.prepare('cards', { ...b.value, content: 'From the head' }, b.value, true);
+  expect(anchored.parents).toEqual([b.id]); expect(anchored.ancestry).toBe('known');
+  const rival = await makeChange({ ...target, parents: [b.id], ancestry: 'known', value: b.value });
+  await engine.receive([rival], authorized);
+  const ambiguous = await journal.prepare('cards', { ...b.value, content: 'Ambiguous' }, b.value, true);
+  expect(ambiguous.parents.length).toBe(1);
+  const synthesized = await journal.entries.get(ambiguous.parents[0]);
+  expect(synthesized?.origin).toBe('baseline'); expect(synthesized?.ancestry).toBe('unknown');
+  expect(synthesized?.id).not.toBe(b.id); expect(synthesized?.id).not.toBe(rival.id);
+});
+
+// Failure mode: an erasure marker committed while a verified batch was mid-flight, so
+// intake read the pre-erasure state and either dropped entries one by one or appended to
+// a journal that was already retired. Intake must refuse the batch as a whole inside the
+// same strict transaction that reads the marker. Intake is genuinely mid-flight: its
+// verification callback awaits the erasure itself, so the guard decides from the markers read
+// inside its own strict transaction, never from a pre-erasure check or a wall-clock sleep.
+it('refuses a batch whose board was retired while reconciliation was in flight', async () => {
+  const { engine, journal } = await open(); const change = await root();
+  const retired = journal.beginBoardErasure('board', null, [], []);
+  await expect(engine.receive([change], async () => { await retired; return true; })).rejects.toThrow();
+  expect(await journal.entries.count()).toBe(0); // nothing half-applied and nothing appended
+  expect(await journal.boardErasure('board')).toBeTruthy(); // a retired journal stays retired
+  expect((await engine.inspect(target)).kind).toBe('empty'); // the retired journal is never read as live history
+  expect((await journal.pending('drive:own-account')).length).toBe(0); // nothing stranded pending
+});

@@ -35,11 +35,9 @@ The two-column home screen, native back, safe-area handling, fixed editor Save, 
 
 The ZIP is a prompt-and-images export, exactly as on the browser. It is not a lossless database backup or a sync/import format; neither client exposes ZIP import.
 
-## Drive and WebRTC integration
+## Drive and realtime integration
 
-Implemented through the shared platform-independent `src/sync/runtime.ts` and Android's native Google Identity Services authorization bridge. Android supports foreground Drive reconciliation, private board/photo snapshots, incoming shared-board discovery, editor/viewer invitations, permission-based write gates, account ordering/hidden-board preferences, shared images and project-scoped WebRTC replication. Settings exposes connection/retry/disconnection; a board exposes its role and connected peer count. Collaborator removal/role management remains in the extension UI. Google setup is documented in [GOOGLE_DRIVE_SETUP.md](GOOGLE_DRIVE_SETUP.md).
-
-Backgrounding stops live pools/signaling and future timers, with resume/online retry; no background service is included. Disconnect preserves local data. Data-channel connectivity has the same NAT/STUN limitations as the extension and no dedicated TURN deployment. Shared snapshot recovery has the same existing restriction: newer shared text merges through a live peer; Drive restores missing shared boards and image data. Cross-device Google authorization and real network replication require the registered Android OAuth client and signed-in test accounts.
+Android uses the shared Drive-authorized v3 operation runtime and a native Credential Manager identity token alongside Drive authorization. Its foreground lifecycle starts synchronization; backgrounding closes live rooms and stops scheduled polling. The app keeps local data and pending operations when offline. Configuration and the real-device test procedure are in [GOOGLE_DRIVE_SETUP.md](GOOGLE_DRIVE_SETUP.md). Android-to-Firefox interoperability has not yet been verified on a physical device.
 
 ## Validation
 

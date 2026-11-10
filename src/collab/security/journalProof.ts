@@ -1,7 +1,7 @@
 import { signedBytes, canonicalize } from "./canonical";
 import { importSigningKey, signBytes, verifyBytes, publicKeyFingerprint } from "./keys";
 import { manifestHash, manifestIsCurrent } from "./manifest";
-import { createMutationReplayCache, verifyMutation, signMutation } from "./mutation";
+import { createMutationReplayCache, verifyMutation, signMutation, MUTATION_PROVENANCE_FIELD } from "./mutation";
 import { makeChange, type PendingEdit } from "../../storage/changeJournal";
 import type { CollaborationSecurityOptions } from "../manager";
 import type { Change, JournalEntry } from "../../storage/changeJournal";
@@ -50,6 +50,25 @@ export async function proveJournalChange(collection: object, change: JournalEntr
   const mutation = await verifyMutation(change.value, { manifest: security.manifest, history: security.manifestHistory,
     boardId: change.boardId, collection: change.collection }, createMutationReplayCache());
   if (!manifestIsCurrent(security.manifest, Date.now()) || mutation.authorKeyId !== security.signer.deviceKeyId) throw new Error("Journal origin does not authorize this author");
+  const payload = { version: 1 as const, changeId: change.id, boardId: change.boardId, authorKeyId: mutation.authorKeyId,
+    epoch: security.manifest.epoch, manifestHash: manifestHash(security.manifest) };
+  return { payload, signature: await signBytes(await importSigningKey(security.signer.privateJwk), signedBytes(DOMAIN, payload)) };
+}
+/**
+ * Re-attest the identity a presenting device claims for content it authored. A
+ * proof binds the exact change it was signed for, so an ancestry re-anchored for
+ * presentation cannot reuse one. Only the author signs, and only for the ancestry
+ * that author actually recorded; ancestry is never inferred from bytes and content
+ * this device did not author is never attested.
+ */
+export async function provePresentedChange(change: Change, security: CollaborationSecurityOptions): Promise<JournalProof | undefined> {
+  // Content with no mutation provenance is not attestable by this device, so it
+  // returns undefined instead of throwing: such a record stays an unattested root
+  // rather than aborting the presentation pass for the rest of the history.
+  if (!change.value[MUTATION_PROVENANCE_FIELD]) return;
+  const mutation = await verifyMutation(change.value, { manifest: security.manifest, history: security.manifestHistory,
+    boardId: change.boardId, collection: change.collection }, createMutationReplayCache());
+  if (mutation.authorKeyId !== security.signer.deviceKeyId || !manifestIsCurrent(security.manifest, Date.now())) return;
   const payload = { version: 1 as const, changeId: change.id, boardId: change.boardId, authorKeyId: mutation.authorKeyId,
     epoch: security.manifest.epoch, manifestHash: manifestHash(security.manifest) };
   return { payload, signature: await signBytes(await importSigningKey(security.signer.privateJwk), signedBytes(DOMAIN, payload)) };

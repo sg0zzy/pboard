@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createRxRepository, type RxRepository } from '../../src/storage/rxdbRepository';
 import { generateDeviceKey } from '../../src/collab/security/keys';
 import { installLiveBoardMutations, verifyLiveBoardVariant, withUntrustedImport } from '../../src/collab/security/liveMutations';
-import { makeChange } from '../../src/storage/changeJournal';
+import { makeChange, pendingHeads } from '../../src/storage/changeJournal';
 import { verifyMutation, signMutation, createMutationReplayCache } from '../../src/collab/security/mutation';
 import { verifyJournalChange } from '../../src/collab/security/journalProof';
 import { createBackendProjectSnapshotStore } from '../../src/sync/snapshot';
@@ -371,6 +371,33 @@ it('rejects permanent disposal of a visible board and aborts deletion if its rev
   await expect(f.repo.discardRemovedBoardWork(f.board.id, ['stale-review'])).rejects.toThrow('Retained work changed');
   expect(await f.repo.journal.pendingEdits.toArray()).toEqual(before);
   expect(await f.repo.journal.receipts.where('destination').equals(`local-pending-discard:${f.board.id}`).toArray()).toEqual([]);
+});
+
+// The confirmable set is what the panel can show: current heads minus drafts a pending
+// review already adopted as an operation. Confirming an adopted draft the panel no longer
+// lists is refused, so a stale or over-broad confirmation still aborts the erasure.
+it('permits permanent disposal of a retained board when one adopted review covers part of its pending heads', async () => {
+  const f = await setup();
+  const other = await f.repo.addItem({ projectId: f.board.id, content: 'Second document' });
+  f.expire();
+  await f.repo.updateItem(f.card.id, { content: 'Adopted draft' });
+  await f.repo.updateItem(other.id, { content: 'Still visible draft' });
+  const rows = await f.repo.journal.pendingEdits.toArray();
+  const adopted = rows.find(edit => edit.base.documentId === f.card.id)!, visible = rows.find(edit => edit.base.documentId === other.id)!;
+  await f.repo.bindOperationBoard({ id: `binding:${f.board.id}`, kind: 'operation-binding', boardId: f.board.id,
+    folderId: 'fixture-folder', role: 'owner', legacyFileIds: [], baseRevision: 0 }, []);
+  await f.repo.reviewPendingWork(adopted.id, [adopted.id]);
+  const heads = pendingHeads((await f.repo.journal.pendingEdits.toArray()).filter(edit => edit.boardId === f.board.id)).map(edit => edit.id).sort();
+  expect(heads).toContain(adopted.id);
+  expect(heads.filter(id => id !== adopted.id)).toEqual((await f.repo.listPendingWork()).map(edit => edit.id).sort());
+  await f.stop(); await f.repo.deleteProject(f.board.id);
+  const confirmable = (await f.repo.listPendingWork()).map(edit => edit.id);
+  expect(confirmable).toContain(visible.id); expect(confirmable).not.toContain(adopted.id);
+  await expect(f.repo.discardRemovedBoardWork(f.board.id, [adopted.id])).rejects.toThrow('Retained work changed');
+  expect((await f.repo.journal.pendingEdits.get(adopted.id))?.id).toBe(adopted.id);
+  await f.repo.discardRemovedBoardWork(f.board.id, confirmable);
+  expect(await f.repo.journal.pendingEdits.toArray()).toEqual([]);
+  expect(await f.repo.listPendingWork()).toEqual([]);
 });
 
 // A signed "independent" board pulled with collaboration sharing off never

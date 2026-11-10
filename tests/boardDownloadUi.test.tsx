@@ -61,14 +61,18 @@ vi.mock("../src/platform/browser", () => ({
 }));
 
 vi.mock("../src/sync/client", () => ({
-  requestDriveReconciliation: vi.fn(async () => undefined),
+  requestDriveReconciliation: vi.fn(async () => ({ ok: true })),
   requestProjectSync: vi.fn(async () => undefined)
 }));
 
 vi.mock("../src/sync/browser", () => ({
+  driveFolderGardener: {},
+  healRelay: async () => "idle:no-room",
+  operationService: { subscribeRole: async () => () => {}, role: async () => "viewer" },
   boardCollaboration: { settings: async () => ({ provider: "drive", url: "wss://pboard.cecosl.ovh/ws" }) },
   collaborationManager: {
     state: () => ({ ready: false, role: "private", connectedPeers: [], error: null }),
+    setEnabled: async () => {},
     start: vi.fn(async () => undefined),
     refreshRole: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined)

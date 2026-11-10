@@ -1,12 +1,16 @@
 import "fake-indexeddb/auto";
 import { afterEach, expect, it, vi } from "vitest";
 import { createDriveRuntime } from "../src/sync/runtime";
+import { defaultDriveIdentityCache } from "../src/sync/driveIdentity";
 import { ensureDeviceKey, generateDeviceKey } from "../src/collab/security/keys";
 import { signManifest, type BoardPermissionManifest, type SignedManifest } from "../src/collab/security/manifest";
 import { hashBlob } from "../src/storage/blobStore";
 import type { RxRepository } from "../src/storage/rxdbRepository";
 
-afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+// Each fixture below stubs its own `about` endpoint. The account-identity cache
+// lives as long as a JS context — one extension worker or one sidebar page — and
+// this process runs many fake contexts, so drop it between cases.
+afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); defaultDriveIdentityCache().invalidate(); });
 async function fixture() {
   vi.stubEnv("DEV", true); vi.stubEnv("VITE_PBOARD_SIGNALING_PROVIDER", "websocket");
   vi.stubEnv("VITE_PBOARD_SIGNALING_WS_URL", "wss://relay.example.test/ws");
@@ -54,7 +58,7 @@ async function fixture() {
     return new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
   }) as typeof fetch;
   const repo = { setProjectOrderAccount: vi.fn(async () => {}), setMutatorRole: vi.fn() } as unknown as RxRepository;
-  const runtime = createDriveRuntime({ auth: { getAccessToken: async () => "fixture-token", getConnectionState: async () => "connected", isConfigured: () => true, connect: async () => {}, disconnect: async () => {} }, storage, fetcher, getRepository: async () => repo });
+  const runtime = createDriveRuntime({ operationSync: false, auth: { getAccessToken: async () => "fixture-token", getConnectionState: async () => "connected", isConfigured: () => true, connect: async () => {}, disconnect: async () => {} }, storage, fetcher, getRepository: async () => repo });
   async function blocked(message: RegExp) {
     try {
       await expect(runtime.collaborationManager.start(board)).rejects.toThrow(message);

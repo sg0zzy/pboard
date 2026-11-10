@@ -1,11 +1,13 @@
 import { expect, it, vi } from 'vitest';
 import { createGoogleIdentitySharing } from '../src/collab/googleIdentitySharing';
 import { createBoardGrantService } from '../src/collab/boardGrants';
+import { instantAuthBudget } from './helpers/authBudget';
 import { generateDeviceKey, publicKeyFingerprint } from '../src/collab/security/keys';
 import { toBase64Url } from '../src/collab/security/canonical';
 
 function fixture(ownerLimit = Number.POSITIVE_INFINITY) {
   const policies = new Map<string, any>(), pending = new Map<string, any[]>(), bundles = new Map<string, any>();
+  const collaborationHistory = new Set<string>();
   let tamper = false, calls = 0, requests = 0;
   const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input)); expect(url.origin).toBe('https://relay.example.test'); calls++;
@@ -25,13 +27,19 @@ function fixture(ownerLimit = Number.POSITIVE_INFINITY) {
     if (operation.publication) {
       const policy = operation.publication.policy;
       if (!policies.has(policy.boardId) && [...policies.values()].filter(p => p.policy.ownerEmail === email).length >= ownerLimit) {
-        return new Response(JSON.stringify({ code: 'directory_capacity' }), { status: 403 });
+        const retired = [...policies.entries()]
+          .filter(([board, p]) => p.policy.ownerEmail === email && !collaborationHistory.has(board) && !p.policy.members.length && !(pending.get(board)?.length))
+          .sort((a, b) => a[1].policy.issuedAt - b[1].policy.issuedAt)[0];
+        if (!retired) return new Response(JSON.stringify({ code: 'directory_capacity' }), { status: 403 });
+        policies.delete(retired[0]);
       }
       policies.set(policy.boardId, operation.publication);
+      if (policy.members.length) collaborationHistory.add(policy.boardId);
     }
     if (operation.type === 'request') {
       requests++;
       const id = operation.request.boardId;
+      collaborationHistory.add(id);
       pending.set(id, [...(pending.get(id) ?? []).filter(p => p.request.deviceKeyId !== operation.request.deviceKeyId), { email, request: operation.request }]);
     }
     const boards = [...policies.values()].filter(p => p.policy.ownerEmail === email || p.policy.members.some((m: any) => m.email === email)).map(p => ({ publication: structuredClone(p), pending: p.policy.ownerEmail === email ? structuredClone(pending.get(p.policy.boardId) ?? []) : [] }));
@@ -43,15 +51,72 @@ function fixture(ownerLimit = Number.POSITIVE_INFINITY) {
     const storage = { get: async (id: string) => ({ [id]: structuredClone(state[id]) }), set: async (patch: Record<string, unknown>) => { Object.assign(state, structuredClone(patch)); } };
     const keys = new Map<string, Awaited<ReturnType<typeof generateDeviceKey>>>();
     const getKey = async (id: string) => { if (!keys.has(id)) keys.set(id, await generateDeviceKey()); return keys.get(id)!; };
-    const grants = createBoardGrantService({ storage, fetcher, getKey });
+    // `allowInitialize === false` models the trust situation the single
+    // decision point refuses: the deployment oracle reports signed local
+    // history, so `adoptAuthority` refuses with the typed block and
+    // `sharing.sync` surfaces it — exactly what this suite used to force
+    // through the removed `canInitialize` seam.
+    const grants = createBoardGrantService({ storage, fetcher, getKey, authBudget: instantAuthBudget(),
+      authority: allowInitialize ? undefined : {
+        hasSignedHistory: async () => true,
+        async describeSignedDataBlock() { return { message: 'Existing signed data cannot change authority', state: 'authority-foreign' }; },
+      } });
     let connected = true;
-    const sharing = createGoogleIdentitySharing({ storage, fetcher, getKey, grants,
+    const sharing = createGoogleIdentitySharing({ storage, fetcher, getKey, grants, authBudget: instantAuthBudget(),
       auth: { getAccessToken: async () => email, getConnectionState: async () => connected ? 'connected' : 'disconnected', isConfigured: () => true, connect: async () => {}, disconnect: async () => {} },
-      canInitialize: async () => { if (!allowInitialize) throw new Error('Existing signed data cannot change authority'); return true; }, canReceive: async () => true });
+      canReceive: async () => true });
     return { grants, sharing, state, disconnect: () => { connected = false; }, enable: () => grants.configure({ provider: 'websocket', url: 'wss://relay.example.test/ws' }) };
   }
-  return { client, policies, bundles, requests: () => requests, calls: () => calls, tamper: () => { tamper = true; } };
+  return { client, policies, pending, bundles, requests: () => requests, calls: () => calls, tamper: () => { tamper = true; } };
 }
+
+it('switches through more than sixteen private boards without saturating or republishing retired boards', async () => {
+  const f = fixture(16), owner = f.client('owner@example.test'); await owner.enable();
+  for (let i = 0; i < 40; i++) {
+    const reply = await owner.sharing.sync(`board-${i}`, true);
+    expect(reply.issues).toEqual([]);
+    expect(reply.ready).toContain(`board-${i}`);
+    expect(f.policies.size).toBeLessThanOrEqual(16);
+  }
+  f.policies.clear();
+  await owner.sharing.sync(undefined, true);
+  expect(f.policies.size).toBe(0); // retained local metadata is not an active invitation
+  await owner.sharing.sync('board-0', true);
+  expect([...f.policies.keys()]).toEqual(['board-0']);
+  expect(await owner.grants.ownsAuthority('board-0')).toBe(true);
+});
+
+it('does not renew inactive private policies, but republishes the selected board', async () => {
+  const f = fixture(), owner = f.client('owner@example.test'); await owner.enable();
+  await owner.sharing.sync('old', true);
+  const oldPolicy = structuredClone(f.policies.get('old'));
+  const oldEpoch = (await owner.grants.localBundle('old'))!.history.at(-1)!.payload.epoch;
+  vi.useFakeTimers(); vi.setSystemTime(Date.now() + 9 * 60_000);
+  try {
+    await owner.sharing.sync('new', true);
+    expect(f.policies.get('old')).toEqual(oldPolicy);
+    expect((await owner.grants.localBundle('old'))!.history.at(-1)!.payload.epoch).toBe(oldEpoch);
+    await owner.sharing.sync('old', true);
+    expect(f.policies.get('old').policy.expiresAt).toBeGreaterThan(oldPolicy.policy.expiresAt);
+  } finally { vi.useRealTimers(); }
+});
+
+it('keeps an unselected same-account paired board renewable even without pending requests or email invitations', async () => {
+  const f = fixture(), owner = f.client('owner@example.test'), paired = f.client('owner@example.test');
+  await owner.enable(); await paired.enable();
+  await owner.sharing.sync('paired', true); await paired.sharing.sync(undefined, true);
+  await owner.sharing.sync('paired', true); await paired.sharing.sync(undefined, true);
+  f.pending.clear();
+  const policies = owner.state.pboardGoogleBoardPolicies as Record<string, { devices: Record<string, string> }>;
+  policies.paired.devices = {}; // the manifest also protects manual/previously paired devices
+  const epoch = (await owner.grants.localBundle('paired'))!.history.at(-1)!.payload.epoch;
+  vi.useFakeTimers(); vi.setSystemTime(Date.now() + 6 * 60_000);
+  try {
+    await owner.sharing.sync('other', true);
+    expect((await owner.grants.localBundle('paired'))!.history.at(-1)!.payload.epoch).toBeGreaterThan(epoch);
+    expect((await paired.sharing.sync(undefined, true)).ready).toContain('paired');
+  } finally { vi.useRealTimers(); }
+});
 it('avoids repeated trust writes for identical verified grants while still reading fresh membership', async () => {
   const f = fixture(), owner = f.client('owner@example.test'), joining = f.client('owner@example.test');
   await owner.enable(); await joining.enable();
@@ -193,6 +258,13 @@ it('polls for grants without resubmitting the same pending request on every five
     expect(f.requests()).toBe(1);
     vi.setSystemTime(Date.now() + 30_000);
     await joining.sharing.sync(); expect(f.requests()).toBe(2);
+    // The re-filing window now covers forced rounds too: the service holds a
+    // filed request for an hour, so a forced refresh seconds after a filing
+    // re-files nothing — that duplicate pair, not the five-second poll, was
+    // the enrollment churn in the service journal. Only the window expiring
+    // files again.
+    await joining.sharing.sync(undefined, true); expect(f.requests()).toBe(2);
+    vi.setSystemTime(Date.now() + 30_000);
     await joining.sharing.sync(undefined, true); expect(f.requests()).toBe(3);
   } finally { vi.useRealTimers(); }
 });
