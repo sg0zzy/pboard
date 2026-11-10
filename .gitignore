@@ -21,3 +21,6 @@ web-ext-artifacts/*.zip
 *.jks
 *.p12
 /reviewed-release-plan/
+
+# Debug bridge runtime artifacts (captures, relay tails)
+/test-results/

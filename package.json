@@ -13,6 +13,12 @@
     "release:chromium": "npm run typecheck && npm test && npm run build:chromium && node scripts/verify-build.mjs chromium",
     "release:all": "npm run typecheck && npm test && npm run build:all && node scripts/verify-build.mjs all",
     "test": "vitest run",
+    "debug:bridge": "node tools/pboard-debug/server.ts",
+    "debug:mcp": "node tools/pboard-debug/mcp.ts",
+    "debug:status": "node tools/pboard-debug/cli.ts status",
+    "debug:test": "vitest run tests/debugProtocol.test.ts tests/debugBridge.test.ts tests/debugStress.test.ts",
+    "debug:test:e2e": "node tools/pboard-debug/firefox-e2e.mjs",
+    "debug:harness": "node tools/pboard-debug/harness.ts",
     "test:watch": "vitest",
     "test:webrtc:browser": "node experiments/collaboration/webrtc-browser-smoke.mjs",
     "test:ui:perf": "node experiments/collaboration/ui-perf.mjs",
@@ -40,9 +46,11 @@
   },
   "devDependencies": {
     "@capacitor/core": "8.5.3",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@types/firefox-webext-browser": "^143.0.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^6.1.1",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^30.0.1",
@@ -50,6 +58,8 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.0",
     "vitest": "^5.0.0",
-    "web-ext": "10.7.0"
+    "web-ext": "10.7.0",
+    "ws": "^8.22.2",
+    "zod": "^4.6.7"
   }
 }
