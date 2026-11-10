@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ImmutableDriveFake } from './driveFake';
 import { canonical, digest, type Segment } from '../../src/sync/operations/protocol';
 import { clearDriveResourceGoneMemory, isDriveGone } from '../../src/sync/driveHttp';
@@ -53,6 +53,23 @@ describe('regular Drive immutable operation storage', () => {
     // failure, and says so instead of failing as a storage error.
     seed('adopt-mine', true);
     await expect(store.protectLegacy('adopt-mine')).rejects.toThrow(/owns the file/);
+  });
+  it('paces repeated 404 restriction writes without declaring an owned file protected', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = new ImmutableDriveFake(), store = fake.store();
+      const id = 'owned-refused';
+      fake.files.set(id, { id, name: 'project.json', parents: ['folder'], body: '{}', createdTime: '2026-01-01', ownedByMe: true });
+      fake.refusePatch = true; fake.refusePatchStatus = 404;
+      await expect(fake.store().protectLegacy(id)).rejects.toThrow(/owns the file/);
+      await expect(store.protectLegacy(id)).rejects.toThrow(/owns the file/);
+      expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(1);
+      fake.refusePatch = false;
+      await vi.advanceTimersByTimeAsync(60_001);
+      await store.protectLegacy(id);
+      expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(2);
+      expect(fake.files.get(id)?.contentRestrictions?.[0].readOnly).toBe(true);
+    } finally { vi.useRealTimers(); }
   });
   it('reports a file Drive deleted as gone, separately from every other failure', async () => {
     // A peer's presence file is deleted the moment its session leaves, so a

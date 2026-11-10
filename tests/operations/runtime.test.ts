@@ -48,3 +48,18 @@ it('publishes account erasure in regular Drive and prevents a fresh profile resu
   const fresh = await profile(drive); await fresh.runtime.googleDrive.reconcileAll();
   expect(await fresh.rx.getProject(project.id)).toBeNull(); expect(await fresh.rx.journal.boardErasure(project.id)).toBeTruthy();
 });
+it('reuses an unchanged validated erasure marker and re-reads it when its Drive version changes', async () => {
+  const drive = new DriveStub();
+  drive.defaultPermissions = [{ id: 'owner', type: 'user', role: 'owner', emailAddress: 'owner@example.com' }];
+  const marker = drive.addFile('erased-board-a.pboard', 'appDataFolder', JSON.stringify({ format: 'pboard-board-erasure', version: 1, boardId: 'board-a' }));
+  const a = await profile(drive);
+  const reads = () => drive.requests.filter(url => url.includes(`/${marker.id}?`) && url.includes('alt=media')).length;
+  await a.runtime.googleDrive.reconcileAll({ force: true });
+  expect(reads()).toBe(1);
+  await a.runtime.googleDrive.reconcileAll({ force: true });
+  expect(reads()).toBe(1);
+  marker.version++;
+  marker.bytes = new TextEncoder().encode(JSON.stringify({ format: 'invalid', version: 1, boardId: 'board-a' }));
+  await expect(a.runtime.googleDrive.reconcileAll({ force: true })).rejects.toThrow('Invalid account erasure marker');
+  expect(reads()).toBe(2);
+});

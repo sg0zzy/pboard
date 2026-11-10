@@ -71,7 +71,7 @@ pub const FRAME_TYPE: &str = "sync";
 pub enum Request {
     /// Catch me up from `after_seq` (exclusive) and keep me live afterwards.
     #[serde(rename_all = "camelCase")]
-    Subscribe { board: String, after_seq: u64 },
+    Subscribe { board: String, after_seq: u64, #[serde(default)] limit: Option<usize> },
     /// Submit operations. Duplicates are answered, never stored twice.
     #[serde(rename_all = "camelCase")]
     Submit { board: String, operations: Vec<SubmittedOperation> },
@@ -466,7 +466,7 @@ pub fn handle(
                 Err(failure) => Outcome::only(error(board, code_for(&failure))),
             }
         }
-        Request::Subscribe { after_seq, .. } => match log.sync_from(board, after_seq, limits.replay_batch) {
+        Request::Subscribe { after_seq, limit, .. } => match log.sync_from(board, after_seq, limit.unwrap_or(limits.replay_batch).clamp(1, limits.replay_batch)) {
             Err(failure) => Outcome::only(error(board, code_for(&failure))),
             Ok(window) => {
                 // A gap is a first-class answer, never an empty list: a client
@@ -994,11 +994,32 @@ mod tests {
     }
 
     #[test]
+    fn replay_pages_are_bounded_and_cover_the_original_window() {
+        let (log, courier) = store();
+        let writer = identity("board", "device-a");
+        let limits = Limits::default();
+        for chunk in 0..3 {
+            let ops = (0..100).map(|index| submitted(&format!("op-{}", chunk * 100 + index))).collect();
+            assert_eq!(accepted(&handle(&log, &courier, &writer, submit("board", ops), &limits)).len(), 100);
+        }
+        let mut after = 0;
+        for expected in [128, 128, 44] {
+            let outcome = handle(&log, &courier, &writer, Request::Subscribe { board: "board".into(), after_seq: after, limit: Some(128) }, &limits);
+            let reply = &outcome.replies[0];
+            let rows = reply["operations"].as_array().expect("operations");
+            assert_eq!(rows.len(), expected);
+            assert_eq!(reply["liveFromSeq"], 301);
+            for row in rows { after += 1; assert_eq!(row["seq"], after); }
+        }
+        assert_eq!(after, 300);
+    }
+
+    #[test]
     fn refuses_any_frame_for_a_board_this_connection_is_not_admitted_to() {
         let (log, courier) = store();
         let writer = identity("board-a", "device-a");
         for request in [
-            Request::Subscribe { board: "board-b".into(), after_seq: 0 },
+            Request::Subscribe { board: "board-b".into(), after_seq: 0, limit: None },
             Request::Release { board: "board-b".into() },
             Request::Status { board: "board-b".into() },
             submit("board-b", vec![submitted("op-1")]),
@@ -1017,7 +1038,7 @@ mod tests {
         let outcome = handle(&log, &courier, &identity("board", "device-a"), submit("board", vec![submitted("op-1")]), &Limits::default());
         assert_eq!(accepted(&outcome)[0]["seq"], 1);
         assert_eq!(outcome.broadcast[0]["actorId"], "device-a");
-        let window = handle(&log, &courier, &identity("board", "device-b"), Request::Subscribe { board: "board".into(), after_seq: 0 }, &Limits::default());
+        let window = handle(&log, &courier, &identity("board", "device-b"), Request::Subscribe { board: "board".into(), after_seq: 0, limit: None }, &Limits::default());
         assert_eq!(window.replies[0]["operations"][0]["actorId"], "device-a");
     }
 
@@ -1036,7 +1057,7 @@ mod tests {
         let second = handle(&log, &courier, &identity, submit("board-b", vec![submitted("op-b")]), &Limits::default());
         assert_eq!(second.broadcast[0]["actorId"], "device-beta");
         // Durable attribution matches the broadcast, per room.
-        let read = handle(&log, &courier, &identity, Request::Subscribe { board: "board-b".into(), after_seq: 0 }, &Limits::default());
+        let read = handle(&log, &courier, &identity, Request::Subscribe { board: "board-b".into(), after_seq: 0, limit: None }, &Limits::default());
         assert_eq!(read.replies[0]["operations"][0]["actorId"], "device-beta");
         // A room that recorded no actor still falls back to the connection's
         // device: that is the v2/pre-field behaviour, unchanged.
@@ -1066,7 +1087,7 @@ mod tests {
     fn a_read_only_client_subscribes_and_is_refused_every_mutation() {
         let (log, courier) = store();
         let reader = reader("board", "device-viewer");
-        let window = handle(&log, &courier, &reader, Request::Subscribe { board: "board".into(), after_seq: 0 }, &Limits::default());
+        let window = handle(&log, &courier, &reader, Request::Subscribe { board: "board".into(), after_seq: 0, limit: None }, &Limits::default());
         assert_eq!(window.replies[0]["action"], "window");
         assert_eq!(window.replies[0]["synced"], json!(true));
         for request in [
@@ -1127,13 +1148,13 @@ mod tests {
         CLOCK.with(|clock| clock.set(now() + 30 * 60_000));
         // Prune through the log's own path, then ask for the pruned range.
         log.prune("board").expect("prune");
-        let outcome = handle(&log, &courier, &writer, Request::Subscribe { board: "board".into(), after_seq: 0 }, &Limits::default());
+        let outcome = handle(&log, &courier, &writer, Request::Subscribe { board: "board".into(), after_seq: 0, limit: None }, &Limits::default());
         assert_eq!(outcome.replies[0]["action"], "snapshotRequired");
         assert_eq!(outcome.replies[0]["synced"], json!(false));
         assert_eq!(outcome.replies[0]["gap"]["reason"], "snapshot_required");
         assert_eq!(outcome.replies[0]["gap"]["snapshotSeq"], 7);
         // A client holding the checkpoint is served normally instead.
-        let current = handle(&log, &courier, &writer, Request::Subscribe { board: "board".into(), after_seq: 2 }, &Limits::default());
+        let current = handle(&log, &courier, &writer, Request::Subscribe { board: "board".into(), after_seq: 2, limit: None }, &Limits::default());
         assert_eq!(current.replies[0]["action"], "window");
         assert_eq!(current.replies[0]["synced"], json!(true));
     }

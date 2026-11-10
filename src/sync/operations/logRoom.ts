@@ -178,33 +178,49 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
     if (!operations.length) { if (sawForeign) await advance(); return; }
     // The cursor advances only after the engine has taken them: an operation it
     // rejected must be seen again on the next reconnect, not skipped.
-    await options.receive(operations);
-    metrics.received += operations.length;
-    for (const seq of sequences) durable.add(seq);
-    await advance();
+    // The local operation store accepts at most 128 operations per durable
+    // transaction, while a relay replay page may contain up to 512. Commit and
+    // advance each chunk independently so a later failure never skips it.
+    for (let offset = 0; offset < operations.length; offset += 128) {
+      const chunk = operations.slice(offset, offset + 128);
+      await options.receive(chunk);
+      metrics.received += chunk.length;
+      for (const seq of sequences.slice(offset, offset + 128)) durable.add(seq);
+      await advance();
+    }
   }
 
   async function resync() {
-    const window = await options.ask('subscribe', { afterSeq: appliedSeq });
+    const window = await options.ask('subscribe', { afterSeq: appliedSeq, limit: 128 });
     checkpointSeq = aNumber(window.checkpointSeq) ?? checkpointSeq;
     await apply(frames(window.operations));
   }
 
   async function bootstrap() {
-    const window = await options.ask('subscribe', { afterSeq: appliedSeq });
-    checkpointSeq = aNumber(window.checkpointSeq) ?? 0;
-    await apply(frames(window.operations));
-    if (window.synced !== true) {
-      const reason = aString((window.gap as Frame | undefined)?.reason) ?? 'history_unavailable';
-      metrics.gaps++;
-      const detail = { reason,
-        checkpointSeq: aNumber((window.gap as Frame | undefined)?.checkpointSeq),
-        checkpointEpoch: aNumber((window.gap as Frame | undefined)?.checkpointEpoch),
-        snapshotSeq: aNumber((window.gap as Frame | undefined)?.snapshotSeq),
-        oldestRetainedSeq: aNumber((window.gap as Frame | undefined)?.oldestRetainedSeq) };
-      options.synchronized('snapshot', { reason });
-      options.gap?.(detail);
-      return;
+    let target: number | undefined;
+    for (;;) {
+      const window = await options.ask('subscribe', { afterSeq: appliedSeq, limit: 128 });
+      checkpointSeq = aNumber(window.checkpointSeq) ?? 0;
+      if (target === undefined) {
+        const liveFrom = aNumber(window.liveFromSeq);
+        if (Number.isSafeInteger(liveFrom) && liveFrom! > 0) target = liveFrom! - 1;
+      }
+      const before = appliedSeq;
+      await apply(frames(window.operations));
+      if (window.synced !== true) {
+        const reason = aString((window.gap as Frame | undefined)?.reason) ?? 'history_unavailable';
+        metrics.gaps++;
+        const detail = { reason,
+          checkpointSeq: aNumber((window.gap as Frame | undefined)?.checkpointSeq),
+          checkpointEpoch: aNumber((window.gap as Frame | undefined)?.checkpointEpoch),
+          snapshotSeq: aNumber((window.gap as Frame | undefined)?.snapshotSeq),
+          oldestRetainedSeq: aNumber((window.gap as Frame | undefined)?.oldestRetainedSeq) };
+        options.synchronized('snapshot', { reason });
+        options.gap?.(detail);
+        return;
+      }
+      if (target === undefined || appliedSeq >= target) break;
+      if (appliedSeq === before) throw new Error('Operation log replay did not advance');
     }
     options.synchronized('synced', {});
     // Everything still unacknowledged predates this connection.
@@ -216,37 +232,45 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
     if (!operations.length) return false;
     for (const operation of operations) unacked.set(operation.opId, operation);
     metrics.submitted += operations.length;
-    const sealed = await Promise.all(operations.map(async operation => ({
-      opId: operation.opId,
-      protocolVersion: LOG_PROTOCOL_VERSION,
-      logicalClock: operation.clock,
-      payload: await options.seal(operation)
-    })));
-    const reply = await options.ask('submit', { operations: sealed });
-    // Answered per batch, never globally: two callers can have operations waiting
-    // at the same time, and "your edit is safe" cannot depend on someone else's.
-    const acknowledged = new Set<string>();
-    for (const result of frames(reply.results)) {
-      const opId = aString(result.opId), seq = aNumber(result.seq), duplicate = aBoolean(result.duplicate);
-      if (!opId || typeof seq !== 'number') continue;
-      unacked.delete(opId);
-      acknowledged.add(opId);
-      metrics.acked++;
-      if (duplicate) metrics.duplicates++;
-      // An acknowledged sequence is durable whether or not the broadcast for it
-      // has arrived; remembering it keeps a reload from waiting on our own edit.
-      durable.add(seq);
-      await advance();
-      if (seq > appliedSeq + 1 && !resyncing) {
-        // Something below our own operation was never delivered to this
-        // connection. Ask for exactly the missing window instead of letting the
-        // cursor settle over it; the log retains it until a snapshot covers it.
-        metrics.holes++;
-        resyncing = true;
-        options.background(async () => { try { await resync(); } finally { resyncing = false; } });
+    let allAcknowledged = true;
+    // The relay fans each accepted operation out separately into a bounded
+    // socket queue, including the sender's own queue. Wait for each small
+    // batch so a backlog cannot fill that queue in one synchronous fan-out.
+    for (let offset = 0; offset < operations.length; offset += 16) {
+      const batch = operations.slice(offset, offset + 16);
+      const sealed = await Promise.all(batch.map(async operation => ({
+        opId: operation.opId,
+        protocolVersion: LOG_PROTOCOL_VERSION,
+        logicalClock: operation.clock,
+        payload: await options.seal(operation)
+      })));
+      const reply = await options.ask('submit', { operations: sealed });
+      // Answered per batch, never globally: two callers can have operations waiting
+      // at the same time, and "your edit is safe" cannot depend on someone else's.
+      const acknowledged = new Set<string>();
+      for (const result of frames(reply.results)) {
+        const opId = aString(result.opId), seq = aNumber(result.seq), duplicate = aBoolean(result.duplicate);
+        if (!opId || typeof seq !== 'number') continue;
+        unacked.delete(opId);
+        acknowledged.add(opId);
+        metrics.acked++;
+        if (duplicate) metrics.duplicates++;
+        // An acknowledged sequence is durable whether or not the broadcast for it
+        // has arrived; remembering it keeps a reload from waiting on our own edit.
+        durable.add(seq);
+        await advance();
+        if (seq > appliedSeq + 1 && !resyncing) {
+          // Something below our own operation was never delivered to this
+          // connection. Ask for exactly the missing window instead of letting the
+          // cursor settle over it; the log retains it until a snapshot covers it.
+          metrics.holes++;
+          resyncing = true;
+          options.background(async () => { try { await resync(); } finally { resyncing = false; } });
+        }
       }
+      allAcknowledged &&= batch.every(op => acknowledged.has(op.opId));
     }
-    return operations.every(op => acknowledged.has(op.opId));
+    return allAcknowledged;
   }
 
   return {
@@ -262,7 +286,7 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
     publish,
     async catchUpTo(sequence: number) {
       for (let page = 0; appliedSeq < sequence && page < 64; page++) {
-        const window = await options.ask('subscribe', { afterSeq: appliedSeq });
+        const window = await options.ask('subscribe', { afterSeq: appliedSeq, limit: 128 });
         checkpointSeq = aNumber(window.checkpointSeq) ?? checkpointSeq;
         const rows = frames(window.operations);
         const before = appliedSeq;

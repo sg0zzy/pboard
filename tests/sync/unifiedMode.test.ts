@@ -68,7 +68,7 @@ it('legacy Drive-provider mode keeps using the AppData-backed provider', async (
   for (const repository of repositories.splice(0)) await repository.db.close();
 });
 
-it('Sync v2 reconcile automatically migrates a legacy AppData board (connect is consent)', async () => {
+it('does not automatically relocate legacy AppData boards', async () => {
   const storage = new MemoryStorage();
   Object.assign(storage.data, { pboardCollaborationSettings: { provider: 'websocket', url: 'wss://relay.example.test/ws' } });
   const rx = await open();
@@ -82,14 +82,9 @@ it('Sync v2 reconcile automatically migrates a legacy AppData board (connect is 
   const runtime = runtimeFor(storage, rx, stub);
   expect(await rx.getProject('old1')).toBe(null);
   expect(await runtime.googleDrive.reconcileAll()).toMatchObject({ status: 'reconciled' });
-  // Fresh-profile recovery: the legacy content is now the local board…
-  expect(await rx.getProject('old1')).toBeTruthy();
-  // …and its canonical unified file exists under pboard/old1/.
-  const root = stub.files.find(f => f.name === 'pboard' && f.parents.includes(REAL_ROOT_ID) && !f.trashed);
-  const folder = stub.files.find(f => f.name === 'old1' && root && f.parents.includes(root!.id) && !f.trashed);
-  expect(folder).toBeTruthy();
-  expect(stub.files.some(f => f.name === 'board.json.gz' && folder && f.parents.includes(folder!.id) && !f.trashed)).toBe(true);
-  // Verified-before-delete: the source survives the migration untouched.
+  expect(await rx.getProject('old1')).toBeNull();
+  expect(stub.files.some(f => f.name === 'old1' && !f.trashed)).toBe(false);
+  // Disabling relocation does not delete the old source.
   expect(appData.trashed).toBe(false);
   expect(appData.version).toBe(1);
   for (const repository of repositories.splice(0)) await repository.db.close();

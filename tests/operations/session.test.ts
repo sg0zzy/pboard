@@ -29,6 +29,29 @@ async function publishLogSnapshot(session: OperationSession) {
 }
 
 describe('operation session integration against simulated regular Drive', () => {
+  it('coalesces concurrent forced syncs into one follow-up and preserves publication', async () => {
+    const fake = new ImmutableDriveFake(), drive = fake.store();
+    const inventory = drive.inventory.bind(drive);
+    let release!: () => void, started!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const firstStarted = new Promise<void>(resolve => { started = resolve; });
+    const calls: boolean[] = [];
+    drive.inventory = async (force = false) => {
+      calls.push(force);
+      if (calls.length === 1) { started(); await blocked; }
+      return await inventory(force);
+    };
+    const { session } = await client(fake, crypto.randomUUID(), { drive });
+    await session.edit(board);
+    const first = session.sync(false, false);
+    await firstStarted;
+    const followers = Array.from({ length: 12 }, () => session.sync(true, false));
+    followers.push(session.sync(false, true));
+    release();
+    await Promise.all([first, ...followers]);
+    expect(calls).toEqual([false, true]);
+    expect(await session.unpublished()).toBe(0);
+  });
   it('drains more than one journal page after an offline period and stops on refusal', async () => {
     const fake = new ImmutableDriveFake();
     let accept = false, delivered = 0;

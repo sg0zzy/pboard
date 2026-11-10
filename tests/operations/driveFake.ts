@@ -11,6 +11,7 @@ export class ImmutableDriveFake {
   timeoutNext = false;
   /** Drive refuses a content-restriction update it will not apply (a file owned by another account). */
   refusePatch = false;
+  refusePatchStatus = 403;
   offline = false;
   /**
    * Ids Drive still lists but can no longer serve — a compacted segment whose id
@@ -42,7 +43,7 @@ export class ImmutableDriveFake {
     if (id === 'files') return Response.json({ files: [...this.files.values()].filter(file => !file.trashed).map(({ body, ...file }) => ({ ...file, size: String(new TextEncoder().encode(body).length) })) });
     const file = this.files.get(id);
     if (!file) return new Response('', { status: 404 });
-    if (method === 'PATCH') { if (this.refusePatch) return new Response('', { status: 403 }); Object.assign(file, JSON.parse(String(init.body))); return Response.json(file); }
+    if (method === 'PATCH') { if (this.refusePatch) return new Response('', { status: this.refusePatchStatus }); Object.assign(file, JSON.parse(String(init.body))); return Response.json(file); }
     if (url.searchParams.get('alt') !== 'media') return Response.json({ ...file, id, parents: file.parents, size: String(new TextEncoder().encode(file.body).length) });
     if (this.unreadable.has(id)) return Response.json({ error: { code: 404, message: `File not found: ${id}`, status: '404', errors: [{ reason: 'notFound' }] } }, { status: 404 });
     if (this.failing.has(id)) return Response.json({ error: { code: 500, message: 'Backend Error', status: '500' } }, { status: 500 });

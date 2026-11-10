@@ -16,6 +16,7 @@ export class OperationSession {
   private queue: Promise<unknown> = Promise.resolve();
   private syncing?: Promise<void>;
   private syncingPublishes = false;
+  private queuedSync?: { force: boolean; publish: boolean; promise: Promise<void> };
   private flushTimer?: ReturnType<typeof setTimeout>;
   private stopped = false;
   private pollTimer?: ReturnType<typeof setTimeout>;
@@ -220,7 +221,27 @@ export class OperationSession {
     }, Math.max(0, deadline - Date.now(), this.flushRetryAt - Date.now()));
   }
   sync(force = false, publish = true): Promise<void> {
-    if (this.syncing) return force || (publish && !this.syncingPublishes) ? this.syncing.then(() => this.sync(force, publish)) : this.syncing;
+    if (this.syncing) {
+      if (this.queuedSync) {
+        this.queuedSync.force ||= force;
+        this.queuedSync.publish ||= publish;
+        return this.queuedSync.promise;
+      }
+      if (!force && (!publish || this.syncingPublishes)) return this.syncing;
+      // A burst of callers that need a fresh read or a publication owes one
+      // follow-up pass, not one complete Drive pass per caller. Preserve the
+      // strongest request so an offline edit is never left unpublished.
+      const queued = { force, publish, promise: undefined as unknown as Promise<void> };
+      this.queuedSync = queued;
+      queued.promise = this.syncing.then(() => {
+        if (this.queuedSync === queued) this.queuedSync = undefined;
+        return this.sync(queued.force, queued.publish);
+      }, error => {
+        if (this.queuedSync === queued) this.queuedSync = undefined;
+        throw error;
+      });
+      return queued.promise;
+    }
     clearTimeout(this.flushTimer); this.flushTimer = undefined;
     this.syncingPublishes = publish;
     const before = this.metrics.downloadedSegments + this.metrics.publishedSegments;

@@ -32,10 +32,41 @@ const TERMINAL_REFUSALS = [
   'authorization_changed',
   'authorization_stale',
   'service_auth_required',
-  'service_binding_invalid'
+  'service_binding_invalid',
+  // The protocol family: the service could not interpret what this client
+  // sent, or refuses the version/action it sent. Reconnecting with the same
+  // frames produces the identical verdict, so these are failures of the *pair*
+  // of builds in play, not of the network. Left retryable they were the worst
+  // possible class to retry: a per-room refusal of this kind re-dials the whole
+  // shared connection (`attachWanted` treats a non-terminal failure as a reason
+  // to rebuild the socket), so every attempt cost the context a dial until the
+  // reconnect ceiling engaged — and the ceiling's `reconnect:throttled` then
+  // replaced the real cause in the sidebar. `malformed` is the service's strict
+  // parse failing before the connection negotiated v3, `invalid_state` is a
+  // frame arriving out of order for the negotiated version, `unknown_action` is
+  // an action this build does not know, `invalid_frame` a frame it cannot read
+  // at all, and `version_unsupported` a version it will not speak.
+  'malformed',
+  'invalid_state',
+  'invalid_frame',
+  'unknown_action',
+  'version_unsupported'
+] as const;
+
+/** Refusals that say *this build and that service do not speak the same
+ * protocol*. Terminal like the rest, and reported in different words, because
+ * the thing that has to change is one of the two builds — not the board's
+ * sharing, not the network, and not a retry. */
+const PROTOCOL_REFUSALS = [
+  'malformed',
+  'invalid_state',
+  'invalid_frame',
+  'unknown_action',
+  'version_unsupported'
 ] as const;
 
 export const terminalRefusal = (code: string): boolean => (TERMINAL_REFUSALS as readonly string[]).includes(code);
+export const protocolRefusal = (code: string): boolean => (PROTOCOL_REFUSALS as readonly string[]).includes(code);
 
 /**
  * One room's service-admission receipt could not be obtained.

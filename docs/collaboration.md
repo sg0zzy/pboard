@@ -216,9 +216,26 @@ All of this is one policy in two files and is stated as bounds, not tuning:
   in the context with full jitter over a 1 s → 30 s bound that doubles while
   refusals keep arriving and decays after 60 clean seconds.
 - **Terminal refusals** stop the room until an explicit Reconnect
-  (`TERMINAL_REFUSALS`, `logPolicy.ts:29-35`): `unauthorized`, `grant_expired`,
+  (`TERMINAL_REFUSALS`, `logPolicy.ts:29-54`): `unauthorized`, `grant_expired`,
   `authorization_changed`, `authorization_stale`, `service_auth_required`,
   `service_binding_invalid`.
+
+  **Protocol-family refusals** (`protocolRefusal`, `logPolicy.ts:69`) are a
+  terminal sub-family — `malformed`, `invalid_state`, `invalid_frame`,
+  `unknown_action`, `version_unsupported` — and they stop the **connection**, not
+  only the room: the code is a verdict on what this build *sends*, so every
+  further dial returns it (`dial` throws it, `recover` reports it and stops
+  instead of laddering). They arrive when a browser and a relay disagree about
+  the wire — the service parses `authenticate` strictly and only tolerates an
+  unknown top-level field once a connection has negotiated v3
+  (`lib.rs:1070`, `:1281`), so a first frame it cannot read is
+  `{"type":"error","code":"malformed"}` plus a close. Reporting matters as much
+  as stopping: a room whose context carries a verdict is told the service's own
+  code and `describeLogStatus` says the two sides do not speak the same protocol.
+  Latching it is what keeps a person re-opening the board from spending the
+  context's dial budget until the per-topic ceiling engaged and replaced the
+  cause with `reconnect:throttled`. An explicit Reconnect clears the verdict —
+  either side's build may be the thing that changed.
 
 ### Measured costs
 
@@ -2701,3 +2718,63 @@ at any moment, not only within five minutes of the first.
 ### Manual Drive folder review
 
 In Android Settings → Google Drive or below the Firefox collaboration panels, **Review Drive folders** lists direct board-folder candidates under every `pboard` root. The scan is read-only and compares folder names with the boards and deletion facts available on this device. An unidentified folder may be a live board or its only recovery copy on another device; absence from the local list is not proof of deletion. The report shows the newest modification date among direct files, excluding subfolders; expand a folder to see its ID and direct contents before deciding. An owned, non-active folder may be moved to Google Drive Trash only after an explicit per-folder confirmation and exact-name entry. The app rechecks the account, root, folder ownership, local board list and direct contents before the move. Unidentified folders containing subfolders are excluded. No permanent deletion is performed, and this does not garden operation history within a live board.
+
+## A protocol verdict that read as throttling — 9 November 2026
+
+One browser of a two-browser pair stopped starting its WebSocket entirely; the
+other worked. Its journal read `Operation log refused: malformed`, then
+`Operation log is disconnected` on every later attempt. The service log called
+the same twelve sessions `reason="malformed"`, ~300 ms after they opened, with
+no `authenticated` line at all: the connection died on its **first** frame.
+Verified against the deployed relay: with `negotiated` still 1, a frame that is
+not a `Client` variant fails the strict parse (`lib.rs:1070`), so a pre-auth
+`attach`/`detach`/`renewGoogle`, or an `authenticate` carrying one unknown
+top-level field, is answered `{"type":"error","code":"malformed"}` + close —
+while a pre-auth `ping` is `invalid_state`. `without_unknown_fields` only runs
+once a connection is v3 (`:1281`), which is why the tolerance exists but does
+not cover the frame that negotiates.
+
+The client made that unrecoverable by classification, not by protocol:
+`malformed` was not in `TERMINAL_REFUSALS`, so a refused room asked
+`attachWanted` to rebuild the whole shared connection, each rebuild spent a
+dial from the context's allowance, and after six in thirty seconds the per-topic
+ceiling engaged. From then on the sidebar reported `reconnect:throttled` and
+**nothing automatic would dial at all** — the real cause had been replaced by
+the symptom of surviving it, and only an explicit Reconnect would resume. That
+is why the second browser looked dead rather than refused.
+
+The protocol family (`protocolRefusal`, `logPolicy.ts:60`) is now terminal, and
+terminal at the **connection**: the session records the verdict (`protocolVerdict`),
+`dial` refuses to ask the relay again, `recover` reports the service's own code
+to every room and stops instead of laddering, and `describeLogStatus` says the
+two sides do not speak the same protocol instead of "the server refused this
+board". An explicit Reconnect clears it, because either side's build may be the
+thing that changed. What this does *not* do is hide the mismatch: the code the
+service sent is the code the person sees.
+
+Deployment state measured the same day, for the next reader of the same journal:
+haproxy on the OVH host already allows `/drive/admit` and `/identity/challenge`
+(`/etc/haproxy/haproxy.cfg:59-60`, limit 180/10 s), so a 404 from
+`/identity/challenge` is the **service's own** posture
+(`identity_enrollment.rs:381`, no `google_enrollment` configured — see the
+`enrollmentAbsent` note above), not a stale proxy rule. Do not go looking for a
+proxy reload in this incident; there was none to do.
+
+### Legacy relocation and restrictions disabled
+
+Automatic relocation of legacy boards and automatic read-only restrictions on
+legacy snapshots are disabled. Operation sync no longer requires those older
+files to have a read-only restriction. Existing Drive restrictions are not
+removed by this change. The `migration-*.json` baseline records remain in use
+by current boards and are still read when another device opens them.
+
+### Drive-authorized operation sync
+
+The operation-sync client uses Google identity and Drive permission checks for
+account and board rooms. It does not fall back to signed device authorities or
+the identity-enrollment directory when those credentials are unavailable; the
+live channel remains unavailable until they can be obtained. Its collaboration
+panel no longer starts the old enrollment flow or offers legacy grant controls.
+The relay's legacy protocol endpoints are unchanged and remain separately
+deployable; disabling those server endpoints requires a coordinated deployment.
+

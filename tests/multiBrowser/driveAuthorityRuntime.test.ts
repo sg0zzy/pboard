@@ -13,6 +13,42 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
   const cloud = createCloud();
   const browsers: BrowserHandle[] = [];
   afterEach(async () => { for (const browser of browsers.splice(0)) await browser.close(); });
+  it('starts and reconnects with Drive admission without contacting legacy identity or grant endpoints', async () => {
+    const ownCloud = createCloud(), originalFetch = ownCloud.fetch;
+    const legacyPaths: string[] = [];
+    ownCloud.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path.startsWith('/identity/') || path.startsWith('/grants/')) legacyPaths.push(path);
+      return await originalFetch(input, init);
+    }) as typeof fetch;
+    const a = await createBrowser({ label: 'drive-only-authority', email: 'drive-only@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
+    const board = await a.rx.createProject('Drive authorized', 'project');
+    await a.runtime.googleDrive.syncProject(board.id, { force: true });
+    await a.runtime.collaborationManager.start(board.id);
+    await waitFor(() => logStatusOf(a, board.id)?.phase === 'synced', 'Drive room connected');
+    await a.runtime.healRelay(board.id, { force: true });
+    const socket = ownCloud.signaling.sockets.find(entry => entry.readyState === 1);
+    socket?.kill();
+    await waitFor(() => logStatusOf(a, board.id)?.phase === 'synced', 'Drive room recovered');
+    expect(ownCloud.signaling.admitted.length).toBeGreaterThan(0);
+    expect(legacyPaths).toEqual([]);
+  });
+  it('does not fall back to a signed authority when Google identity credentials are unavailable', async () => {
+    const ownCloud = createCloud(), originalFetch = ownCloud.fetch;
+    const legacyPaths: string[] = [];
+    ownCloud.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      if (path.startsWith('/identity/') || path.startsWith('/grants/')) legacyPaths.push(path);
+      return await originalFetch(input, init);
+    }) as typeof fetch;
+    const a = await createBrowser({ label: 'missing-drive-identity', email: 'missing@example.com', cloud: ownCloud }); browsers.push(a);
+    const board = await a.rx.createProject('No identity credentials', 'project');
+    await a.runtime.googleDrive.syncProject(board.id, { force: true });
+    await a.runtime.accountChannel.start();
+    await a.runtime.collaborationManager.start(board.id);
+    expect(ownCloud.signaling.sockets).toHaveLength(0);
+    expect(legacyPaths).toEqual([]);
+  });
   it('discovers new boards in both directions without a manual Drive sync', async () => {
     const ownCloud = createCloud();
     const a = await createBrowser({ label: 'new-board-a', email: 'same@example.com', cloud: ownCloud, driveAuthority: true, publishCreated: true }); browsers.push(a);

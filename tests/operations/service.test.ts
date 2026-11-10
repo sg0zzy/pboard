@@ -23,9 +23,10 @@ it('migrates an actual repository, captures editing commands and synchronizes wi
   const a = await client(fake, layout); const project = await a.rx.createProject('Original', 'project');
   const card = await a.rx.addItem({ projectId: project.id, content: 'Original card' });
   await a.service.sync(project.id, true);
-  expect(fake.files.get(layout.projectFileId!)?.contentRestrictions?.[0].readOnly).toBe(true);
+  expect(fake.files.get(layout.projectFileId!)?.contentRestrictions).toBeUndefined();
   const oldBytes = fake.files.get(layout.projectFileId!)!.body;
   fake.role = 'editor'; const b = await client(fake, layout); await b.service.sync(project.id, true);
+  expect(fake.requests.filter(request => request.method === 'PATCH')).toHaveLength(0);
   expect((await b.rx.listCards(project.id))[0].content).toBe('Original card');
   await a.rx.updateItem(card.id, { content: 'Edited by A' });
   await b.rx.updateItem(card.id, { title: 'Edited by B' });

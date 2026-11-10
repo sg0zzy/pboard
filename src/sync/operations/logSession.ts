@@ -36,7 +36,7 @@ import { collaborationCounters } from '../../collab/counters';
 import { trackTransportSocket, type TransportDial, type TransportTrigger } from '../transportDiagnostics';
 import { automaticAuthBudget, type AuthBudget } from '../../collab/authBudget';
 import {
-  LOG_CONNECT_TIMEOUT_MS, LOG_HEARTBEAT_MS, LOG_REQUEST_TIMEOUT_MS, reconnectDelay, terminalRefusal, ServiceAdmissionUnavailable
+  LOG_CONNECT_TIMEOUT_MS, LOG_HEARTBEAT_MS, LOG_REQUEST_TIMEOUT_MS, protocolRefusal, reconnectDelay, terminalRefusal, ServiceAdmissionUnavailable
 } from './logPolicy';
 
 export type Frame = Record<string, unknown>;
@@ -171,6 +171,14 @@ export class RelaySession {
   private attempts = 0;
   private bypassRemaining = false;
   private throttled = false;
+  /** The service's protocol-family verdict (`malformed`, `unknown_action`, …)
+   * that stopped this connection, when that is why it stopped. Kept apart from
+   * `throttled` because the two need different words: one is "this browser and
+   * that service do not speak the same protocol", the other is "this context
+   * dialled too often". Both stop automatic dials; only one is cured by a person
+   * pressing Reconnect, and reporting the ceiling's reason for the other hid the
+   * cause entirely. */
+  private protocolVerdict: string | undefined;
   private lastDisconnect: string | null = null;
   private releaseDial: (() => void) | undefined;
   /** The diagnostics record of the socket this session currently owns. */
@@ -321,6 +329,12 @@ export class RelaySession {
     const versions = Array.isArray(probe.welcome.supportedVersions)
       ? probe.welcome.supportedVersions.filter((value): value is number => typeof value === 'number') : [];
     if (!versions.includes(3)) throw new Error('The relay did not offer protocol 3');
+    // A socket can enter CLOSING before its close event runs. A new attachment
+    // can start a dial in that interval, so retire the old socket and its
+    // authentication state before adopting the new welcome.
+    if (this.socket) this.dropSocket('replaced', { reconnect: false });
+    this.authenticated = false;
+    this.primaryPending = undefined;
     this.install(probe.socket, probe.dial);
     this.socket = probe.socket;
     this.welcome = this.readWelcome(probe.welcome);
@@ -340,28 +354,35 @@ export class RelaySession {
     if (this.mode === 'closed') throw new Error('Operation log session is closed');
     // The ceiling is the connection's, so a room attaching to a connection that
     // has stopped is refused with the connection's verdict — not retried into
-    // another dial. Only an explicit Reconnect clears it.
+    // another dial. Only an explicit Reconnect clears either stop.
+    if (this.protocolVerdict !== undefined) throw new AttachRefused(this.protocolVerdict);
     if (this.throttled) throw new SessionThrottled();
     // The room joins the wanted set *before* the dial: a dial is "attach every
     // room this connection is responsible for", and a room that is not wanted yet
     // would make the recovery of a dead context find nothing to carry.
     this.wanted.set(this.roomKey(attachment), attachment);
-    await this.ensureSocket(attachment.dialCause);
-    // `ensureSocket` only resolves once this connection has welcomed; a missing
-    // welcome here is therefore a programming error, and saying so beats sending
-    // a proof bound to nothing.
-    let proof: RoomProof;
-    try {
-      proof = await attachment.prove(this.requireWelcome());
-    } catch (failure) {
-      // A proof that never got built is this room's cause and nobody else's: the
-      // socket it would have used stays up for the siblings, and the room leaves
-      // the wanted set so a dead handle is not re-proved on every later dial.
-      // A refusal no retry can cure is stated in the protocol's own word.
-      this.wanted.delete(this.roomKey(attachment));
-      if (failure instanceof ServiceAdmissionUnavailable && failure.terminal) throw new AttachRefused('service_auth_required');
-      throw failure;
+    let proof: RoomProof | undefined;
+    // An admission ticket is tied to one welcome. If that socket disappears
+    // during the HTTP/key work, discard the ticket and retry against the new
+    // welcome; the session's dial budget still bounds reconnect attempts.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (this.protocolVerdict !== undefined) throw new AttachRefused(this.protocolVerdict);
+      if (this.throttled) throw new SessionThrottled();
+      await this.ensureSocket(attachment.dialCause);
+      const welcome = this.requireWelcome();
+      try {
+        const candidate = await attachment.prove(welcome);
+        if (this.protocolVerdict !== undefined) throw new AttachRefused(this.protocolVerdict);
+        if (this.connected() && this.welcome === welcome) { proof = candidate; break; }
+      } catch (failure) {
+        if (this.protocolVerdict !== undefined) throw new AttachRefused(this.protocolVerdict);
+        if (!this.connected() || this.welcome !== welcome) continue;
+        this.wanted.delete(this.roomKey(attachment));
+        if (failure instanceof ServiceAdmissionUnavailable && failure.terminal) throw new AttachRefused('service_auth_required');
+        throw failure;
+      }
     }
+    if (!proof) throw new Error('Operation log connection repeatedly changed during attachment');
     // A room already carried by this connection is the *hand-over* case: the
     // caller built a fresh handle for a board the context still holds (a heal, a
     // close-and-re-enable, a session re-created after a refusal, or a second
@@ -469,8 +490,13 @@ export class RelaySession {
     const redial = options.redial !== false;
     if (options.userInitiated) {
       // The person pressed Reconnect: they may have renewed exactly the material
-      // that was refused, so both the ceiling and its ledger start again.
+      // that was refused, so both the ceiling and its ledger start again. A
+      // protocol verdict is cleared by the same gesture — pressing it is how a
+      // person says "I updated something the ledger cannot see" — and unlike the
+      // ceiling it may genuinely be worth another try, because the thing that
+      // changed can be the extension or the service.
       this.throttled = false;
+      this.protocolVerdict = undefined;
       this.attempts = 0;
       this.attemptsAt.length = 0;
       this.bypassRemaining = false;
@@ -527,6 +553,10 @@ export class RelaySession {
   /** A dial after the mode is known: the ceiling and both budget gates, then the
    * handshake, then every wanted room goes back in. */
   private async dial(trigger?: TransportTrigger): Promise<void> {
+    // No path into a dial bypasses the connection's protocol verdict: re-asking
+    // a relay that answered `malformed` buys the identical verdict and spends a
+    // shared-budget upgrade to get it.
+    if (this.protocolVerdict !== undefined) throw new AttachRefused(this.protocolVerdict);
     // Everything local is settled before the network is asked for anything: a
     // room whose authorization has expired must not spend this context's dial
     // attempt — the recovery ladder it belongs to is backoff, not the ceiling.
@@ -566,7 +596,12 @@ export class RelaySession {
     if (!versions.includes(3)) {
       probe.release();
       probe.socket.close();
+      // The same stop as a protocol refusal, with the same reporting: the
+      // service does not speak this context's protocol, so no further dial can
+      // change the answer. Recorded as the verdict so a later `attach` says
+      // `version_unsupported` instead of the ceiling's reason.
       this.throttled = true;
+      this.protocolVerdict = 'version_unsupported';
       this.dropSocket('version_unsupported', { reconnect: false });
       throw new Error('The relay does not offer protocol 3');
     }
@@ -771,6 +806,17 @@ export class RelaySession {
       // The socket is up; what is missing is a room that never made it back in.
       await this.attachWanted();
     } catch (failure) {
+      if (failure instanceof AttachRefused) {
+        // The connection carries a protocol verdict, so `dial` refused to ask the
+        // relay again. Reporting the service's own code and stopping is the whole
+        // point: the ladder would otherwise wake forever to produce the identical
+        // verdict, and every room's status would end up reading as a reconnect.
+        for (const [room, attachment] of [...this.wanted]) {
+          this.wanted.delete(room);
+          attachment.failed(failure.code);
+        }
+        return;
+      }
       if (failure instanceof SessionThrottled) {
         // The ceiling engaged: nothing automatic may try again. Every room this
         // connection was carrying is stopped with that verdict — the ceiling is
@@ -800,8 +846,8 @@ export class RelaySession {
   // --- the wire -------------------------------------------------------------
 
   private install(socket: WebSocket, dial?: TransportDial): void {
-    socket.onmessage = event => { void this.receive(String(event.data)); };
-    socket.onerror = () => { this.lastDisconnect ??= 'network'; };
+    socket.onmessage = event => { if (this.socket === socket) void this.receive(String(event.data)); };
+    socket.onerror = () => { if (this.socket === socket) this.lastDisconnect ??= 'network'; };
     // Recorded before the ownership guard in `onClose`: a dial that a *newer*
     // socket has already replaced still ended, and the diagnostics ledger
     // counts connections, not the session's current one.
@@ -978,7 +1024,17 @@ export class RelaySession {
         const code = aString(message.code) ?? 'server_error';
         collaborationDiagnostic('logsync.session_refused');
         this.lastDisconnect = `refused:${code}`;
-        this.throttled = false;
+        // A protocol-family verdict is about *this build's frames*, not about the
+        // network: every further dial this context makes will be answered the same
+        // way, and each one costs a shared-budget request. So the connection stops
+        // as `version_unsupported` already does — `attach` refuses to dial and only
+        // an explicit Reconnect may try again — and it stops *as that verdict*:
+        // `attach` reports the service's own code rather than the ceiling's, which
+        // is what previously let `reconnect:throttled` replace the real cause in the
+        // sidebar after a few re-opened boards had spent the dial allowance.
+        const protocol = protocolRefusal(code);
+        this.throttled = protocol;
+        if (protocol) this.protocolVerdict = code;
         const failure = new AttachRefused(code);
         for (const entry of [...this.pending.values()]) { clearTimeout(entry.timer); entry.reject(failure); entry.attachment.failed(code); }
         this.pending.clear();
@@ -1084,6 +1140,9 @@ export class RelaySession {
       } catch (cause) {
         clearTimeout(timer);
         this.pending.delete(proof.room);
+        // A failed first send never authenticated anything. Leaving this set
+        // makes the next room send `attach` as the first frame on the socket.
+        if (first && this.primaryPending === proof.room) this.primaryPending = undefined;
         reject(cause instanceof Error ? cause : new Error(String(cause)));
       }
     });

@@ -664,7 +664,9 @@ of scope; rotation is a separate decision.
 ### Limits
 
 Per connection: submit batch and operation size derived from the existing message
-budget; replay 512 rows per frame. Per board: 200 000 operations, 64 MiB. Global:
+budget; replay at most 512 rows per frame by default. Clients can request `limit: 128`
+and must request subsequent pages until
+they reach the first response's `liveFromSeq - 1`. Per board: 200 000 operations, 64 MiB. Global:
 512 MiB. A batch that would exceed capacity is refused whole, because accepting
 part of a batch leaves a client with an acknowledgment it cannot retry
 idempotently. Live subscribers that cannot drain are dropped, never waited on.

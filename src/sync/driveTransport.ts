@@ -12,6 +12,8 @@ export type DriveAppDataFile = {
   id: string;
   name: string;
   modifiedTime?: string;
+  /** Google Drive's monotonically increasing file version, when available. */
+  version?: string;
 };
 
 export interface DriveTransport {
@@ -108,7 +110,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
       const params = new URLSearchParams({
         spaces: regularParent ? "drive" : "appDataFolder",
         q: `name contains '${escapeDriveQuery(filePrefix)}' and trashed = false${regularParent ? ` and '${escapeDriveQuery(await regularParent())}' in parents` : ''}`,
-        fields: "nextPageToken,files(id,name,modifiedTime)",
+        fields: "nextPageToken,files(id,name,modifiedTime,version)",
         pageSize: "100"
       });
       if (pageToken) params.set("pageToken", pageToken);

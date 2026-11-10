@@ -147,7 +147,7 @@ export class DriveStub {
         && (nameEq === undefined || f.name === nameEq)
         && (nameIn === undefined || f.name.includes(nameIn))
         && (mimeType === undefined || f.mimeType === mimeType));
-      return json({ files: listed.map(f => ({ id: f.id, name: f.name, parents: f.parents, mimeType: f.mimeType, createdTime: f.createdTime, modifiedTime: f.modifiedTime, size: String(f.bytes.length) })) });
+      return json({ files: listed.map(f => ({ id: f.id, name: f.name, parents: f.parents, mimeType: f.mimeType, createdTime: f.createdTime, modifiedTime: f.modifiedTime, version: String(f.version), size: String(f.bytes.length) })) });
     }
     if (api && method === "POST") {
       const parsed = JSON.parse(String(init.body)) as { name?: string; parents?: string[]; mimeType?: string };

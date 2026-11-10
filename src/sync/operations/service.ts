@@ -224,9 +224,8 @@ export function createOperationService(options: {
         for (const file of markers) {
           const marker = parseStrictJson(await drive.read(file.id)) as unknown as MigrationMarker;
           if (marker.protocol !== PROTOCOL || marker.boardId !== boardId || !Array.isArray(marker.legacyFileIds) || (typeof marker.snapshotFileId !== 'string' && !Array.isArray(marker.baselineSegmentIds))) throw new Error('Unsupported board protocol. Upgrade Pboard; local work is retained.');
-          for (const id of marker.legacyFileIds) {
-            if (!await legacyBarrierIntact(drive, id)) throw new Error('The legacy write barrier was removed. Re-lock the legacy snapshot before syncing.');
-          }
+          // Legacy write barriers are no longer required; existing markers are
+          // still read because current boards use them to locate their baseline.
           legacyIds.push(...marker.legacyFileIds);
         }
         for (const file of initialFiles.filter(file => file.name.startsWith('snapshot-'))) checkpoints.push((await readSnapshot(drive, file.id, boardId)).checkpoint);
@@ -275,21 +274,20 @@ export function createOperationService(options: {
           throw new Error('Legacy content is available read-only. A Drive editor must upgrade this board to synchronize operations.');
         }
         if (legacyFileId) {
-          // Validate compatibility before installing a write barrier. Read again
-          // after locking so an edit committed during preflight is included.
+          // Validate the discovery snapshot before creating the operation baseline.
           const preflight = await readLegacy();
           if (preflight.project.id !== boardId) throw new Error('Legacy board identity mismatch');
           await legacyBootstrap(preflight, rx);
-          await drive.protectLegacy(legacyFileId); legacyIds = [legacyFileId];
+          // Do not make the board snapshot read-only for legacy clients.
+          legacyIds = [legacyFileId];
           legacy = await readLegacy();
         }
         if (!legacy && local) legacy = { format: 'pboard-project', version: 1, exportedAt: new Date().toISOString(), ...local };
         if (!legacy || legacy.project.id !== boardId) throw new Error('No matching recoverable board exists');
         const bootstrap = await legacyBootstrap(legacy, rx); base = bootstrap.engine;
-        await options.freezeLegacyMirrors?.(boardId, drive);
+        // Automatic protection of legacy mirrors is disabled.
         if (local && legacyFileId) await preserveLocalFork(rx, local, legacy);
-        // Keep the legacy discovery identity, including for new unified boards.
-        // Old clients can read this checkpoint but cannot overwrite it.
+        // Keep the discovery identity used by existing current-board clients.
         let discoveryId = shared.projectFileId;
         if (!discoveryId) {
           discoveryId = await drive.allocateId();
@@ -303,8 +301,7 @@ export function createOperationService(options: {
         if (!intent) intent = await rx.operationSource.local.prepareSnapshot(await createSnapshotAsync(base), await drive.allocateId());
         await drive.publishSnapshot(intent.fileId, intent.snapshot); await rx.operationSource.local.snapshotPublished(intent.id);
         await syncImages(rx, drive, boardId, base.state().cards.flatMap(card => card.image ? [card.image as { id: string }] : []));
-        // The marker is immutable; a crash before it leaves the source locked and
-        // recoverable, and retry publishes another equivalent candidate safely.
+        // The marker is immutable; a retry can publish an equivalent candidate.
         await drive.publishMigration(await drive.allocateId(), { protocol: PROTOCOL, boardId, snapshotFileId: intent.fileId, legacyFileIds: legacyIds });
         } else {
           // Editors bootstrap through the same immutable operation protocol;
@@ -359,7 +356,7 @@ export function createOperationService(options: {
       return verifiedRole;
     };
     const session = new OperationSession({ boardId, polling: false, realtime: false,
-      beforeSync: async () => { await rx.operationSource.recover(boardId); for (const id of binding!.legacyFileIds) if (!await legacyBarrierIntact(drive, id)) throw new Error('Legacy write protection was removed. Re-lock the legacy checkpoint before synchronization.'); },
+      beforeSync: async () => { await rx.operationSource.recover(boardId); },
       afterSync: async publish => syncImages(rx, drive, boardId, (await rx.db.cards.find({ selector: { projectId: boardId } }).exec()).flatMap(card => card.imageId ? [{ id: card.imageId }] : []), publish),
       broadcast: operations => realtime?.broadcast(operations) ?? Promise.resolve(false),
       setRealtimeEnabled: async enabled => {

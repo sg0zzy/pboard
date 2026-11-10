@@ -111,6 +111,17 @@ beforeEach(async () => {
 afterEach(() => { vi.useRealTimers(); Relay.instances = []; });
 
 describe('operation log transport', () => {
+  it('submits a backlog in bounded batches without losing acknowledgments', async () => {
+    const sync = await start();
+    try {
+      const operations = Array.from({ length: 70 }, (_, i) => operation(i + 1));
+      expect(await sync.broadcast(operations)).toBe(true);
+      const batches = Relay.instances[0].requests.filter(request => request.action === 'submit');
+      expect(batches.map(request => request.operations.length)).toEqual([16, 16, 16, 16, 6]);
+      expect(batches.flatMap(request => request.operations.map((op: { opId: string }) => op.opId))).toEqual(operations.map(op => op.opId));
+      expect(sync.status().appliedSeq).toBe(70);
+    } finally { await sync.close(); }
+  });
   it('sends migration fence and cancellation over the existing connection', async () => {
     const sync = await start();
     try {
@@ -142,7 +153,7 @@ describe('operation log transport', () => {
       expect(authenticate.room).toBe(room);
       expect(room).not.toBe(topic); // The log never sees the Drive topic as an identity.
       expect(authenticate.version).toBe(2);
-      expect(Relay.instances[0].requests[0]).toEqual({ action: 'subscribe', board: room, afterSeq: 7 });
+      expect(Relay.instances[0].requests[0]).toEqual({ action: 'subscribe', board: room, afterSeq: 7, limit: 128 });
       expect(sync.status()).toMatchObject({ phase: 'synced', appliedSeq: 7 });
     } finally { await sync.close(); }
   });
@@ -331,6 +342,11 @@ describe('operation log transport', () => {
     expect(describeLogStatus(status('offline'))).toContain('Reconnecting');
     expect(describeLogStatus(status('snapshot'))).toContain('snapshot');
     expect(describeLogStatus(status('error', { error: 'authorization_changed' }))).toContain('authorization_changed');
+    // A protocol verdict is a mismatch between this build and the service, so it
+    // must not be worded as the board being refused: that sends the person to
+    // re-share a board that needs an update instead. The service's code stays.
+    expect(describeLogStatus(status('error', { error: 'malformed' }))).toMatch(/do not speak the same protocol \(malformed\)/);
+    expect(describeLogStatus(status('error', { error: 'version_unsupported' }))).toMatch(/do not speak the same protocol/);
   });
 
   it('grants a consolidation lease and records snapshot evidence with that epoch', async () => {

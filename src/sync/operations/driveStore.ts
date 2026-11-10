@@ -10,6 +10,11 @@ import { driveHttpError, isDriveGone, noteDriveResourceGone, driveResourceKnownG
 
 const API = 'https://www.googleapis.com/drive/v3';
 const UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
+// A 404 on PATCH is not proof that a readable file is gone. Cool down only the
+// rejected write, scoped to the auth provider and transport; each caller still
+// rechecks the file's metadata and preserves the original protection verdict.
+const LEGACY_PATCH_RETRY_MS = 60_000;
+const legacyPatchRefusals = new WeakMap<GoogleAuthProvider, WeakMap<typeof fetch, Map<string, { until: number; owned: boolean }>>>();
 export type ImmutableFile = { id: string; name: string; size?: string; createdTime?: string };
 export type DriveRole = 'owner' | 'editor' | 'viewer' | 'revoked';
 /** Receives a known regular Drive folder ID; never invokes legacy filename merge.
@@ -21,6 +26,11 @@ export function createOperationDriveStore(options: {
   inventory?: (full: () => Promise<ImmutableFile[]>, force: boolean) => Promise<ImmutableFile[]>; quota?: DriveQuotaThrottle;
 }) {
   const fetcher = options.fetcher ?? fetch;
+  let byFetcher = legacyPatchRefusals.get(options.auth);
+  if (!byFetcher) { byFetcher = new WeakMap(); legacyPatchRefusals.set(options.auth, byFetcher); }
+  let refusals = byFetcher.get(fetcher);
+  if (!refusals) { refusals = new Map(); byFetcher.set(fetcher, refusals); }
+  const patchRefusals = refusals;
   const quota = options.quota ?? defaultDriveQuotaThrottle();
   const assertRole = async (write: boolean, owner = false) => {
     const role = await options.role();
@@ -161,7 +171,13 @@ export function createOperationDriveStore(options: {
     }
     if (!['board.json.gz', 'project.json', `project-${options.boardId}.pboard`].includes(file.name)
       || (file.name === 'project.json' && !file.parents?.includes(options.folderId))) throw new Error('Legacy migration file identity mismatch');
-    if (file.contentRestrictions?.some(restriction => restriction.readOnly)) return;
+    if (file.contentRestrictions?.some(restriction => restriction.readOnly)) { patchRefusals.delete(fileId); return; }
+    const refusal = patchRefusals.get(fileId);
+    if (refusal && refusal.until > Date.now() && refusal.owned === (file.ownedByMe === true)) {
+      if (refusal.owned) throw new Error('Legacy write barrier could not be applied: this account owns the file but Drive refused to restrict it.');
+      return;
+    }
+    patchRefusals.delete(fileId);
     const response = await call(`${API}/files/${encodeURIComponent(fileId)}?fields=contentRestrictions`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentRestrictions: [
         { readOnly: true, ownerRestricted: boardRole === 'owner' && file.ownedByMe === true, reason: 'Pboard operation protocol: upgrade Pboard before editing this board.' }
@@ -180,6 +196,10 @@ export function createOperationDriveStore(options: {
         if (isDriveGone(error)) { noteDriveResourceGone(fileId); return null; }
         throw error;
       });
+      if (response.status === 404 && current && !current.contentRestrictions?.some(restriction => restriction.readOnly)) {
+        if (patchRefusals.size >= 512) patchRefusals.delete(patchRefusals.keys().next().value!);
+        patchRefusals.set(fileId, { until: Date.now() + LEGACY_PATCH_RETRY_MS, owned: current.ownedByMe === true });
+      }
       if (current === null || current.contentRestrictions?.some(restriction => restriction.readOnly) || !current.ownedByMe) return;
       throw new Error('Legacy write barrier could not be applied: this account owns the file but Drive refused to restrict it.');
     }
@@ -187,7 +207,7 @@ export function createOperationDriveStore(options: {
   }
   return {
     allocateId, inventory, read, metadata, folderRole, protectLegacy,
-    async createLegacy(fileId: string, text: string) { await publish(fileId, 'project.json', text); await protectLegacy(fileId); },
+    async createLegacy(fileId: string, text: string) { await publish(fileId, 'project.json', text); },
     async publishImage(fileId: string, imageId: string, image: BoardImage) {
       if (!/^[a-f0-9]{64}$/.test(imageId) || !['image/png', 'image/jpeg', 'image/webp'].includes(image.mimeType)
         || !image.dataUrl.startsWith(`data:${image.mimeType};base64,`) || (await hashBlob(await imageToBlob(image.dataUrl))) !== imageId) throw new Error('Invalid image asset');

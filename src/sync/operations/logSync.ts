@@ -42,7 +42,7 @@ import type { Operation } from './protocol';
 import { readLegacyMigrationWindow } from './legacyMigrationWindow';
 import { createGoogleDriveRoomProof, type GoogleDriveCredentials } from './googleDriveAdmission';
 import type { LegacyRelayRow } from './legacyRelayRecovery';
-import { clearReconnectLedger as clearPolicyLedger, reconnectDelay, reconnectLedger, terminalRefusal, ServiceAdmissionUnavailable } from './logPolicy';
+import { clearReconnectLedger as clearPolicyLedger, protocolRefusal, reconnectDelay, reconnectLedger, terminalRefusal, ServiceAdmissionUnavailable } from './logPolicy';
 import {
   aBoolean, aNumber, aString, createRoomCore, frames, proveRoom, type Frame, type LogMetrics, type RoomCore
 } from './logRoom';
@@ -97,7 +97,13 @@ export function describeLogStatus(status: LogSyncStatus): string {
       : 'Connected to the Pboard server; edits are stored there as you type.';
     case 'bootstrap': return 'Reading the board’s stored history from the Pboard server…';
     case 'snapshot': return 'This board needs a newer snapshot before it can continue; your edits stay on this device until it is published.';
-    case 'error': return `The Pboard server refused this board (${status.error ?? 'reason unknown'}).`;
+    // A protocol-family verdict names a mismatch between *this build and that
+    // service*, not a fault of the board. Saying "refused this board" here sends
+    // the person to re-share something that needs updating instead. The service's
+    // own code stays in the sentence because it is the diagnostic.
+    case 'error': return status.error && protocolRefusal(status.error)
+      ? `This browser and the Pboard server do not speak the same protocol (${status.error}); one of them needs to be updated.`
+      : `The Pboard server refused this board (${status.error ?? 'reason unknown'}).`;
     default: return 'Reconnecting to the Pboard server; your edits stay on this device until it returns.';
   }
 }
