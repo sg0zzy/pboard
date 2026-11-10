@@ -6,7 +6,7 @@ Milestone 0.1 established the native shell. Milestone 0.2 adds local boards and 
 
 ## Google Drive and WebRTC
 
-Android now shares the extension's Drive snapshots, shared-board discovery, account ordering/preferences, permissions, image transport and WebRTC replication. Native Google Identity Services supplies access tokens. **Settings → Google Drive** provides Connect, Reconnect, Sync now and Disconnect. Open a board to see its access role/live peer count and invite editors or viewers through **Share board**. Existing collaborators can also be managed from the extension.
+Android now shares the extension's Drive snapshots, shared-board discovery, account ordering/preferences, permissions, image transport and WebRTC replication. Native Google Identity Services supplies access tokens. **Settings → Google Drive** provides Connect, Reconnect, Sync now and Disconnect. Open a board to see its access role/live peer count and invite editors or viewers through **Share board**. The control sits on that same status row and keeps its place from the first frame: it is rendered but disabled while the role is resolving, so finishing the connection does not move the board content, and the invitation form opens below the row rather than inside it. Editors and viewers, who cannot invite, do not get the control. Existing collaborators can also be managed from the extension.
 
 Create an **Android OAuth client in the existing Firefox Google Cloud project**. No Android client ID, client secret, `.env` variables or `google-services.json` needs to be put into this app. Google identifies the package/signing certificate directly. See [GOOGLE_DRIVE_SETUP.md](GOOGLE_DRIVE_SETUP.md) for exact fields, this machine's debug SHA-1 and validation steps.
 
@@ -38,9 +38,44 @@ Boards reuse the existing `Project` model (`id`, `name`, `template`, `revision`,
 
 `sortBoards` receives this ordered list, deduplicates by ID (first occurrence wins), places the four most recently edited boards first, then appends the remainder in manual order. Equal timestamps retain manual order; invalid/missing dates are oldest. Reads, opening a board, preview settings and manual board ordering do not change edit timestamps. Card edits and card moves do. Synchronization is not implemented and cannot touch timestamps here.
 
-Categories are presentation mappings: brainstorming → Notes, idea → Ideas, project/software_project → Project. Overview accents/tints follow the first visible card type, using the browser’s existing `boardTemplates` definitions; empty boards use its neutral note colors. Card chips and accent borders use the same definitions, and status colors match the browser in both themes. These presentation choices add no persisted fields. A preview uses the first card in repository order that is neither deleted nor in trash, preferring its title over text. Trash cards remain editable in their collapsible container so their status can be restored. Permanent deletion uses the repository’s existing tombstone behavior.
+Categories are presentation mappings: brainstorming → Notes, idea → Ideas, project/software_project → Project. Each category owns one accent colour in `src/data/categories.ts`, which also supplies the label, so name and colour cannot drift apart. The home tile's top border and category chip use that accent; the hue is taken from the template's own card palette, so a board never shows a colour that does not exist inside it. Both project templates share the Project hue, and an unknown or missing template falls back to Notes. Because the accent comes from the category rather than the first card, editing, reordering or emptying a board cannot change its tile colour. The tile surface is theme-derived, with the preview panel one step raised so it stays a distinct block in dark mode. Card chips and accent borders use the same definitions, and status colors match the browser in both themes. These presentation choices add no persisted fields. A preview uses the first card in repository order that is active — not deleted, and not in the Done, Rejected or Trash containers — preferring its title over text. Moving every active card into a terminal container therefore returns the tile to “No cards yet”; the home screen follows the reactive snapshot, so it updates without reopening the board. Trash cards remain editable in their collapsible container so their status can be restored. Permanent deletion uses the repository’s existing tombstone behavior.
+
+### Main and board layouts
+
+Two toolbar toggles switch presentation only; neither changes cards, ranks, statuses or edit timestamps.
+
+- **Home — Board only.** The `Board only layout` button in the home toolbar is the same persisted `android.showCardPreviews` setting as **Settings → Show card previews**, so both stay in sync. With previews off, tiles drop the preview panel and shrink to name + category (`board-tile--compact`); with previews on they keep the fixed-height tile and three-line preview.
+- **Board — First row only.** `First row only` in the board toolbar persists `android.collapseCards`. When set, every active and terminal card collapses to its existing top line — category chip, status and a one-line summary (title, else first non-empty text line, else “Image card”) — followed by the card actions button. Tapping, Enter or Space on a collapsed row expands that card in place without opening the editor; the expansion is per visit and not stored. Swipe, drag, reorder, status, bulk actions and the export buttons are unchanged. Both settings are read through `readSnapshot`, written by `setShowPreviews`/`setCollapseCards`, and rendered only from the reactive snapshot.
 
 ## Development
+
+### Responsiveness
+
+Measured on the current board code before changing it, at 300 cards. Numbers are
+desktop timings, so treat them as relative rather than absolute phone costs.
+
+| Path | Before | After |
+| --- | --- | --- |
+| Drag update, one frame | ~78 ms (re-queried the whole list per candidate card) | ~0.03 ms (one node map per frame) |
+| Board re-render per card write | ~92 ms (every row re-parsed its Markdown) | ~19 ms (memoized rows, `StableFingerprint`) |
+| Snapshot renders per write | 3 (watcher ×2 plus an explicit read) | 1 (`snapshotsEqual` dedupe) |
+| Idle foreground tick | 1 full-tree render per second (`pollLive` emitted unconditionally) | none unless peers/error change |
+| Board download, 60 photos | compression blocked the UI thread for ~170–200 ms | worker thread; UI kept ticking (measured in Chromium: 0 timer ticks during sync zip, 55 during the worker zip, worst stall 12 ms) |
+| Photo picked | decode + re-encode on the UI thread | `createImageBitmap` + `OffscreenCanvas` off the render path |
+
+Cards are now rendered by the memoized `components/BoardCard.tsx`, so a single
+write only re-renders the row whose data changed. `mutate` queues edits instead
+of dropping them: the previous in-flight guard silently discarded a second tap,
+which lost a fast second swipe or a Save pressed twice. The queue keeps
+repository writes ordered and clears `busy` only when nothing is pending.
+
+Two behaviours were deliberately left alone. Drag moves still compute one update
+per input event rather than coalescing through `requestAnimationFrame`; coalescing
+changed observable drop-order timing for no measurable gain once the O(n²) lookup
+was removed. Archive compression stays on the ZIP codec already used by the
+shared builder — fflate's callback `zip` is not a substitute, because it only
+offloads files of 160 KB or more, so normal photos still compress on the calling
+thread (measured parity with `zipSync`).
 
 Use Node 24 (the root `.nvmrc`), npm, JDK 21 and Android SDK 36. From the repository root:
 
@@ -55,7 +90,7 @@ npm run android:run   # build, sync and run on a selected device/emulator
 npm run android:debug # build, sync and Gradle assembleDebug
 ```
 
-Tests use `*.check.ts(x)` with an Android-local Vitest pattern so extension test discovery remains unchanged. They cover sorting, restart persistence, edit timestamps, ordering/previews, subscription cleanup, forms, back navigation, error recovery, deletion confirmation and draft preservation.
+Tests use `*.check.ts(x)` with an Android-local Vitest pattern so extension test discovery remains unchanged. They cover sorting, restart persistence, edit timestamps, ordering/previews, subscription cleanup, forms, back navigation, error recovery, deletion confirmation, draft preservation, queued writes, off-thread photo processing and board-archive parity with the shared builder.
 
 ## Android build and ADB installation
 
@@ -109,7 +144,9 @@ Run the debug APK on a connected device and open `chrome://inspect/#devices` in 
 
 From the repository root, extension checks remain `npm ci && npm run check`.
 
-Workspace validation: all 82 Android tests in 12 files, frontend typecheck/build, Capacitor sync and Gradle debug APK passed. Extension checks on rebased main passed all 399 tests in 60 files, both Firefox/Chromium builds and build verification. Pixel 8a/API 36 emulator checks covered light/dark startup and live theme changes, creation of a board/card with no active network, persisted text and preview settings after process restart, native back and no horizontal overflow. Follow-up emulator checks verified trusted touch hold/drag, persisted new order after restart, and tapping toolbar Save while the soft keyboard was visible.
+Current workspace validation at this revision: 130 Android tests in 23 files, Android `tsc --noEmit` and the frontend build pass, and the extension suite passes 1,870 tests in 257 files. Capacitor sync, the Gradle debug APK and Pixel 8a/API 36 emulator checks were **not** re-run after the recent UI changes; the device checks recorded in the milestone sections below describe earlier builds.
+
+Layout and behaviour changes after those builds were verified in Chromium at phone viewport (1080 × 1920 and 380 × 620, light and dark) using the repository's own Vite bundle and the real components, not only unit tests. That covers the two view layouts, the Material card-menu glyphs, the collaboration strip's fixed header row, and the category-coloured home tiles. A real WebView remains the outstanding check for those surfaces.
 
 ## Limitations and later milestones
 
@@ -156,6 +193,8 @@ Container changes: added `src/data/cardContainers.ts`; updated `src/screens/Boar
 
 Pixel 8a/API 36 container verification: trash persisted after APK update and process restart; trusted taps expanded its section; restoring a card returned it to the active list; a trusted right swipe moved it into collapsed Done; the Done bulk action moved it into Trash; Android back cancelled the empty-trash confirmation; confirming it removed the trash cards. No horizontal overflow occurred throughout.
 
+
+Card menu icons: `src/components/MaterialIcon.tsx` adds the standard Material Symbols (filled, 24 dp) used only by menu surfaces, so menus match Android's own menu rows while the toolbar keeps the app's outline set. Every card-action row has a leading glyph — copy, duplicate, add-below, merge, delete — and the display-mode segmented control uses four-line/standard/collapse glyphs that stay mutually distinguishable at 20 dp. Icons inherit the row's colour, so the destructive row dims and reddens as one unit, and disabled rows dim the icon and label together. Merge-target rows put the target's status inline after the label instead of beneath it, keeping one row height per target. `tests/cardMenuIcons.check.tsx` pins each row's label, glyph and order, and that no two actions share a glyph.
 
 Colored card choices: the board’s category/status buttons open `src/components/CardFieldPicker.tsx`, a compact Material-style dialog. Category options reuse `cardColors` and `.card-type-label`; status options reuse `.card-status` and the existing status color classes, including light/dark overrides. The current choice has a checkmark and accessible pressed state. Selecting an option follows the same immediate single-field save path; Cancel, Escape and Android back close the chooser without saving or leaving the board. These in-app dialogs replace the board’s native select popup so option colors render consistently on Android; editor form selects are unchanged. Changes are confined to the picker, board screen, App modal handling, CSS, interaction/navigation tests and this README.
 

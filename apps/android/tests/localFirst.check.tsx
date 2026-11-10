@@ -93,12 +93,20 @@ describe('local-first editing while cloud role resolution runs', () => {
   });
 
   it('still blocks edits with a notice when the resolved role is viewer', async () => {
+    storage.snapshot.cards = [{ id: 'card', projectId: 'phone', content: 'Locked', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
     cloud.set({ connected: true, resolving: false, projectId: 'phone', role: 'viewer' });
     await act(async () => root.render(<App />)); await click('Open PhoneHaul');
-    // Edit board is disabled only when busy (readOnly) — diagnostic for the gate.
-    console.log('EDIT BOARD DISABLED:', host.querySelector<HTMLButtonElement>('button[aria-label="Edit board"], form-actions button')?.textContent);
-    const buttons = [...host.querySelectorAll('button')].filter(b => b.textContent === 'Edit board');
-    console.log('EDIT DISABLED:', buttons.map(b => b.disabled));
+    // The card row itself is inert, not just the toolbar: this is the path that
+    // a memoized row could silently lose while the tests still passed.
+    const row = host.querySelector<HTMLElement>('[data-card-id]')!;
+    expect(row.tabIndex).toBe(-1);
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.querySelector<HTMLButtonElement>('.card-status')!.disabled).toBe(true);
+    await act(async () => row.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 })));
+    await act(async () => row.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 })));
+    await act(async () => row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true })));
+    expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
+    expect(storage.update).not.toHaveBeenCalled();
     // The resolved viewer gate keeps the board read-only.
     expect(host.querySelector<HTMLButtonElement>('button[aria-label="Create card"]')!.disabled).toBe(true);
     expect(storage.add).not.toHaveBeenCalled();

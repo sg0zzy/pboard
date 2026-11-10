@@ -11457,434 +11457,6 @@
 		"expanded"
 	];
 	//#endregion
-	//#region ../../../../src/cardDisplayModes.ts
-	var DEFAULT_CARD_DISPLAY_MODE = "standard";
-	function normalizeCardDisplayMode(value) {
-		return CARD_DISPLAY_MODES.includes(value) ? value : DEFAULT_CARD_DISPLAY_MODE;
-	}
-	function nextCardDisplayMode(value) {
-		const current = normalizeCardDisplayMode(value);
-		return CARD_DISPLAY_MODES[(CARD_DISPLAY_MODES.indexOf(current) + 1) % CARD_DISPLAY_MODES.length];
-	}
-	//#endregion
-	//#region ../../../../src/sidebar/linkify.ts
-	var URL_PATTERN = /(https?:\/\/[^\s<>"']+|www\.[^\s<>"']+)/gi;
-	var TRAILING_PUNCTUATION = /[.,;:!?\)\]\}]$/;
-	function toSafeWebHref(value) {
-		const candidate = value.toLowerCase().startsWith("www.") ? `https://${value}` : value;
-		try {
-			const url = new URL(candidate);
-			return url.protocol === "http:" || url.protocol === "https:" ? candidate : null;
-		} catch {
-			return null;
-		}
-	}
-	function tokenizeLinks(text) {
-		const parts = [];
-		let cursor = 0;
-		for (const match of text.matchAll(URL_PATTERN)) {
-			const start = match.index;
-			if (start > cursor) parts.push({
-				type: "text",
-				text: text.slice(cursor, start)
-			});
-			const candidate = match[0];
-			let linkText = candidate;
-			while (linkText && TRAILING_PUNCTUATION.test(linkText)) linkText = linkText.slice(0, -1);
-			const href = linkText ? toSafeWebHref(linkText) : null;
-			if (href) parts.push({
-				type: "link",
-				text: linkText,
-				href
-			});
-			const trailing = candidate.slice(linkText.length);
-			if (trailing) parts.push({
-				type: "text",
-				text: trailing
-			});
-			cursor = start + candidate.length;
-		}
-		if (cursor < text.length) parts.push({
-			type: "text",
-			text: text.slice(cursor)
-		});
-		return parts.length ? parts : [{
-			type: "text",
-			text
-		}];
-	}
-	//#endregion
-	//#region ../../node_modules/react/cjs/react-jsx-runtime.production.js
-	/**
-	* @license React
-	* react-jsx-runtime.production.js
-	*
-	* Copyright (c) Meta Platforms, Inc. and affiliates.
-	*
-	* This source code is licensed under the MIT license found in the
-	* LICENSE file in the root directory of this source tree.
-	*/
-	var require_react_jsx_runtime_production = /* @__PURE__ */ __commonJSMin(((exports) => {
-		var REACT_ELEMENT_TYPE = Symbol.for("react.transitional.element");
-		var REACT_FRAGMENT_TYPE = Symbol.for("react.fragment");
-		function jsxProd(type, config, maybeKey) {
-			var key = null;
-			void 0 !== maybeKey && (key = "" + maybeKey);
-			void 0 !== config.key && (key = "" + config.key);
-			if ("key" in config) {
-				maybeKey = {};
-				for (var propName in config) "key" !== propName && (maybeKey[propName] = config[propName]);
-			} else maybeKey = config;
-			config = maybeKey.ref;
-			return {
-				$$typeof: REACT_ELEMENT_TYPE,
-				type,
-				key,
-				ref: void 0 !== config ? config : null,
-				props: maybeKey
-			};
-		}
-		exports.Fragment = REACT_FRAGMENT_TYPE;
-		exports.jsx = jsxProd;
-		exports.jsxs = jsxProd;
-	}));
-	//#endregion
-	//#region ../../../../src/sidebar/markdown.tsx
-	var import_jsx_runtime = (/* @__PURE__ */ __commonJSMin(((exports, module) => {
-		module.exports = require_react_jsx_runtime_production();
-	})))();
-	var INLINE_MARKDOWN = /(`[^`\n]+`|\[[^\]\n]+\]\([^\s)\n]+\)|\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g;
-	var UNORDERED_ITEM = /^\s*[-*]\s+(.+)$/;
-	var ORDERED_ITEM = /^\s*(\d+)\.\s+(.+)$/;
-	var TASK_ITEM = /^\s*[-*]\s+\[([ xX])\]\s+(.+)$/;
-	function tokenizeInlineMarkdown(text) {
-		const tokens = [];
-		let cursor = 0;
-		function appendPlain(value) {
-			tokenizeLinks(value).forEach((part) => tokens.push(part));
-		}
-		for (const match of text.matchAll(INLINE_MARKDOWN)) {
-			const start = match.index;
-			if (start > cursor) appendPlain(text.slice(cursor, start));
-			const source = match[0];
-			if (source.startsWith("`")) tokens.push({
-				type: "code",
-				text: source.slice(1, -1)
-			});
-			else if (source.startsWith("[")) {
-				const separator = source.lastIndexOf("](");
-				const label = source.slice(1, separator);
-				const href = toSafeWebHref(source.slice(separator + 2, -1));
-				if (href) tokens.push({
-					type: "link",
-					text: label,
-					href
-				});
-				else appendPlain(source);
-			} else if (source.startsWith("**")) tokens.push({
-				type: "bold",
-				text: source.slice(2, -2)
-			});
-			else tokens.push({
-				type: "italic",
-				text: source.slice(1, -1)
-			});
-			cursor = start + source.length;
-		}
-		if (cursor < text.length) appendPlain(text.slice(cursor));
-		return tokens.length ? tokens : [{
-			type: "text",
-			text
-		}];
-	}
-	function parseMarkdownBlocks(text) {
-		const blocks = [];
-		let paragraph = [];
-		function flushParagraph() {
-			if (!paragraph.length) return;
-			blocks.push({
-				type: "paragraph",
-				text: paragraph.join("\n")
-			});
-			paragraph = [];
-		}
-		for (const [lineIndex, line] of text.split(/\r?\n/).entries()) {
-			const task = line.match(TASK_ITEM);
-			const unordered = line.match(UNORDERED_ITEM);
-			const ordered = line.match(ORDERED_ITEM);
-			if (task) {
-				flushParagraph();
-				const previous = blocks.at(-1);
-				const item = {
-					text: task[2],
-					checked: task[1].toLowerCase() === "x",
-					lineIndex
-				};
-				if (previous?.type === "task-list") previous.items.push(item);
-				else blocks.push({
-					type: "task-list",
-					items: [item]
-				});
-			} else if (unordered) {
-				flushParagraph();
-				const previous = blocks.at(-1);
-				if (previous?.type === "unordered-list") previous.items.push(unordered[1]);
-				else blocks.push({
-					type: "unordered-list",
-					items: [unordered[1]]
-				});
-			} else if (ordered) {
-				flushParagraph();
-				const previous = blocks.at(-1);
-				if (previous?.type === "ordered-list") previous.items.push(ordered[2]);
-				else blocks.push({
-					type: "ordered-list",
-					items: [ordered[2]],
-					start: Number(ordered[1])
-				});
-			} else if (!line.trim()) flushParagraph();
-			else paragraph.push(line);
-		}
-		flushParagraph();
-		return blocks;
-	}
-	function setTaskCheckedAtLine(text, lineIndex, checked) {
-		const lines = text.split(/\r?\n/);
-		const line = lines[lineIndex];
-		if (line === void 0 || !TASK_ITEM.test(line)) return text;
-		lines[lineIndex] = line.replace(/^(\s*[-*]\s+\[)[ xX](\])/, (_match, prefix, suffix) => `${prefix}${checked ? "x" : " "}${suffix}`);
-		return lines.join("\n");
-	}
-	function MarkdownInline({ text }) {
-		return tokenizeInlineMarkdown(text).map((token, index) => {
-			const key = `${index}-${token.type}`;
-			switch (token.type) {
-				case "bold": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: token.text }, key);
-				case "italic": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("em", { children: token.text }, key);
-				case "code": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: token.text }, key);
-				case "link": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("a", {
-					className: "card-link",
-					href: token.href,
-					target: "_blank",
-					rel: "noreferrer",
-					onDoubleClick: (event) => event.stopPropagation(),
-					children: token.text
-				}, key);
-				default: return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_react.Fragment, { children: token.text }, key);
-			}
-		});
-	}
-	function MarkdownContent({ text, onTaskToggle }) {
-		return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-			className: "card-content",
-			children: parseMarkdownBlocks(text).map((block, index) => {
-				if (block.type === "unordered-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: block.items.map((item, itemIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item }) }, itemIndex)) }, index);
-				if (block.type === "ordered-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ol", {
-					start: block.start,
-					children: block.items.map((item, itemIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item }) }, itemIndex))
-				}, index);
-				if (block.type === "task-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", {
-					className: "task-list",
-					children: block.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-						type: "checkbox",
-						checked: item.checked,
-						"aria-label": `${item.checked ? "Mark incomplete" : "Mark complete"}: ${item.text}`,
-						onChange: (event) => onTaskToggle?.(item.lineIndex, event.currentTarget.checked),
-						onDoubleClick: (event) => event.stopPropagation()
-					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-						className: item.checked ? "task-complete" : void 0,
-						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item.text })
-					})] }, item.lineIndex))
-				}, index);
-				return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: block.text }) }, index);
-			})
-		});
-	}
-	//#endregion
-	//#region ../../../../src/templates/boardTemplates.ts
-	var note = {
-		id: "note",
-		label: "Uncategorized",
-		color: "#73766f",
-		tint: "#f0f1ed"
-	};
-	var boardTemplates = {
-		brainstorming: {
-			id: "brainstorming",
-			displayName: "Brainstorming",
-			description: "Free-form notes, no categories.",
-			cardTypes: [{
-				...note,
-				label: "Note"
-			}],
-			defaultCardType: "note",
-			showTypeSelector: false,
-			includeTypeInPrompt: false
-		},
-		idea: {
-			id: "idea",
-			displayName: "Idea",
-			description: "Light structure for exploring and refining ideas.",
-			cardTypes: [
-				{
-					id: "core_idea",
-					label: "Core Idea",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "opportunity",
-					label: "Opportunity",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "question",
-					label: "Question",
-					color: "#9a7714",
-					tint: "#fff7d9"
-				},
-				{
-					id: "risk",
-					label: "Risk",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "constraint",
-					label: "Constraint",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "reference",
-					label: "Reference",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "note",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		},
-		project: {
-			id: "project",
-			displayName: "Project",
-			description: "Structured board for goals, decisions, risks and next steps.",
-			cardTypes: [
-				{
-					id: "goal",
-					label: "Goal",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "decision",
-					label: "Decision",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "task",
-					label: "Task / Next Step",
-					color: "#22827d",
-					tint: "#e4f6f4"
-				},
-				{
-					id: "constraint",
-					label: "Constraint",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "question",
-					label: "Open Question",
-					color: "#9a7714",
-					tint: "#fff7d9"
-				},
-				{
-					id: "risk",
-					label: "Risk / Blocker",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "reference",
-					label: "Reference",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "note",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		},
-		software_project: {
-			id: "software_project",
-			displayName: "SW Project",
-			description: "Software goals, product work, issues and implementation tasks.",
-			cardTypes: [
-				{
-					id: "issue",
-					label: "Issue",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "feature",
-					label: "Feature",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "decision",
-					label: "Decision",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "task",
-					label: "Task",
-					color: "#22827d",
-					tint: "#e4f6f4"
-				},
-				{
-					id: "main_goal",
-					label: "Main Goal",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "main_description",
-					label: "Main Description",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "task",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		}
-	};
-	function getCardTypeDefinition(template, type) {
-		return boardTemplates[template].cardTypes.find((candidate) => candidate.id === type) ?? note;
-	}
-	//#endregion
-	//#region ../../../../src/sidebar/cardCycle.ts
-	var STATUS_CYCLE = BOARD_ITEM_STATUS_CYCLE;
-	function stepStatus(status, direction) {
-		const index = STATUS_CYCLE.indexOf(status);
-		return STATUS_CYCLE[((index === -1 ? 0 : index) + direction + STATUS_CYCLE.length) % STATUS_CYCLE.length];
-	}
-	function stepCardType(template, type, direction) {
-		const supported = boardTemplates[template].cardTypes;
-		const current = supported.findIndex((candidate) => candidate.id === type);
-		return supported[current === -1 ? direction === 1 ? 0 : supported.length - 1 : (current + direction + supported.length) % supported.length].id;
-	}
-	//#endregion
 	//#region ../../../../src/statuses.ts
 	var STATUS_METADATA = {
 		candidate: {
@@ -11936,7 +11508,45 @@
 		return status.replaceAll(" ", "-");
 	}
 	//#endregion
+	//#region ../../node_modules/react/cjs/react-jsx-runtime.production.js
+	/**
+	* @license React
+	* react-jsx-runtime.production.js
+	*
+	* Copyright (c) Meta Platforms, Inc. and affiliates.
+	*
+	* This source code is licensed under the MIT license found in the
+	* LICENSE file in the root directory of this source tree.
+	*/
+	var require_react_jsx_runtime_production = /* @__PURE__ */ __commonJSMin(((exports) => {
+		var REACT_ELEMENT_TYPE = Symbol.for("react.transitional.element");
+		var REACT_FRAGMENT_TYPE = Symbol.for("react.fragment");
+		function jsxProd(type, config, maybeKey) {
+			var key = null;
+			void 0 !== maybeKey && (key = "" + maybeKey);
+			void 0 !== config.key && (key = "" + config.key);
+			if ("key" in config) {
+				maybeKey = {};
+				for (var propName in config) "key" !== propName && (maybeKey[propName] = config[propName]);
+			} else maybeKey = config;
+			config = maybeKey.ref;
+			return {
+				$$typeof: REACT_ELEMENT_TYPE,
+				type,
+				key,
+				ref: void 0 !== config ? config : null,
+				props: maybeKey
+			};
+		}
+		exports.Fragment = REACT_FRAGMENT_TYPE;
+		exports.jsx = jsxProd;
+		exports.jsxs = jsxProd;
+	}));
+	//#endregion
 	//#region ../../../../src/sidebar/components/ProjectFingerprint.tsx
+	var import_jsx_runtime = (/* @__PURE__ */ __commonJSMin(((exports, module) => {
+		module.exports = require_react_jsx_runtime_production();
+	})))();
 	var CELL_SIZE = 7;
 	var CELL_STEP = 10;
 	var GRID_X = 4;
@@ -12195,6 +11805,420 @@
 		return items.some((item) => item.status !== "trash");
 	}
 	//#endregion
+	//#region ../../../../src/templates/boardTemplates.ts
+	var note = {
+		id: "note",
+		label: "Uncategorized",
+		color: "#73766f",
+		tint: "#f0f1ed"
+	};
+	var boardTemplates = {
+		brainstorming: {
+			id: "brainstorming",
+			displayName: "Brainstorming",
+			description: "Free-form notes, no categories.",
+			cardTypes: [{
+				...note,
+				label: "Note"
+			}],
+			defaultCardType: "note",
+			showTypeSelector: false,
+			includeTypeInPrompt: false
+		},
+		idea: {
+			id: "idea",
+			displayName: "Idea",
+			description: "Light structure for exploring and refining ideas.",
+			cardTypes: [
+				{
+					id: "core_idea",
+					label: "Core Idea",
+					color: "#3974c1",
+					tint: "#e9f2ff"
+				},
+				{
+					id: "opportunity",
+					label: "Opportunity",
+					color: "#398458",
+					tint: "#eaf7ee"
+				},
+				{
+					id: "question",
+					label: "Question",
+					color: "#9a7714",
+					tint: "#fff7d9"
+				},
+				{
+					id: "risk",
+					label: "Risk",
+					color: "#b6504b",
+					tint: "#fdecea"
+				},
+				{
+					id: "constraint",
+					label: "Constraint",
+					color: "#745e99",
+					tint: "#f1edf8"
+				},
+				{
+					id: "reference",
+					label: "Reference",
+					color: "#59758d",
+					tint: "#edf3f7"
+				},
+				note
+			],
+			defaultCardType: "note",
+			showTypeSelector: true,
+			includeTypeInPrompt: true
+		},
+		project: {
+			id: "project",
+			displayName: "Project",
+			description: "Structured board for goals, decisions, risks and next steps.",
+			cardTypes: [
+				{
+					id: "goal",
+					label: "Goal",
+					color: "#3974c1",
+					tint: "#e9f2ff"
+				},
+				{
+					id: "decision",
+					label: "Decision",
+					color: "#398458",
+					tint: "#eaf7ee"
+				},
+				{
+					id: "task",
+					label: "Task / Next Step",
+					color: "#22827d",
+					tint: "#e4f6f4"
+				},
+				{
+					id: "constraint",
+					label: "Constraint",
+					color: "#745e99",
+					tint: "#f1edf8"
+				},
+				{
+					id: "question",
+					label: "Open Question",
+					color: "#9a7714",
+					tint: "#fff7d9"
+				},
+				{
+					id: "risk",
+					label: "Risk / Blocker",
+					color: "#b6504b",
+					tint: "#fdecea"
+				},
+				{
+					id: "reference",
+					label: "Reference",
+					color: "#59758d",
+					tint: "#edf3f7"
+				},
+				note
+			],
+			defaultCardType: "note",
+			showTypeSelector: true,
+			includeTypeInPrompt: true
+		},
+		software_project: {
+			id: "software_project",
+			displayName: "SW Project",
+			description: "Software goals, product work, issues and implementation tasks.",
+			cardTypes: [
+				{
+					id: "issue",
+					label: "Issue",
+					color: "#b6504b",
+					tint: "#fdecea"
+				},
+				{
+					id: "feature",
+					label: "Feature",
+					color: "#398458",
+					tint: "#eaf7ee"
+				},
+				{
+					id: "decision",
+					label: "Decision",
+					color: "#745e99",
+					tint: "#f1edf8"
+				},
+				{
+					id: "task",
+					label: "Task",
+					color: "#22827d",
+					tint: "#e4f6f4"
+				},
+				{
+					id: "main_goal",
+					label: "Main Goal",
+					color: "#3974c1",
+					tint: "#e9f2ff"
+				},
+				{
+					id: "main_description",
+					label: "Main Description",
+					color: "#59758d",
+					tint: "#edf3f7"
+				},
+				note
+			],
+			defaultCardType: "task",
+			showTypeSelector: true,
+			includeTypeInPrompt: true
+		}
+	};
+	function getCardTypeDefinition(template, type) {
+		return boardTemplates[template].cardTypes.find((candidate) => candidate.id === type) ?? note;
+	}
+	//#endregion
+	//#region ../../../../src/sidebar/linkify.ts
+	var URL_PATTERN = /(https?:\/\/[^\s<>"']+|www\.[^\s<>"']+)/gi;
+	var TRAILING_PUNCTUATION = /[.,;:!?\)\]\}]$/;
+	function toSafeWebHref(value) {
+		const candidate = value.toLowerCase().startsWith("www.") ? `https://${value}` : value;
+		try {
+			const url = new URL(candidate);
+			return url.protocol === "http:" || url.protocol === "https:" ? candidate : null;
+		} catch {
+			return null;
+		}
+	}
+	function tokenizeLinks(text) {
+		const parts = [];
+		let cursor = 0;
+		for (const match of text.matchAll(URL_PATTERN)) {
+			const start = match.index;
+			if (start > cursor) parts.push({
+				type: "text",
+				text: text.slice(cursor, start)
+			});
+			const candidate = match[0];
+			let linkText = candidate;
+			while (linkText && TRAILING_PUNCTUATION.test(linkText)) linkText = linkText.slice(0, -1);
+			const href = linkText ? toSafeWebHref(linkText) : null;
+			if (href) parts.push({
+				type: "link",
+				text: linkText,
+				href
+			});
+			const trailing = candidate.slice(linkText.length);
+			if (trailing) parts.push({
+				type: "text",
+				text: trailing
+			});
+			cursor = start + candidate.length;
+		}
+		if (cursor < text.length) parts.push({
+			type: "text",
+			text: text.slice(cursor)
+		});
+		return parts.length ? parts : [{
+			type: "text",
+			text
+		}];
+	}
+	//#endregion
+	//#region ../../../../src/sidebar/markdown.tsx
+	var INLINE_MARKDOWN = /(`[^`\n]+`|\[[^\]\n]+\]\([^\s)\n]+\)|\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g;
+	var UNORDERED_ITEM = /^\s*[-*]\s+(.+)$/;
+	var ORDERED_ITEM = /^\s*(\d+)\.\s+(.+)$/;
+	var TASK_ITEM = /^\s*[-*]\s+\[([ xX])\]\s+(.+)$/;
+	function tokenizeInlineMarkdown(text) {
+		const tokens = [];
+		let cursor = 0;
+		function appendPlain(value) {
+			tokenizeLinks(value).forEach((part) => tokens.push(part));
+		}
+		for (const match of text.matchAll(INLINE_MARKDOWN)) {
+			const start = match.index;
+			if (start > cursor) appendPlain(text.slice(cursor, start));
+			const source = match[0];
+			if (source.startsWith("`")) tokens.push({
+				type: "code",
+				text: source.slice(1, -1)
+			});
+			else if (source.startsWith("[")) {
+				const separator = source.lastIndexOf("](");
+				const label = source.slice(1, separator);
+				const href = toSafeWebHref(source.slice(separator + 2, -1));
+				if (href) tokens.push({
+					type: "link",
+					text: label,
+					href
+				});
+				else appendPlain(source);
+			} else if (source.startsWith("**")) tokens.push({
+				type: "bold",
+				text: source.slice(2, -2)
+			});
+			else tokens.push({
+				type: "italic",
+				text: source.slice(1, -1)
+			});
+			cursor = start + source.length;
+		}
+		if (cursor < text.length) appendPlain(text.slice(cursor));
+		return tokens.length ? tokens : [{
+			type: "text",
+			text
+		}];
+	}
+	function parseMarkdownBlocks(text) {
+		const blocks = [];
+		let paragraph = [];
+		function flushParagraph() {
+			if (!paragraph.length) return;
+			blocks.push({
+				type: "paragraph",
+				text: paragraph.join("\n")
+			});
+			paragraph = [];
+		}
+		for (const [lineIndex, line] of text.split(/\r?\n/).entries()) {
+			const task = line.match(TASK_ITEM);
+			const unordered = line.match(UNORDERED_ITEM);
+			const ordered = line.match(ORDERED_ITEM);
+			if (task) {
+				flushParagraph();
+				const previous = blocks.at(-1);
+				const item = {
+					text: task[2],
+					checked: task[1].toLowerCase() === "x",
+					lineIndex
+				};
+				if (previous?.type === "task-list") previous.items.push(item);
+				else blocks.push({
+					type: "task-list",
+					items: [item]
+				});
+			} else if (unordered) {
+				flushParagraph();
+				const previous = blocks.at(-1);
+				if (previous?.type === "unordered-list") previous.items.push(unordered[1]);
+				else blocks.push({
+					type: "unordered-list",
+					items: [unordered[1]]
+				});
+			} else if (ordered) {
+				flushParagraph();
+				const previous = blocks.at(-1);
+				if (previous?.type === "ordered-list") previous.items.push(ordered[2]);
+				else blocks.push({
+					type: "ordered-list",
+					items: [ordered[2]],
+					start: Number(ordered[1])
+				});
+			} else if (!line.trim()) flushParagraph();
+			else paragraph.push(line);
+		}
+		flushParagraph();
+		return blocks;
+	}
+	function setTaskCheckedAtLine(text, lineIndex, checked) {
+		const lines = text.split(/\r?\n/);
+		const line = lines[lineIndex];
+		if (line === void 0 || !TASK_ITEM.test(line)) return text;
+		lines[lineIndex] = line.replace(/^(\s*[-*]\s+\[)[ xX](\])/, (_match, prefix, suffix) => `${prefix}${checked ? "x" : " "}${suffix}`);
+		return lines.join("\n");
+	}
+	var MarkdownInline = (0, import_react.memo)(function MarkdownInline({ text }) {
+		return tokenizeInlineMarkdown(text).map((token, index) => {
+			const key = `${index}-${token.type}`;
+			switch (token.type) {
+				case "bold": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: token.text }, key);
+				case "italic": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("em", { children: token.text }, key);
+				case "code": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: token.text }, key);
+				case "link": return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("a", {
+					className: "card-link",
+					href: token.href,
+					target: "_blank",
+					rel: "noreferrer",
+					onDoubleClick: (event) => event.stopPropagation(),
+					children: token.text
+				}, key);
+				default: return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(import_react.Fragment, { children: token.text }, key);
+			}
+		});
+	});
+	function MarkdownContent({ text, onTaskToggle }) {
+		const blocks = (0, import_react.useMemo)(() => parseMarkdownBlocks(text), [text]);
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+			className: "card-content",
+			children: blocks.map((block, index) => {
+				if (block.type === "unordered-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: block.items.map((item, itemIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item }) }, itemIndex)) }, index);
+				if (block.type === "ordered-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ol", {
+					start: block.start,
+					children: block.items.map((item, itemIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item }) }, itemIndex))
+				}, index);
+				if (block.type === "task-list") return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", {
+					className: "task-list",
+					children: block.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+						type: "checkbox",
+						checked: item.checked,
+						"aria-label": `${item.checked ? "Mark incomplete" : "Mark complete"}: ${item.text}`,
+						onChange: (event) => onTaskToggle?.(item.lineIndex, event.currentTarget.checked),
+						onDoubleClick: (event) => event.stopPropagation()
+					}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+						className: item.checked ? "task-complete" : void 0,
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: item.text })
+					})] }, item.lineIndex))
+				}, index);
+				return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: block.text }) }, index);
+			})
+		});
+	}
+	//#endregion
+	//#region ../../../../src/cardDisplayModes.ts
+	var DEFAULT_CARD_DISPLAY_MODE = "standard";
+	function normalizeCardDisplayMode(value) {
+		return CARD_DISPLAY_MODES.includes(value) ? value : DEFAULT_CARD_DISPLAY_MODE;
+	}
+	function nextCardDisplayMode(value) {
+		const current = normalizeCardDisplayMode(value);
+		return CARD_DISPLAY_MODES[(CARD_DISPLAY_MODES.indexOf(current) + 1) % CARD_DISPLAY_MODES.length];
+	}
+	//#endregion
+	//#region ../../../../src/sidebar/cardCycle.ts
+	var STATUS_CYCLE = BOARD_ITEM_STATUS_CYCLE;
+	function stepStatus(status, direction) {
+		const index = STATUS_CYCLE.indexOf(status);
+		return STATUS_CYCLE[((index === -1 ? 0 : index) + direction + STATUS_CYCLE.length) % STATUS_CYCLE.length];
+	}
+	function stepCardType(template, type, direction) {
+		const supported = boardTemplates[template].cardTypes;
+		const current = supported.findIndex((candidate) => candidate.id === type);
+		return supported[current === -1 ? direction === 1 ? 0 : supported.length - 1 : (current + direction + supported.length) % supported.length].id;
+	}
+	//#endregion
+	//#region ../../src/data/cardColors.ts
+	function cardColors(template, type) {
+		const definition = template && type ? getCardTypeDefinition(template, type) : note;
+		return {
+			"--card-accent": definition.color,
+			"--card-tint": definition.tint
+		};
+	}
+	//#endregion
+	//#region ../../src/interactions/cardSwipeStatus.ts
+	var SWIPE_STATUSES = [
+		"candidate",
+		"confirmed",
+		"started",
+		"to validate",
+		"done"
+	];
+	/** Swipe progress stays within the active workflow; terminal/manual statuses are untouched. */
+	function swipeStatus(status, direction) {
+		const index = SWIPE_STATUSES.indexOf(status);
+		return index < 0 ? status : SWIPE_STATUSES[Math.max(0, Math.min(SWIPE_STATUSES.length - 1, index + direction))];
+	}
+	//#endregion
 	//#region ../../src/images/thumbnail.ts
 	/** Fit the entire photo; never crop it or upscale small pictures. */
 	function thumbnailSize(width, height) {
@@ -12276,6 +12300,233 @@
 		});
 	}
 	//#endregion
+	//#region ../../src/components/Icon.tsx
+	var paths = {
+		cards: "M4 4h16v7H4zM4 13h16v7H4z",
+		rows: "M4 6h16M4 12h16M4 18h11",
+		more: "M12 5h.01M12 12h.01M12 19h.01",
+		copy: "M9 9h12v12H9zM15 9V3H3v12h6",
+		download: "M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4",
+		photo: "M3 4h18v16H3zM3 17l5-5 4 4 4-6 5 7M10 8a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z",
+		cloud: "M7 18h10a4.5 4.5 0 0 0 .7-8.9A6 6 0 0 0 6 8a5 5 0 0 0 1 10Z",
+		settings: "m9 3-.6 2.3-2 .9-2.2-.6-2 3.5 1.6 1.7v2.4l-1.6 1.7 2 3.5 2.2-.6 2 .9L9 21h6l.6-2.3 2-.9 2.2.6 2-3.5-1.6-1.7v-2.4l1.6-1.7-2-3.5-2.2.6-2-.9L15 3H9Z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z",
+		back: "m12 5-7 7 7 7M5 12h14",
+		trash: "M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7",
+		add: "M12 5v14M5 12h14"
+	};
+	function Icon({ name }) {
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("svg", {
+			viewBox: "0 0 24 24",
+			width: "24",
+			height: "24",
+			fill: "none",
+			stroke: "currentColor",
+			strokeWidth: name === "more" ? 3 : 1.7,
+			strokeLinecap: "round",
+			strokeLinejoin: "round",
+			"aria-hidden": "true",
+			children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d: paths[name] })
+		});
+	}
+	//#endregion
+	//#region ../../src/components/BoardCard.tsx
+	/** A status, text or display-mode write touches one card. Re-rendering every
+	* row re-parsed every card's Markdown and threw away all image state, which
+	* measured ~80 ms per write on a 300-card board. The comparator keeps a row
+	* when nothing it displays changed — including when the reactive snapshot
+	* hands back fresh but equal objects after each write. */
+	function sameCard(a, b) {
+		return a.id === b.id && a.title === b.title && a.content === b.content && a.type === b.type && a.status === b.status && a.displayMode === b.displayMode && a.order === b.order && a.imageId === b.imageId && a.imageMimeType === b.imageMimeType && a.imageWidth === b.imageWidth && a.imageHeight === b.imageHeight && a.image === b.image && a.source?.conversationUrl === b.source?.conversationUrl && a.source?.provider === b.source?.provider;
+	}
+	var BoardCard = (0, import_react.memo)(function BoardCard({ card, index, project, collapsed, collapseActive, dragging, readOnly, swipeOffset, hasActions, getImage, api }) {
+		const mode = normalizeCardDisplayMode(card.displayMode);
+		const sourceHref = card.source?.conversationUrl ? toSafeWebHref(card.source.conversationUrl) : null;
+		const summary = card.title?.trim() || card.content.trim().split("\n").find((line) => line.trim())?.trim() || "Image card";
+		const number = index + 1;
+		function click(event) {
+			if (readOnly || dragging || api.swipeOffset(card.id) !== void 0 || api.suppressClick()) return;
+			if (event.target instanceof Element) {
+				if (event.target.closest("button, select, input, a")) return;
+				if (collapsed) {
+					api.dropTap();
+					api.expand(card.id);
+					return;
+				}
+				const field = event.target.closest("[data-edit-field]")?.dataset.editField;
+				if (field) {
+					api.dropTap();
+					api.edit(card, field);
+					return;
+				}
+			}
+			if (event.detail === 0) {
+				api.dropTap();
+				if (collapsed) {
+					api.expand(card.id);
+					return;
+				}
+				api.edit(card);
+				return;
+			}
+			if (api.takeTap(card.id, Date.now(), event.clientX, event.clientY)) api.editCard(card);
+		}
+		function key(event) {
+			if (readOnly || dragging || event.target instanceof Element && event.target.closest("button, select, input, a")) return;
+			if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+				event.preventDefault();
+				api.insertAfter(card);
+			} else if (event.key === "Enter" || event.key === " ") {
+				event.preventDefault();
+				if (collapsed) {
+					api.expand(card.id);
+					return;
+				}
+				api.edit(card, event.target instanceof Element ? event.target.closest("[data-edit-field]")?.dataset.editField : void 0);
+			} else if (event.key === "Delete") {
+				event.preventDefault();
+				api.remove(card);
+			} else if ((event.altKey || event.shiftKey && (event.ctrlKey || event.metaKey)) && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+				event.preventDefault();
+				api.reorderByKey(card, event.key === "ArrowUp" ? -1 : 1);
+			} else if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
+				event.preventDefault();
+				api.focusAdjacent(card, event.key === "ArrowUp" ? -1 : 1);
+			} else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+				event.preventDefault();
+				const direction = event.key === "ArrowRight" ? 1 : -1;
+				api.update(card, event.ctrlKey || event.metaKey ? { type: stepCardType(project.template, card.type, direction) } : { status: stepStatus(card.status, direction) });
+			} else if (event.key.toLowerCase() === "v" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+				event.preventDefault();
+				api.update(card, { displayMode: nextCardDisplayMode(card.displayMode) });
+			}
+		}
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			className: "swipe-row",
+			children: [swipeOffset !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+				className: `swipe-status-preview${swipeOffset < 0 ? " swipe-status-preview--left" : ""}`,
+				"aria-hidden": "true",
+				children: [
+					swipeOffset < 0 ? "←" : "→",
+					" ",
+					swipeStatus(card.status, swipeOffset < 0 ? -1 : 1)
+				]
+			}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("article", {
+				role: "group",
+				tabIndex: readOnly ? -1 : 0,
+				"aria-disabled": readOnly || void 0,
+				"aria-expanded": collapseActive ? !collapsed : void 0,
+				"aria-describedby": "drag-help",
+				"aria-label": `Edit card ${number}: ${card.title || card.content || "Image card"}`,
+				onClick: click,
+				onKeyDown: key,
+				"data-card-id": card.id,
+				className: `editor-card display-mode-${mode}${card.title?.trim() ? " has-title" : " no-title"}${collapsed ? " is-collapsed" : ""}${dragging ? " drag-placeholder" : ""}`,
+				style: {
+					...cardColors(project.template, card.type),
+					...swipeOffset !== void 0 ? { transform: `translateX(${swipeOffset}px)` } : {}
+				},
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					className: "card-topline",
+					children: [
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "card-type-label card-field-control card-field-button",
+							"aria-label": `Change category of card ${number}`,
+							"aria-haspopup": "dialog",
+							disabled: dragging,
+							onClick: (event) => {
+								event.stopPropagation();
+								if (!api.suppressClick()) api.chooseField(card, "type");
+							},
+							children: getCardTypeDefinition(project.template, card.type).label
+						}),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: `card-status card-field-control card-field-button status-${card.status.replaceAll(" ", "-")}`,
+							"aria-label": `Change status of card ${number}`,
+							"aria-haspopup": "dialog",
+							disabled: readOnly || dragging,
+							onClick: (event) => {
+								event.stopPropagation();
+								if (!api.suppressClick()) api.chooseField(card, "status");
+							},
+							children: card.status
+						}),
+						collapsed && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							className: "card-summary",
+							role: "button",
+							tabIndex: readOnly ? -1 : 0,
+							"aria-expanded": false,
+							"aria-label": `Expand card ${number}`,
+							onClick: (event) => {
+								event.stopPropagation();
+								if (!api.suppressClick()) api.expand(card.id);
+							},
+							children: summary
+						}),
+						hasActions ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "card-more-button",
+							disabled: readOnly || dragging,
+							"aria-label": `Actions for card ${number}`,
+							"aria-haspopup": "dialog",
+							onClick: (event) => {
+								event.stopPropagation();
+								if (!api.suppressClick()) api.actions(card);
+							},
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: "more" })
+						}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							className: "drag-grip",
+							"aria-hidden": "true",
+							children: "⠿"
+						})
+					]
+				}), !collapsed && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
+					card.title && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						"data-edit-field": "title",
+						role: "button",
+						tabIndex: readOnly ? -1 : 0,
+						"aria-label": `Edit title of card ${number}`,
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: card.title })
+					}),
+					mode !== "compact" && (card.imageId || card.image) && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						"data-edit-field": "content",
+						role: "button",
+						tabIndex: readOnly ? -1 : 0,
+						"aria-label": `Edit photo of card ${number}`,
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CardImage, {
+							card,
+							getImage,
+							thumbnail: mode !== "expanded",
+							alt: card.title || "Card photo"
+						})
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "card-text",
+						"data-edit-field": "content",
+						tabIndex: readOnly ? -1 : 0,
+						"aria-label": `Edit text of card ${number}`,
+						children: card.content ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownContent, {
+							text: card.content,
+							onTaskToggle: (line, checked) => {
+								if (readOnly || dragging) return;
+								const content = setTaskCheckedAtLine(card.content, line, checked);
+								if (content !== card.content) api.update(card, { content });
+							}
+						}) : !(card.imageId || card.image) && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: "Tap to add text" })
+					}),
+					sourceHref && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("a", {
+						className: "source-link",
+						href: sourceHref,
+						target: "_blank",
+						rel: "noreferrer",
+						children: ["From ", card.source?.provider || "source"]
+					})
+				] })]
+			})]
+		});
+	}, (previous, next) => previous.index === next.index && previous.project === next.project && previous.collapsed === next.collapsed && previous.collapseActive === next.collapseActive && previous.readOnly === next.readOnly && previous.dragging === next.dragging && previous.swipeOffset === next.swipeOffset && previous.hasActions === next.hasActions && previous.getImage === next.getImage && previous.api === next.api && sameCard(previous.card, next.card));
+	//#endregion
 	//#region ../../../../src/sidebar/reorder.ts
 	function reorderAtTarget(orderedIds, draggedId, targetId, position) {
 		if (draggedId === targetId || !orderedIds.includes(draggedId) || !orderedIds.includes(targetId)) return orderedIds;
@@ -12306,20 +12557,8 @@
 		return status === "done" || status === "rejected" || status === "trash" ? status : "active";
 	}
 	//#endregion
-	//#region ../../src/interactions/cardSwipeStatus.ts
+	//#region ../../src/interactions/useCardDrag.ts
 	var import_react_dom = require_react_dom();
-	var SWIPE_STATUSES = [
-		"candidate",
-		"confirmed",
-		"started",
-		"to validate",
-		"done"
-	];
-	/** Swipe progress stays within the active workflow; terminal/manual statuses are untouched. */
-	function swipeStatus(status, direction) {
-		const index = SWIPE_STATUSES.indexOf(status);
-		return index < 0 ? status : SWIPE_STATUSES[Math.max(0, Math.min(SWIPE_STATUSES.length - 1, index + direction))];
-	}
 	var SCROLL_SLOP = 8;
 	/** Touch listeners remain non-passive so a hold can claim the first move without blocking ordinary swipes. */
 	function useCardDrag(list, scroller, ids, disabled, onDrop, trash, onDelete, statusSwipe) {
@@ -12352,12 +12591,12 @@
 			if (!element || !scroll) return;
 			let gesture = null;
 			let hold;
-			let frame = 0;
+			let scrollFrame = 0;
 			let preview = [];
 			let lastTime = 0;
 			function cancel() {
 				if (hold) clearTimeout(hold);
-				cancelAnimationFrame(frame);
+				cancelAnimationFrame(scrollFrame);
 				if (gesture?.active || gesture?.swiping) {
 					suppressClickUntil.current = Date.now() + 350;
 					setAnnouncement("Dragging cancelled.");
@@ -12372,12 +12611,12 @@
 				const rect = trash.current?.getBoundingClientRect();
 				return !!rect && rect.width > 0 && point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
 			}
-			function update() {
-				if (!gesture?.active) return;
+			function compute() {
+				if (!gesture?.active) return null;
 				const selected = gesture;
 				if (overTrash(selected.point)) {
 					preview = selected.base;
-					setDrag({
+					return {
 						id: selected.id,
 						order: preview,
 						left: selected.rect.left + selected.point.x - selected.start.x,
@@ -12385,33 +12624,40 @@
 						width: selected.rect.width,
 						height: selected.rect.height,
 						overTrash: true
-					});
-					setAnnouncement("Release over trash to discard this card.");
-					return;
+					};
 				}
-				setAnnouncement("Card lifted. Drag to reorder, or onto the top-right trash to discard.");
-				const group = selected.base.filter((id) => current.current.statusSwipe.container?.(id) === current.current.statusSwipe.container?.(selected.id));
+				const containerOf = current.current.statusSwipe.container;
+				const selectedContainer = containerOf?.(selected.id);
+				const nodes = /* @__PURE__ */ new Map();
+				for (const card of element.querySelectorAll("[data-card-id]")) {
+					const cardId = card.dataset.cardId;
+					if (cardId) nodes.set(cardId, card);
+				}
+				const group = selected.base.filter((id) => containerOf?.(id) === selectedContainer);
 				const remaining = group.filter((id) => id !== selected.id);
 				const center = selected.rect.top + selected.point.y - selected.start.y + selected.rect.height / 2;
 				let insertion = remaining.length;
-				const outsideGroup = [...element.querySelectorAll("[data-card-id]")].some((card) => {
-					if (current.current.statusSwipe.container?.(card.dataset.cardId) === current.current.statusSwipe.container?.(selected.id)) return false;
-					if (card.closest("details:not([open])")) return false;
+				let outsideGroup = false;
+				for (const [cardId, card] of nodes) {
+					if (containerOf?.(cardId) === selectedContainer) continue;
+					if (card.closest("details:not([open])")) continue;
 					const rect = card.getBoundingClientRect();
-					return rect.height > 0 && center >= rect.top && center <= rect.bottom;
-				});
-				for (const [index, id] of remaining.entries()) {
-					const target = [...element.querySelectorAll("[data-card-id]")].find((card) => card.dataset.cardId === id);
-					if (target) {
-						const rect = target.getBoundingClientRect();
-						if (rect.height > 0 && center < rect.top + rect.height / 2) {
-							insertion = index;
-							break;
-						}
+					if (rect.height > 0 && center >= rect.top && center <= rect.bottom) {
+						outsideGroup = true;
+						break;
+					}
+				}
+				if (!outsideGroup) for (const [index, id] of remaining.entries()) {
+					const target = nodes.get(id);
+					if (!target) continue;
+					const rect = target.getBoundingClientRect();
+					if (rect.height > 0 && center < rect.top + rect.height / 2) {
+						insertion = index;
+						break;
 					}
 				}
 				preview = outsideGroup || insertion === group.indexOf(selected.id) || !remaining.length ? selected.base : reorderAtTarget(selected.base, selected.id, remaining[insertion] ?? remaining.at(-1), insertion < remaining.length ? "before" : "after");
-				setDrag({
+				return {
 					id: selected.id,
 					order: preview,
 					left: selected.rect.left + selected.point.x - selected.start.x,
@@ -12419,7 +12665,13 @@
 					width: selected.rect.width,
 					height: selected.rect.height,
 					overTrash: false
-				});
+				};
+			}
+			function update() {
+				const next = compute();
+				if (!next) return;
+				setDrag(next);
+				setAnnouncement(next.overTrash ? "Release over trash to discard this card." : "Card lifted. Drag to reorder, or onto the top-right trash to discard.");
 			}
 			function autoScroll(time) {
 				if (!gesture?.active) return;
@@ -12433,7 +12685,7 @@
 					scroll.scrollTop += velocity * elapsed * .6;
 					update();
 				}
-				frame = requestAnimationFrame(autoScroll);
+				scrollFrame = requestAnimationFrame(autoScroll);
 			}
 			function activate() {
 				if (!gesture || gesture.active || gesture.swiping || current.current.disabled) return;
@@ -12442,7 +12694,7 @@
 				setAnnouncement("Card lifted. Drag to reorder, or onto the top-right trash to discard.");
 				update();
 				lastTime = 0;
-				frame = requestAnimationFrame(autoScroll);
+				scrollFrame = requestAnimationFrame(autoScroll);
 			}
 			function start(target, point, pointerId) {
 				cancel();
@@ -12491,10 +12743,10 @@
 				update();
 			}
 			function finish() {
+				if (hold) clearTimeout(hold);
+				cancelAnimationFrame(scrollFrame);
 				const selected = gesture;
 				const order = preview;
-				if (hold) clearTimeout(hold);
-				cancelAnimationFrame(frame);
 				gesture = null;
 				setDrag(null);
 				setSwipe(null);
@@ -12626,42 +12878,6 @@
 		};
 	}
 	//#endregion
-	//#region ../../src/data/cardColors.ts
-	function cardColors(template, type) {
-		const definition = template && type ? getCardTypeDefinition(template, type) : note;
-		return {
-			"--card-accent": definition.color,
-			"--card-tint": definition.tint
-		};
-	}
-	//#endregion
-	//#region ../../src/components/Icon.tsx
-	var paths = {
-		more: "M12 5h.01M12 12h.01M12 19h.01",
-		copy: "M9 9h12v12H9zM15 9V3H3v12h6",
-		download: "M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4",
-		photo: "M3 4h18v16H3zM3 17l5-5 4 4 4-6 5 7M10 8a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0Z",
-		cloud: "M7 18h10a4.5 4.5 0 0 0 .7-8.9A6 6 0 0 0 6 8a5 5 0 0 0 1 10Z",
-		settings: "m9 3-.6 2.3-2 .9-2.2-.6-2 3.5 1.6 1.7v2.4l-1.6 1.7 2 3.5 2.2-.6 2 .9L9 21h6l.6-2.3 2-.9 2.2.6 2-3.5-1.6-1.7v-2.4l1.6-1.7-2-3.5-2.2.6-2-.9L15 3H9Z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z",
-		back: "m12 5-7 7 7 7M5 12h14",
-		trash: "M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7",
-		add: "M12 5v14M5 12h14"
-	};
-	function Icon({ name }) {
-		return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("svg", {
-			viewBox: "0 0 24 24",
-			width: "24",
-			height: "24",
-			fill: "none",
-			stroke: "currentColor",
-			strokeWidth: name === "more" ? 3 : 1.7,
-			strokeLinecap: "round",
-			strokeLinejoin: "round",
-			"aria-hidden": "true",
-			children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d: paths[name] })
-		});
-	}
-	//#endregion
 	//#region ../../src/components/ScreenHeader.tsx
 	function ScreenHeader({ title, onBack, children }) {
 		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", {
@@ -12680,14 +12896,18 @@
 	}
 	//#endregion
 	//#region ../../src/screens/BoardScreen.tsx
-	function BoardScreen({ project, cards, busy, onBack, onEditBoard, onDeleteBoard, onAddCard, onEditCard, onDeleteCard, onReorderCard, onUpdateCard, onTrashSection, onEmptyTrash, onChooseCardField, getImage, onCardActions, onInsertAfter, onCopyBoard, onDownloadBoard, onCopySection, uiScale = 1, fingerprintTransition = null, focusCardId, onFocusHandled, cloud, readOnly = false }) {
+	function BoardScreen({ project, cards, busy, onBack, onEditBoard, onDeleteBoard, onAddCard, onEditCard, onDeleteCard, onReorderCard, onUpdateCard, onTrashSection, onEmptyTrash, onChooseCardField, getImage, onCardActions, onInsertAfter, onCopyBoard, onDownloadBoard, onCopySection, uiScale = 1, fingerprintTransition = null, focusCardId, onFocusHandled, cloud, readOnly = false, collapseCards = false, onCollapseCards }) {
 		const actionBusy = busy;
-		busy = busy || readOnly;
+		const inputLocked = readOnly;
+		const [expanded, setExpanded] = (0, import_react.useState)(() => /* @__PURE__ */ new Set());
+		(0, import_react.useEffect)(() => {
+			if (!collapseCards) setExpanded(/* @__PURE__ */ new Set());
+		}, [collapseCards]);
 		const list = (0, import_react.useRef)(null);
 		const scroller = (0, import_react.useRef)(null);
 		const trash = (0, import_react.useRef)(null);
 		(0, import_react.useEffect)(() => {
-			if (!focusCardId || busy) return;
+			if (!focusCardId) return;
 			const frame = requestAnimationFrame(() => {
 				const card = [...list.current?.querySelectorAll("[data-card-id]") ?? []].find((value) => value.dataset.cardId === focusCardId);
 				const section = card?.closest("details");
@@ -12702,12 +12922,11 @@
 			return () => cancelAnimationFrame(frame);
 		}, [
 			focusCardId,
-			busy,
 			cards,
 			onFocusHandled
 		]);
 		const lastTap = (0, import_react.useRef)(null);
-		const { drag, swipe, announcement, suppressClick } = useCardDrag(list, scroller, cards.map((card) => card.id), busy, (id, ids) => {
+		const { drag, swipe, announcement, suppressClick } = useCardDrag(list, scroller, cards.map((card) => card.id), inputLocked, (id, ids) => {
 			const card = cards.find((value) => value.id === id);
 			if (card) onReorderCard(card, ids);
 		}, trash, (id) => {
@@ -12755,187 +12974,111 @@
 			}
 			cardTops.current = next;
 		}, [drag]);
+		const api = (0, import_react.useRef)(null);
+		const cardsRef = (0, import_react.useRef)(cards);
+		cardsRef.current = cards;
+		const dragRef = (0, import_react.useRef)(drag);
+		dragRef.current = drag;
+		const swipeRef = (0, import_react.useRef)(swipe);
+		swipeRef.current = swipe;
+		const expandedRef = (0, import_react.useRef)(expanded);
+		expandedRef.current = expanded;
+		const handlers = (0, import_react.useRef)({
+			onEditCard,
+			onDeleteCard,
+			onUpdateCard,
+			onChooseCardField,
+			onReorderCard,
+			onInsertAfter,
+			onCardActions,
+			cards
+		});
+		handlers.current = {
+			onEditCard,
+			onDeleteCard,
+			onUpdateCard,
+			onChooseCardField,
+			onReorderCard,
+			onInsertAfter,
+			onCardActions,
+			cards
+		};
+		if (!api.current) api.current = {
+			dragging: () => !!dragRef.current,
+			swipeOffset: (id) => swipeRef.current?.id === id ? swipeRef.current.offset : void 0,
+			expand: (id) => {
+				lastTap.current = null;
+				setExpanded((old) => old.has(id) ? old : new Set(old).add(id));
+				requestAnimationFrame(() => {
+					[...list.current?.querySelectorAll("[data-card-id]") ?? []].find((value) => value.dataset.cardId === id)?.focus({ preventScroll: true });
+				});
+			},
+			suppressClick: () => suppressClick(),
+			edit: (card, field) => handlers.current.onEditCard(card, field),
+			editCard: (card) => handlers.current.onEditCard(card),
+			remove: (card) => handlers.current.onDeleteCard(card),
+			update: (card, patch) => handlers.current.onUpdateCard(card, patch),
+			chooseField: (card, field) => handlers.current.onChooseCardField(card, field),
+			actions: (card) => handlers.current.onCardActions?.(card),
+			insertAfter: (card) => handlers.current.onInsertAfter?.(card),
+			reorderByKey: (card, direction) => {
+				const group = handlers.current.cards.filter((value) => cardContainer(value.status) === cardContainer(card.status));
+				const target = group[group.findIndex((value) => value.id === card.id) + direction];
+				if (target) handlers.current.onReorderCard(card, reorderAtTarget(handlers.current.cards.map((value) => value.id), card.id, target.id, direction < 0 ? "before" : "after"));
+			},
+			focusAdjacent: (card, direction) => {
+				const group = handlers.current.cards.filter((value) => cardContainer(value.status) === cardContainer(card.status));
+				const target = group[group.findIndex((value) => value.id === card.id) + direction];
+				const element = [...list.current?.querySelectorAll("[data-card-id]") ?? []].find((value) => value.dataset.cardId === target?.id);
+				element?.focus();
+				element?.scrollIntoView?.({ block: "nearest" });
+			},
+			takeTap: (id, time, x, y) => {
+				const previous = lastTap.current;
+				if (previous?.id === id && time - previous.time <= 300 && Math.hypot(x - previous.x, y - previous.y) <= 24) {
+					lastTap.current = null;
+					return true;
+				}
+				lastTap.current = {
+					id,
+					time,
+					x,
+					y
+				};
+				return false;
+			},
+			dropTap: () => {
+				lastTap.current = null;
+			}
+		};
 		function renderCard(card) {
-			const index = cards.findIndex((value) => value.id === card.id);
-			const mode = normalizeCardDisplayMode(card.displayMode);
-			const sourceHref = card.source?.conversationUrl ? toSafeWebHref(card.source.conversationUrl) : null;
-			return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-				className: "swipe-row",
-				children: [swipe?.id === card.id && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-					className: `swipe-status-preview${swipe.offset < 0 ? " swipe-status-preview--left" : ""}`,
-					"aria-hidden": "true",
-					children: [
-						swipe.offset < 0 ? "←" : "→",
-						" ",
-						swipeStatus(card.status, swipe.offset < 0 ? -1 : 1)
-					]
-				}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("article", {
-					role: "group",
-					tabIndex: busy ? -1 : 0,
-					"aria-disabled": busy,
-					"aria-label": `Edit card ${index + 1}: ${card.title || card.content || "Image card"}`,
-					"aria-describedby": "drag-help",
-					onClick: (event) => {
-						if (busy || drag || swipe || suppressClick()) return;
-						if (event.target instanceof Element) {
-							if (event.target.closest("button, select, input, a")) return;
-							const field = event.target.closest("[data-edit-field]")?.dataset.editField;
-							if (field) {
-								lastTap.current = null;
-								onEditCard(card, field);
-								return;
-							}
-						}
-						if (event.detail === 0) {
-							lastTap.current = null;
-							onEditCard(card);
-							return;
-						}
-						const previous = lastTap.current;
-						const time = Date.now();
-						if (previous?.id === card.id && time - previous.time <= 300 && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) <= 24) {
-							lastTap.current = null;
-							onEditCard(card);
-						} else lastTap.current = {
-							id: card.id,
-							time,
-							x: event.clientX,
-							y: event.clientY
-						};
-					},
-					onKeyDown: (event) => {
-						if (busy || drag || swipe || event.target instanceof Element && event.target.closest("button, select, input, a")) return;
-						if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-							event.preventDefault();
-							onInsertAfter?.(card);
-						} else if (event.key === "Enter" || event.key === " ") {
-							event.preventDefault();
-							onEditCard(card, event.target instanceof Element ? event.target.closest("[data-edit-field]")?.dataset.editField : void 0);
-						} else if (event.key === "Delete") {
-							event.preventDefault();
-							onDeleteCard(card);
-						} else if ((event.altKey || event.shiftKey && (event.ctrlKey || event.metaKey)) && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
-							event.preventDefault();
-							const group = cards.filter((value) => cardContainer(value.status) === cardContainer(card.status));
-							const target = group[group.findIndex((value) => value.id === card.id) + (event.key === "ArrowUp" ? -1 : 1)];
-							if (target) onReorderCard(card, reorderAtTarget(cards.map((value) => value.id), card.id, target.id, event.key === "ArrowUp" ? "before" : "after"));
-						} else if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
-							event.preventDefault();
-							const group = cards.filter((value) => cardContainer(value.status) === cardContainer(card.status));
-							const target = group[group.findIndex((value) => value.id === card.id) + (event.key === "ArrowUp" ? -1 : 1)];
-							const element = [...list.current.querySelectorAll("[data-card-id]")].find((value) => value.dataset.cardId === target?.id);
-							element?.focus();
-							element?.scrollIntoView?.({ block: "nearest" });
-						} else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
-							event.preventDefault();
-							const direction = event.key === "ArrowRight" ? 1 : -1;
-							onUpdateCard(card, event.ctrlKey || event.metaKey ? { type: stepCardType(project.template, card.type, direction) } : { status: stepStatus(card.status, direction) });
-						} else if (event.key.toLowerCase() === "v" && !event.ctrlKey && !event.metaKey && !event.altKey) {
-							event.preventDefault();
-							onUpdateCard(card, { displayMode: nextCardDisplayMode(card.displayMode) });
-						}
-					},
-					"data-card-id": card.id,
-					className: `editor-card display-mode-${mode}${card.title?.trim() ? " has-title" : " no-title"}${drag?.id === card.id ? " drag-placeholder" : ""}`,
-					style: {
-						...cardColors(project.template, card.type),
-						...swipe?.id === card.id ? { transform: `translateX(${swipe.offset}px)` } : {}
-					},
-					children: [
-						/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-							className: "card-topline",
-							children: [
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-									type: "button",
-									className: "card-type-label card-field-control card-field-button",
-									"aria-label": `Change category of card ${index + 1}`,
-									"aria-haspopup": "dialog",
-									disabled: busy || !!drag,
-									onClick: (event) => {
-										event.stopPropagation();
-										if (!suppressClick()) onChooseCardField(card, "type");
-									},
-									children: getCardTypeDefinition(project.template, card.type).label
-								}),
-								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-									type: "button",
-									className: `card-status card-field-control card-field-button status-${card.status.replaceAll(" ", "-")}`,
-									"aria-label": `Change status of card ${index + 1}`,
-									"aria-haspopup": "dialog",
-									disabled: busy || !!drag,
-									onClick: (event) => {
-										event.stopPropagation();
-										if (!suppressClick()) onChooseCardField(card, "status");
-									},
-									children: card.status
-								}),
-								onCardActions ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-									type: "button",
-									className: "card-more-button",
-									disabled: busy || !!drag,
-									"aria-label": `Actions for card ${index + 1}`,
-									"aria-haspopup": "dialog",
-									onClick: (event) => {
-										event.stopPropagation();
-										if (!suppressClick()) onCardActions(card);
-									},
-									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: "more" })
-								}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-									className: "drag-grip",
-									"aria-hidden": "true",
-									children: "⠿"
-								})
-							]
-						}),
-						card.title && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
-							"data-edit-field": "title",
-							role: "button",
-							tabIndex: busy ? -1 : 0,
-							"aria-label": `Edit title of card ${index + 1}`,
-							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownInline, { text: card.title })
-						}),
-						mode !== "compact" && (card.imageId || card.image) && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							"data-edit-field": "content",
-							role: "button",
-							tabIndex: busy ? -1 : 0,
-							"aria-label": `Edit photo of card ${index + 1}`,
-							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CardImage, {
-								card,
-								getImage,
-								thumbnail: mode !== "expanded",
-								alt: card.title || "Card photo"
-							})
-						}),
-						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-							className: "card-text",
-							"data-edit-field": "content",
-							tabIndex: busy ? -1 : 0,
-							"aria-label": `Edit text of card ${index + 1}`,
-							children: card.content ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(MarkdownContent, {
-								text: card.content,
-								onTaskToggle: (line, checked) => {
-									if (busy || drag || swipe) return;
-									const content = setTaskCheckedAtLine(card.content, line, checked);
-									if (content !== card.content) onUpdateCard(card, { content });
-								}
-							}) : !(card.imageId || card.image) && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: "Tap to add text" })
-						}),
-						sourceHref && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("a", {
-							className: "source-link",
-							href: sourceHref,
-							target: "_blank",
-							rel: "noreferrer",
-							children: ["From ", card.source?.provider || "source"]
-						})
-					]
-				})]
+			return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(BoardCard, {
+				card,
+				index: cards.findIndex((value) => value.id === card.id),
+				project,
+				collapsed: collapseCards && !expanded.has(card.id),
+				collapseActive: collapseCards,
+				dragging: drag?.id === card.id,
+				readOnly,
+				swipeOffset: swipe?.id === card.id ? swipe.offset : void 0,
+				hasActions: !!onCardActions,
+				getImage,
+				api: api.current
 			}, card.id);
 		}
 		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
-			/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ScreenHeader, {
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)(ScreenHeader, {
 				title: project.name,
 				onBack,
-				children: drag && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				children: [onCollapseCards && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+					className: "icon-button",
+					"aria-label": "First row only",
+					"aria-pressed": collapseCards,
+					title: collapseCards ? "Show full cards" : "Show one row per card",
+					disabled: readOnly || !!drag,
+					onClick: () => onCollapseCards(!collapseCards),
+					children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: collapseCards ? "rows" : "cards" })
+				}), drag && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 					ref: trash,
 					role: "region",
 					"aria-label": "Drop card here to trash",
@@ -12944,7 +13087,7 @@
 						className: "sr-only",
 						children: "Release here to trash"
 					})]
-				})
+				})]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("main", {
 				ref: scroller,
@@ -12955,17 +13098,17 @@
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "form-actions",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-							disabled: busy,
+							disabled: readOnly || !!drag,
 							onClick: onEditBoard,
 							children: "Edit board"
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 							className: "danger",
-							disabled: actionBusy,
+							disabled: actionBusy || !!drag,
 							onClick: onDeleteBoard,
 							children: "Delete board"
 						})]
 					}),
-					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ProjectFingerprint, {
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(StableFingerprint, {
 						projectId: project.id,
 						items: cards,
 						transition: fingerprintTransition
@@ -13015,7 +13158,7 @@
 									/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 										type: "button",
 										className: "icon-button",
-										disabled: busy || !!drag,
+										disabled: readOnly || !!drag,
 										"aria-label": label,
 										title: label,
 										onClick: (event) => {
@@ -13091,13 +13234,34 @@
 			}), document.body),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 				className: "add-button",
-				disabled: busy,
 				"aria-label": "Create card",
+				disabled: readOnly,
 				onClick: onAddCard,
 				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: "add" })
 			})
 		] });
 	}
+	/** The fingerprint hashes and lays out one SVG cell per card. It only needs to
+	* re-render when a card identity/status or the animation revision changes, so
+	* an unrelated board render (busy flags, expansion, another card's text)
+	* skips ~25 ms of layout work at 300 cards. */
+	var StableFingerprint = (0, import_react.memo)(function StableFingerprint({ projectId, items, transition }) {
+		return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ProjectFingerprint, {
+			projectId,
+			items,
+			transition
+		});
+	}, (previous, next) => {
+		if (previous.projectId !== next.projectId) return false;
+		if (previous.transition?.revision !== next.transition?.revision) return false;
+		if (previous.items === next.items) return true;
+		if (previous.items.length !== next.items.length) return false;
+		for (let index = 0; index < previous.items.length; index++) {
+			const left = previous.items[index], right = next.items[index];
+			if (left.id !== right.id || left.status !== right.status) return false;
+		}
+		return true;
+	});
 	//#endregion
 	//#region board-entry.mjs
 	var project = {

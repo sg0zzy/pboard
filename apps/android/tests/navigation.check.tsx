@@ -20,6 +20,8 @@ vi.mock('../src/storage/repository', async importOriginal => {
     openRepository: storage.open,
     watchRepository: (_repository: unknown, listener: (value: Snapshot) => void) => { storage.listener = listener; listener(storage.snapshot); return storage.stop; },
     readSnapshot: storage.read,
+    setShowPreviews: async (_repository: unknown, show: boolean) => { storage.snapshot = { ...storage.snapshot, showPreviews: show }; },
+    setCollapseCards: async (_repository: unknown, collapse: boolean) => { storage.snapshot = { ...storage.snapshot, collapseCards: collapse }; },
   };
 });
 let root: Root;
@@ -140,6 +142,23 @@ describe('mobile navigation and editing', () => {
     expect(host.querySelectorAll('details')).toHaveLength(0);
     expect(storage.snapshot.cards.map(card => card.id)).toEqual(['other']);
   });
+  it('queues a second edit made while the first is still saving instead of dropping it', async () => {
+    storage.snapshot.cards = [{ id: 'card', projectId: 'phone', content: 'Busy', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
+    // Hold the first write open so the second arrives while it is in flight.
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    storage.update.mockImplementationOnce(async (id, patch) => { await blocked; storage.snapshot = { ...storage.snapshot, cards: storage.snapshot.cards.map(card => card.id === id ? { ...card, ...patch } : card) }; });
+    storage.update.mockImplementation(async (id, patch) => { storage.snapshot = { ...storage.snapshot, cards: storage.snapshot.cards.map(card => card.id === id ? { ...card, ...patch } : card) }; });
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+    await click('Change status of card 1'); await click('confirmed');
+    // Second action while the first is unresolved: previously discarded outright.
+    await click('Change status of card 1'); await click('started');
+    expect(storage.update.mock.calls).toHaveLength(1);
+    await act(async () => { release(); await blocked; });
+    expect(storage.update.mock.calls).toHaveLength(2);
+    expect(storage.update.mock.calls[1]).toEqual(['card', { status: 'started' }]);
+    expect(storage.snapshot.cards[0].status).toBe('started');
+  });
   it('puts discarded cards into trash and permits restoring them without changing order', async () => {
     storage.snapshot.cards = [{ id: 'card', projectId: 'phone', content: 'Keep me', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
     storage.update.mockImplementation(async (id, patch) => { storage.snapshot = { ...storage.snapshot, cards: storage.snapshot.cards.map(card => card.id === id ? { ...card, ...patch } : card) }; });
@@ -173,6 +192,53 @@ describe('mobile navigation and editing', () => {
     await click('Change status of card 1');
     await act(async () => host.querySelector('dialog')!.dispatchEvent(new Event('cancel', { cancelable: true })));
     expect(host.querySelector('dialog')).toBeNull(); expect(storage.update).not.toHaveBeenCalled();
+  });
+  it('switches the home board-only layout from the toolbar and persists it', async () => {
+    await act(async () => root.render(<App />));
+    expect(host.querySelector('.card-preview')?.textContent).toBe('No cards yet');
+    await click('Board only layout');
+    expect(host.querySelector('.card-preview')).toBeNull();
+    expect(host.querySelector('.board-tile')?.getAttribute('aria-label')).toBe('Open PhoneHaul');
+    expect(host.querySelector('button[aria-label="Board only layout"]')?.getAttribute('aria-pressed')).toBe('true');
+    expect(storage.snapshot.showPreviews).toBe(false);
+  });
+  it('collapses board cards to one row, expands one on tap and persists the layout', async () => {
+    storage.snapshot.cards = [{ id: 'card', projectId: 'phone', title: 'A title', content: 'First line\nSecond line', type: 'task' as const, status: 'candidate' as const, order: 0, createdAt: '', updatedAt: '' }];
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+    const card = () => host.querySelector<HTMLElement>('[data-card-id]')!;
+    expect(card().querySelector('.card-summary')).toBeNull();
+    expect(card().querySelector('h2')).not.toBeNull();
+    await click('First row only');
+    expect(storage.snapshot.collapseCards).toBe(true);
+    expect(card().classList.contains('is-collapsed')).toBe(true);
+    expect(card().getAttribute('aria-expanded')).toBe('false');
+    expect(card().querySelector('.card-summary')?.textContent).toBe('A title');
+    expect(card().querySelector('.card-summary')?.getAttribute('aria-expanded')).toBe('false');
+    expect(card().querySelector('h2')).toBeNull();
+    expect(card().querySelector('.card-text')).toBeNull();
+    // A collapsed row opens without leaving the board or opening the editor.
+    await act(async () => card().dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 })));
+    expect(card().classList.contains('is-collapsed')).toBe(false);
+    expect(card().getAttribute('aria-expanded')).toBe('true');
+    expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
+    // The layout survives leaving and reopening the board.
+    await click('Back'); await click('Open PhoneHaul');
+    expect(storage.snapshot.collapseCards).toBe(true);
+    expect(card().classList.contains('is-collapsed')).toBe(true);
+  });
+  it('keeps the collapsed row summary on the first non-empty text line and supports keyboard expansion', async () => {
+    storage.snapshot.cards = [
+      { id: 'text', projectId: 'phone', content: '\n  First visible line  \nSecond line', type: 'task' as const, status: 'candidate' as const, order: 0, createdAt: '', updatedAt: '' },
+      { id: 'photo', projectId: 'phone', content: '', type: 'task' as const, status: 'candidate' as const, order: 1, createdAt: '', updatedAt: '', imageId: 'blob-1' },
+    ];
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul'); await click('First row only');
+    const rows = () => [...host.querySelectorAll<HTMLElement>('[data-card-id]')];
+    expect(rows().map(row => row.querySelector('.card-summary')?.textContent)).toEqual(['First visible line', 'Image card']);
+    rows()[0].focus();
+    await act(async () => rows()[0].dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })));
+    expect(rows()[0].getAttribute('aria-expanded')).toBe('true');
+    expect(host.querySelector('h1')?.textContent).toBe('PhoneHaul');
+    expect(document.activeElement).toBe(rows()[0]);
   });
   it('opens a saved board and returns from board/settings using system back', async () => {
     await act(async () => root.render(<App />));
@@ -322,7 +388,7 @@ describe('mobile navigation and editing', () => {
     } finally { error.mockRestore(); }
   });
   it('renders safe fallbacks for malformed or missing optional data', async () => {
-    await act(async () => root.render(<HomeScreen boards={[{ id: 'bad', name: {}, category: 5, color: [], firstCard: {} }, { id: 'missing' }]} onOpen={vi.fn()} onSettings={vi.fn()} onNotice={vi.fn()} onCreate={vi.fn()} />));
+    await act(async () => root.render(<HomeScreen boards={[{ id: 'bad', name: {}, category: 5, firstCard: {} }, { id: 'missing' }]} onOpen={vi.fn()} onSettings={vi.fn()} onNotice={vi.fn()} onCreate={vi.fn()} />));
     expect(host.querySelectorAll('.board-tile')).toHaveLength(2);
     for (const text of ['Untitled board', 'Notes', 'No cards yet']) expect(host.textContent).toContain(text);
   });

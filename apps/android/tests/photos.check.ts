@@ -4,16 +4,23 @@ import { processImageFile } from '../../../src/images/processing';
 import { pickPhoto } from '../src/platform/pickPhoto';
 import { thumbnailSize } from '../src/images/thumbnail';
 vi.mock('@capacitor/camera', () => ({ Camera: { chooseFromGallery: vi.fn() }, CameraErrorCode: { ChooseMediaCancelled: 'OS-PLUG-CAMR-0020' }, MediaTypeSelection: { Photo: 0 } }));
-vi.mock('../../../src/images/processing', () => ({ processImageFile: vi.fn() }));
+vi.mock('../../../src/images/processing', async importOriginal => ({ ...await importOriginal<typeof import('../../../src/images/processing')>(), processImageFile: vi.fn() }));
+const offThread = vi.hoisted(() => ({ processPhotoFileAsync: vi.fn() }));
+vi.mock('../src/images/processPhotoAsync', () => ({
+  processPhotoFileAsync: offThread.processPhotoFileAsync,
+  supportsOffThreadProcessing: () => true,
+}));
 beforeEach(() => vi.resetAllMocks());
 describe('Android photo selection and thumbnails', () => {
   it('uses a single-photo picker and runs the existing image processing utility', async () => {
     const image = { dataUrl: 'data:image/png;base64,AA==', mimeType: 'image/png', width: 100, height: 200 };
     vi.mocked(Camera.chooseFromGallery).mockResolvedValue({ results: [{ type: 0, saved: false, webPath: image.dataUrl }] });
-    vi.mocked(processImageFile).mockResolvedValue(image);
+    offThread.processPhotoFileAsync.mockResolvedValue(image);
     expect(await pickPhoto()).toEqual(image);
+    expect(offThread.processPhotoFileAsync).toHaveBeenCalledOnce();
+    expect(processImageFile).not.toHaveBeenCalled();
     expect(Camera.chooseFromGallery).toHaveBeenCalledExactlyOnceWith({ mediaType: MediaTypeSelection.Photo, allowMultipleSelection: false, editable: 'no', includeMetadata: true });
-    const file = vi.mocked(processImageFile).mock.calls[0][0];
+    const file = offThread.processPhotoFileAsync.mock.calls[0][0];
     expect(file.type).toBe('image/png'); expect(file.size).toBeGreaterThan(0);
   });
   it('treats cancellation and an empty selection as no change, but surfaces real failures', async () => {

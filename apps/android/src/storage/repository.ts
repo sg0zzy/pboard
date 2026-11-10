@@ -3,13 +3,16 @@ import { normalizeUiScale, DEFAULT_UI_SCALE, UI_SCALE_STORAGE_KEY } from '../../
 import { createRxRepository, type RxRepository } from '../../../../src/storage/rxdbRepository';
 import { createIndexedDbBlobStore } from '../../../../src/storage/blobStore';
 import { compareOrdered } from '../../../../src/storage/orderKey';
+import { cardContainer } from '../data/cardContainers';
+import { categoryOf } from '../data/categories';
 import type { CardRecord } from '../../../../src/storage/rxdbSchemas';
 import type { BoardItem, Project } from '../../../../src/types';
 import type { BoardOverview } from '../data/boards';
 
-export type Snapshot = { projects: Project[]; cards: BoardItem[]; showPreviews: boolean; uiScale?: number };
-export const EMPTY_SNAPSHOT: Snapshot = { projects: [], cards: [], showPreviews: true };
+export type Snapshot = { projects: Project[]; cards: BoardItem[]; showPreviews: boolean; collapseCards?: boolean; uiScale?: number };
+export const EMPTY_SNAPSHOT: Snapshot = { projects: [], cards: [], showPreviews: true, collapseCards: false };
 const PREVIEWS_KEY = 'android.showCardPreviews';
+const COLLAPSE_KEY = 'android.collapseCards';
 let opening: Promise<RxRepository> | undefined;
 
 /** Reuse the browser-independent repository, without its browser/Drive adapters. */
@@ -27,8 +30,8 @@ export function openRepository(): Promise<RxRepository> {
 }
 
 export async function readSnapshot(repository: RxRepository): Promise<Snapshot> {
-  const [projects, documents, setting, scale] = await Promise.all([
-    repository.listProjects(), repository.db.cards.find().exec(), repository.db.settings.findOne(PREVIEWS_KEY).exec(), repository.db.settings.findOne(UI_SCALE_STORAGE_KEY).exec(),
+  const [projects, documents, setting, scale, collapse] = await Promise.all([
+    repository.listProjects(), repository.db.cards.find().exec(), repository.db.settings.findOne(PREVIEWS_KEY).exec(), repository.db.settings.findOne(UI_SCALE_STORAGE_KEY).exec(), repository.db.settings.findOne(COLLAPSE_KEY).exec(),
   ]);
   const records = documents.map(doc => doc.toJSON()).filter(card => !card.deletedAt).sort(compareOrdered);
   const ranks = new Map<string, number>();
@@ -38,7 +41,35 @@ export async function readSnapshot(repository: RxRepository): Promise<Snapshot> 
     ranks.set(record.projectId, order + 1);
     return { ...(card as BoardItem), order };
   });
-  return { projects, cards, showPreviews: setting?.value !== 'false', uiScale: normalizeUiScale(scale?.value ? Number(scale.value) : DEFAULT_UI_SCALE) };
+  return { projects, cards, showPreviews: setting?.value !== 'false', collapseCards: collapse?.value === 'true', uiScale: normalizeUiScale(scale?.value ? Number(scale.value) : DEFAULT_UI_SCALE) };
+}
+
+/** Cheap value comparison for the reactive snapshot. One repository write
+ * emits several snapshots (cards + settings subscriptions, plus the explicit
+ * read after a mutation), and each distinct array identity used to re-render
+ * the whole board. Comparing fields costs microseconds against a render.
+ * `uiScale` may legitimately be `undefined`; `collapseCards` is a setting. */
+export function snapshotsEqual(a: Snapshot, b: Snapshot): boolean {
+  if (a.showPreviews !== b.showPreviews || a.collapseCards !== b.collapseCards || a.uiScale !== b.uiScale) return false;
+  if (a.projects !== b.projects) {
+    if (a.projects.length !== b.projects.length) return false;
+    for (let index = 0; index < a.projects.length; index++) {
+      const left = a.projects[index], right = b.projects[index];
+      if (left.id !== right.id || left.name !== right.name || left.template !== right.template
+        || left.updatedAt !== right.updatedAt || left.revision !== right.revision) return false;
+    }
+  }
+  if (a.cards === b.cards) return true;
+  if (a.cards.length !== b.cards.length) return false;
+  for (let index = 0; index < a.cards.length; index++) {
+    const left = a.cards[index], right = b.cards[index];
+    if (left.id !== right.id || left.projectId !== right.projectId || left.status !== right.status
+      || left.title !== right.title || left.content !== right.content || left.type !== right.type
+      || left.displayMode !== right.displayMode || left.order !== right.order || left.updatedAt !== right.updatedAt
+      || left.imageId !== right.imageId || left.imageMimeType !== right.imageMimeType
+      || left.imageWidth !== right.imageWidth || left.imageHeight !== right.imageHeight) return false;
+  }
+  return true;
 }
 
 /** A generation guard prevents slower reads overwriting a newer snapshot. */
@@ -69,13 +100,20 @@ export async function setUiScale(repository: RxRepository, scale: number): Promi
   await repository.db.settings.upsert({ id: UI_SCALE_STORAGE_KEY, value: String(normalizeUiScale(scale)) });
 }
 
-const categories = { brainstorming: 'Notes', idea: 'Ideas', project: 'Project', software_project: 'Project' } as const;
+export async function setCollapseCards(repository: RxRepository, collapse: boolean): Promise<void> {
+  await repository.db.settings.upsert({ id: COLLAPSE_KEY, value: String(collapse) });
+}
+
 export function overviewBoards(snapshot: Snapshot): BoardOverview[] {
   return snapshot.projects.map(project => {
-    const first = snapshot.cards.filter(card => card.projectId === project.id && card.status !== 'trash').sort((a, b) => a.order - b.order)[0];
+    // The tile summarizes the board's working list. Done, rejected and trash
+    // cards live in collapsed containers, so none of them may become the
+    // preview after the active list has been emptied or cleared.
+    const first = snapshot.cards.filter(card => card.projectId === project.id && cardContainer(card.status) === 'active').sort((a, b) => a.order - b.order)[0];
     return {
       id: project.id, name: project.name, updatedAt: project.updatedAt,
-      category: categories[project.template] ?? 'Notes', template: project.template, firstCardType: first?.type,
+      category: categoryOf(project.template).label, categoryColor: categoryOf(project.template).color,
+      template: project.template,
       firstCard: first ? first.title?.trim() || first.content || 'Image card' : 'No cards yet',
     };
   });

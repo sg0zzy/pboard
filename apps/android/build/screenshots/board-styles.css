@@ -43,9 +43,14 @@ button:active:not(:disabled) { filter: brightness(.94); }
 .toolbar-save { flex: none; border: 0; border-radius: 24px; min-width: 72px; min-height: 48px; padding: 10px 16px; background: var(--md-primary); color: var(--md-on-primary); }
 .home-content { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; padding: 8px 16px 96px; }
 .board-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.board-tile { min-width: 0; width: 100%; height: clamp(152px, 44vw, 208px); display: flex; flex-direction: column; align-items: stretch; padding: 14px 10px 10px; border: 1px solid var(--md-outline-variant); border-top: 3px solid var(--card-accent); border-radius: 12px; background: var(--card-tint); user-select: none; -webkit-user-select: none; overflow: hidden; }
+.board-tile { min-width: 0; width: 100%; height: clamp(152px, 44vw, 208px); display: flex; flex-direction: column; align-items: stretch; padding: 14px 10px 10px; border: 1px solid var(--md-outline-variant); border-top: 3px solid var(--category-accent); border-radius: 12px; background: var(--md-surface-container); user-select: none; -webkit-user-select: none; overflow: hidden; }
+/* Board-only home layout: name and category, no reserved preview box. */
+.board-tile--compact { height: auto; min-height: 72px; padding-bottom: 12px; }
+.board-tile--compact .board-category { margin-bottom: 0; }
 .board-title { flex: none; min-width: 0; text-align: center; font-size: 16px; font-weight: 600; line-height: 24px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.board-category { flex: none; text-align: center; font-size: 12px; line-height: 16px; color: var(--muted); margin: 3px 0 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The category chip is tinted with its own accent so the colour reads as a
+   label, not just as a 3 px edge. */
+.board-category { flex: none; align-self: center; max-width: 100%; font-size: 11px; font-weight: 600; line-height: 16px; letter-spacing: .02em; color: var(--category-accent); background: color-mix(in srgb, var(--category-accent) 14%, transparent); border-radius: 999px; padding: 1px 10px; margin: 3px 0 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card-preview { display: block; flex: 1; min-height: 0; border-radius: 8px; background: var(--preview); padding: 10px; overflow: hidden; text-align: left; font-size: 13px; font-weight: 400; line-height: 1.4; }
 .card-preview > span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; }
 .add-button { position: absolute; right: calc(16px + var(--safe-right)); bottom: calc(16px + var(--safe-bottom)); display: grid; place-items: center; width: 56px; height: 56px; border: 0; border-radius: 16px; background: var(--md-primary-container); color: var(--md-on-primary-container); box-shadow: 0 3px 6px #0002; }
@@ -67,6 +72,12 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px
 .editor-card { position: relative; background: var(--preview); border: 1px solid var(--md-outline-variant); border-top: 3px solid var(--card-accent); border-radius: 12px; padding: 16px; min-width: 0; touch-action: pan-y; user-select: none; -webkit-user-select: none; }
 .editor-card h2 { font-size: 18px; font-weight: 500; line-height: 24px; margin: 8px 0; overflow-wrap: anywhere; }
 .card-topline { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+/* One-row board layout: the top line becomes the whole card until tapped. */
+.editor-card.is-collapsed { padding: 10px 12px; }
+.editor-card.is-collapsed .card-topline { margin-bottom: 0; }
+.card-summary { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 14px; line-height: 20px; text-align: left; background: none; border: 0; padding: 4px 0; color: inherit; cursor: pointer; }
+.card-summary:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; border-radius: 4px; }
+.editor-card.is-collapsed .card-more-button, .editor-card.is-collapsed .drag-grip { margin-left: auto; }
 .card-type-label { display: inline-block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; line-height: 16px; border-radius: 4px; background: var(--card-tint); color: var(--card-accent); padding: 4px 8px; }
 .drag-grip { flex: none; margin-left: auto; color: var(--md-on-surface-variant); font-size: 24px; line-height: 24px; }
 .card-status { flex: none; font-size: 12px; line-height: 16px; color: var(--muted); white-space: nowrap; }
@@ -109,7 +120,11 @@ dialog::backdrop { background: #0006; }
     --md-inverse-surface: #e7e7e3; --md-inverse-on-surface: #292a27;
     --preview: #292a27;
   }
-  .board-tile { background: color-mix(in srgb, var(--card-accent) 20%, #292a27); }
+  .board-tile { background: var(--md-surface-container); }
+  /* The preview panel and the tile now share a role, so the panel keeps a
+     slightly raised surface to stay a distinct block in dark mode. */
+  .board-tile .card-preview { background: var(--md-surface-container-high); }
+  .board-category { color: color-mix(in srgb, var(--category-accent) 60%, white); background: color-mix(in srgb, var(--category-accent) 24%, #292a27); }
   .card-type-label { background: color-mix(in srgb, var(--card-accent) 20%, #292a27); color: color-mix(in srgb, var(--card-accent) 65%, white); }
   .status-candidate, .status-trash { color: #b1b3aa; }
   .status-confirmed { color: #8fbf9e; }
@@ -195,14 +210,37 @@ dialog::backdrop { background: #0006; }
 .photo-placeholder { display: block; padding: 12px; color: var(--muted); font-size: 13px; }
 .photo-error { color: var(--md-error); font-size: 14px; }
 
+/* Collaboration strip: one fixed header row, so role resolution and the
+   invitation form cannot push the board's cards around. */
+.cloud-board { margin: 0 0 8px; }
+.cloud-row { display: flex; align-items: center; gap: 8px; min-height: 48px; }
+.cloud-status { flex: 1; min-width: 0; margin: 0; font-size: 13px; line-height: 18px; color: var(--muted); overflow-wrap: anywhere; }
+.cloud-share-button { flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 0 12px; border: 1px solid var(--md-outline); border-radius: 20px; background: transparent; color: var(--md-primary); font-size: 14px; font-weight: 500; white-space: nowrap; }
+.cloud-share-button:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; }
+.cloud-share-button[aria-expanded=true] { background: var(--md-primary-container); color: var(--md-on-primary-container); border-color: transparent; }
+.cloud-share-button:disabled { color: var(--muted); }
+/* Below the header row, never inside it: as a flex sibling the open form
+   squeezed the status text to one character per line. */
+.cloud-share-form { display: grid; gap: 12px; padding: 12px; margin: 8px 0; border-radius: 12px; background: var(--md-surface-container); }
+.cloud-share-form button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; justify-self: start; }
+.cloud-share-form label { display: grid; gap: 6px; font-size: 13px; color: var(--md-on-surface-variant); }
+.cloud-message { margin: 0 0 8px; font-size: 13px; color: var(--md-on-surface-variant); }
+
 /* Local feature parity keeps actions inside menus rather than adding a card action bar. */
 .screen-content .card-more-button { display: grid; place-items: center; flex: none; margin-left: auto; min-width: 32px; min-height: 32px; padding: 0; border: 0; background: transparent; color: var(--muted); }
 .card-actions-dialog { width: min(360px, calc(100% - 48px)); max-height: calc(100dvh - var(--safe-top) - var(--safe-bottom) - 48px); overflow-y: auto; }
 .card-menu-options { display: grid; gap: 4px; }
-.card-menu-options button { min-height: 48px; width: 100%; text-align: left; border-radius: 12px; overflow-wrap: anywhere; }
-.card-menu-options button span { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.card-menu-options small { display: block; margin-top: 4px; }
+/* Material menu rows: leading 24 dp icon, label, optional trailing state.
+   A merge target's status stays on the same line so the row keeps one height. */
+.card-menu-options button { display: flex; align-items: center; gap: 16px; min-height: 48px; width: 100%; padding: 8px 12px; text-align: left; border-radius: 12px; overflow-wrap: anywhere; }
+.card-menu-options button > span { flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.card-menu-options small { flex: none; margin: 0; font-size: 12px; line-height: 16px; }
+.card-menu-options .material-icon { flex: none; }
+/* Material menu rows colour the leading icon with the label; disabled rows
+   dim both together through the button's opacity. */
+.card-menu-options .danger .material-icon { color: inherit; }
 .display-mode-options { display: flex; flex-wrap: wrap; gap: 4px; }
+.display-mode-options button { display: inline-flex; align-items: center; gap: 8px; }
 .display-mode-options [aria-pressed=true] { background: var(--md-primary-container); color: var(--md-on-primary-container); }
 .muted { color: var(--muted); }
 .board-export-actions button { display: inline-flex; align-items: center; gap: 8px; }

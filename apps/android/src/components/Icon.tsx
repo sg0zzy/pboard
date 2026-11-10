@@ -1,5 +1,7 @@
-type IconName = 'cloud' | 'settings' | 'back' | 'add' | 'trash' | 'photo' | 'more' | 'copy' | 'download';
+type IconName = 'cloud' | 'settings' | 'back' | 'add' | 'trash' | 'photo' | 'more' | 'copy' | 'download' | 'cards' | 'rows';
 const paths: Record<IconName, string> = {
+  cards: 'M4 4h16v7H4zM4 13h16v7H4z',
+  rows: 'M4 6h16M4 12h16M4 18h11',
   more: 'M12 5h.01M12 12h.01M12 19h.01',
   copy: 'M9 9h12v12H9zM15 9V3H3v12h6',
   download: 'M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4',

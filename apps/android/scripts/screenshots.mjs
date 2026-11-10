@@ -38,15 +38,23 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import "../../src/styles/index.css";
 import { HomeScreen } from "../../src/screens/HomeScreen";
+import { categoryOf } from "../../src/data/categories";
 
-const boards = [
-  { id: "phone", name: "PhoneHaul", category: "Project", template: "project", firstCardType: "task", firstCard: "Improve Android transfer UX", updatedAt: "2026-10-14T09:00:00Z" },
-  { id: "film", name: "filmTidy", category: "Project", template: "project", firstCardType: "task", firstCard: "Photo metadata analysis", updatedAt: "2026-10-13T09:00:00Z" },
-  { id: "personal", name: "Personal ideas", category: "Ideas", template: "brainstorming", firstCardType: "idea", firstCard: "A lightweight notes system", updatedAt: "2026-10-12T09:00:00Z" },
-  { id: "website", name: "Website", category: "Project", template: "project", firstCardType: "task", firstCard: "Publish the landing page", updatedAt: "2026-10-11T09:00:00Z" },
-  { id: "ai", name: "AI experiments", category: "Ideas", template: "brainstorming", firstCardType: "idea", firstCard: "Test new coding agents", updatedAt: "2026-10-02T09:00:00Z" },
-  { id: "archive", name: "Archive", category: "Notes", template: "brainstorming", firstCardType: "note", firstCard: "Reading list and references", updatedAt: "2026-10-01T09:00:00Z" },
+// Category label and colour are derived from the template exactly as
+// overviewBoards() does, so a fixture cannot show a label that disagrees with
+// its colour.
+const seed = [
+  { id: "phone", name: "PhoneHaul", template: "project", firstCard: "Improve Android transfer UX", updatedAt: "2026-10-14T09:00:00Z" },
+  { id: "film", name: "filmTidy", template: "project", firstCard: "Photo metadata analysis", updatedAt: "2026-10-13T09:00:00Z" },
+  { id: "personal", name: "Personal ideas", template: "idea", firstCard: "A lightweight notes system", updatedAt: "2026-10-12T09:00:00Z" },
+  { id: "website", name: "Website", template: "project", firstCard: "Publish the landing page", updatedAt: "2026-10-11T09:00:00Z" },
+  { id: "ai", name: "AI experiments", template: "idea", firstCard: "Test new coding agents", updatedAt: "2026-10-02T09:00:00Z" },
+  { id: "archive", name: "Archive", template: "brainstorming", firstCard: "Reading list and references", updatedAt: "2026-10-01T09:00:00Z" },
 ];
+const boards = seed.map(board => {
+  const category = categoryOf(board.template);
+  return { ...board, category: category.label, categoryColor: category.color };
+});
 
 createRoot(document.getElementById("root")).render(
   React.createElement(HomeScreen, {

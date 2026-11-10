@@ -1,5 +1,6 @@
 import { Camera, CameraErrorCode, MediaTypeSelection } from '@capacitor/camera';
 import { processImageFile } from '../../../../src/images/processing';
+import { processPhotoFileAsync, supportsOffThreadProcessing } from '../images/processPhotoAsync';
 import type { BoardImage } from '../../../../src/types';
 
 /** The system picker grants access to just the selected photo. No gallery permission is requested. */
@@ -16,7 +17,10 @@ export async function pickPhoto(): Promise<BoardImage | null> {
     const blob = await response.blob();
     const format = photo.metadata?.format?.toLowerCase().replace('jpg', 'jpeg');
     const mime = blob.type.startsWith('image/') ? blob.type : format ? `image/${format}` : '';
-    return await processImageFile(new File([blob], 'photo', { type: mime }));
+    const file = new File([blob], 'photo', { type: mime });
+    // A large photo decodes and re-encodes off the main thread when the WebView
+    // supports it; the shared, main-thread function is the fallback.
+    return supportsOffThreadProcessing() ? await processPhotoFileAsync(file) : await processImageFile(file);
   } catch (error) {
     const failure = error as { code?: string; message?: string };
     if (failure?.code === CameraErrorCode.ChooseMediaCancelled || failure?.message === 'User cancelled photos app') return null;

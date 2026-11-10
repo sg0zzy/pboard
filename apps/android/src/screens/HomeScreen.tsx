@@ -8,10 +8,11 @@ type Props = {
   onSettings: () => void;
   onCreate: () => void;
   showPreviews?: boolean;
+  onPreviews?: (show: boolean) => void;
   onNotice: (message: string) => void;
   cloud?: { connected: boolean; error: string; lastSynced: string } | null;
 };
-export function HomeScreen({ boards, onOpen, onSettings, onCreate, showPreviews = true, onNotice, cloud }: Props) {
+export function HomeScreen({ boards, onOpen, onSettings, onCreate, showPreviews = true, onPreviews, onNotice, cloud }: Props) {
   const driveNotice = !cloud?.connected
     ? 'Google Drive is not connected. Open Settings to connect it.'
     : cloud.error ? `Google Drive: ${cloud.error}`
@@ -19,6 +20,7 @@ export function HomeScreen({ boards, onOpen, onSettings, onCreate, showPreviews 
   return <>
     <header className="toolbar">
       <h1>pboard</h1>
+      {onPreviews && <button className="icon-button" aria-label="Board only layout" aria-pressed={!showPreviews} title={showPreviews ? 'Show boards only' : 'Show card previews on boards'} onClick={() => onPreviews(!showPreviews)}><Icon name={showPreviews ? 'cards' : 'rows'} /></button>}
       <button className="icon-button" aria-label="Google Drive integration" onClick={() => onNotice(driveNotice)}><Icon name="cloud" /></button>
       <button className="icon-button" aria-label="Settings" onClick={onSettings}><Icon name="settings" /></button>
     </header>

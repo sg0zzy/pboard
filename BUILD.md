@@ -83,6 +83,8 @@ cargo test --manifest-path services/pboard-signaling/Cargo.toml
 cargo clippy --manifest-path services/pboard-signaling/Cargo.toml --all-targets
 ```
 
+`scripts/test-all.sh` runs the local, offline subset of all of that in one pass — root and Android typechecks, both Vitest suites, the relay `cargo test`, the durable buffer probe and the recovery inventory — and summarises each suite with its own result lines. `--full` adds the recovery harness's local Chromium fixtures, `--only <suite>` runs one, `--keep-going` reports every failure instead of stopping at the first, and `--list` documents the suites. It never runs `npm run test:collaboration`, `automatic-smoke.mjs`, `secure-browser-smoke.mjs` or the geckodriver/hosted smokes, because those need a public endpoint, live Google credentials or a browser driver; that exclusion is deliberate rather than an oversight. Browser builds and `verify-build.mjs` are also out of scope: they produce artifacts, so `npm run check` remains the gate for those.
+
 The vitest configuration includes `tests/**/*.test.{ts,tsx,mjs}`, so the isolated two-browser suite under `tests/multiBrowser/` runs as part of `npm test` rather than as a separate harness. `verify-build.mjs` takes `firefox`, `chromium` or `all`; with no argument it verifies `all`, and it is the gate that fails a build whose bundled background script cannot start. `cargo clippy --all-targets` is the lint gate for the relay and must report zero warnings.
 
 ## Relay service (`services/pboard-signaling`)

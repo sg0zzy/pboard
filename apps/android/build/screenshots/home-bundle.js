@@ -11434,217 +11434,6 @@
 	var import_react = /* @__PURE__ */ __toESM(require_react(), 1);
 	var import_client = require_client();
 	//#endregion
-	//#region ../../../../src/templates/boardTemplates.ts
-	var note = {
-		id: "note",
-		label: "Uncategorized",
-		color: "#73766f",
-		tint: "#f0f1ed"
-	};
-	var boardTemplates = {
-		brainstorming: {
-			id: "brainstorming",
-			displayName: "Brainstorming",
-			description: "Free-form notes, no categories.",
-			cardTypes: [{
-				...note,
-				label: "Note"
-			}],
-			defaultCardType: "note",
-			showTypeSelector: false,
-			includeTypeInPrompt: false
-		},
-		idea: {
-			id: "idea",
-			displayName: "Idea",
-			description: "Light structure for exploring and refining ideas.",
-			cardTypes: [
-				{
-					id: "core_idea",
-					label: "Core Idea",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "opportunity",
-					label: "Opportunity",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "question",
-					label: "Question",
-					color: "#9a7714",
-					tint: "#fff7d9"
-				},
-				{
-					id: "risk",
-					label: "Risk",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "constraint",
-					label: "Constraint",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "reference",
-					label: "Reference",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "note",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		},
-		project: {
-			id: "project",
-			displayName: "Project",
-			description: "Structured board for goals, decisions, risks and next steps.",
-			cardTypes: [
-				{
-					id: "goal",
-					label: "Goal",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "decision",
-					label: "Decision",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "task",
-					label: "Task / Next Step",
-					color: "#22827d",
-					tint: "#e4f6f4"
-				},
-				{
-					id: "constraint",
-					label: "Constraint",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "question",
-					label: "Open Question",
-					color: "#9a7714",
-					tint: "#fff7d9"
-				},
-				{
-					id: "risk",
-					label: "Risk / Blocker",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "reference",
-					label: "Reference",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "note",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		},
-		software_project: {
-			id: "software_project",
-			displayName: "SW Project",
-			description: "Software goals, product work, issues and implementation tasks.",
-			cardTypes: [
-				{
-					id: "issue",
-					label: "Issue",
-					color: "#b6504b",
-					tint: "#fdecea"
-				},
-				{
-					id: "feature",
-					label: "Feature",
-					color: "#398458",
-					tint: "#eaf7ee"
-				},
-				{
-					id: "decision",
-					label: "Decision",
-					color: "#745e99",
-					tint: "#f1edf8"
-				},
-				{
-					id: "task",
-					label: "Task",
-					color: "#22827d",
-					tint: "#e4f6f4"
-				},
-				{
-					id: "main_goal",
-					label: "Main Goal",
-					color: "#3974c1",
-					tint: "#e9f2ff"
-				},
-				{
-					id: "main_description",
-					label: "Main Description",
-					color: "#59758d",
-					tint: "#edf3f7"
-				},
-				note
-			],
-			defaultCardType: "task",
-			showTypeSelector: true,
-			includeTypeInPrompt: true
-		}
-	};
-	function getCardTypeDefinition(template, type) {
-		return boardTemplates[template].cardTypes.find((candidate) => candidate.id === type) ?? note;
-	}
-	//#endregion
-	//#region ../../src/data/cardColors.ts
-	function cardColors(template, type) {
-		const definition = template && type ? getCardTypeDefinition(template, type) : note;
-		return {
-			"--card-accent": definition.color,
-			"--card-tint": definition.tint
-		};
-	}
-	//#endregion
-	//#region ../../../../src/types/index.ts
-	var BOARD_ITEM_TYPES = [
-		"note",
-		"core_idea",
-		"opportunity",
-		"idea",
-		"goal",
-		"decision",
-		"task",
-		"issue",
-		"feature",
-		"main_goal",
-		"main_description",
-		"constraint",
-		"question",
-		"risk",
-		"reference"
-	];
-	[
-		["candidate", "confirmed"],
-		["started", "to validate"],
-		["done", "rejected"]
-	].flat();
-	var BOARD_TEMPLATES = [
-		"brainstorming",
-		"idea",
-		"project",
-		"software_project"
-	];
-	//#endregion
 	//#region ../../src/data/boards.ts
 	function displayText(value, fallback) {
 		return typeof value === "string" && value.trim() ? value.trim() : fallback;
@@ -11671,6 +11460,44 @@
 		}).slice(0, 4);
 		const recentIds = new Set(recent.map((board) => board.id));
 		return [...recent, ...unique.filter((board) => !recentIds.has(board.id))];
+	}
+	//#endregion
+	//#region ../../src/data/categories.ts
+	/**
+	* A board's category is derived from its template, and each category owns one
+	* accent colour so the home grid can be scanned by kind at a glance. The colour
+	* comes from the template's own palette (its card types), so a board never
+	* shows a hue that does not exist inside it. Both the display name and the
+	* colour live here, so the tile label and the tile accent cannot drift apart.
+	*/
+	var BOARD_CATEGORIES = {
+		brainstorming: {
+			label: "Notes",
+			color: "#73766f"
+		},
+		idea: {
+			label: "Ideas",
+			color: "#3974c1"
+		},
+		project: {
+			label: "Project",
+			color: "#22827d"
+		},
+		software_project: {
+			label: "Project",
+			color: "#22827d"
+		}
+	};
+	var FALLBACK_CATEGORY = BOARD_CATEGORIES.brainstorming;
+	function categoryOf(template) {
+		return typeof template === "string" && template in BOARD_CATEGORIES ? BOARD_CATEGORIES[template] : FALLBACK_CATEGORY;
+	}
+	/** Tile accent only. The tile's own surface tint stays theme-derived so the
+	* dark theme does not need a second palette. `overviewBoards` already resolved
+	* the colour; the template lookup is only a fallback for callers that build an
+	* overview by hand. */
+	function categoryColors(board) {
+		return { "--category-accent": typeof board.categoryColor === "string" ? board.categoryColor : categoryOf(board.template).color };
 	}
 	//#endregion
 	//#region ../../node_modules/react/cjs/react-jsx-runtime.production.js
@@ -11712,13 +11539,19 @@
 	var import_jsx_runtime = (/* @__PURE__ */ __commonJSMin(((exports, module) => {
 		module.exports = require_react_jsx_runtime_production();
 	})))();
+	/**
+	* Home tile. Its accent and chip come from the board's **category**, not from
+	* the first card, so the grid reads by board kind: all Notes share one hue, all
+	* Ideas another, and a board's colour never changes because a card was edited,
+	* reordered or emptied. The accent is the colour `overviewBoards` already
+	* resolved for `categoryColor`, so the chip's label and the tile's hue are
+	* decided once, together.
+	*/
 	function BoardTile({ board, onOpen, showPreview = true }) {
 		const title = displayText(board.name, "Untitled board");
-		const template = BOARD_TEMPLATES.includes(board.template) ? board.template : void 0;
-		const type = BOARD_ITEM_TYPES.includes(board.firstCardType) ? board.firstCardType : void 0;
 		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-			className: "board-tile",
-			style: cardColors(template, type),
+			className: `board-tile${showPreview ? "" : " board-tile--compact"}`,
+			style: categoryColors(board),
 			onClick: () => onOpen(board),
 			"aria-label": `Open ${title}`,
 			children: [
@@ -11740,6 +11573,8 @@
 	//#endregion
 	//#region ../../src/components/Icon.tsx
 	var paths = {
+		cards: "M4 4h16v7H4zM4 13h16v7H4z",
+		rows: "M4 6h16M4 12h16M4 18h11",
 		more: "M12 5h.01M12 12h.01M12 19h.01",
 		copy: "M9 9h12v12H9zM15 9V3H3v12h6",
 		download: "M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4",
@@ -11766,16 +11601,25 @@
 	}
 	//#endregion
 	//#region ../../src/screens/HomeScreen.tsx
-	function HomeScreen({ boards, onOpen, onSettings, onNotice, onCreate, showPreviews = true }) {
+	function HomeScreen({ boards, onOpen, onSettings, onCreate, showPreviews = true, onPreviews, onNotice, cloud }) {
+		const driveNotice = !cloud?.connected ? "Google Drive is not connected. Open Settings to connect it." : cloud.error ? `Google Drive: ${cloud.error}` : `Google Drive connected. Boards and photos sync while the app is open.${cloud.lastSynced ? ` Last synced: ${cloud.lastSynced}.` : ""}`;
 		return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
 			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", {
 				className: "toolbar",
 				children: [
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", { children: "pboard" }),
+					onPreviews && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+						className: "icon-button",
+						"aria-label": "Board only layout",
+						"aria-pressed": !showPreviews,
+						title: showPreviews ? "Show boards only" : "Show card previews on boards",
+						onClick: () => onPreviews(!showPreviews),
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: showPreviews ? "cards" : "rows" })
+					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
 						className: "icon-button",
 						"aria-label": "Google Drive integration",
-						onClick: () => onNotice("Google Drive integration is not yet configured."),
+						onClick: () => onNotice(driveNotice),
 						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Icon, { name: "cloud" })
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
@@ -11811,63 +11655,59 @@
 	}
 	//#endregion
 	//#region home-entry.mjs
+	var boards = [
+		{
+			id: "phone",
+			name: "PhoneHaul",
+			template: "project",
+			firstCard: "Improve Android transfer UX",
+			updatedAt: "2026-10-14T09:00:00Z"
+		},
+		{
+			id: "film",
+			name: "filmTidy",
+			template: "project",
+			firstCard: "Photo metadata analysis",
+			updatedAt: "2026-10-13T09:00:00Z"
+		},
+		{
+			id: "personal",
+			name: "Personal ideas",
+			template: "idea",
+			firstCard: "A lightweight notes system",
+			updatedAt: "2026-10-12T09:00:00Z"
+		},
+		{
+			id: "website",
+			name: "Website",
+			template: "project",
+			firstCard: "Publish the landing page",
+			updatedAt: "2026-10-11T09:00:00Z"
+		},
+		{
+			id: "ai",
+			name: "AI experiments",
+			template: "idea",
+			firstCard: "Test new coding agents",
+			updatedAt: "2026-10-02T09:00:00Z"
+		},
+		{
+			id: "archive",
+			name: "Archive",
+			template: "brainstorming",
+			firstCard: "Reading list and references",
+			updatedAt: "2026-10-01T09:00:00Z"
+		}
+	].map((board) => {
+		const category = categoryOf(board.template);
+		return {
+			...board,
+			category: category.label,
+			categoryColor: category.color
+		};
+	});
 	(0, import_client.createRoot)(document.getElementById("root")).render(import_react.createElement(HomeScreen, {
-		boards: [
-			{
-				id: "phone",
-				name: "PhoneHaul",
-				category: "Project",
-				template: "project",
-				firstCardType: "task",
-				firstCard: "Improve Android transfer UX",
-				updatedAt: "2026-10-14T09:00:00Z"
-			},
-			{
-				id: "film",
-				name: "filmTidy",
-				category: "Project",
-				template: "project",
-				firstCardType: "task",
-				firstCard: "Photo metadata analysis",
-				updatedAt: "2026-10-13T09:00:00Z"
-			},
-			{
-				id: "personal",
-				name: "Personal ideas",
-				category: "Ideas",
-				template: "brainstorming",
-				firstCardType: "idea",
-				firstCard: "A lightweight notes system",
-				updatedAt: "2026-10-12T09:00:00Z"
-			},
-			{
-				id: "website",
-				name: "Website",
-				category: "Project",
-				template: "project",
-				firstCardType: "task",
-				firstCard: "Publish the landing page",
-				updatedAt: "2026-10-11T09:00:00Z"
-			},
-			{
-				id: "ai",
-				name: "AI experiments",
-				category: "Ideas",
-				template: "brainstorming",
-				firstCardType: "idea",
-				firstCard: "Test new coding agents",
-				updatedAt: "2026-10-02T09:00:00Z"
-			},
-			{
-				id: "archive",
-				name: "Archive",
-				category: "Notes",
-				template: "brainstorming",
-				firstCardType: "note",
-				firstCard: "Reading list and references",
-				updatedAt: "2026-10-01T09:00:00Z"
-			}
-		],
+		boards,
 		showPreviews: true,
 		onOpen: () => {},
 		onSettings: () => {},
