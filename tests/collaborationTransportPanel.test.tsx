@@ -62,6 +62,7 @@ vi.mock("../src/sync/client", () => ({
 }));
 
 vi.mock("../src/sync/browser", () => ({
+  driveFolderGardener: {},
   healRelay: async () => "idle:no-room",
   operationService: { subscribeRole: async () => () => {}, role: async () => "viewer" },
   boardCollaboration: { settings: async () => fake.settings },

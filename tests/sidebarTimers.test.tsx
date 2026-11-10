@@ -54,6 +54,7 @@ vi.mock("../src/platform/browser", () => ({
 }));
 vi.mock("../src/sync/client", () => ({ requestDriveReconciliation: vi.fn(async () => ({ ok: true })), requestProjectSync: vi.fn(async () => undefined) }));
 vi.mock("../src/sync/browser", () => ({
+  driveFolderGardener: {},
   healRelay: async () => "idle:no-room",
   operationService: { subscribeRole: async () => () => {}, role: async () => "viewer" },
   boardCollaboration: { settings: async () => ({ provider: "drive", url: "wss://relay.invalid/ws" }) },

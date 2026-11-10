@@ -29,9 +29,8 @@ it("exposes production opt-in, requests only the selected host on a user gesture
   await act(async () => resolve(true));
   expect(mocks.configure).toHaveBeenCalledWith({ provider: "websocket", url: "wss://pboard.cecosl.ovh/ws" });
   expect(changed).toHaveBeenCalledOnce();
-  expect(node.querySelector('textarea[aria-label="Board grant input"]')).not.toBeNull();
-  expect(button("Owner: approve device request").disabled).toBe(true);
-  expect(button("Create / renew board invitation").disabled).toBe(true);
+  expect(button("Use Drive signaling")).toBeDefined();
+  expect(node.textContent).toContain("Board access is managed through Google Drive sharing.");
 });
 it("keeps settings untouched when the browser refuses the rendezvous permission", async () => {
   mocks.request.mockResolvedValue(false);
@@ -51,7 +50,7 @@ it("says what is outstanding and returns control when a queued command cannot fi
     await act(async () => { root.render(<BoardCollaborationControls projectId="board" onChanged={changed} />); });
     await act(async () => { button("Enable WebSocket collaboration").click(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
-    expect(node.textContent).toContain("has not answered an earlier command");
+    expect(node.textContent).toContain("still processing an earlier command");
     expect(mocks.configure).not.toHaveBeenCalled(); expect(changed).not.toHaveBeenCalled();
     expect(button("Enable WebSocket collaboration").disabled).toBe(false);
   } finally {
