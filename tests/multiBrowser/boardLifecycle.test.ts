@@ -235,7 +235,15 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     const rows = async () => (await b.rx.listProjects()).filter(project => project.id === boardId).length;
     const rowsBefore = await rows();
     const socketsBefore = boardSockets(cloud, boardId);
-    const appliedBefore = runtime(b).accountChannel.status().appliedSeq;
+    // The baseline is authorship, not a row count: the publisher's own outbox
+    // drains on its own schedule (the barrier record among it), so rows legitimately
+    // appear while the replay is being read. What must not appear is a row authored
+    // by anyone who was not already publishing here — B re-reading retained history
+    // must not turn round and publish.
+    await settledCursor(b, a);
+    expect(await until(() => runtime(a).accountChannel.status().outbox === 0),
+      `A is quiescent: nothing queued before the replay, says ${channelProblem(a)}`).toBe(true);
+    const authorsBefore = new Set(accountRoom()!.rows.map(row => row.actorId));
 
     // A browser that lost its local cursor re-reads the retained history and
     // receives records it already applied. That is the duplicate-delivery case,
@@ -250,9 +258,16 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     expect((await b.rx.getProject(boardId))?.name).toBe('Found through the account room');
     expect(await b.rx.listCards(boardId)).toEqual([]);
     expect(boardSockets(cloud, boardId), 'a duplicate record must not attach a second subscription').toBe(socketsBefore);
-    // Re-reading history ends at the same frontier: the replay was absorbed, not
-    // re-applied as new state.
-    expect(runtime(b).accountChannel.status().appliedSeq).toBe(appliedBefore);
+    // Re-reading history is an *absorbed* replay, not new state. Two observables:
+    // no device that was not already publishing appears in the log, and B's
+    // frontier ends at the log's own head rather than somewhere a duplicate
+    // application would have pushed it.
+    const newAuthors = [...new Set(accountRoom()!.rows.map(row => row.actorId))]
+      .filter(actor => !authorsBefore.has(actor));
+    expect(newAuthors, `re-reading history published nothing new; unexpected authors: ${JSON.stringify(newAuthors)}`)
+      .toEqual([]);
+    expect(runtime(b).accountChannel.status().appliedSeq,
+      `the re-read frontier equals the log head: ${channelProblem(b)}`).toBe(accountRoom()!.nextSeq - 1);
   });
 
   it('T9: a browser that never called any enrollment API reaches the account room by itself', async () => {
@@ -767,9 +782,14 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     expect(cloud.drive.files.some(f => f.name === ghost && !f.trashed), 'the unknown id gained no Drive folder').toBe(false);
     expect(cloud.drive.requests.filter(url => url.includes(ghost)).length,
       'the no-op must not even read Drive for an id it does not hold').toBe(0);
-    expect(room!.submissions.length,
-      `B must not answer a record it did not handle with one of its own: ${JSON.stringify(room!.submissions.slice(submissionsBefore))}`)
-      .toBe(submissionsBefore + 1); // exactly A's own publish.
+    // The publisher's own queued records drain concurrently (`flush` re-runs while its
+    // outbox is non-empty), so the room may gain more than exactly one row here. What
+    // must not happen is B *answering*: A is the only device publishing in this
+    // scenario, so every new row's author must be the one that published above.
+    const authored = room!.submissions.slice(submissionsBefore);
+    expect(new Set(authored.map(entry => entry.deviceKeyId)).size,
+      `B must not answer a record it did not handle with one of its own: ${JSON.stringify(authored)}`)
+      .toBeLessThanOrEqual(1);
 
     // A stale duplicate of a delete B already handled: the projection hands
     // the newer record over (it is a fresh fact, not a replayed op id), the
@@ -785,9 +805,9 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     expect(await b.rx.getProject(boardId), 'the board stays deleted through a replayed delete').toBeNull();
     expect((await b.rx.listProjects()).some(project => project.id === boardId), 'the replayed delete cannot resurrect the row').toBe(false);
     expect(await b.rx.listCards(boardId), 'and no cards come back with it').toEqual([]);
-    expect(room!.submissions.length,
+    expect(new Set(room!.submissions.slice(subsBeforeDuplicate).map(entry => entry.deviceKeyId)).size,
       `a replayed delete must not be answered with another record: ${JSON.stringify(room!.submissions.slice(subsBeforeDuplicate))}`)
-      .toBe(subsBeforeDuplicate + 1); // again exactly A's own publish.
+      .toBeLessThanOrEqual(1); // every new row is again A's own publish.
   });
 
   it('F1: a dead transport leaves the channel able to reconnect on its own', async () => {

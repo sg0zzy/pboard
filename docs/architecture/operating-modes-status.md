@@ -5,11 +5,12 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 
 > **State at 6 November 2026 — read this before the record below.** The
 > validation figures in this document are the 20 October measurements and are kept
-> as a record, not as current claims. Measured now: client `tsc` clean, full suite
-> **1 621 tests in 225 files**, multiBrowser **126**, build 0 errors; the extension
-> sidebar chunk is **611 kB** (178 kB gzip) against a 600 kB advisory, background
-> 799 kB (240 kB gzip); `services/pboard-signaling` **155 tests**, `cargo clippy
-> --all-targets` 0 warnings. Nothing in either repository is committed.
+> as a record, not as current claims. Measured on 10 November 2026: client `tsc`
+> clean, full suite **1 870 tests in 257 files**, multiBrowser **172 in 18 files**,
+> Android **106 in 18 files**, build 0 errors; the extension sidebar chunk is
+> **637 kB** (183 kB gzip) against a 600 kB advisory, background 839 kB (247 kB
+> gzip); `services/pboard-signaling` **169 tests**, `cargo clippy --all-targets`
+> 0 warnings. Nothing in either repository is committed.
 >
 > Two of the "remaining" items below did not move, and are still the honest answer:
 > the contract status resolver `boardSyncStatus`
@@ -17,9 +18,11 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 > it, so the sidebar's status line still comes from the Drive sync state
 > (`src/sidebar/components/DriveSyncControls.tsx:139-144`), not from the four
 > contract labels — and the mode-generation lifecycle for M02–M04/M08 is still
-> unimplemented. The transport picture did change: in the extension WebRTC is off
-> (`src/sync/browser.ts:17`) and a board uses the multiplexed operation log or Drive
-> polling ([operation log](websocket-operation-log.md)).
+> unimplemented. The transport picture did change: WebRTC is off in every
+> composition root (`src/sync/browser.ts:17` and
+> `apps/android/src/sync/service.ts:15`), and a board uses the multiplexed operation
+> log where the auth provider supplies Drive identity credentials (Firefox, Android)
+> or Drive polling everywhere else ([operation log](websocket-operation-log.md)).
 
 ## Job 11: two operating modes and unified recovery
 
@@ -73,9 +76,10 @@ boundary in the production UI.
 
 Matrix validated on this checkout with simulated Google HTTP (no live accounts);
 no tag or release. **These are the 20 October figures and are retained as the
-record of that gate.** At 6 November 2026 the same gates measured: client full
-suite 1 621 tests / 225 files, multiBrowser 126, `tsc` clean, build 0 errors;
-`services/pboard-signaling` 155 tests with clippy at 0 warnings. The inventory
+record of that gate.** On 10 November 2026 the same gates measured: client full
+suite 1 870 tests / 257 files, multiBrowser 172 in 18 files, Android 106 in 18 files,
+`tsc` clean, build 0 errors; `services/pboard-signaling` 169 tests with clippy at
+0 warnings. The inventory
 counts below still match `scripts/recovery/scenarios.json` (45 partial, 10 gap, 0
 known-gap), which `tests/recovery/recoveryInventory.test.mjs` re-checks against the
 contract's 55 scenario rows.
@@ -93,10 +97,11 @@ Remaining scenario gaps are platform/live-boundary claims the local harness
 cannot honestly make: full account/mode UI lifecycle (M02–M04, M08), live Google
 verification, Firefox native recovery, Android onboarding/attachment validation,
 per-account socket binding at the public relay, upstream proxy/TCP quotas and
-measured VPS capacity. To that list, add the transport defects this revision
-documents: the account channel is inert (its only pin creator is an unmounted
-component), "Sync now" does not rediscover, only the displayed board receives edits
-passively, grant renewals cut live sockets, and the account inbox has no client
-half. Release tagging remains blocked by the
+measured VPS capacity. To that list, add what the transport actually does not do:
+live rooms exist only where the auth provider supplies Google identity credentials
+(Firefox and Android, not the Chromium side panel), "Sync now" does not rediscover,
+only the displayed board receives edits passively, and a cross-account invitation
+travels the inbox as a hint that buys a Drive read rather than board traffic.
+Release tagging remains blocked by the
 [standards migration blockers](../../STANDARDS_MIGRATION_REPORT.md) (unreviewed
 production Android signing history and repository protections).

@@ -64,7 +64,7 @@ Implemented behavior:
 - A user can switch projects with a custom dropdown selector styled like the previous compact project control.
 - Projects can be dragged directly inside the open dropdown to change their persistent order; an insertion line previews the destination.
 - The dropdown supports Up/Down and Home/End navigation, Enter selection, Escape dismissal, and closing by clicking outside it.
-- Reordering does not change the current project or board content. The RxDB repository stores an account-specific project-order preference, persisted as a Drive preference file and applied during reconciliation (`src/sync/accountPreferences.ts`). It is not realtime: another browser of the account picks the new order up on its next reconcile round. Selection stays local.
+- Reordering does not change the current project or board content. The RxDB repository stores an account-specific project-order preference, persisted as a Drive preference file and applied during reconciliation (`src/sync/accountPreferences.ts`). A settling reorder also publishes one `board.order` record on the account room, so another browser of the account applies the new order without waiting for a round; the Drive file remains the durable record and the fallback where the account room is unreachable. Selection stays local.
 - A folder-plus icon in the project-title row opens and closes the New Project form, replacing the previous separate text action.
 - A pencil icon replaces the project selector with a focused inline name field; Enter persists a non-empty trimmed name and Escape cancels without changes.
 - The selected project is global to the extension; it is not tied to the current ChatGPT conversation.
@@ -416,7 +416,7 @@ Invited boards are discovered from Drive while connected. A newer remote snapsho
 
 ### 7.3 Live collaboration: the operation-log relay
 
-The live transport is an authenticated WebSocket to the Pboard relay (`services/pboard-signaling`), which keeps a **bounded, durable operation log per board** and replays it. Protocol 3 multiplexes rooms on one connection: the client holds **one socket per browser context per relay URL** regardless of board count, authenticates once, and attaches/detaches rooms on it. Board switching is attach/detach — no reconnect, no re-authentication, no new socket. If the relay does not advertise version 3, the client falls back to one socket per room, which is the deployed v2 behaviour.
+The live transport is an authenticated WebSocket to the Pboard relay (`services/pboard-signaling`), which keeps a **bounded, durable operation log per board** and replays it. It is used on Firefox and Android; the Chromium side panel has no credential to admit a room (see §7.4) and uses Drive synchronization alone. Protocol 3 multiplexes rooms on one connection: the client holds **one socket per browser context per relay URL** regardless of board count, authenticates once, and attaches/detaches rooms on it. Board switching is attach/detach — no reconnect, no re-authentication, no new socket. If the relay does not advertise version 3, the client falls back to one socket per room, which is the deployed v2 behaviour.
 
 The relay is not a board-state engine: it stores opaque operations, assigns per-board sequences, deduplicates by `(board_id, op_id)`, enforces order and durability, and holds no Drive credential. Acknowledgment means the relay's own write landed, never that Drive has the data.
 
@@ -426,15 +426,12 @@ Convergence is deterministic in the client: `src/sync/operations/engine.ts` merg
 
 Stated here because the rest of this document would otherwise imply more than the code delivers. The full list, with file references, is [the collaboration gaps](docs/collaboration.md#status-and-known-gaps).
 
-- **The account channel is inert in a normal install.** Cross-browser discovery of a new board needs an `account:<hash>` pin, and only an unmounted panel creates one. Without it the channel reports `absent-pin` and opens nothing; a new board reaches another browser after the Drive publication flush plus a poll, or on reload.
+- **Live collaboration is a Firefox-and-Android path.** A Drive-authorized room needs the auth provider to supply paired Google ID/access credentials. Firefox and Android do; the Chromium side panel's provider supplies only a Drive access token, so a Chromium board opens no live channel and converges through Drive synchronization and polling. Drive persistence, discovery and sharing still work on Chromium.
 - **"Sync now" does not rediscover.** It forces a reconcile over boards the client already knows about.
 - **Edits to a board this context does not have open are not delivered passively.** Exactly one board is attached — the one on screen — so a background board converges on its next Drive round or when it is reopened.
-- **Grant renewals cut live sockets**, because the service's revocation watch compares manifest digests and a renewal changes the digest. Rooms detach with `authorization_changed` roughly every three minutes.
-- **Opening a board is slow in the two-browser case** (~13 s, about two-thirds of it automatic-auth budget pacing) and a re-attach doubles it.
 - **Add and delete are not atomic in the UI**: an entity is published when created, so a peer renders it empty and fills it as keystrokes arrive.
-- **Account board order is not realtime** (§3).
-- **Grants are held only in service memory**: a relay restart drops them, and an expired grant is indistinguishable at the wire from one never published.
-- **Cross-account realtime discovery does not exist.** The per-account inbox is server-side only; its client half is unwired, so a board shared with another Google account is still found by that account's Drive polling.
+- **Account board order is realtime over the account room, with the Drive preference file as the durable record and the poll as backstop.** A reorder made where the account room cannot be reached — Chromium, or an unadmitted device — still converges on the next reconcile.
+- **Cross-account realtime board traffic does not exist.** An invitation to another Google account travels the per-account inbox and buys that account a Drive read; the shared board's own operations never cross accounts, so its changes reach the other account through Drive synchronization.
 
 ## 8. Extension architecture
 
@@ -482,7 +479,7 @@ Privacy properties:
 
 - Google authentication and Drive synchronization are optional and user-initiated.
 - Google scopes are `drive.appdata` for private backups/preferences and full `drive` for incoming shared-board discovery, shared files, and permissions. Shared content lives in visible Drive folders.
-- Live collaboration connects only to the configured Pboard relay over HTTPS/WSS. The extension build sets no WebRTC peer connection up, so no STUN or TURN service is contacted; the Android application still builds the peer path. See the [privacy policy](docs/privacy.md) for data handling and deletion controls.
+- Live collaboration connects only to the configured Pboard relay over HTTPS/WSS. Neither shipped platform sets a WebRTC peer connection up — the extension and the Android application both disable the peer pools — so no STUN or TURN service is contacted and no Drive signaling room or peer DataChannel exists. See the [privacy policy](docs/privacy.md) for data handling and deletion controls.
 - No telemetry.
 - No AI API request.
 - No conversation scraping.

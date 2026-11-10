@@ -6,8 +6,10 @@
  * `setWebRtcDisabled(true)`, and the manager and the runtime return at that gate
  * before either constructs a pool, DataChannel or history session), so the
  * extension builds resolve that specifier to `peerRuntime.stub.ts` instead and
- * ship no peer code at all. Android builds the same sources without this plugin
- * and loads the real modules.
+ * ship no peer code at all. Android builds the same sources without this plugin and
+ * would load the real modules, but its composition root calls
+ * `setWebRtcDisabled(true)` too (`apps/android/src/sync/service.ts`), so no platform
+ * reaches them.
  *
  * `resolveId` rather than a `resolve.alias` entry: the specifier is relative
  * (`./peerRuntime`, `../collab/peerRuntime`), and an alias replacement is

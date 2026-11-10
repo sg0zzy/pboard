@@ -51,7 +51,7 @@ Two limits shape the multiplexing claim, and both are deliberate:
   (`healRelay` answers `idle:not-attached`). The earlier behaviour — a room per
   listed board — is what leaked sockets.
 - **32 rooms per connection** is a fan-out cap, not an authorization cap
-  (`sync_api.rs:755`, `rooms_per_connection`). Every room still passes its own
+  (`services/pboard-signaling/src/sync_api.rs:755`, `rooms_per_connection`). Every room still passes its own
   admission, and the attach path draws on the same automatic-auth budget as
   `authenticate`, so an authenticated socket cannot become an unthrottled verifier.
 
@@ -102,12 +102,12 @@ not becoming one. Attribution follows the **attachment**, so `submit`, `lease`,
 `release`, `commit`, `publishDeviceKey`, `publishKeyGrants`, `fetchKeyGrants` and
 `publishAccountHint` all record the room's verified device as `actorId` — a
 multiplexed socket cannot launder three devices' writes into one identity
-(`lib.rs:1065`, `tests/attach_device.rs`).
+(`services/pboard-signaling/src/lib.rs:1065`, `services/pboard-signaling/tests/attach_device.rs`).
 
 ### A receipt belongs to one attach
 
 `serviceAdmission` is **single-use**. The service deletes a receipt the moment it
-consumes one (`identity_enrollment.rs` `consume`), and the binding it checks is
+consumes one (`services/pboard-signaling/src/identity_enrollment.rs` `consume`), and the binding it checks is
 `(challenge, session, room, device)` — the connection's welcome, this attach's
 room, and the device this attach presents. So the v3 `attach` frame must carry a
 receipt minted for *itself*, exactly as `authenticate` does, and the client mints
@@ -141,7 +141,7 @@ one would deny a device the board's content key without protecting anything.
 
 ### Revocation and expiry are per room
 
-`admission.rs` publishes a revocation watch per authorization scope. A scope change
+`services/pboard-signaling/src/admission.rs` publishes a revocation watch per authorization scope. A scope change
 — epoch bump, republished manifest, pruned grant — ends **only the rooms whose
 scope moved**:
 
@@ -168,7 +168,7 @@ part of why an open costs ~13 s in a two-browser scenario. See
 `Limits::session_bytes` was a **lifetime** total that never reset: one socket died
 permanently at 4 MiB. Correct for a socket reopened on every board switch, fatal
 for the long-lived socket v3 asks a client to hold. It is replaced by rolling
-windows, renewed rather than accumulated (`lib.rs:175-181`):
+windows, renewed rather than accumulated (`services/pboard-signaling/src/lib.rs:175-181`):
 
 | Budget | Default | Renews | Scope |
 | --- | --- | --- | --- |
@@ -180,9 +180,9 @@ windows, renewed rather than accumulated (`lib.rs:175-181`):
 4 MiB per 60 s is ≈ 68 KiB/s sustained, above a board under active editing. The
 per-room share means one busy board exhausts *its own* budget instead of starving
 its siblings: in v3 that detaches the room (`{"type":"detached","code":"budget"}`,
-`lib.rs:1011-1012`) and in v1/v2 it remains `traffic_limit` followed by a close.
+`services/pboard-signaling/src/lib.rs:1011-1012`) and in v1/v2 it remains `traffic_limit` followed by a close.
 Operator knobs are `PBOARD_SIGNALING_MAX_SESSION_WINDOW_BYTES` and
-`PBOARD_SIGNALING_MAX_ROOM_WINDOW_BYTES` (`policy.rs:34-35`);
+`PBOARD_SIGNALING_MAX_ROOM_WINDOW_BYTES` (`services/pboard-signaling/src/policy.rs:34-35`);
 `PBOARD_SIGNALING_MAX_SESSION_BYTES` is **retired** — no code reads it and it is
 ignored if it survives in an environment file, because a drop-in silently keeping a
 4 MiB *lifetime* cap is the bug being fixed.
@@ -205,7 +205,7 @@ the cursor only over contiguous sequences**: an out-of-order or duplicate row wa
 in a durable set until the hole is filled, an acknowledged sequence with a hole
 below it triggers a re-subscribe, and an operation the engine rejects keeps the
 cursor below it so it is seen again on reconnect. Replay is 512 rows per frame
-(`sync_api.rs:751`).
+(`services/pboard-signaling/src/sync_api.rs:751`).
 
 Recovery from a pruned history is automatic: the runtime treats a gap as "read the
 board from Drive, then resume above the committed checkpoint"
@@ -220,16 +220,16 @@ of the immutable snapshot the writer says it uploaded — and never an entity ta
 The name is kept for wire compatibility. The relay holds no Drive credential and
 **cannot** verify the upload; the protocol says so rather than implying otherwise.
 What the service does enforce at the commit boundary
-(`sync_log.rs:228-245`): evidence present, ≤256 bytes, `[A-Za-z0-9_-]` with at
+(`services/pboard-signaling/src/sync_log.rs:228-245`): evidence present, ≤256 bytes, `[A-Za-z0-9_-]` with at
 least 4 bytes, and `snapshotSeq` non-zero; each failure is `evidence_rejected` and
 **writes nothing** — no checkpoint row, no coverage row. Shape is not provenance, so
 the checkpoint row also carries `evidence_kind`, written to `1` only by this commit
-path (`sync_log.rs:868-870`); a row from before schema v3 keeps `0` and is never a
+path (`services/pboard-signaling/src/sync_log.rs:868-870`); a row from before schema v3 keeps `0` and is never a
 pruning licence.
 
 The sweeper runs in the service process, not on a client request: one pass per
-hour, ≤16 boards, ≤20 000 rows per board (`sync_log.rs:341-344`, started by
-`main.rs:704`, journal line `operation log retention sweep started`). Its guarantee
+hour, ≤16 boards, ≤20 000 rows per board (`services/pboard-signaling/src/sync_log.rs:341-344`, started by
+`services/pboard-signaling/src/main.rs:704`, journal line `operation log retention sweep started`). Its guarantee
 is the conjunction of two server-side conditions:
 
 1. a checkpoint row this build wrote (`evidence_kind = 1`) whose stored evidence
@@ -240,7 +240,7 @@ is the conjunction of two server-side conditions:
    forever.
 
 The cutoff is `MAX(upto_seq) FROM coverage WHERE covered_at <= now - retention_ms`
-and `eligible = seq <= min(cutoff, board.checkpoint_seq)` (`sync_log.rs:949-950`,
+and `eligible = seq <= min(cutoff, board.checkpoint_seq)` (`services/pboard-signaling/src/sync_log.rs:949-950`,
 `:1024-1037`). The `checkpoint_seq` term is the hard barrier answering "can this
 delete un-snapshotted data": **no** — a row older than the whole window but above
 the checkpoint is kept, because the log holds its only copy. Coverage rows for
@@ -272,20 +272,26 @@ same value the account-room scope already uses):
   the read path, so "read somebody else's inbox" has no wire shape in which to be
   expressed.
 
-Bounds (`account_inbox.rs:101-124`): payload 4 KiB decoded, 64 hints per inbox,
+Bounds (`services/pboard-signaling/src/account_inbox.rs:101-124`): payload 4 KiB decoded, 64 hints per inbox,
 1024 inboxes service-wide, 7-day TTL. Over capacity the answer is **eviction, never
 refusal** — refusal at the cap would let any device holding any board deny
 share-notification delivery to every future account. Lost hints degrade to Drive
 polling. Hints live in the operation log's SQLite file with the same WAL /
 `synchronous = FULL`, so a restart preserves undelivered hints.
 
-**The client half is unwired.** There is no sender and no consumer in `src/`;
-`publishAccountHint` / `replayAccountHints` appear nowhere outside the server and
-its tests. Cross-account discovery therefore still runs on Drive polling, and the
-receiver's existing create-free verification path
-(`src/sync/operations/accountChannel.ts`) remains the only route from a record to
-anything interactive. The wire shape was chosen so that path needs only a new
-action; until one exists the frames are inert.
+**The client half is wired, both directions.** `sharePermissions.invite` publishes
+one `publishAccountHint` frame addressed to the invitee's account hash
+(`src/sync/runtime.ts`), and the account channel replays its own inbox on every
+`synced` edge (`replayAccountHints`, `src/sync/operations/accountChannel.ts`) and
+hands each hint to the create-free Drive verification path. Lost hints degrade to
+Drive polling rather than failing the invitation.
+`tests/multiBrowser/driveAuthorityRuntime.test.ts` covers delivery to an
+already-connected invitee, non-delivery to an outsider, and replay after the
+recipient reconnects.
+
+What the hint buys is a Drive read, not board traffic: the shared board's own
+operations never cross accounts, so its later changes reach the other account
+through Drive synchronization.
 
 ### Rollout order: server first
 
@@ -318,22 +324,25 @@ risk if a v3 server is rolled back.
 These are gaps, not plans. A sentence elsewhere in this repository that promises
 any of them is wrong.
 
-1. **The account channel is inert in production.** It needs an `account:<hash>`
-   pin, and the only code that creates one is a button in
-   `ExperimentalEnrollment.tsx`, which is not mounted anywhere in the app
-   (`grep` finds no import of the component). In normal use the channel reports
-   `absent-pin`, opens no socket, and a newly created board reaches another browser
-   only after the Drive publication flush (25–30 min) plus a poll — or a reload.
-   Tests call `initialize('account')` explicitly, so the suite does not catch this.
+1. **The account channel is a Firefox-and-Android path.** A Drive-authorized room
+   needs the auth provider to supply paired Google ID/access credentials. Firefox
+   (`src/sync/googleAuth.ts`) and Android (`apps/android/src/sync/auth.ts`) do; the
+   Chromium provider (`src/sync/googleChromeAuth.ts`) supplies only a Drive access
+   token, so a Chromium board opens no account room and no board room, and a newly
+   created board reaches another browser only after the Drive publication flush
+   (25–30 min) plus a poll — or a reload. The `account:<hash>` pin the channel used
+   to need survives only on the retained signed-authority tooling, where its sole
+   creator is the unmounted `ExperimentalEnrollment.tsx`.
 2. **"Sync now" reconciles only boards already known**; it does not rediscover, so
    it cannot find a board the client has never heard of.
 3. **Edits to a board this context does not have open are not delivered
    passively** — the attach set is exactly one board (see above). Delivery happens
    by reopening (relay replay) or by the Drive poll.
-4. **Grant renewals cut live sockets** (`authorization_changed` every ~3 min per
-   room), doubling re-attach cost; a board open costs ~13 s in a two-browser
-   scenario, about two-thirds of it budget pacing (~15 identity exchanges ≈ 30
-   tokens at 2.5/s).
+4. **Grant renewals cut live sockets on the signed path only**
+   (`authorization_changed` every ~3 min per room there), doubling re-attach cost;
+   a board open on that path costs ~13 s in a two-browser scenario, about two-thirds
+   of it budget pacing (~15 identity exchanges ≈ 30 tokens at 2.5/s). A
+   Drive-authorized room renews in place with `renewGoogle` and pays neither.
 5. **Add/delete are not atomic in the UI**: the entity is published on creation, so
    a peer renders an empty card and fills it as keystrokes arrive.
 6. **`projectOrder` (board sorting) is realtime through the account room** — a
@@ -345,11 +354,11 @@ any of them is wrong.
 7. **Grants live only in service memory**: a restart drops every published grant,
    and an expired grant returns 404 indistinguishable from never-published (the
    client now labels `expired` vs `never-published`). Grant lifetime is capped at
-   360 s by the protocol (`admission.rs:113`), so an owner-chosen 15 minutes needs
+   360 s by the protocol (`services/pboard-signaling/src/admission.rs:113`), so an owner-chosen 15 minutes needs
    a coordinated client+server change.
-8. **The inbox's client half is unwired** (above), so cross-account discovery is
+8. **The inbox carries a hint, not board traffic** (above), so cross-account discovery is
    still Drive polling.
-9. **The extension sidebar chunk is 611 kB** against a 600 kB advisory.
+9. **The extension sidebar chunk is 637 kB** against a 600 kB advisory.
 
 ## Why the architecture changes
 
@@ -398,7 +407,7 @@ of what a card is, and enforces only identity, permission, order and durability.
 | `src/sync/operations/logConsolidation.ts` | **New.** One consolidation cycle: the order and failure semantics of lease → catch up → build → upload → commit, testable without Drive or timers. |
 | `src/sync/logConsolidationRuntime.ts` | **New.** The same cycle wired to a board's session, Drive folder, log connection and storage, plus the owner-only policy. |
 | `services/pboard-signaling/src/leader.rs` | **Retained.** In-memory lease arbiter for the legacy HTTP buffer; the SQLite lease supersedes it for the new path. |
-| `services/pboard-signaling/src/op_buffer.rs`, `buffer_api.rs` | **Legacy.** Kept for clients in the field; retired once no client calls them. |
+| `services/pboard-signaling/src/op_buffer.rs`, `services/pboard-signaling/src/buffer_api.rs` | **Legacy.** Kept for clients in the field; retired once no client calls them. |
 | `src/collab/manager.ts`, `webrtcHandler.ts`, `signaling.ts`, `experimentalWebSocketSignaling.ts`, `signalingSelection.ts`, `security/ice.ts`, `scopedPull.ts`, `peerHistory.ts`, `boardPairing.ts` | **To remove** with the client cutover. Peer connections, ICE, STUN/TURN configuration, SDP exchange and Drive presence exist only to serve WebRTC. |
 | `src/collab/security/{keys,manifest,enrollment,checkpoint}.ts`, `boardGrants.ts`, `googleIdentitySharing.ts` | **Retained.** Client-side trust roots and the relay's authorization vocabulary survive the transport change. |
 | `src/sync/operations/engine.ts`, `protocol.ts`, `localStore.ts` | **Retained.** The CRDT-style merge model and the local journal are the reconciliation layer the new transport needs. |
@@ -429,7 +438,7 @@ which is what changed during implementation: an epoch is a small per-board
 integer, and accepting any number a client typed let one device commit as another.
 `commit_checkpoint` now requires the presented epoch to be the one the board
 issued **and** the writer to be the device it was issued to. Detection of the
-residual race is preserved the way `leader.rs` documented it: a commit whose
+residual race is preserved the way `services/pboard-signaling/src/leader.rs` documented it: a commit whose
 snapshot generation is not strictly newer is accepted and flagged `stale`, and the
 next leader watermark-merges before publishing.
 
@@ -486,7 +495,7 @@ state directory:
 
 Counters live in `board` so capacity checks are O(1) instead of a table scan.
 Pruning deletes only checkpoint-covered rows after retention and adjusts the
-counters in the same transaction (`sync_log.rs:1024-1082`). The account inbox's
+counters in the same transaction (`services/pboard-signaling/src/sync_log.rs:1024-1082`). The account inbox's
 tables were added without raising `sync_schema` on purpose: raising it would make an
 older binary refuse a file it can in fact read, which is the opposite of what a
 rollback needs.
@@ -563,21 +572,21 @@ presence folder. The plan, in order, with no destructive step:
 
 ## Status
 
-Measured at this revision (6 November 2026): `services/pboard-signaling` runs
-**155 tests** with `cargo clippy --all-targets` at **0 warnings**. Those tests cover
+Measured at this revision (10 November 2026): `services/pboard-signaling` runs
+**169 tests** with `cargo clippy --all-targets` at **0 warnings**. Those tests cover
 the durable log, replay, dedupe, gaps, leases, fencing, publication evidence and
 retention, the protocol frames, hub fan-out, cross-board refusal, role
 enforcement, restart durability, the reply-order contract, the key courier, the
 per-room byte budget, multiplexed attach/detach and the account inbox
-(`tests/sync.rs` 14, `tests/multiplex.rs` 9, `tests/attach_device.rs` 5,
-`tests/inbox.rs` 7).
+(`services/pboard-signaling/tests/sync.rs` 14, `services/pboard-signaling/tests/multiplex.rs` 9,
+`services/pboard-signaling/tests/attach_device.rs` 5, `services/pboard-signaling/tests/inbox.rs` 7).
 
 Implemented on the client: `src/sync/operations/logSync.ts` (transport: bootstrap
 from a persisted cursor, live application, sealed payloads through the existing
 board content key, per-batch acknowledgment, resubmission of unacknowledged
 operations after a reconnect, gap reporting, lease/commit for consolidation, and
-repair of a live broadcast the relay dropped) — 14 tests in
-`tests/operations/logSync.test.ts`, plus convergence and heal suites (6 and 5).
+repair of a live broadcast the relay dropped) — 17 tests in
+`tests/operations/logSync.test.ts`, plus convergence and heal suites (3 and 5).
 `logSession.ts` owns the context's single socket and `logRoom.ts` the per-room
 cursor; `tests/multiBrowser/singleSocket.test.ts` (9) and `attachSetBound.test.ts`
 (8) measure the socket and attach-set claims at the relay itself.
@@ -587,10 +596,10 @@ collaboration **and** the board has a pinned grant **and** a provisioned content
 key; otherwise the board takes the Drive-first path described under
 [Degrade honestly](#degrade-honestly-the-courier-less-relay-contract) — in the
 extension this tree opts out of WebRTC entirely
-(`setWebRtcDisabled(true)`, `src/sync/browser.ts:17`), and the peer stack is
-excluded from the extension bundles by a build-time alias to
-`src/collab/peerRuntime.stub.ts`, while `apps/android/src/sync/service.ts` builds
-the same runtime without that call and still carries real peer pools.
+(`setWebRtcDisabled(true)`, `src/sync/browser.ts:17`), the peer stack is excluded
+from the extension bundles by a build-time alias to `src/collab/peerRuntime.stub.ts`,
+and `apps/android/src/sync/service.ts:15` calls the same `setWebRtcDisabled(true)`, so
+Android opens no peer pool either.
 
 Implemented: consolidation from the log to Drive under a lease
 (`runLogConsolidationCycle`; `runLogConsolidation` for the runtime adapters;
@@ -669,11 +678,12 @@ stack is no longer reachable at runtime: `src/sync/browser.ts:17` calls
 `setWebRtcDisabled(true)` and both extension bundles alias
 `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts` (`scripts/peer-runtime-stub.mjs`,
 used by `vite.sidebar.config.ts` and `vite.background.config.ts`), whose exports
-throw. Android builds the same sources with no alias and keeps real peer pools
-(`apps/android/src/sync/service.ts` never calls the posture). So "WebRTC is gone"
-is true of the extension and false of the repository: the modules remain, and the
-Android runtime still executes them. That is why the extension's sidebar and
-background chunks no longer carry the stack while the sources still exist.
+throw. Android has no alias, but its composition root calls the same
+`setWebRtcDisabled(true)` (`apps/android/src/sync/service.ts:15`), so it opens no peer
+pool either. "WebRTC is gone" is therefore true of what runs everywhere and false only
+of the source tree: the modules remain and their unit tests still exercise them, but no
+shipping path executes them. That is why the extension's sidebar and background chunks
+no longer carry the stack while the sources still exist.
 
 **A backfill was examined and rejected as unnecessary.** The plan asked for a
 one-time submission of a legacy board's `operations-*.json` history into the log so
@@ -697,8 +707,8 @@ service on the relay host now runs the binary containing this protocol with
 `PBOARD_SIGNALING_SYNC_DIR` set, the journal reports `operation log enabled`, and
 the SQLite log exists with `integrity_check` ok and every table empty. Observed
 state, hashes, backup location and rollback are recorded in
-[`vps-maint/SERVICES.md`](../../../vps-maint/SERVICES.md) and
-[`vps-maint/PBBOARD-COLLABORATION.md`](../../../vps-maint/PBBOARD-COLLABORATION.md).
+[`vps-maint/SERVICES.md`](../../../vps-maint/SERVICES.md) and that repository's
+`CHANGELOG.md` (formerly `PBBOARD-COLLABORATION.md`).
 No client had connected at the time of that record.
 
 That record covers the 2 November binary. **Everything added since — multiplexing,
@@ -717,7 +727,7 @@ of them cosmetic:
 1. **Authority issuance for ungranted boards.** Authentication today is `version: 2`
    with a signature over `["pboard-ws-auth-v2", challenge, session, room, deviceKeyId,
    digest]`, and the room is derived from an **authority-signed manifest** carrying
-   `drive_project_file_id` / `drive_folder_id` (`src/admission.rs:24-25,67-68,109`).
+   `drive_project_file_id` / `drive_folder_id` (`services/pboard-signaling/src/admission.rs:24-25,67-68,109`).
    A board with no pinned grant has no manifest, so it cannot authenticate — that, not
    the log, is what restricts the transport to granted boards. Extending means the
    host's authority signing a manifest for a board on request. `PBOARD_SIGNALING_
@@ -799,9 +809,9 @@ Three consequences need an owner rather than an engineer:
    them changes Drive folder layout and per-collaborator ACL side-effects and the
    persisted record shape that several tests pin: a Drive-visible migration, not a
    deletion.
-3. **The server is coupled where it is not obvious**: `admission.rs` produces
+3. **The server is coupled where it is not obvious**: `services/pboard-signaling/src/admission.rs` produces
    `signals::Context` for protocol-2 admission and the *sync* path shares that
-   authorization plumbing, so `Context` and `hex` move into `admission.rs` rather than
+   authorization plumbing, so `Context` and `hex` move into `services/pboard-signaling/src/admission.rs` rather than
    being deleted with `Client::Signal`; `Join`/`joined`/`peer_joined` and
    `supportedVersions: [1, 2]` become advertised-but-unused until protocol 1/2 is
    formally retired.
@@ -815,11 +825,12 @@ the log: `setWebRtcDisabled(true)` (`src/sync/browser.ts:17`) plus a build-time 
 of `src/collab/peerRuntime.ts` → `peerRuntime.stub.ts` means no peer pool, DataChannel,
 Drive signaling room or ICE attempt can start in a shipped extension. A board that is
 not on the log has no live channel and converges through Drive synchronization
-(see "Degrade honestly"). The modules were **not** deleted, because Android still runs
-them: `apps/android/src/sync/service.ts` builds the same runtime without the posture
-call, so it gets real `replicateWebRTC` pools and real operation DataChannels. The
-Drive-signaled room therefore remains in the repository and remains reachable on one
-platform — which is why consequences 2 and 3 are still open questions, not history.
+(see "Degrade honestly"). The modules were **not** deleted, but they are no longer
+reachable from any composition root: `apps/android/src/sync/service.ts:15` calls
+`setWebRtcDisabled(true)` as well, so it opens neither `replicateWebRTC` pools nor
+operation DataChannels. The Drive-signaled room therefore survives as source and unit
+tests, not as a path on any platform — consequences 2 and 3 are historical questions
+about a transport nothing runs.
 
 ## Development posture: peer pools switched off
 
@@ -932,7 +943,7 @@ read *future* keys, and content-key rotation. Both remain separate decisions, wh
 why the log should not yet be treated as the sole transport for unattended users.
 
 **Deployment dependency:** the courier requires the service binary containing
-`src/key_courier.rs` (schema version 2). Against an older binary the client records a
+`services/pboard-signaling/src/key_courier.rs` (schema version 2). Against an older binary the client records a
 courier refusal and falls back to the manual control rather than failing the board.
 
 

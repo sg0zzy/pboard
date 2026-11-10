@@ -10,8 +10,8 @@ selection and defaults are unchanged. [Job 7](peer-causal-history.md) adds authe
 >
 > - **The peer exchange this document points at is historical** —
 >   [peer-causal-history](peer-causal-history.md) is a banner-marked record, because
->   the extension opens no WebRTC peer pools (`src/sync/browser.ts:17`); Android
->   still does.
+>   neither platform opens WebRTC peer pools (`src/sync/browser.ts:17` and
+>   `apps/android/src/sync/service.ts:15`).
 > - **The mechanism changed shape, not purpose.** Under `operationSync` (the
 >   default) a board's own folder holds immutable operation segments, snapshots and
 >   `image-<sha256>.json` assets; the private-history engine is still the

@@ -5,7 +5,8 @@
  * (`src/sync/browser.ts`), so no peer pool, DataChannel or history session can
  * ever start in it; `vite.sidebar.config.ts` and `vite.background.config.ts`
  * alias `./peerRuntime` to this file for that build. Android builds the same
- * sources with no alias and gets the real modules.
+ * sources with no alias, but its composition root passes the same posture
+ * (`apps/android/src/sync/service.ts`), so it starts none of them either.
  *
  * Every function here throws for two reasons:
  *

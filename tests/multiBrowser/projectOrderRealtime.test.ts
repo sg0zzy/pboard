@@ -207,7 +207,11 @@ describe('project-list sorting over the account room', { timeout: 180_000 }, () 
       a.rx.reorderProjects([gamma, beta, alpha]),
       b.rx.reorderProjects([beta, alpha, gamma, mine])
     ]);
-    // Each session must apply the other's record: two new order rows each.
+    // Each session publishes its own order and applies the *other's*, so one new
+    // row per side is the crossing. The lists can still disagree at this instant —
+    // one side may not have projected the record it just applied — which is what
+    // the convergence wait below is for, and why it has a real-time budget rather
+    // than a turn count.
     expect(await until(() => ordersApplied(a) - beforeA >= 1 && ordersApplied(b) - beforeB >= 1),
       `the concurrent reorders did not both cross the room: A ${channelProblem(a)}, B ${channelProblem(b)}`).toBe(true);
     // Convergence is on the shared boards, which is what both sessions can

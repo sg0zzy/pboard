@@ -70,15 +70,27 @@ async function grantRound(browsers: BrowserHandle[], boardId: string) {
 }
 
 /** Scheduler turns, never wall clock: a zero-delay timer yields the microtask
- * and timer queues, so the bound is a number of rounds, not milliseconds. */
+ * and timer queues, so this is a number of rounds. Used only for the short
+ * "let the local write settle" gaps between commands; convergence itself uses
+ * `converge` below, which has a real-time budget. */
 async function settleTurns(rounds: number) {
   for (let turn = 0; turn < rounds; turn++) await new Promise<void>(resolve => setTimeout(resolve, 0));
 }
 
-async function converge(row: Row, ctx: Ctx) {
-  for (let turn = 0; turn < 4000; turn++) {
+/** A bounded wait on the observable the scenario owns.
+ *
+ * Both bounds matter. A zero-delay spin yields the microtask and timer queues, so
+ * a turn count alone is not a timeout: tens of thousands of turns fit in one real
+ * millisecond. Under a full parallel suite some of these commands legitimately wait
+ * on a real timer (the Drive poll and the reconnect ladder), so a turn-only bound
+ * reported "never reached B" for a board that converged a moment later. The 1 ms
+ * yield plus the real-time budget is the rule the rest of `tests/multiBrowser` uses.
+ */
+async function converge(row: Row, ctx: Ctx, budgetMs = 20_000) {
+  const deadline = performance.now() + budgetMs;
+  while (performance.now() < deadline) {
     if (await row.arrived!(ctx)) return;
-    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    await new Promise<void>(resolve => setTimeout(resolve, 1));
   }
   const cards = await ctx.b.rx.listCards(ctx.boardId);
   const project = await ctx.b.rx.getProject(ctx.boardId);

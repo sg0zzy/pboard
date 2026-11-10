@@ -17,12 +17,12 @@ legacy-client treatment for the restored roster remain.
 >   relay room and an operation log, not a DataChannel. The relay connection is one
 >   multiplexed socket per browser context with per-room admission
 >   ([operation log](websocket-operation-log.md)).
-> - **Grant lifetime is capped at 360 s by the protocol** (`admission.rs:113`), not
+> - **Grant lifetime is capped at 360 s by the protocol** (`services/pboard-signaling/src/admission.rs:113`), not
 >   the five minutes this document describes as normal: a 300 s manifest
 >   (`src/collab/boardGrants.ts:50`) with a 120 s renew window fits under it, but an
 >   owner-chosen 15-minute grant does not, and would need a coordinated client+server
 >   change. Service-admission receipts are still consumed within 30 s and cap the
->   socket to 300 s (`identity_enrollment.rs:307-317`).
+>   socket to 300 s (`services/pboard-signaling/src/identity_enrollment.rs:307-317`).
 
 ## Audit and implemented changes
 
@@ -134,7 +134,7 @@ server stores no token or new persistent user record.
 
 The receipt is bound to the actual socket challenge, connection ID, derived room
 and device fingerprint. It is consumed once within 30 seconds and caps the admitted
-socket to 300 s (`identity_enrollment.rs:307-317`). In v3 the tuple includes the
+socket to 300 s (`services/pboard-signaling/src/identity_enrollment.rs:307-317`). In v3 the tuple includes the
 attach's own `deviceKeyId`, so a multiplexed connection needs one receipt per device
 it speaks for; a receipt minted for the connection's device is refused
 `service_binding_invalid` when presented on an attach naming another.

@@ -6,7 +6,9 @@
 > that transport cannot start: `src/sync/browser.ts:17` calls
 > `setWebRtcDisabled(true)` and both extension bundles resolve
 > `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`, whose exports throw. Android
-> builds the same sources without that call and still runs this code.
+> builds the same sources without that alias, but its composition root also calls
+> `setWebRtcDisabled(true)` (`apps/android/src/sync/service.ts:15`), so this code is
+> unreachable there as well: it survives as source and unit tests, not as a path.
 >
 > What replaced it for the default runtime:
 >

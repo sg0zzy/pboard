@@ -1,18 +1,26 @@
 # Drive-first operation synchronization
 
-Status: active default browser and Android runtime, 28 October 2026; revised
-6 November 2026. Supersedes peer-authority and mutable-board synchronization for
+Status: active default Firefox and Android runtime, 28 October 2026; revised
+10 November 2026. Supersedes peer-authority and mutable-board synchronization for
 normal application use. No dependency, authentication service, backend, or
 framework was added.
+
+**Platform scope.** The live half of this design — the relay room that carries
+operations — needs an auth provider that supplies paired Google ID and access
+tokens. Firefox (`src/sync/googleAuth.ts`) and Android
+(`apps/android/src/sync/auth.ts`) do. The Chromium side panel's provider
+(`src/sync/googleChromeAuth.ts`) supplies only a Drive access token, so a Chromium
+board has no live channel; it keeps Drive persistence, discovery, sharing and
+periodic synchronization exactly as described below, and simply never opens a room.
 
 What changed since the first draft, in one place, because the rest of this document
 is the design argument and reads as if none of it had:
 
-- `operationSync` is the **default** (`src/sync/runtime.ts:174`,
+- `operationSync` is the **default** (`src/sync/runtime.ts:231`,
   `operationSync = true`), so the Drive-first operation protocol below is what runs.
   Membership is the Drive folder ACL (`src/sync/drivePermissions.ts:720`, `invite`),
   and the separate identity-sharing authority (`usesIdentitySharing`) is inactive in
-  that mode (`runtime.ts:2559`).
+  that mode (`runtime.ts:3754`).
 - There is **no authoritative peer election** anywhere. The optional WebRTC leg
   (below) is a latency path, not an authority, and nothing in the operation protocol
   waits for a peer.
@@ -21,8 +29,8 @@ is the design argument and reads as if none of it had:
   `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`
   (`scripts/peer-runtime-stub.mjs`), whose exports throw. A board without the
   durable operation log therefore has no live channel and converges through Drive.
-  **Android still runs it**: `apps/android/src/sync/service.ts` builds the same
-  runtime without that call.
+  **Android does not run it either**: `apps/android/src/sync/service.ts:15` calls
+  the same `setWebRtcDisabled(true)`.
 - The owner "Maintenance"/"Compact" button is **gone**
   (`src/sidebar/components/BoardMaintenanceControls.tsx` was deleted). Snapshot
   publication is automatic from the consolidation cycle
@@ -75,7 +83,7 @@ is the design argument and reads as if none of it had:
   Escape cancels uncommitted form edits; trash restore is a normal card update.
   A future command undo must emit conditional property changes, never restore a board.
 - Vitest covers storage, peer history, permissions, snapshots, recovery and the realtime
-  frame rules (`tests/operations/realtime.test.ts`, 49 assertions). The live
+  frame rules (`tests/operations/realtime.test.ts`, 31 tests, 108 assertions). The live
   browser/WebRTC and UI performance harnesses (`npm run test:webrtc:browser`,
   `npm run test:ui:perf`) are integration checks outside vitest; toolbar overflow is
   asserted by the post-build Chromium smoke, not vitest. Counters
@@ -227,10 +235,10 @@ never reuses a file id, so a 404 on an image copy is final.
 
 Local edits commit immediately and are sent over the live channel immediately when
 one exists. In the extension that channel is the durable operation log or nothing —
-`setWebRtcDisabled(true)` (`src/sync/browser.ts:17`) plus the build-time
-`peerRuntime` stub mean no peer pool or DataChannel can start — so with no log the
-edit waits for the next Drive round. On Android the optional WebRTC leg below is
-still live.
+`setWebRtcDisabled(true)` (`src/sync/browser.ts:17`, and
+`apps/android/src/sync/service.ts:15` for Android) plus the extension's build-time
+`peerRuntime` stub mean no peer pool or DataChannel can start on either platform —
+so with no log the edit waits for the next Drive round.
 Automatic Drive publication runs at the earlier of 30 minutes of editing inactivity
 or 25 minutes after the oldest unpublished operation (`src/sync/syncPolicy.ts:3-4`).
 Since 25 minutes is shorter,
@@ -331,16 +339,17 @@ detection compares the observed permission id instead of a creation timestamp.
 
 ## Optional WebRTC
 
-**Platform scope at this revision: absent from the extension, live on Android.**
-The extension calls `setWebRtcDisabled(true)` (`src/sync/browser.ts:17`) and both of
-its bundles resolve `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`, whose
-exports throw — so nothing in the paragraphs below can start in a shipped extension,
-and a board without the durable operation log has no live channel at all. Android
-builds the same runtime without the posture call and executes this section for real
-(`apps/android/src/sync/service.ts`). The code is retained, not dead: it is one
-platform's live path. What replaced it *in the extension* is the multiplexed
-operation log ([operation log](websocket-operation-log.md)) or, failing its
-preconditions, plain Drive synchronization.
+**Platform scope at this revision: absent from both shipped platforms.** Each
+composition root calls `setWebRtcDisabled(true)` — `src/sync/browser.ts:17` and
+`apps/android/src/sync/service.ts:15` — so `doStart()` and the runtime's room
+factory return before a pool or DataChannel exists, and the extension additionally
+resolves `src/collab/peerRuntime.ts` to `peerRuntime.stub.ts`, whose exports throw.
+A board without the durable operation log therefore has no live channel at all and
+converges through Drive. The code below is retained as source, with its unit tests,
+because Android loads it without the aliasing plugin; no shipping path executes it.
+What replaced it is the multiplexed operation log
+([operation log](websocket-operation-log.md)) or, failing its preconditions, plain
+Drive synchronization.
 
 `realtime.ts` uses native DataChannels and the existing Drive signaling folder.
 Only operations with the same durable IDs and a small frontier handshake are
@@ -512,7 +521,7 @@ Per-edit wire volume for a representative card patch, one client and one actor:
 | 128-operation patch batch | 28,632 B → 4 frames | measured / derived |
 | inbound buffer bound per connection | 16,777,216 B | derived from `realtime.ts:33,36` (`16 × 1 MiB`); `[INFERENCE]`, not observed |
 
-`tests/operations/realtime.test.ts` (29 tests, green) covers frame rules, permission
+`tests/operations/realtime.test.ts` (31 tests, green) covers frame rules, permission
 gates, the 256 in-flight cap, chunk windows, roster, signalling, broadcast, close and
 the frontier handshake, and asserts exactly one new frame per broadcast through the
 real `send` path.
@@ -536,18 +545,18 @@ segment payload bodies only; multipart CREATE envelope and metadata overhead are
 excluded, and no live Google API cost or latency is implied.
 Live Google accounts/real ACL propagation, physical Android devices, and native
 Firefox collaborative sessions have not been exercised here. Browser builds and
-Android tests validate integration, not those external environments. Retained
-legacy WebRTC tests have shown an intermittent pre-delete conflict timeout; record
-full-suite outcomes separately from focused new-protocol results. A complete
-serialized run passed **175 files / 1,162 tests** after the checksum/empty-text
-compatibility additions. The focused operation suite passes **76 tests**. Android
-passes **15 files / 98 tests**; both TypeScript checks and managed Firefox/Chromium
+Android tests validate integration, not those external environments. Record
+full-suite outcomes separately from focused new-protocol results. Measured on
+10 November 2026: a complete run passes **257 files / 1,870 tests**, and Android
+passes **18 files / 106 tests**; both TypeScript checks and managed Firefox/Chromium
 builds/package verification pass. Firefox lint has zero warnings/errors/notices.
-Final board-scoped notification, locale-independent RxDB order ties, offline
-deleted-board recovery, and WebRTC
-setup/toggle/reconnect adjustments were verified with the focused operation suite,
-storage journal tests, and the native Chromium DataChannel probe. The latter also
-closes a live RTCPeerConnection and verifies automatic replacement/delivery. No live-account validation is implied.
+Board-scoped notification, locale-independent RxDB order ties, offline
+deleted-board recovery and the WebRTC setup/toggle/reconnect adjustments were verified
+with `tests/operations/` (43 files, 368 tests) and the native Chromium DataChannel
+probe. The WebRTC paths themselves are unreachable from any composition root now; the
+probe remains as a harness for the retained source. It also closes a live
+RTCPeerConnection and verifies automatic replacement/delivery. No live-account
+validation is implied.
 
 Drive API references: [content restrictions](https://developers.google.com/workspace/drive/api/guides/content-restrictions),
 [Changes API](https://developers.google.com/workspace/drive/api/guides/manage-changes),

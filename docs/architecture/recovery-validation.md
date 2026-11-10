@@ -11,8 +11,8 @@ are unchanged. No service is deployed, tagged or released by these checks.
 > evidence rules below are unchanged and still current: 55 scenarios, 45 partial,
 > 10 gap, 0 known-gap, `--strict` exits 1 as designed. The *figures* recorded at the
 > end of this document are the 19 October ones (609 tests, 36 Rust tests) and are
-> explicitly historical; the tree now measures 1 621 client tests in 225 files and
-> 155 Rust tests. Jobs 3–12 landed after this document was written, so its
+> explicitly historical; the tree now measures 1 870 client tests in 257 files, 106
+> Android checks and 169 Rust tests. Jobs 3–12 landed after this document was written, so its
 > "Job 3 must…" planning sentences are a record of the sequence, not open work.
 
 Jobs 3/4 add the [durable journal and causal reconciliation foundation](causal-change-journal.md),

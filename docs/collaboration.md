@@ -17,8 +17,8 @@ Collaboration has three layers, and only the first two are authoritative:
 - **Drive is the durable store and the ACL authority.** Membership is the Drive
   folder ACL (`src/sync/drivePermissions.ts:720-738`), not a signed manifest, in
   the deployed configuration. `operationSync` defaults to `true`
-  (`src/sync/runtime.ts:174`), and in that mode `usesIdentitySharing()` is false
-  (`src/sync/runtime.ts:2559`), so the identity/device-grant path is not the
+  (`src/sync/runtime.ts:231`), and in that mode `usesIdentitySharing()` is false
+  (`src/sync/runtime.ts:3754`), so the identity/device-grant path is not the
   authority for access.
 - **The relay is a bounded buffer and relay with replay, not a board-state
   engine.** It enforces identity, permission, order and durability; it does not
@@ -27,13 +27,19 @@ Collaboration has three layers, and only the first two are authoritative:
   `evidence_kind`, not a free string.
 - **No authoritative peer is elected.** Nothing in the running path requires an
   online owner, causal peer ordering, or a single-writer leader to converge.
-- The legacy WebRTC peer path is **dead in the extension**:
-  `setWebRtcDisabled(true)` (`src/sync/browser.ts:17`), with the peer runtime
-  replaced at build time by a stub (`src/collab/peerRuntime.ts` →
-  `peerRuntime.stub.ts`, aliased by `vite.sidebar.config.ts` and
-  `vite.background.config.ts`). It remains **live on Android**
-  (`apps/android/src/sync/service.ts`), which builds the same sources without the
-  alias.
+- The legacy WebRTC peer path is **dead on both platforms**. Each composition
+  root calls `setWebRtcDisabled(true)` — `src/sync/browser.ts:17` for the
+  extension and `apps/android/src/sync/service.ts:15` for Android — so
+  `createCollaborationManager`'s `doStart()` and the runtime's operation room
+  both return before a pool, DataChannel or Drive signaling poll exists
+  (`src/collab/manager.ts:505`, `src/sync/runtime.ts:2873`, `:3063`; Android's own
+  `apps/android/tests/relayPosture.check.ts` asserts the flag is true). The peer
+  runtime is additionally replaced at build time by a stub
+  (`src/collab/peerRuntime.ts` → `peerRuntime.stub.ts`, aliased by
+  `vite.sidebar.config.ts` and `vite.background.config.ts`), so the extension
+  bundles ship none of it. The modules are retained as source — Android has no
+  aliasing plugin and would load them if a future entry point enabled the pools
+  — and their unit tests still run, but no shipping path reaches them.
 
 ## How to read this document
 
@@ -57,16 +63,22 @@ Everything before the first history banner describes code in the tree today.
 These are the gaps this build actually has. They are not planned work being
 described as done, and no section above should be read as promising any of them.
 
-1. **The account room follows the same admission as the boards.** On the
-   Drive-authorized path (`getDriveIdentityCredentials` is supplied — the
-   Firefox and Android composition roots both do) the account room is admitted
-   through `/drive/admit` exactly like a board room, so no `account:<hash>` pin
-   and no enrollment gesture are involved: the channel reports
-   `connected`/`ready` from nothing but a connected Google account, and a board
-   created on one browser reaches another browser of the same account over that
-   room. The `absent-pin` / `no account pin` state that this gap used to describe
-   still exists, but only on the retained signed-authority tooling
-   (`operationSync: false`, which no composition root selects) — there the sole
+1. **Live collaboration is a Firefox-and-Android path; Chromium has none.**
+   The Drive-authorized room needs `getDriveIdentityCredentials` on the auth
+   provider. `src/sync/googleAuth.ts` (Firefox, OpenID + Drive) supplies it, and
+   the Android provider does too. `src/sync/googleChromeAuth.ts` — the Chromium
+   side panel's provider — does **not**, so on Chromium
+   `ensureAccountChannel()` returns without starting the account room, the
+   board's realtime factory selects the retained signed-authority branch and then
+   fails closed for want of credentials, and no room is opened. Chromium keeps
+   Drive persistence, discovery and synchronization; it simply has no live
+   channel. Giving it one is a Chromium OAuth change (an ID token whose audience
+   the relay accepts), not a documentation fix.
+   Where the credentials *are* supplied the account room is admitted through
+   `/drive/admit` exactly like a board room, so no `account:<hash>` pin and no
+   enrollment gesture are involved: the channel reports `connected`/`ready` from
+   nothing but a connected Google account. The `absent-pin` / `no account pin`
+   state still exists on the retained signed-authority tooling, where the sole
    code that creates a pin is the button in
    `src/sidebar/components/ExperimentalEnrollment.tsx`, which is not mounted
    anywhere. Covered by `tests/multiBrowser/boardLifecycle.test.ts` (a browser
@@ -75,26 +87,31 @@ described as done, and no section above should be read as promising any of them.
    `tests/multiBrowser/sameAccount.test.ts`.
 2. **"Sync now" reconciles only boards already known.** It forces a full
    reconcile round over the local project list, the Drive listing and the shared
-   project list (`src/sync/runtime.ts:2283`). It cannot rediscover a board this
+   project list `src/sync/runtime.ts:3221`. It cannot rediscover a board this
    client has never heard of; discovery of an unknown id still comes from a
    Drive listing or the account channel.
 3. **Edits to a board this context does not have open are not delivered
    passively.** The attach set is exactly one board, the one the context
    displays: `healRelayWork` answers `idle:not-attached` for anything else
-   (`src/sync/runtime.ts:2368-2377`). This is deliberate — it stopped a socket
+   (`src/sync/runtime.ts:3561`). This is deliberate — it stopped a socket
    leak — and the consequence is delivery by reopening the board (relay replay)
    or by the Drive poll.
-4. **Grant renewals cut live sockets.** The service's revocation watch compares
-   manifest digests (`services/pboard-signaling/src/lib.rs:201-205`,
-   `:1510`), and a renewal changes the digest, so every renewal looks like a
-   revocation: the journal records `reason="authorization_changed"` roughly every
-   three minutes per room. The cadence is set by the 300 s grant lifetime with a
-   120 s renew window (`BOARD_GRANT_LIFETIME_MS` / `BOARD_GRANT_RENEW_WINDOW_MS`,
-   `src/collab/boardGrants.ts:50-51`). Re-attaching after the change tears the
-   room down and rebuilds it.
-5. **A board open costs about 13 s in a two-browser scenario**, about two-thirds
-   of it budget pacing: one open issues roughly 15 identity exchanges (~30
-   tokens at 2.5/s). The re-attach in gap 4 roughly doubles the open.
+4. **Grant renewals cut live sockets, but only on the retained signed path.** The
+   service's revocation watch compares manifest digests
+   (`services/pboard-signaling/src/lib.rs`), and a renewal changes the digest, so
+   every renewal there looks like a revocation: `reason="authorization_changed"`
+   roughly every three minutes per room, at the 300 s grant lifetime with a 120 s
+   renew window (`BOARD_GRANT_LIFETIME_MS` / `BOARD_GRANT_RENEW_WINDOW_MS`,
+   `src/collab/boardGrants.ts:50-51`). **The Drive-authorized rooms Firefox and
+   Android open do not take that path**: they renew in place with `renewGoogle`
+   (`services/pboard-signaling/src/lib.rs`, which re-runs the Google/Drive check for
+   the same room and connection), so no detach, no re-attach, and no replayed
+   history follow a renewal.
+5. **A board open on the signed path costs about 13 s in a two-browser scenario**,
+   about two-thirds of it budget pacing: one open issues roughly 15 identity
+   exchanges (~30 tokens at 2.5/s), and the re-attach in gap 4 roughly doubles it. A
+   Drive-authorized open spends a single `/drive/admit` call per room instead, so
+   that figure does not describe it.
 6. **Add and delete are not atomic in the UI.** A card (or board) is published as
    an entity on creation, so a peer renders an empty card and fills it as
    keystrokes arrive.
@@ -122,15 +139,16 @@ described as done, and no section above should be read as promising any of them.
    **360 s** by the protocol (`services/pboard-signaling/src/admission.rs:113`,
    `:175`), so an owner-chosen 15 minutes needs a coordinated client and server
    change (PB-08).
-9. **The extension sidebar chunk is 611 kB against a 600 kB advisory.** The
+9. **The extension sidebar chunk is 637 kB against a 600 kB advisory.** The
    advisory is `chunkSizeWarningLimit: 600` in `vite.sidebar.config.ts:39`; it has
-   not been raised.
+   not been raised. The background worker is one IIFE by manifest constraint and
+   cannot be split: 839 kB, 247 kB gzip.
 
-Two more limits are structural rather than defects, and both are stated where
-they belong below: cross-account realtime discovery does not exist (the
-per-account inbox is server-side only and its client half is unwired), and a
-reconcile round's per-board work is gated on a Drive feed revision, so a board
-outside the local set waits for the next listing.
+One more limit is structural rather than a defect, and is stated where it belongs
+below: a reconcile round's per-board work is gated on a Drive feed revision, so a
+board outside the local set waits for the next listing. Cross-account invitations
+are *not* in this list — the per-account inbox carries them (see "Account-level
+board discovery").
 
 ## Runtime wiring
 
@@ -144,7 +162,7 @@ in the background rather than stopped first, and start/stop/role-refresh are
 serialized.
 
 A reconcile round is one account-wide pass (`reconcileOperations`,
-`src/sync/runtime.ts:2231`). In order it: opens the account channel,
+`src/sync/runtime.ts:3410`). In order it: opens the account channel,
 re-verifies deferred lifecycle records, lists shared projects, applies erasures,
 runs the legacy pass, syncs the account preference, polls the Drive Changes feed
 **once**, then iterates the union of local boards, Drive-listed boards and
@@ -179,7 +197,9 @@ state; `logPolicy.ts` holds the reconnect policy.
   different device keys share one connection while each keeps its own
   attribution: every operation a room appends is authored by *that room's*
   device. Board switches are `detach(old)` + `attach(new)` — no dial, no
-  re-authentication, zero new sockets.
+  re-authentication, zero new sockets. This is the Firefox and Android
+  configuration; Chromium's auth provider supplies no Drive identity, so it
+  opens no room at all (see gap 1).
 - **The account channel is one more room on the same socket**, not a second one.
   On the Drive-authorized path each room presents its own short-lived
   `/drive/admit` ticket, and the account room is the one opened as
@@ -240,7 +260,7 @@ All of this is one policy in two files and is stated as bounds, not tuning:
   instead of laddering). They arrive when a browser and a relay disagree about
   the wire — the service parses `authenticate` strictly and only tolerates an
   unknown top-level field once a connection has negotiated v3
-  (`lib.rs:1070`, `:1281`), so a first frame it cannot read is
+  (`services/pboard-signaling/src/lib.rs:1070`, `:1281`), so a first frame it cannot read is
   `{"type":"error","code":"malformed"}` plus a close. Reporting matters as much
   as stopping: a room whose context carries a verdict is told the service's own
   code and `describeLogStatus` says the two sides do not speak the same protocol.
@@ -570,13 +590,13 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   (`MAX_DEFERRED`, `:218`). Both counts appear in `pboardCollaboration()`'s
   `account` field.
 - **Verification is create-free.** `boardFolderExists` lists; it never resolves or
-  creates a folder (`src/sync/driveBoardStore.ts:289`). Only after Drive names the
+  creates a folder (`src/sync/driveBoardStore.ts:318`, `boardFolderExists`). Only after Drive names the
   folder is the role read (`operationService.role`) consulted, and it must already
   report owner/editor/viewer. A record for a board absent from Drive causes **no
   Drive write** — this was a real bug: the earlier order probed with the
   find-or-create folder resolver, the "verification" minted `/pboard/<boardId>`,
   its ACL gate then passed on the folder it had just created, and the ghost
-  persisted into every later listing (`src/sync/runtime.ts:502-517`).
+  persisted into every later listing (`src/sync/runtime.ts:864-882`).
 - **Deletion is verified through the operation log, not folder absence.** A delete
   is durable in Drive as an *operation*, never as a missing folder — removing a
   board never removes its folder, because the log is append-only — so folder
@@ -585,7 +605,7 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   Drive-gated synchronize path and lets the board's own projection materialise the
   delete. A failed read keeps the board and defers the record: hiding a board
   because Drive could not be read is the unsafe direction
-  (`src/sync/runtime.ts:518-540`). A `board.tombstone` record needs none of this:
+  (`src/sync/runtime.ts:875-900`). A `board.tombstone` record needs none of this:
   it carries the evidence itself and is applied from the store
   ("Deletion evidence travels with the fact"), so a peer that never had the
   board's log — or whose Drive read fails — still learns the decision.
@@ -610,12 +630,13 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   `updatedAt` standing in for the local intent; an exact tie is broken by the two
   orders restricted to the boards both sessions hold, so both sides keep the same
   winner.
-- **Content key**: on the retained signed-authority tooling the account room has
-  its own content key, carried by the same key courier as a board's and created
-  only by the device holding `account-authority:<hash>`. On the Drive-authorized
-  path — every shipped composition root — the room is a plaintext plane like a
-  board room (`createPlaintextOperationCodec`), so no key is couriered for it at
-  all.
+- **Content key**: on the Drive-authorized path (Firefox and Android) both the
+  account room and the board rooms are plaintext planes
+  (`createPlaintextOperationCodec`), so no key is couriered for either. On the
+  retained signed-authority tooling — which is also what Chromium falls back to,
+  without credentials to admit anything — the account room has its own content
+  key, carried by the same key courier as a board's and created only by the
+  device holding `account-authority:<hash>`.
 - **Failure reporting**: the channel's state and cause live in
   `pboardCollaboration()`'s `account` field and one console line. On the
   Drive-authorized path a missing Google connection is the only way it cannot
@@ -640,14 +661,19 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   (`src/sidebar/components/BoardCollaborationControls.tsx`), so
   `repinPublishedAuthority()` currently rejects for a Drive-authorized runtime and
   has no UI caller otherwise.
-- **Cross-account delivery is not wired.** A per-account **inbox** exists
-  server-side (`services/pboard-signaling/src/account_inbox.rs`): durable, bounded
-  at 4 KiB × 64 hints per inbox, 7-day TTL, eviction rather than refusal, addressed
-  by account hash so the relay never holds the address. Its **client half does not
-  exist** — there is no sender and no consumer in `src/`. Cross-account discovery
-  therefore still runs on Drive polling. An account room is also writable only by
-  that account's own devices, so a board shared *with* another account cannot be
-  announced into that account's room at all.
+- **Cross-account delivery goes through the per-account inbox.** A per-account
+  **inbox** exists server-side (`services/pboard-signaling/src/account_inbox.rs`):
+  durable, bounded at 4 KiB × 64 hints per inbox, 7-day TTL, eviction rather than
+  refusal, addressed by account hash so the relay never holds the address. Its
+  client half is wired both ways: `sharePermissions.invite` publishes one
+  `publishAccountHint` frame addressed to the invitee's account hash
+  (`src/sync/runtime.ts:3772`), and the account channel replays its own inbox on
+  every `synced` edge (`replayAccountHints`, `accountChannel.ts:706`) and hands each
+  hint to the ordinary Drive verification path. Covered end to end, including replay
+  after the recipient reconnects, by
+  `tests/multiBrowser/driveAuthorityRuntime.test.ts`. The account *room* remains
+  writable only by that account's own devices — which is exactly why the inbox, not
+  the room, carries an invitation to another account.
 
 Covered by `tests/multiBrowser/boardLifecycle.test.ts` (realtime discovery without a
 Drive poll, duplicate delivery leaving one row and one subscription, a browser that
@@ -667,7 +693,7 @@ Two authority stories coexist in the tree, and only one of them governs access i
 the deployed configuration.
 
 **Access is the Drive ACL.** In `operationSync` mode (the default,
-`src/sync/runtime.ts:174`) membership comes from the board folder's Drive
+`src/sync/runtime.ts:231`) membership comes from the board folder's Drive
 permissions, `usesIdentitySharing()` is false (`:2559`), and the permission service
 is what invites, re-roles and removes (`src/sync/drivePermissions.ts:720-738`).
 The signed-manifest model below does not decide who may read a board in that mode.
@@ -2249,7 +2275,7 @@ plus `npm run test:buffer` (21 live-server checks) and `cargo test --lib`
 > foundation as not yet the active runtime. It is now the active runtime: board
 > persistence goes through the operation log and Drive snapshots
 > (`src/sync/operations/`), and `operationSync` defaults to `true`
-> (`src/sync/runtime.ts:174`). The entry is kept because it is the point at which
+> (`src/sync/runtime.ts:231`). The entry is kept because it is the point at which
 > the transport-independent engine landed, and the
 > [architecture assessment](architecture/drive-operation-sync.md) it links to is
 > still the design record.
@@ -2564,16 +2590,14 @@ The account channel (`pboard-account-<hash>-order`) enrols its own device
 (`account-device:<hash>`) and is a room like any other, so it joins a board's
 socket on the same terms. Two things are **not** true:
 
-- **Cross-account delivery does not exist.** Another account's devices cannot
-  discover or reach a board over the socket, because an account room is writable
-  only by that account's own devices. The per-account inbox that would route a
-  hint across accounts is implemented **server-side only**
-  (`services/pboard-signaling/src/account_inbox.rs`) and has no sender or
-  consumer in `src/`; it is not faked with polling, and Drive polling is what
-  actually finds such boards.
-- **The channel is inert in the shipped build anyway** (gap 1): without an
-  `account:<hash>` pin it reports `absent-pin` and attaches nothing, so in
-  practice this room is absent from the socket rather than sharing it.
+- **The account *room* cannot reach another account; the inbox can.** An account
+  room is writable only by that account's own devices, so a board shared *with*
+  somebody cannot be announced into their room. The per-account inbox
+  (`services/pboard-signaling/src/account_inbox.rs`, addressed by account hash) is
+  the primitive that closes that: `sharePermissions.invite` publishes a hint into
+  the invitee's inbox and their account channel replays it.
+- **The room needs Drive identity credentials** (gap 1): Firefox and Android supply
+  them, Chromium does not, and without them this room never attaches.
 
 Everything above is per *browser context*, not per tab and not per profile: the
 MV3 worker and the sidebar are two module graphs, so they are two sessions and
@@ -2588,7 +2612,7 @@ and `PBOARD_SIGNALING_GOOGLE_IDENTITIES` were removed from the service and
 `PBOARD_SIGNALING_REQUIRE_TLS_PROXY` set to `0` (the binary's
 `public_service_requires_google_admission` guard keys on that flag; HAProxy
 still terminates TLS for every client and the app binds loopback only — see
-vps-maint `PBBOARD-COLLABORATION.md` / `CHANGELOG.md`, 2026-11-07 entries).
+vps-maint `CHANGELOG.md`, 2026-11-07 entries; formerly `PBBOARD-COLLABORATION.md`).
 Consequences for this repository:
 
 - **No service-admission tickets.** With no enrollment configured, the
@@ -2606,7 +2630,7 @@ Consequences for this repository:
   `canAccessEndpoint`) refuses silently without it. A missing host permission
   is the canonical cause of "dials, receives welcome, sends nothing, closes".
 - **Five-minute room leases need an attached keep-alive.** `MANIFEST_LIFETIME_MS`
-  is 300 s and the server caps issuance at 360 s (`admission.rs`), so an
+  is 300 s and the server caps issuance at 360 s (`services/pboard-signaling/src/admission.rs`), so an
   attached account socket's lease expires between reconcile rounds by design.
   `keepAccountManifestTicker` (runtime.ts) renews under the pinned authority
   on a 60 s tick whenever the account channel reports `connected` and the
@@ -2699,7 +2723,7 @@ with it, and the 300-second grant leases expired behind the dead socket
 The relay now answers control frames the way the protocol layer promises: ping
 and pong refresh the inbound-idle clock and spend neither the message-rate nor
 the byte budget; a Close ends the session; only a Binary frame stays an invalid
-frame (`lib.rs`, hardening test
+frame (`services/pboard-signaling/src/lib.rs`, hardening test
 `browser_control_pings_keep_the_connection_and_binary_still_closes_it`). The
 application heartbeat remains the JSON ping every 15 s — this fix makes idle
 survivable, not unnecessary. Deploying this binary is part of the fix: until
@@ -2745,7 +2769,7 @@ other worked. Its journal read `Operation log refused: malformed`, then
 the same twelve sessions `reason="malformed"`, ~300 ms after they opened, with
 no `authenticated` line at all: the connection died on its **first** frame.
 Verified against the deployed relay: with `negotiated` still 1, a frame that is
-not a `Client` variant fails the strict parse (`lib.rs:1070`), so a pre-auth
+not a `Client` variant fails the strict parse (`services/pboard-signaling/src/lib.rs:1070`), so a pre-auth
 `attach`/`detach`/`renewGoogle`, or an `authenticate` carrying one unknown
 top-level field, is answered `{"type":"error","code":"malformed"}` + close —
 while a pre-auth `ping` is `invalid_state`. `without_unknown_fields` only runs
@@ -2774,7 +2798,7 @@ Deployment state measured the same day, for the next reader of the same journal:
 haproxy on the OVH host already allows `/drive/admit` and `/identity/challenge`
 (`/etc/haproxy/haproxy.cfg:59-60`, limit 180/10 s), so a 404 from
 `/identity/challenge` is the **service's own** posture
-(`identity_enrollment.rs:381`, no `google_enrollment` configured — see the
+(`services/pboard-signaling/src/identity_enrollment.rs:381`, no `google_enrollment` configured — see the
 `enrollmentAbsent` note above), not a stale proxy rule. Do not go looking for a
 proxy reload in this incident; there was none to do.
 

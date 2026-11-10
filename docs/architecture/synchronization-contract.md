@@ -20,14 +20,19 @@ existing data, grants, keys or OAuth configuration. No tag or release is authori
 > Three statements in the body are now factually wrong about the runtime, and a
 > reader should not plan against them:
 >
-> - §1 and several rows say WebRTC carries authorized peer replication. In the
->   extension **no WebRTC peer pool starts** (`src/sync/browser.ts:17`,
->   `setWebRtcDisabled(true)`, plus a build-time stub of
->   `src/collab/peerRuntime.ts`); Android still runs it. A board either attaches to
->   the multiplexed operation log or has no live channel and converges through Drive.
+> - §1 and several rows say WebRTC carries authorized peer replication. **No WebRTC
+>   peer pool starts on any platform**: both composition roots call
+>   `setWebRtcDisabled(true)` (`src/sync/browser.ts:17`,
+>   `apps/android/src/sync/service.ts:15`), and the extension additionally stubs
+>   `src/collab/peerRuntime.ts` at build time. A board either attaches to the
+>   multiplexed operation log or has no live channel and converges through Drive.
+>   In practice that log is only reachable where the auth provider supplies Drive
+>   identity credentials — Firefox and Android. The Chromium side panel's provider
+>   supplies none (`src/sync/googleChromeAuth.ts`), so a Chromium board has no live
+>   channel at all and converges through Drive.
 > - The header note above pointed at the "independent board-grant authority" as the
 >   intended authority. It is not active in the default runtime: `operationSync`
->   defaults to true (`src/sync/runtime.ts:174`) and membership is the Drive folder
+>   defaults to true (`src/sync/runtime.ts:231`) and membership is the Drive folder
 >   ACL (`src/sync/drivePermissions.ts:720`).
 > - "No authoritative peer election" is not a target but a fact: there is none
 >   anywhere in the tree.
@@ -67,8 +72,8 @@ tested compatibility transition; their data and trust cannot simply be removed.
   *(Superseded 6 November 2026: the extension runs no WebRTC at all
   (`src/sync/browser.ts:17`), so the WebSocket now carries sealed operations
   themselves as well as authorization metadata, over one multiplexed connection per
-  browser context. Android retains the WebRTC leg. See
-  [the operation log](websocket-operation-log.md).)*
+  browser context. Android applies the same posture, so neither platform retains a
+  WebRTC leg. See [the operation log](websocket-operation-log.md).)*
 - Google verification establishes account identity and service admission. A
   verifiable board grant establishes board access. Neither substitutes for the
   other on the target public service.
@@ -146,7 +151,7 @@ never sufficient acknowledgement.
 | ID | Scenario | Required outcome and test assertion |
 | --- | --- | --- |
 | S01 | Drive acknowledges current state and attachments; no peers online; signaling healthy | Synced with the above scope. No claim of delivery to offline collaborators. |
-| S02 | Peers receive edits but Drive is unavailable | Edits replicate through WebRTC; status remains Synchronization pending for private persistence. *(Extension, 6 Nov 2026: no WebRTC peer pool starts, so an edit with Drive unavailable and no operation-log channel stays local until Drive returns. Android retains the WebRTC leg.)* |
+| S02 | Peers receive edits but Drive is unavailable | Edits replicate through WebRTC; status remains Synchronization pending for private persistence. *(10 Nov 2026: no WebRTC peer pool starts on any platform, so an edit with Drive unavailable and no operation-log channel stays local until Drive returns.)* |
 | S03 | Drive succeeds but signaling is unavailable | Private persistence continues; status is Synchronization pending for collaboration recovery. |
 | S04 | An unresolved conflict is safely persisted remotely | Conflict requires resolution remains visible; successful upload cannot mark it resolved. |
 

@@ -12,8 +12,9 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 > `src/collab/peerRuntime.ts` with `peerRuntime.stub.ts`, whose
 > `createProjectImageSync` and `createPboardWebRTCConnectionHandler` throw. So the
 > peer `image-want`/`image-put`/`image-part` exchange described here **cannot run in
-> the extension**; Android builds the same sources without the posture call and still
-> runs it.
+> the extension**. Android cannot reach it either: `apps/android/src/sync/service.ts:15`
+> calls `setWebRtcDisabled(true)` too, so no peer pool or DataChannel starts there.
+> The path is retained as source only.
 >
 > What replaced it in the extension is not a new image protocol: image bytes remain
 > immutable, content-addressed Drive files referenced from card operations, written
@@ -21,8 +22,8 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 > (`src/sync/operations/driveStore.ts:191-203`) and uploaded **once per content hash**
 > under a device-local receipt rather than on every publish
 > ([drive-operation-sync](drive-operation-sync.md), "Images are uploaded once, by
-> content"). Peer transfer is therefore a latency path on Android and nothing at all
-> in the browser.
+> content"). Peer transfer is therefore not a latency path on any shipped platform:
+> Android disables the peer pools as well.
 >
 > One detail below is also obsolete on its own terms: the account-private asset
 > store is no longer a module called `privateImageTransport.ts` (that file does not
@@ -35,7 +36,8 @@ The [approved behavior contract](synchronization-contract.md) remains the target
 The independent WebSocket/WebRTC path now transfers and recovers attachment bytes
 using the existing blob storage, content hashes and private Drive persistence:
 
-- **Account-private asset store** ([privateImageTransport.ts](../../src/sync/privateImageTransport.ts)):
+- **Account-private asset store** (the `imageTransport` of
+  [`privateDriveHistory.ts`](../../src/sync/privateDriveHistory.ts)):
   immutable, content-addressed `image-<hash>.json` records in this account's own
   `appDataFolder`, reusing the existing `DriveTransport` (bounded transient
   retry, no-store reads, immutable create; identical bytes are a no-op).

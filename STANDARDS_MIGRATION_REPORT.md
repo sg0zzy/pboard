@@ -366,8 +366,8 @@ compliance.
 - No application undo/redo command stack exists in `src`. Every undo/redo/rollback
   match is a comment or recovery semantics: `src/sync/attachmentGc.ts:11`,
   `src/storage/boardErasure.ts:6`, `src/collab/security/checkpoint.ts:107,135`,
-  `src/security/mutation.ts:159`, `src/webrtcHandler.ts:111,133,140`;
-  `tests/recovery/attachmentGc.test.ts:31` is a GC grace window and
+  `src/collab/security/mutation.ts:159`, `src/collab/webrtcHandler.ts:111,133,140` (the JSEP `rollback` signal type, not an application undo);
+  `tests/sync/attachmentGc.test.ts:31` is a GC grace window and
   `tests/recovery/causalReconciliation.test.ts:114` uses "undone" for a replay
 conflict. The absence statement at `docs/architecture/drive-operation-sync.md:48` is
 accurate, and the Escape clause at `:49` is backed by the form handlers at
@@ -377,7 +377,7 @@ capture selection overlay has its own handler at
 - Presence and cursor shapes are absent at the operation layer by design:
   `src/sync/operations/realtime.ts:42-43` accepts only `have` and `operations`; live
   cursors and ephemeral drag remain in `src/collab/signaling.ts` and
-  `src/webrtcHandler.ts`.
+  `src/collab/webrtcHandler.ts`.
 - The AppData boundary holds for the operation protocol
   (`src/sync/operations/driveStore.ts:12-14`) but not as a blanket claim. Legacy
   writers remain: `src/sync/driveTransport.ts` defaults to AppData when no regular
@@ -450,7 +450,7 @@ Inspection covered root/ancestor/nested agent instructions (no project-owned AGE
 
 The internal checklist established before edits was: preserve initial dirty work; pin/verify standards; consolidate authority/docs; map architecture/version/platform/signing/distribution; fix local snapshot/storage/retention; update read-only CI outputs; share release coordination and staged publication; fail closed on unverified production signing/history; validate documentation, scripts, workflows, tests and builds; report gaps without application rewrites.
 
-The checkout already had edited/untracked build/release work and a staged deletion of `scripts/build-manifest.mjs`. Those changes were incorporated rather than reset; the staged deletion remains untouched. No branch switch, Git commit/tag creation, push, remote dispatch, publication, deployment or credential change was performed.
+The checkout already had edited/untracked build/release work and a staged deletion of `scripts/build-manifest.mjs` (absent from this tree; version metadata now flows through `scripts/version.mjs` and `scripts/sync-version.mjs`). Those changes were incorporated rather than reset; the staged deletion remains untouched. No branch switch, Git commit/tag creation, push, remote dispatch, publication, deployment or credential change was performed.
 
 ## Implemented documentation changes
 
@@ -840,7 +840,7 @@ flowchart LR
 ```
 
 Added `src/collab/googleBrokerEnrollment.ts` and server
-`src/google_enrollment.rs`; reused `CollaborationSecurityOptions`, device keys,
+`services/pboard-signaling/src/google_enrollment.rs`; reused `CollaborationSecurityOptions`, device keys,
 manifest signatures, relay challenge-response, collection scoping, WebRTC mutual
 proofs, RxDB storage guards and existing role refresh lifecycle. The runtime selects
 this path only with the explicit experimental build flag and an independently

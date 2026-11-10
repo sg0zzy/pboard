@@ -1,5 +1,16 @@
-/** Versioned plaintext relay payloads. This codec is not selected by the
- * production transport until the relay admission and migration barriers exist. */
+/**
+ * Versioned plaintext relay payloads.
+ *
+ * This **is** the production codec for every Drive-authorized room: the board
+ * log in `runtime.ts` and the account room in `accountChannel.ts` both select it
+ * whenever the auth provider supplies Drive identity credentials, because such a
+ * room is admitted by Google's own verification of the account and the Drive
+ * folder instead of by a device-manifest content key. `integrity` detects
+ * accidental corruption; it is not an authentication mechanism, and the relay's
+ * authorization is what makes accepting these rows safe. On the retained
+ * signed-authority tooling the rooms still use `createOperationLogCodec`, which
+ * seals with a board content key.
+ */
 import { parseStrictJson } from '../../collab/security/canonical';
 import { digest, record, validateOperation, type Operation } from './protocol';
 

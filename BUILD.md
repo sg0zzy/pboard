@@ -365,16 +365,18 @@ code-split.
 
 The WebRTC peer stack is not in the extension at all. The extension's
 composition root calls `setWebRtcDisabled(true)` (`src/sync/browser.ts`), so no
-peer pool, DataChannel, peer history session or Drive signaling poll can start in
-it; the Android app builds the same `createDriveRuntime` without that call and
-does run them. Every peer import therefore goes through one module,
+peer pool, DataChannel, peer history session or Drive signaling poll can start;
+Android's composition root calls the same function
+(`apps/android/src/sync/service.ts:15`), so no platform runs them. Every peer import
+therefore goes through one module,
 `src/collab/peerRuntime.ts`, and the `peerRuntimeStub()` plugin
 (`scripts/peer-runtime-stub.mjs`) resolves that one path to
 `peerRuntime.stub.ts` in `vite.sidebar.config.ts` and
-`vite.background.config.ts`. Android has no such plugin and gets the real
-modules, so it still loads `rxdb/plugins/replication-webrtc`, `webrtcHandler`,
-`scopedPull`, `imageSync`, `signaling` and `operations/realtime` exactly as
-before. The stub throws instead of returning empty values: a board that silently
+`vite.background.config.ts`. Android has no such plugin and would load the real
+modules (`rxdb/plugins/replication-webrtc`, `webrtcHandler`, `scopedPull`,
+`imageSync`, `signaling`, `operations/realtime`), but its composition root disables
+them, so nothing executes them there either. The stub throws instead of returning
+empty values: a board that silently
 stopped collaborating would be worse than a build that fails on the first
 attempt. Removing the plugin, or importing one of those modules directly outside
 `peerRuntime.ts`, puts the stack back in the extension bundle.

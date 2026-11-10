@@ -30,7 +30,7 @@
 > are still useful checklists, and nothing here should be quoted as a current
 > guarantee.
 
-Status: proposed design, 15 October 2026. This plan describes work to implement and verify; it does not certify the current application. It applies to the Android runtime, where the peer path is live, and only historically to the browser extension.
+Status: proposed design, 15 October 2026. This plan describes work to implement and verify; it does not certify the current application. It applied to the peer path, which no composition root runs today — neither the browser extension nor Android — so it describes intended work on a transport nothing executes.
 
 The target is encrypted transport for collaboration content, authenticated peers, and permissions enforced by every receiving client. These are separate properties. Replacing `isPeerValid: () => true` addresses only one entry point and cannot establish all three.
 
@@ -44,7 +44,7 @@ Do not use “all connections are encrypted without any doubt.” Ordinary STUN/
 
 | Surface | Current behavior | Required change |
 | --- | --- | --- |
-| Live content | `src/collab/webrtcHandler.ts` creates simple-peer WebRTC data channels — **Android only; the extension never constructs a pool** | Retain DTLS; authenticate sessions before exposing them to RxDB |
+| Live content | `src/collab/webrtcHandler.ts` creates simple-peer WebRTC data channels — **no composition root constructs a pool; neither the extension nor Android runs this path** | Retain DTLS; authenticate sessions before exposing them to RxDB |
 | Shared snapshots and images | `src/sync/drivePermissions.ts` uses HTTPS Google API endpoints | Retain HTTPS; authenticate imported content and validate image hashes |
 | Account snapshots and signaling | `src/sync/driveTransport.ts` and `accountSignaling.ts` use HTTPS | Apply account device authentication and content validation |
 | Shared signaling | `src/collab/signaling.ts` exchanges ordinary JSON through Drive | Add signatures, session binding, expiry, replay protection and bounded parsing |
@@ -54,7 +54,7 @@ Do not use “all connections are encrypted without any doubt.” Ordinary STUN/
 | Development WebSocket | Caller supplies the URL with no `wss:` requirement | Reject insecure network URLs outside an explicit loopback development mode |
 | ICE services | simple-peer defaults include Google and Twilio `stun:` URLs | Document metadata exposure and make configuration explicit |
 
-The Android service imports the same `createDriveRuntime`, so it must use the same protocol and validation. Audit platform authentication, key storage and networking separately.
+The Android service imports the same `createDriveRuntime` and applies the same `setWebRtcDisabled(true)` posture, so it uses the same operation-log protocol and validation. Audit platform authentication, key storage and networking separately.
 
 WebRTC data channels carry SCTP over DTLS, providing transport confidentiality and integrity ([RFC 8831](https://www.rfc-editor.org/rfc/rfc8831.html)). Identity must be bound to the actual connection; an arbitrary application peer ID does not establish it ([RFC 8827](https://www.rfc-editor.org/rfc/rfc8827.html)).
 

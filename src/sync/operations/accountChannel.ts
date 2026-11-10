@@ -628,6 +628,11 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
    * record one attempt per try it actually took part in. */
   function flush(): Promise<void> {
     if (flushing) return flushing;
+    // Whether this pass stopped because the relay was not taking anything.
+    // A `break` on a failed send leaves its row for the next `synced` edge and
+    // must not be retried here, or a refusing relay would be dialled in a tight
+    // loop; the field is set only by that path.
+    let relayRefused = false;
     const pass = (async () => {
       const handle = log;
       if (!handle || !durable || !sendActor || !durable.outbox.length) return;
@@ -682,6 +687,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
         });
         // A failed send means the relay is not taking anything right now;
         // stop the pass and let the next `synced` edge try again.
+        relayRefused = true;
         break;
       }
       announce();
@@ -696,7 +702,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
       // pass is the only thing that has to know, so it re-runs itself while
       // the queue it left behind is non-empty and the connection is usable; a
       // send failure leaves the row for the next edge, exactly as below.
-      if (durable?.outbox.length && log && state === 'connected' && !throttled) void flush();
+      if (!relayRefused && durable?.outbox.length && log && state === 'connected' && !throttled) void flush();
     });
     return flushing;
   }
