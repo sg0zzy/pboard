@@ -236,7 +236,7 @@ it('propagates a board created under the posture to the other browser with its c
   }
 });
 
-it('degrades honestly: a courier-less relay produces a stated reason and no per-round relay work', async () => {
+it('reports missing Drive identity and avoids relay requests without credentials', async () => {
   setWebRtcDisabled(true);
   const drive = new DriveStub();
   drive.defaultPermissions = [{ id: 'owner', type: 'user', role: 'owner', emailAddress: 'owner@example.com' }];
@@ -250,25 +250,20 @@ it('degrades honestly: a courier-less relay produces a stated reason and no per-
   // Drive delivery is unaffected — but the status text must say why, instead
   // of claiming to wait for another browser.
   await a.runtime.collaborationManager.start(project.id);
-  expect(a.runtime.collaborationManager.state().error).toBeTruthy();
-  // And it asked the relay once, not once per round: later role passes take
-  // the recorded failure inside the backoff window instead of re-running the
-  // bootstrap and enrolment network path.
-  expect(relayRequests.length).toBeGreaterThan(0);
+  expect(a.runtime.collaborationManager.state().error).toContain('Google Drive identity credentials are required');
+  // Missing credentials are rejected before sending anything to the relay.
+  expect(relayRequests).toHaveLength(0);
   const requestsAfterStart = relayRequests.length;
   for (let round = 0; round < 3; round++) await a.runtime.collaborationManager.refreshRole().catch(() => undefined);
   expect(relayRequests.length).toBe(requestsAfterStart);
-  // The unresolved-posture case resolves the same way: with nothing stored
-  // the posture means websocket, so a board session asks the relay rather
-  // than silently stubbing (the split the raw stored reads used to answer
-  // differently from the transport).
+  // The same identity requirement applies when the posture is not stored.
   const bareData: Record<string, unknown> = {}, bareRelay: string[] = [];
   const bare = await relayProfile(drive, bareData, bareRelay);
   const bareProject = await bare.rx.createProject('Nothing stored', 'project');
   await bare.runtime.googleDrive.syncProject(bareProject.id, { force: true });
   await bare.runtime.collaborationManager.start(bareProject.id).catch(() => undefined);
-  expect(bareRelay.length).toBeGreaterThan(0);
-  expect(bare.runtime.collaborationManager.state().error).toBeTruthy();
+  expect(bareRelay).toHaveLength(0);
+  expect(bare.runtime.collaborationManager.state().error).toContain('Google Drive identity credentials are required');
 });
 
 // ---------------------------------------------------------------------------

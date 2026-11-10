@@ -331,6 +331,14 @@ export class FakeSocketImpl {
       const ticket = this.service.driveTickets.get(ticketId);
       this.service.driveTickets.delete(ticketId);
       if (!ticket || ticket.room !== room || ticket.session !== this.session || ticket.challenge !== this.challenge || (this.googleEmail && this.googleEmail !== ticket.email)) return 'unauthorized';
+      // The Drive-authorized room takes the same armed-refusal answer as a
+      // manifest room: `refuseAttachRoom` names a board, and this is the only
+      // admission a Drive-authorized browser performs, so an armed code must be
+      // resolved here or no scenario could exercise a refused attach at all.
+      // Like every refusal in the service it is the code for that room and it
+      // leaves the socket (and its other rooms) untouched.
+      const armed = this.service.attachRefusals.get(room) ?? this.service.attachRefusalsByBoard.get(ticket.board);
+      if (armed) return armed;
       this.googleEmail = ticket.email;
       this.service.roles.set(`${deviceKeyId}|${ticket.board}`, ticket.role);
       this.service.admitted.push({ room, deviceKeyId, email: ticket.email, kind });

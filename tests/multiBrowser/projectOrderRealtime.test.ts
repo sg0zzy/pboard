@@ -44,13 +44,24 @@ const runtime = (browser: BrowserHandle) => browser.runtime as unknown as Accoun
 const ordersApplied = (browser: BrowserHandle) => runtime(browser).accountChannel.status().appliedByKind['board.order'] ?? 0;
 const channelProblem = (browser: BrowserHandle) => JSON.stringify(runtime(browser).accountChannel.status());
 
-/** Scheduler-turn bound: the two browsers converge over real sockets and
- * asynchronous storage, so waiting means yielding the task queue — never a
- * duration whose failure mode is "the machine was busy". */
-async function until(probe: () => boolean | Promise<boolean>, turns = 20_000): Promise<boolean> {
-  for (let turn = 0; turn < turns; turn++) {
+/**
+ * Bounded wait over the observable the scenario owns.
+ *
+ * Both bounds are needed. A turn count alone is not a timeout: a zero-delay
+ * spin runs tens of thousands of turns in the time one real millisecond takes,
+ * so it exhausts long before a real timer fires — and one leg of these
+ * scenarios really does wait on a timer (the relay goes `unreachable`, the
+ * socket is killed, and the channel's reconnect ladder is a `setTimeout` with a
+ * one-second base). Under parallel suite load that turned "the collapsed order
+ * never reached B" into a load-dependent failure. The 1 ms yield plus the
+ * real-time budget is the same rule `tests/multiBrowser/boardLifecycle.test.ts`
+ * documents.
+ */
+async function until(probe: () => boolean | Promise<boolean>, budgetMs = 20_000): Promise<boolean> {
+  const deadline = performance.now() + budgetMs;
+  while (performance.now() < deadline) {
     if (await probe()) return true;
-    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    await new Promise<void>(resolve => setTimeout(resolve, 1));
   }
   return await probe();
 }

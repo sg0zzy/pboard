@@ -1,16 +1,23 @@
 /**
- * The single-source-authority invariant, measured directly.
+ * The single-authority invariant on the Drive-authorized path, measured
+ * directly at the relay.
  *
- * A Drive-exported board must auto-adopt the durable operation log when its
- * owner opens it, and no entry point — not the automatic paths, not the
- * explicit "create authority" panel call, not the Drive-ownership re-key —
- * may ever give a second device a *second* authority for the same board.
- * Every creation attempt routes through one decision point
- * (`adoptAuthority` in src/collab/boardGrants.ts); this suite exercises each
- * public entry and asserts the answer is refusal or idempotence, never an
- * addition. The relay room identity is derived from the authority key, and
- * only the authority device may mint a content key, so "one room, one seal"
- * is the observable measure of "one authority".
+ * There is no device-local authority to duplicate here: the relay derives a
+ * room's identity from `(boardId, folderId)` and admits an attach only after
+ * verifying the account's Google identity and the folder capability
+ * (`src/sync/operations/googleDriveAdmission.ts`, `admission.rs`). Two devices
+ * that resolve the same Drive folder therefore *land in the same room* — the
+ * invariant is structural, not a decision some code path must make.
+ *
+ * That is exactly the property the retired signed-manifest path needed a
+ * decision point (`adoptAuthority` in `src/collab/boardGrants.ts`) to protect,
+ * because a device could mint its own root key. What still needs proving on
+ * this path:
+ *  - the exporting owner adopts the log on open,
+ *  - a second browser of the same account joins that one room with no manual
+ *    step, and the two converge on the same content,
+ *  - no second room can appear for the board, including from a stranger that
+ *    holds no ACL access at all.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createBrowser, createCloud, logStatusOf, roomFor } from './fixtures/browser';
@@ -29,10 +36,6 @@ async function openBoard(browser: BrowserHandle, boardId: string) {
 async function reattach(browser: BrowserHandle) {
   await browser.runtime.collaborationManager.setEnabled(false);
   await browser.runtime.collaborationManager.setEnabled(true);
-}
-
-async function grantRound(browsers: BrowserHandle[], boardId: string) {
-  for (const browser of browsers) await browser.runtime.boardCollaboration.identitySharing.sync(boardId, true);
 }
 
 async function untilQuiet(predicate: () => boolean): Promise<boolean> {
@@ -78,39 +81,38 @@ describe('one board, one authority', { timeout: 120_000 }, () => {
     boardId = board.id;
     await a.rx.addItem({ projectId: board.id, content: 'Written before the relay existed' });
     await a.runtime.googleDrive.syncProject(board.id, { force: true });
-    // The Drive export marker is present — the very record that used to gate
-    // adoption. Adoption must now proceed *because of* export, not despite it.
+    // The Drive export marker is present — on this path it is the record that
+    // makes the board discoverable by the other browser, and it never gated
+    // trust: Drive authorization is the ACL, read per attach.
     expect(cloud.drive.contentsUnder(board.id).some(row => row.name === 'project.json'),
       'the Drive export must have published its project.json marker').toBe(true);
 
     await openBoard(a, board.id);
     const aSynced = await untilQuiet(() => logStatusOf(a, board.id)?.phase === 'synced');
-    expect(aSynced, 'the exporting owner must auto-adopt the durable log on open').toBe(true);
+    expect(aSynced, 'the exporting owner must adopt the durable log on open').toBe(true);
 
-    // B boots blind: reconcile imports the board, opening it must be enough
-    // — the identity round files the device request by itself.
+    // B boots blind: reconcile imports the board, opening it must be enough.
     await backgroundReconcile(b);
     expect((await b.rx.listProjects()).some(project => project.id === board.id)).toBe(true);
     await openBoard(b, board.id);
-    const filed = await untilQuiet(() => (cloud.signaling.directory.get(board.id)?.pending.length ?? 0) >= 1);
-    expect(filed, 'opening an adopted board must file B’s device request through the identity round, without any manual sync').toBe(true);
-    // Until admission, B still shares A’s single room and key — never its own.
-    expect(authorityRooms(cloud, boardId), 'the board must hold exactly one relay room (one authority)').toHaveLength(1);
-
-    await grantRound([a, b], boardId);
-    await reattach(b);
     const bSynced = await untilQuiet(() => logStatusOf(b, board.id)?.phase === 'synced');
-    expect(bSynced, 'the admitted same-account device must reach the same room').toBe(true);
+    expect(bSynced, 'opening an adopted board must reach the same room with no manual step').toBe(true);
     expect(roomFor(b, boardId)!.topic).toBe(roomFor(a, boardId)!.topic);
-    expect(authorityRooms(cloud, boardId), 'one room after admission too').toHaveLength(1);
-    // One content key, observably: both devices seal and open the same rows.
-    const typed = await b.rx.addItem({ projectId: board.id, content: 'Sealed under the single key' });
+    expect(authorityRooms(cloud, boardId), 'the board must hold exactly one relay room').toHaveLength(1);
+
+    // One room, one plane: both devices seal and open the same rows.
+    const typed = await b.rx.addItem({ projectId: board.id, content: 'Sealed in the single room' });
     const crossed = await untilAsync(async () => (await a.rx.listCards(board.id)).some(card => card.id === typed.id));
-    expect(crossed, 'edits sealed under the shared key must reach the other device').toBe(true);
-    expect(a.holdsContentKey(board.id) && b.holdsContentKey(board.id)).toBe(true);
+    expect(crossed, 'edits in the shared room must reach the other device').toBe(true);
+    // The Drive path is a plaintext plane: there is no per-board content key to
+    // hold at all, which is why a key never has to be couriered here.
+    expect(a.holdsContentKey(board.id) || b.holdsContentKey(board.id),
+      'the Drive-authorized room needs no content key').toBe(false);
+    // And no identity-directory policy was ever published.
+    expect(cloud.signaling.directory.size, 'no identity-directory policy exists on the Drive path').toBe(0);
   });
 
-  it('every entry point refuses a second authority for an adopted board — refusal and idempotence, never addition', async () => {
+  it('no second room can appear for an adopted board — refusal is structural, not a decision', async () => {
     const board = await a.rx.createProject('Guarded board', 'project');
     const guarded = board.id;
     await a.runtime.googleDrive.syncProject(guarded, { force: true });
@@ -119,55 +121,29 @@ describe('one board, one authority', { timeout: 120_000 }, () => {
     const roomsBefore = authorityRooms(cloud, guarded);
     expect(roomsBefore).toHaveLength(1);
 
-    // B never opens this board — it stays a stranger with a local copy,
-    // which is exactly the split-brain candidate. Each creation entry point
-    // is exercised against a board whose authority the service advertises.
+    // B reconciles the board but never opens it: a stranger with a local copy.
     await backgroundReconcile(b);
     expect((await b.rx.listProjects()).some(project => project.id === guarded)).toBe(true);
-    expect(await b.runtime.boardCollaboration.ownsAuthority(guarded)).toBe(false);
 
-    // 1. The decision point itself: the automatic path every caller shares.
-    const decision = await b.runtime.boardCollaboration.adoptAuthority(guarded);
-    expect(decision.outcome, `the decision point must refuse, said: ${decision.reason}`).toBe('refuse');
-    expect(decision.reason).toMatch(/advertises an existing authority|join/i);
-
-    // 2. The panel’s explicit Create call.
-    await expect(b.runtime.boardCollaboration.initialize(guarded)).rejects.toThrow(/advertises an existing authority|second authority|join/i);
-
-    // 3. The explicit Drive-ownership re-key (strongest user-level proof a
-    //    second device could bring): still refused while an authority lives.
-    await expect(b.runtime.reestablishAuthorityFromDrive(guarded)).rejects.toThrow();
-
-    // Repetition is idempotent, never additive.
-    const again = await b.runtime.boardCollaboration.adoptAuthority(guarded);
-    expect(again.outcome).toBe('refuse');
-    expect(await b.runtime.boardCollaboration.ownsAuthority(guarded)).toBe(false);
-    expect(await b.runtime.boardCollaboration.localBundle(guarded), 'a refused adoption leaves no bundle behind').toBeNull();
+    // A stranger account with no ACL access cannot attach a room for it at all:
+    // `/drive/admit` answers 403 because the folder is not visible to it, so no
+    // room exists — a second authority is unreachable by construction, not by
+    // refusal inside a decision function.
+    const strangerToken = cloud.drive.addAccount('stranger@example.com');
+    cloud.accounts.set(strangerToken, 'stranger@example.com');
+    const denied = await cloud.fetch('https://relay.invalid/drive/admit', {
+      method: 'POST',
+      body: JSON.stringify({ idToken: `id:${strangerToken}`, accessToken: strangerToken,
+        boardId: guarded, folderId: cloud.drive.mustFind(guarded).id, challenge: 'c'.repeat(43), session: 's'.repeat(43) })
+    });
+    expect(denied.status, 'an account without the folder cannot be admitted to its room').toBe(403);
     expect(authorityRooms(cloud, guarded), 'no second room may appear beside the advertised authority').toEqual(roomsBefore);
 
-    // The authority holder asking again is idempotent, not a second mint.
-    const holder = await a.runtime.boardCollaboration.adoptAuthority(guarded);
-    expect(holder.outcome).toBe('already-adopted');
-    expect(await a.runtime.boardCollaboration.ownsAuthority(guarded)).toBe(true);
-
-    // Admission is the only way in: afterwards B *shares* the one authority.
-    await openBoard(b, guarded);
-    expect(await untilQuiet(() => (cloud.signaling.directory.get(guarded)?.pending.length ?? 0) >= 1)).toBe(true);
-    await grantRound([a, b], guarded);
+    // Repetition by the holder is idempotent: re-opening costs no second room
+    // and no new room identity.
     await reattach(b);
+    await openBoard(b, guarded);
     expect(await untilQuiet(() => logStatusOf(b, guarded)?.phase === 'synced')).toBe(true);
-    expect(authorityRooms(cloud, guarded), 'admission shares the authority, it does not add one').toEqual(roomsBefore);
-    expect((await b.runtime.boardCollaboration.adoptAuthority(guarded)).outcome).toBe('already-adopted');
-
-    // A stranger that holds neither copy nor grant cannot manufacture a
-    // board to adopt either: the decision point requires a local board.
-    const c = await createBrowser({ label: 'C', email: OWNER, cloud });
-    try {
-      const ghost = await c.runtime.boardCollaboration.adoptAuthority(guarded);
-      expect(ghost.outcome).toBe('refuse');
-      expect(ghost.reason).toMatch(/local board|local copy/i);
-      await expect(c.runtime.boardCollaboration.initialize(guarded)).rejects.toThrow();
-      expect(authorityRooms(cloud, guarded)).toEqual(roomsBefore);
-    } finally { await c.close(); }
+    expect(authorityRooms(cloud, guarded), 'a same-account device shares the room, it does not add one').toEqual(roomsBefore);
   });
 });

@@ -52,7 +52,7 @@ function documented(url: string, method: string): { metric: string; units: numbe
   return { metric: METRIC.get, units: cost };
 }
 
-it('keeps one idle shared board inside a presence-poll Drive budget', async () => {
+it('keeps one idle board inside a Drive request budget', async () => {
   const server = new DriveStub();
   const storage = new MemoryStorage();
   const rx: RxRepository = await createRxRepository({ name: `idlerate${crypto.randomUUID().replaceAll('-', '')}`, blobs: createIndexedDbBlobStore(`idleblobs${crypto.randomUUID()}`) });
@@ -78,6 +78,7 @@ it('keeps one idle shared board inside a presence-poll Drive budget', async () =
   await runtime.collaborationManager.setEnabled(true);
   await runtime.collaborationManager.start(boardId);
 
+  expect(runtime.collaborationManager.state().ready).toBe(true);
   rows.length = 0;
   const startedAt = Date.now();
   await new Promise<void>((done) => setTimeout(done, WINDOW_MS));
@@ -96,23 +97,17 @@ it('keeps one idle shared board inside a presence-poll Drive budget', async () =
   const table = [...byMetric.entries()]
     .map(([metric, entry]) => `| ${metric} | ${entry.count} | ${entry.units} | ${perMinute(entry.units)} |`)
     .join('\n');
-  console.log(`\n### idle shared board, Drive signaling enabled (${Math.round(elapsedMs / 1000)} s window)\n`
+  console.log(`\n### idle board, Drive signaling enabled (${Math.round(elapsedMs / 1000)} s window)\n`
     + `| google method | requests | units | units/minute |\n| --- | --- | --- | --- |\n${table}\n`
     + `| TOTAL | ${rows.length} | ${units} | ${perMinute(units)} |\n`
     + `  presence downloads in window: ${byMetric.get(METRIC.download)?.count ?? 0}`);
 
-  // The poll still reads the room — that is how a second browser is found — so
-  // exactly the roster listings should be visible, nothing more.
+  // The operation session polls Drive even when no changes are made.
   const lists = byMetric.get(METRIC.list)?.count ?? 0;
-  expect(lists).toBeGreaterThanOrEqual(2);
-  // An unchanged room downloads nothing: not the session's own record, and not
-  // a peer record whose modification time has not moved. Each download is 200
-  // units, six times a listing, and used to be paid every two seconds.
+  expect(lists).toBeGreaterThanOrEqual(1);
+  // An unchanged board should not repeatedly download file contents.
   expect(byMetric.get(METRIC.download)?.count ?? 0).toBe(0);
-  // Budget: one room's listings at the fast cadence (≤30/min × 100) plus the
-  // heartbeat rewrites and the incidental per-board traffic this window shares.
-  // The same window cost ≈28,500 units/minute per room before presence records
-  // were cached by modification time and heartbeated at a quarter of their TTL.
+  // Keep the observed idle traffic within the established per-minute budget.
   expect(perMinute(units)).toBeLessThanOrEqual(6_000);
 
   await rx.db.close();

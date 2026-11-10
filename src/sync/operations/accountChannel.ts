@@ -377,6 +377,9 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
   let throttled = false;
   let durable: SharedAccountState | undefined;
   let closed = false;
+  // Queued publications must not reopen a channel after explicit teardown.
+  // A later explicit start enables automatic retries again.
+  let allowImplicitStart = true;
   /**
    * Records whose board was not verifiable when they arrived, keyed by board
    * id. In memory on purpose: a deferral is a wait for *this* session's next
@@ -683,7 +686,18 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
       }
       announce();
     })().catch(cause => report(cause, 'flush'));
-    flushing = pass.then(() => { flushing = undefined; });
+    flushing = pass.then(() => {
+      flushing = undefined;
+      // A record queued while this pass was reading the outbox is *not* in the
+      // snapshot it iterated, and nothing else would send it until the next
+      // `synced` edge — which a healthy connection never reaches again. The
+      // publisher's own queue therefore stalled for the rest of the session
+      // (an `outbox: 1` that never drains, the board never re-announced). The
+      // pass is the only thing that has to know, so it re-runs itself while
+      // the queue it left behind is non-empty and the connection is usable; a
+      // send failure leaves the row for the next edge, exactly as below.
+      if (durable?.outbox.length && log && state === 'connected' && !throttled) void flush();
+    });
     return flushing;
   }
 
@@ -745,6 +759,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
    * the rate limit that once locked an owner out through a proxy. */
   function start(): Promise<void> {
     if (closed) return Promise.resolve();
+    allowImplicitStart = true;
     if (starting) return starting;
     if (log && (state === 'failed' || throttled)) {
       const dead = log;
@@ -905,7 +920,10 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
         // outbox, and sit there until something else happened to flush. A
         // settled-but-dead handle counts as no connection: `start()` rebuilds
         // it, and the record goes out on the rebuilt one.
-        if (!durable || !log || state === 'failed' || throttled) await start();
+        if (!durable || !log || state === 'failed' || throttled) {
+          if (!allowImplicitStart) return false;
+          await start();
+        }
         if (!durable) {
           // Nothing durable to queue into yet (no account, or no pin): the next
           // `start()` re-attempts nothing for this board, so say so out loud in
@@ -1018,6 +1036,7 @@ export function createAccountLifecycleChannel(options: AccountChannelOptions): A
     },
     async reset() {
       await this.close();
+      allowImplicitStart = false;
       closed = false;
       account = null;
       durable = undefined;

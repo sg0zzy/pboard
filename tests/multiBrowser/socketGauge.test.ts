@@ -151,3 +151,20 @@ describe('the socket gauge', { timeout: 180_000 }, () => {
     expect(cloud.signaling.sockets).toEqual([]);
   });
 });
+
+it('allows an explicit account-channel start after it is closed', async () => {
+  const cloud = createCloud();
+  const browser = await createBrowser({ label: 'restart', email: OWNER, cloud });
+  try {
+    await browser.runtime.accountChannel.start();
+    expect(browser.runtime.accountChannel.status().state).toBe('connected');
+    await browser.runtime.accountChannel.close();
+    expect(await browser.runtime.accountChannel.publish('board.created', 'late-board')).toBe(false);
+    expect(cloud.signaling.sockets).toHaveLength(0);
+    await browser.runtime.accountChannel.start();
+    expect(browser.runtime.accountChannel.status().state).toBe('connected');
+    expect(cloud.signaling.sockets).toHaveLength(1);
+  } finally {
+    await browser.close();
+  }
+});

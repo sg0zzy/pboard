@@ -21,7 +21,7 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
       if (path.startsWith('/identity/') || path.startsWith('/grants/')) legacyPaths.push(path);
       return await originalFetch(input, init);
     }) as typeof fetch;
-    const a = await createBrowser({ label: 'drive-only-authority', email: 'drive-only@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
+    const a = await createBrowser({ label: 'drive-only-authority', email: 'drive-only@example.com', cloud: ownCloud }); browsers.push(a);
     const board = await a.rx.createProject('Drive authorized', 'project');
     await a.runtime.googleDrive.syncProject(board.id, { force: true });
     await a.runtime.collaborationManager.start(board.id);
@@ -41,7 +41,7 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
       if (path.startsWith('/identity/') || path.startsWith('/grants/')) legacyPaths.push(path);
       return await originalFetch(input, init);
     }) as typeof fetch;
-    const a = await createBrowser({ label: 'missing-drive-identity', email: 'missing@example.com', cloud: ownCloud }); browsers.push(a);
+    const a = await createBrowser({ label: 'missing-drive-identity', email: 'missing@example.com', cloud: ownCloud, withoutDriveIdentity: true }); browsers.push(a);
     const board = await a.rx.createProject('No identity credentials', 'project');
     await a.runtime.googleDrive.syncProject(board.id, { force: true });
     await a.runtime.accountChannel.start();
@@ -51,8 +51,8 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
   });
   it('discovers new boards in both directions without a manual Drive sync', async () => {
     const ownCloud = createCloud();
-    const a = await createBrowser({ label: 'new-board-a', email: 'same@example.com', cloud: ownCloud, driveAuthority: true, publishCreated: true }); browsers.push(a);
-    const b = await createBrowser({ label: 'new-board-b', email: 'same@example.com', cloud: ownCloud, driveAuthority: true, publishCreated: true }); browsers.push(b);
+    const a = await createBrowser({ label: 'new-board-a', email: 'same@example.com', cloud: ownCloud, publishCreated: true }); browsers.push(a);
+    const b = await createBrowser({ label: 'new-board-b', email: 'same@example.com', cloud: ownCloud, publishCreated: true }); browsers.push(b);
     await Promise.all([a.runtime.accountChannel.start(), b.runtime.accountChannel.start()]);
     await waitFor(() => [a, b].every(client => client.runtime.accountChannel.status().state === 'connected'), 'account rooms connected');
     const first = await a.rx.createProject('Created by A', 'project');
@@ -62,7 +62,7 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
   });
   it('keeps account discovery connected when the selected board closes', async () => {
     const ownCloud = createCloud();
-    const a = await createBrowser({ label: 'account-stays-open', email: 'same@example.com', cloud: ownCloud, driveAuthority: true, publishCreated: true }); browsers.push(a);
+    const a = await createBrowser({ label: 'account-stays-open', email: 'same@example.com', cloud: ownCloud, publishCreated: true }); browsers.push(a);
     const board = await a.rx.createProject('Board', 'project');
     await waitFor(() => a.rx.operationSource.bindings.has(board.id), 'board published');
     await a.runtime.collaborationManager.start(board.id);
@@ -74,9 +74,9 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
     expect(socket.readyState).toBe(1);
   });
   it('delivers live edits to the same account and a Drive editor without manifests', async () => {
-    const owner = await createBrowser({ label: 'owner', email: 'owner@example.com', cloud, driveAuthority: true }); browsers.push(owner);
-    const same = await createBrowser({ label: 'same', email: 'owner@example.com', cloud, driveAuthority: true }); browsers.push(same);
-    const editor = await createBrowser({ label: 'editor', email: 'editor@example.com', cloud, driveAuthority: true }); browsers.push(editor);
+    const owner = await createBrowser({ label: 'owner', email: 'owner@example.com', cloud }); browsers.push(owner);
+    const same = await createBrowser({ label: 'same', email: 'owner@example.com', cloud }); browsers.push(same);
+    const editor = await createBrowser({ label: 'editor', email: 'editor@example.com', cloud }); browsers.push(editor);
     const board = await owner.rx.createProject('Drive authority board', 'project');
     await owner.runtime.googleDrive.syncProject(board.id, { force: true });
     cloud.drive.grant(board.id, editor.email, 'writer');
@@ -133,8 +133,8 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
   });
   it('replicates the sidebar board order over the same Google account room', async () => {
     const ownCloud = createCloud();
-    const a = await createBrowser({ label: 'sort-a', email: 'sort@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
-    const b = await createBrowser({ label: 'sort-b', email: 'sort@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(b);
+    const a = await createBrowser({ label: 'sort-a', email: 'sort@example.com', cloud: ownCloud }); browsers.push(a);
+    const b = await createBrowser({ label: 'sort-b', email: 'sort@example.com', cloud: ownCloud }); browsers.push(b);
     const first = await a.rx.createProject('First', 'project');
     const second = await a.rx.createProject('Second', 'project');
     await a.runtime.googleDrive.syncProject(first.id, { force: true });
@@ -153,9 +153,9 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('announces creation and deletion only to the same account, without opening the board on the receiver', async () => {
     const ownCloud = createCloud();
-    const a = await createBrowser({ label: 'lifecycle-a', email: 'lifecycle@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
-    const b = await createBrowser({ label: 'lifecycle-b', email: 'lifecycle@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(b);
-    const stranger = await createBrowser({ label: 'lifecycle-stranger', email: 'stranger@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(stranger);
+    const a = await createBrowser({ label: 'lifecycle-a', email: 'lifecycle@example.com', cloud: ownCloud }); browsers.push(a);
+    const b = await createBrowser({ label: 'lifecycle-b', email: 'lifecycle@example.com', cloud: ownCloud }); browsers.push(b);
+    const stranger = await createBrowser({ label: 'lifecycle-stranger', email: 'stranger@example.com', cloud: ownCloud }); browsers.push(stranger);
     await Promise.all([a.runtime.accountChannel.start(), b.runtime.accountChannel.start(), stranger.runtime.accountChannel.start()]);
     await waitFor(() => [a, b, stranger].every(client => client.runtime.accountChannel.status().state === 'connected'), 'lifecycle account rooms connected');
     const board = await a.rx.createProject('Lifecycle board', 'project');
@@ -175,9 +175,9 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('synchronizes an editor leaving to that account while keeping the owner board', async () => {
     const ownCloud = createCloud();
-    const owner = await createBrowser({ label: 'leave-owner', email: 'leave-owner@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(owner);
-    const a = await createBrowser({ label: 'leave-a', email: 'leave-editor@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
-    const b = await createBrowser({ label: 'leave-b', email: 'leave-editor@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(b);
+    const owner = await createBrowser({ label: 'leave-owner', email: 'leave-owner@example.com', cloud: ownCloud }); browsers.push(owner);
+    const a = await createBrowser({ label: 'leave-a', email: 'leave-editor@example.com', cloud: ownCloud }); browsers.push(a);
+    const b = await createBrowser({ label: 'leave-b', email: 'leave-editor@example.com', cloud: ownCloud }); browsers.push(b);
     await Promise.all([owner.runtime.accountChannel.start(), a.runtime.accountChannel.start(), b.runtime.accountChannel.start()]);
     await waitFor(() => [owner, a, b].every(client => client.runtime.accountChannel.status().state === 'connected'), 'leave account rooms connected');
     const board = await owner.rx.createProject('Shared board', 'project');
@@ -195,8 +195,8 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('delivers an owner deletion to an editor subscribed to that board', async () => {
     const ownCloud = createCloud();
-    const owner = await createBrowser({ label: 'delete-owner', email: 'delete-owner@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(owner);
-    const editor = await createBrowser({ label: 'delete-editor', email: 'delete-editor@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(editor);
+    const owner = await createBrowser({ label: 'delete-owner', email: 'delete-owner@example.com', cloud: ownCloud }); browsers.push(owner);
+    const editor = await createBrowser({ label: 'delete-editor', email: 'delete-editor@example.com', cloud: ownCloud }); browsers.push(editor);
     const board = await owner.rx.createProject('Deleted shared board', 'project');
     await owner.runtime.googleDrive.syncProject(board.id, { force: true });
     ownCloud.drive.grant(board.id, editor.email, 'writer');
@@ -210,9 +210,9 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('announces a newly discovered Drive subscription to another session of that account', async () => {
     const ownCloud = createCloud();
-    const owner = await createBrowser({ label: 'share-owner', email: 'share-owner@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(owner);
-    const a = await createBrowser({ label: 'share-a', email: 'share-editor@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(a);
-    const b = await createBrowser({ label: 'share-b', email: 'share-editor@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(b);
+    const owner = await createBrowser({ label: 'share-owner', email: 'share-owner@example.com', cloud: ownCloud }); browsers.push(owner);
+    const a = await createBrowser({ label: 'share-a', email: 'share-editor@example.com', cloud: ownCloud }); browsers.push(a);
+    const b = await createBrowser({ label: 'share-b', email: 'share-editor@example.com', cloud: ownCloud }); browsers.push(b);
     await Promise.all([a.runtime.accountChannel.start(), b.runtime.accountChannel.start()]);
     await waitFor(() => [a, b].every(client => client.runtime.accountChannel.status().state === 'connected'), 'subscription account rooms connected');
     const board = await owner.rx.createProject('New shared subscription', 'project');
@@ -227,9 +227,9 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('notifies an already-connected invitee over WebSocket and verifies the Drive share', async () => {
     const ownCloud = createCloud();
-    const owner = await createBrowser({ label: 'invite-owner', email: 'invite-owner@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(owner);
-    const guest = await createBrowser({ label: 'invite-guest', email: 'invite-guest@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(guest);
-    const outsider = await createBrowser({ label: 'invite-outsider', email: 'invite-outsider@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(outsider);
+    const owner = await createBrowser({ label: 'invite-owner', email: 'invite-owner@example.com', cloud: ownCloud }); browsers.push(owner);
+    const guest = await createBrowser({ label: 'invite-guest', email: 'invite-guest@example.com', cloud: ownCloud }); browsers.push(guest);
+    const outsider = await createBrowser({ label: 'invite-outsider', email: 'invite-outsider@example.com', cloud: ownCloud }); browsers.push(outsider);
     await Promise.all([guest.runtime.accountChannel.start(), outsider.runtime.accountChannel.start()]);
     await waitFor(() => [guest, outsider].every(client => client.runtime.accountChannel.status().state === 'connected'), 'recipient inbox connected');
     const board = await owner.rx.createProject('A live invitation', 'project');
@@ -245,8 +245,8 @@ describe('Firefox Drive-authorized board runtime', { timeout: 120_000 }, () => {
 
   it('replays an invitation after the recipient reconnects', async () => {
     const ownCloud = createCloud();
-    const owner = await createBrowser({ label: 'replay-owner', email: 'replay-owner@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(owner);
-    const guest = await createBrowser({ label: 'replay-guest', email: 'replay-guest@example.com', cloud: ownCloud, driveAuthority: true }); browsers.push(guest);
+    const owner = await createBrowser({ label: 'replay-owner', email: 'replay-owner@example.com', cloud: ownCloud }); browsers.push(owner);
+    const guest = await createBrowser({ label: 'replay-guest', email: 'replay-guest@example.com', cloud: ownCloud }); browsers.push(guest);
     await guest.runtime.accountChannel.start();
     await waitFor(() => guest.runtime.accountChannel.status().state === 'connected', 'recipient account connected');
     const board = await owner.rx.createProject('Invitation during outage', 'project');

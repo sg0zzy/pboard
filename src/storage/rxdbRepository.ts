@@ -312,7 +312,12 @@ export async function createRxRepository(options: {
       // The board's own log can delete the board while this device still has
       // it open. Authoring another operation for it would push content its
       // owner erased back into the log; the retained journal still exports.
-      if (!(await projects.findOne(projectId).exec())) throw new Error('This board was deleted; your retained history is exportable');
+      // The marker, not the row, is the authority: an erase recorded as a
+      // tombstone fact (`isDeletedProject`) leaves the document in place while
+      // hiding it from every read, so a row-only check let a device that was
+      // still live on the board author into it after the owner's erase — the
+      // write resolved, matched no project, and vanished.
+      if (await isDeletedProject(projectId) || !(await projects.findOne(projectId).exec())) throw new Error('This board was deleted; your retained history is exportable');
       return;
     }
     const permission = await journal.permissions.get(projectId);

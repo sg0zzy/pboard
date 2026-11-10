@@ -1,31 +1,24 @@
 /**
- * Cold load, measured in `/ws` upgrades: one browser context, five boards, no
- * more key-courier dials than there are rooms that need one.
+ * Cold load, measured in `/ws` upgrades: one browser context, five boards, and
+ * not one key-courier dial.
  *
- * The field report this pins: a 40-minute window showed **80** `101` upgrades
- * through the proxy, **zero** of them refused, while only ~123 auth/session
- * events landed — and the identity-enrolment diagnostics fired at :53, :57,
- * :58.2, :58.9, :59.7, 00:06:24. Connections created and destroyed every few
+ * The field report this suite came from: a 40-minute window showed **80** `101`
+ * upgrades through the proxy, **zero** of them refused, while only ~123
+ * auth/session events landed. Connections created and destroyed every few
  * seconds with no user action is *churn*, and the key courier was its largest
  * source: `keyCourierTransport.ts` opened one short-lived socket per pass, and
- * `runtime.ts` runs a pass from six places — including a 2-second debounced
- * foreign-row trigger.
+ * `runtime.ts` runs a pass from six places.
  *
- * Measured before the queue (`tests/operations/keyCourierQueue.test.ts` carries
- * the unit half of the same claim; this is the end-to-end half), with a stack
- * captured at the socket constructor:
- *
- * | phase                   | courier dials before         | after                        |
- * |-------------------------|------------------------------|------------------------------|
- * | first board open        | 4 (`account` ×3, `attach` ×1)| 2 (`account` ×1, `attach` ×1)|
- * | each further board open | 2 (`account` ×1, `attach` ×1)| 1 (`attach` ×1)              |
- * | one reconcile round     | 1 (`account` ×1)             | 0                            |
- *
- * Five boards: **13 → 6**. The 6 are the five board rooms' own necessary attach
- * passes plus **one** account-room pass for the whole context, against the eight
- * the account room used to make. Nothing here asserts a duration: every wait
- * polls an observable this test owns, and the count is read from the relay's own
- * sockets, not from the client's bookkeeping.
+ * The queue coalesced those passes, and that is what this file used to assert
+ * (five boards: 13 dials → 6). The Drive-authorized architecture then removed
+ * the reason for the exchange entirely: every room is a plaintext plane
+ * (`createPlaintextOperationCodec`), so no wrap key is published and no
+ * content-key grant is fetched. The claim is now absolute — **zero** — and it
+ * is still counted at the relay, from the frames the sockets carried
+ * (`publishDeviceKey` and friends are actions nothing else sends), never from
+ * the client's own bookkeeping. The unit half of the old claim remains in
+ * `tests/operations/keyCourierQueue.test.ts` for the signed path it still
+ * serves.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createBrowser, createCloud, logStatusOf, type BrowserHandle, type Cloud } from './fixtures/browser';
@@ -109,31 +102,28 @@ describe('the key courier on a cold load', { timeout: 240_000 }, () => {
     return dials.filter(dial => dial.actions.some(action => COURIER_ACTIONS.has(action)));
   }
 
-  it('opens one courier exchange per room, not one per trigger, across five boards', async () => {
-    // One board's first open: the account room's pass and the board's own. Both
-    // are necessary — the account room's content key and the board's are two
-    // different keys — and neither is repeated by the other triggers that fire
-    // in the same turn (three of them open the account channel).
+  it('dials no courier exchange at all: the Drive-authorized room is a plaintext plane', async () => {
+    // The cold-load churn this suite was written for came from the key courier:
+    // one self-closing socket per trigger, per room, to publish wrap keys and
+    // fetch a board's content-key grant. That machinery belongs to the retired
+    // signed-authority path. Every room a Drive-authorized browser opens —
+    // boards and the account room alike — seals with
+    // `createPlaintextOperationCodec`, so there is no key to courier and the
+    // whole class of dials is gone rather than merely coalesced.
     await a.runtime.collaborationManager.start(boards[0]);
     expect(await untilQuiet(() => logStatusOf(a, boards[0])?.phase === 'synced'),
       `board never synced: ${JSON.stringify(logStatusOf(a, boards[0]))}`).toBe(true);
-    expect(courierDials().length, `first board: ${JSON.stringify(courierDials().map(d => d.actions))}`).toBe(2);
-
-    // Each further board open: its own pass, and nothing for the account room —
-    // a pass that resolved a key already answered the room, and the queue is what
-    // makes the three account triggers one answer.
     for (const boardId of boards.slice(1)) {
       await a.runtime.collaborationManager.start(boardId);
       expect(await untilQuiet(() => logStatusOf(a, boardId)?.phase === 'synced'),
         `board never synced: ${JSON.stringify(logStatusOf(a, boardId))}`).toBe(true);
     }
-    const afterOpens = courierDials().length;
-    expect(afterOpens, `five boards opened: ${JSON.stringify(courierDials().map(d => d.actions))}`).toBe(BOARDS + 1);
-
-    // A reconcile round is maintenance with nothing new to say: a pass that
-    // already resolved every room's key answers it, so it dials nothing.
-    const before = courierDials().length;
     await a.runtime.googleDrive.reconcileAll({ force: true });
-    expect(courierDials().length - before, 'a round inside the quiet window dials nothing').toBe(0);
+    expect(courierDials(), `no courier exchange may be dialled on the Drive path: ${JSON.stringify(courierDials().map(d => d.actions))}`)
+      .toHaveLength(0);
+    // The instrumented sockets are still the ones the rooms used, so the count
+    // above is a real absence and not a broken wrapper.
+    expect(dials.some(dial => dial.actions.includes('attach') || dial.actions.includes('authenticate')),
+      'the relay still saw the rooms dial').toBe(true);
   });
 });

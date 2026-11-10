@@ -341,29 +341,39 @@ describe('one socket per browser context', { timeout: 240_000 }, () => {
     expect(socket.deviceForRoom.get(roomIdFor(cloud, current)!), 'the room kept its own device key').not.toBe(socket.deviceKeyId);
   });
 
-  it('falls back to protocol 2 unchanged: one socket per room, no attach ever sent', async () => {
+  it('refuses a relay without protocol 3 and states the reason, leaving Drive delivery intact', async () => {
+    // Drive authorization is a socket-bound admission (`/drive/admit` returns a
+    // ticket for one challenge/session/room), and protocol 2 has no `attach`
+    // frame to carry a second room's own ticket. The product therefore refuses
+    // a v2-only relay for a Drive-authorized room — by design, and loudly:
+    // `logSync.ts` answers `Drive authorization requires relay protocol 3`.
+    // What must not happen is a silent fallback to the retired signed-authority
+    // transport, so the board simply has no live channel while Drive keeps
+    // carrying its edits.
     const fallback = createCloud();
     fallback.signaling.protocolVersion = 2;
     const b = await createBrowser({ label: 'legacy', email: OWNER, cloud: fallback });
     try {
-      const first = await b.rx.createProject('Legacy one', 'project');
-      await b.runtime.googleDrive.syncProject(first.id, { force: true });
-      await openBoard(b, first.id);
-      await expectSynced(b, first.id);
-      const second = await b.rx.createProject('Legacy two', 'project');
-      await b.rx.addItem({ projectId: second.id, content: 'second board' });
-      await b.runtime.googleDrive.syncProject(second.id, { force: true });
-      await openBoard(b, second.id);
-      await expectSynced(b, second.id);
-
-      // The deployed server's vocabulary: `authenticate` only. A v3-only frame
-      // would have closed the socket (on v2, an unknown frame is fatal), so the
-      // absence of `attach` is what proves the fallback is byte-compatible.
+      const board = await b.rx.createProject('Legacy relay', 'project');
+      await b.rx.addItem({ projectId: board.id, content: 'delivered by Drive' });
+      await b.runtime.googleDrive.syncProject(board.id, { force: true });
+      await openBoard(b, board.id);
+      // The verdict is reported on the collaboration state: the factory refuses
+      // before a room record exists, so there is no log to read it from.
+      const refused = await untilQuiet(() => /protocol 3/i.test(b.runtime.collaborationManager.state().error ?? ''));
+      expect(refused, `the state states the version verdict: ${JSON.stringify(b.runtime.collaborationManager.state())}`)
+        .toBe(true);
+      expect(roomFor(b, board.id)?.log ?? null, 'no room was created for a relay that cannot admit it').toBeNull();
+      // Nothing was attached, and no v3-only frame was ever sent to a v2
+      // server (where an unknown frame is fatal).
       expect(fallback.signaling.attached.length, 'a v2 server is never sent attach').toBe(0);
-      expect(fallback.signaling.admitted.length, 'each room authenticated its own socket').toBeGreaterThanOrEqual(2);
-      const status = logStatusOf(b, second.id);
-      expect(status?.phase, `the v2 room synced: ${JSON.stringify(roomFor(b, second.id) ?? null)}`).toBe('synced');
-      expect(status?.error).toBeNull();
+      // The edit is still durable and still reaches another browser through
+      // Drive: losing the relay is not losing the board.
+      const other = await createBrowser({ label: 'legacy-reader', email: OWNER, cloud: fallback });
+      try {
+        await other.runtime.googleDrive.reconcileAll({ force: true });
+        expect((await other.rx.listCards(board.id)).map(card => card.content)).toEqual(['delivered by Drive']);
+      } finally { await other.close(); }
     } finally { await b.close(); }
   });
 });

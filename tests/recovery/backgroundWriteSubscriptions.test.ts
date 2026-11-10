@@ -167,9 +167,13 @@ it('the current board\'s own visible changes still notify both board views', asy
     const beforeBatch = { ...counts };
     await applyAppliedBatch(rx, current.id, 1);
     await rx.renameProject(current.id, 'Renamed after the batch');
-    expect(await untilQuiet(() => counts.projects > beforeBatch.projects)).toBe(true);
+    // Gate on *both* views moving, then assert each moved exactly once. Gating
+    // on `projects` alone made the `currentProject` delta a race: the two
+    // notifiers are separate subscriptions, so the board header can legitimately
+    // be read one scheduler turn after the picker was.
+    expect(await untilQuiet(() => counts.projects > beforeBatch.projects && counts.currentProject > beforeBatch.currentProject)).toBe(true);
     expect(counts.projects - beforeBatch.projects, 'the batch itself is invisible; only the second rename may emit').toBe(1);
-    expect(counts.currentProject - beforeBatch.currentProject).toBe(1);
+    expect(counts.currentProject - beforeBatch.currentProject, 'and the board header heard the same one rename').toBe(1);
   } finally { stop(); }
 });
 

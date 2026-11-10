@@ -233,7 +233,18 @@ export async function createBrowser(options: {
    * bucket's own bounds are pinned by `tests/collab/authBudget.test.ts`; pass
    * `automaticAuthBudget` here to exercise the pacing end-to-end. */
   authBudget?: AuthBudget;
-  driveAuthority?: boolean;
+  /** Model an authentication provider with no Drive identity credentials, i.e.
+   * an account that can neither admit a Drive-authorized room nor contact the
+   * legacy `/identity/`, `/grants/` endpoints (`runtime.ts` fails closed).
+   * Pair it with `operationSync: false` to exercise the retained
+   * signed-authority tooling the runtime keeps for compatibility and recovery;
+   * no product composition root selects that posture. */
+  withoutDriveIdentity?: boolean;
+  /** The runtime's `operationSync` switch. Default `true`, which is what both
+   * composition roots pass. `false` is the retained legacy signed-authority
+   * path (`createDriveRuntime`'s own contract calls it compatibility/recovery
+   * tooling), used by the suites that cover it. */
+  operationSync?: boolean;
   publishCreated?: boolean;
 }): Promise<BrowserHandle> {
   ensureSharedIndexedDb();
@@ -373,9 +384,11 @@ export async function createBrowser(options: {
     isConfigured: () => true,
     connect: async () => {},
     disconnect: async () => {},
-    ...(options.driveAuthority ? { getDriveIdentityCredentials: async () => ({ accessToken: token, idToken: `id:${token}` }) } : {}),
+    // The production operation runtime admits account and board rooms with Drive identity.
+    ...(options.withoutDriveIdentity ? {} : { getDriveIdentityCredentials: async () => ({ accessToken: token, idToken: `id:${token}` }) }),
   };
-  const runtime = createDriveRuntime({ auth, storage, getRepository: async () => rx, fetcher: cloud.fetch, authBudget: options.authBudget ?? instantAuthBudget() }) as unknown as BrowserRuntime;
+  const runtime = createDriveRuntime({ auth, storage, getRepository: async () => rx, fetcher: cloud.fetch, authBudget: options.authBudget ?? instantAuthBudget(),
+    ...(options.operationSync === undefined ? {} : { operationSync: options.operationSync }) }) as unknown as BrowserRuntime;
   runtimeRef = runtime;
 
   let closed = false;

@@ -57,16 +57,22 @@ Everything before the first history banner describes code in the tree today.
 These are the gaps this build actually has. They are not planned work being
 described as done, and no section above should be read as promising any of them.
 
-1. **The account channel is inert in production.** The channel needs an
-   `account:<hash>` pin. The only code that creates one is the button in
-   `src/sidebar/components/ExperimentalEnrollment.tsx`, which is **not mounted
-   anywhere** in the application. In normal use the channel reports
-   `absent-pin` / `no account pin` and opens no room
-   (`src/sync/operations/accountChannel.ts:646`). A newly created board therefore
-   reaches another browser of the same account only after the Drive publication
-   flush (`DRIVE_MAX_UNPUBLISHED_MS`, 25 minutes, `src/sync/syncPolicy.ts:4`)
-   plus a poll — or a reload. The automated suite calls `initialize('account')`
-   explicitly, so it does not catch this.
+1. **The account room follows the same admission as the boards.** On the
+   Drive-authorized path (`getDriveIdentityCredentials` is supplied — the
+   Firefox and Android composition roots both do) the account room is admitted
+   through `/drive/admit` exactly like a board room, so no `account:<hash>` pin
+   and no enrollment gesture are involved: the channel reports
+   `connected`/`ready` from nothing but a connected Google account, and a board
+   created on one browser reaches another browser of the same account over that
+   room. The `absent-pin` / `no account pin` state that this gap used to describe
+   still exists, but only on the retained signed-authority tooling
+   (`operationSync: false`, which no composition root selects) — there the sole
+   code that creates a pin is the button in
+   `src/sidebar/components/ExperimentalEnrollment.tsx`, which is not mounted
+   anywhere. Covered by `tests/multiBrowser/boardLifecycle.test.ts` (a browser
+   that never called an enrollment API reaches the room by itself; two contexts
+   of one profile end with one room and no pin) and
+   `tests/multiBrowser/sameAccount.test.ts`.
 2. **"Sync now" reconciles only boards already known.** It forces a full
    reconcile round over the local project list, the Drive listing and the shared
    project list (`src/sync/runtime.ts:2283`). It cannot rediscover a board this
@@ -175,10 +181,16 @@ state; `logPolicy.ts` holds the reconnect policy.
   device. Board switches are `detach(old)` + `attach(new)` — no dial, no
   re-authentication, zero new sockets.
 - **The account channel is one more room on the same socket**, not a second one.
-  The account room attaches under `account-device:<hash>` while board rooms
-  attach under their own `board-device:<board>` keys (`logSession.ts:13`,
-  `:880`). A second socket appears only in the v2 fallback or transiently while a
-  key-courier exchange is in flight.
+  On the Drive-authorized path each room presents its own short-lived
+  `/drive/admit` ticket, and the account room is the one opened as
+  `accountRoom` (empty board and folder). On the retained signed tooling the
+  account room attaches under `account-device:<hash>` while board rooms attach
+  under their own `board-device:<board>` keys (`logSession.ts:13`, `:880`). A
+  second socket appears only in the v2 fallback or transiently while a
+  key-courier exchange is in flight. After an explicit account-channel close,
+  queued publications cannot reopen it — a record enqueued after the teardown
+  resolves `false` instead of dialling — and a later explicit start enables
+  automatic retries again (`tests/multiBrowser/socketGauge.test.ts`).
 - **Per-room state is per room.** Cursor, `appliedSeq`, the unacknowledged queue,
   phase and error live in `logRoom.ts`. A `refused` or a coded `detached` is
   routed to the room it names: siblings keep their phase, cursor and attachment,
@@ -490,14 +502,14 @@ there is no automatic blob garbage collection.
 
 ## Account-level board discovery (lifecycle hints)
 
-> **Status: implemented, unwired in production — see gap 1.** The channel below is
-> complete and tested, but it needs an `account:<hash>` pin, and the only code
-> that creates one is the button in
-> `src/sidebar/components/ExperimentalEnrollment.tsx:52`, which is not mounted
-> anywhere. In a normal install the channel reports `absent-pin` / `no account
-> pin` and opens no room. Everything here is therefore a design that a normal user
-> does not exercise; a newly created board reaches a second browser of the same
-> account by the Drive publication flush plus a poll, or by a reload.
+> **Status: live on the Drive-authorized path.** The room below is admitted
+> exactly like a board room — `/drive/admit` over the account's Google identity —
+> so a normal install reports `connected`/`ready` with no pin and no enrollment
+> gesture. The `account:<hash>` pin machinery described further down belongs to
+> the retained signed-authority tooling (`operationSync: false`, selected by no
+> composition root): there the channel reports `absent-pin` / `no account pin`,
+> because the only code that creates a pin is the button in
+> `src/sidebar/components/ExperimentalEnrollment.tsx:52`, which is not mounted.
 
 A board id is a `crypto.randomUUID()` and its Drive path is derived from it, so a
 second browser of the same Google account needs only the id to open the board — but
@@ -598,35 +610,36 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   `updatedAt` standing in for the local intent; an exact tie is broken by the two
   orders restricted to the boards both sessions hold, so both sides keep the same
   winner.
-- **Content key**: the account room has its own content key, carried by the same key
-  courier as a board's and created only by the device holding
-  `account-authority:<hash>`; the room is not a plaintext plane. A device enrolled
-  later receives a grant on the next courier pass, which each reconcile round and
-  board open runs.
-- **Failure reporting**: no `account:<hash>` pin means no connection at all — the
-  channel reports `absent-pin` / `no account pin` in `pboardCollaboration()`'s
-  `account` field and one console line, instead of reconnecting at a room it cannot
-  join (`accountChannel.ts:646`). Nothing in this path is awaited by opening a
-  board.
-- **A foreign manifest is refused, and re-pinning is explicit.** The automatic
-  bootstrap verifies the published authorization under the *pin*. A manifest signed
-  by a different authority therefore reports `failed` and the pin is left exactly
-  where it was — fail-closed on purpose, because that file lives in this account's
-  private `appDataFolder` and any client able to write that folder could otherwise
-  make itself the account's authority. The escape is
-  `accountChannel.repinPublishedAuthority()` (`runtime.ts`, offered only by the
-  collaboration panel's account section, and only while the channel is
-  `absent-pin` for that reason). It reads the published file, verifies it under the
-  key the file *carries* rather than the stale pin, and requires that it names
-  exactly `account:<hash>`, lists this browser's `account-device:<hash>`, is
-  unexpired, and carries no Drive binding. Any refusal names the check that failed
-  and writes nothing; success replaces the pin (and the accepted-membership record
-  that described the retired authority) and re-runs the bootstrap. Nothing
-  automatic calls it: a bootstrap, reconcile round, channel start, or retry over
-  the same manifest a re-pin would accept still reports `failed` and moves nothing.
-  The honest consequence is reported, never softened: the browser can read and
-  write the account room afterwards only if the new authority's private key is
-  local, and otherwise it reports `authority-not-local` and can never renew.
+- **Content key**: on the retained signed-authority tooling the account room has
+  its own content key, carried by the same key courier as a board's and created
+  only by the device holding `account-authority:<hash>`. On the Drive-authorized
+  path — every shipped composition root — the room is a plaintext plane like a
+  board room (`createPlaintextOperationCodec`), so no key is couriered for it at
+  all.
+- **Failure reporting**: the channel's state and cause live in
+  `pboardCollaboration()`'s `account` field and one console line. On the
+  Drive-authorized path a missing Google connection is the only way it cannot
+  join, and it says so. On the retained signed tooling, no `account:<hash>` pin
+  means no connection at all — `absent-pin` / `no account pin` — instead of
+  reconnecting at a room it cannot join. Nothing in this path is awaited by
+  opening a board.
+- **A foreign manifest is refused, and re-pinning is explicit** (signed-authority
+  tooling only). The automatic bootstrap verifies the published authorization
+  under the *pin*. A manifest signed by a different authority therefore reports
+  `failed` and the pin is left exactly where it was — fail-closed on purpose,
+  because that file lives in this account's private `appDataFolder` and any client
+  able to write that folder could otherwise make itself the account's authority.
+  The escape is `accountChannel.repinPublishedAuthority()` (`runtime.ts`); it reads
+  the published file, verifies it under the key the file *carries* rather than the
+  stale pin, and requires that it names exactly `account:<hash>`, lists this
+  browser's `account-device:<hash>`, is unexpired, and carries no Drive binding.
+  Any refusal names the check that failed and writes nothing; success replaces the
+  pin and re-runs the bootstrap. Nothing automatic calls it. **No panel offers it
+  in this build**: the collaboration panel's account section was removed when the
+  Drive-authorized path made the whole pin question moot
+  (`src/sidebar/components/BoardCollaborationControls.tsx`), so
+  `repinPublishedAuthority()` currently rejects for a Drive-authorized runtime and
+  has no UI caller otherwise.
 - **Cross-account delivery is not wired.** A per-account **inbox** exists
   server-side (`services/pboard-signaling/src/account_inbox.rs`): durable, bounded
   at 4 KiB × 64 hints per inbox, 7-day TTL, eviction rather than refusal, addressed
@@ -637,14 +650,15 @@ this device's tombstone store (see "Deletion evidence travels with the fact").
   announced into that account's room at all.
 
 Covered by `tests/multiBrowser/boardLifecycle.test.ts` (realtime discovery without a
-Drive poll, duplicate delivery leaving one row and one subscription, the missing-pin
-report, a record that grants nothing, a delete reaching a peer that holds no room,
-a rename, two contexts of one profile publishing at once, and — for creation-time
-announcement — a board created while Drive refuses writes: the peer holds the
-record as verified-absent with zero Drive mutations of its own, then converges
-without a reload once the board is published, plus a count assertion that an
-importing device announces nothing so the room carries exactly one `board.created`
-per board). `tests/multiBrowser/latencyProbe.test.ts` measures the delivery path
+Drive poll, duplicate delivery leaving one row and one subscription, a browser that
+never called an enrollment API reaching the room by itself with no pin, a record
+that grants nothing, a delete reaching a peer that holds no room, a rename, two
+contexts of one profile ending in one room, transport death recovered on the
+channel's own retries, and — for creation-time announcement — a board created while
+Drive refuses writes: the peer holds the record as verified-absent with zero Drive
+mutations of its own, then converges without a reload once the board is published,
+plus a count assertion that an importing device announces nothing so the room
+carries exactly one `board.created` per board). `tests/multiBrowser/latencyProbe.test.ts` measures the delivery path
 end to end.
 
 ## Authorization and security limits
@@ -2048,9 +2062,13 @@ of them could be told apart from the outside:
   `peerRole` now consults the same remembered-absence memory the legacy write
   barrier uses (`driveHttp.ts`): asked once, then never again, while a peer whose
   file Drive *can* serve is still verified every pass.
-  `tests/ghostPresenceRequests.test.ts` plants that exact shape — listed,
-  downloadable, metadata 404 — and pins one metadata ask across three polls,
-  failing to three asks without the memory.
+  `tests/driveSignalingStore.test.ts` plants that exact shape — listed,
+  downloadable, metadata 404 — and pins one metadata ask across repeated polls.
+  The end-to-end twin of that claim (`ghostPresenceRequests.test.ts`) covered a
+  browser-composition path that no longer exists: the extension and Android both
+  open no Drive-presence room, so the assertion could only be made on the
+  retained signed-authority tooling, where `start()` has no trusted manifest to
+  admit. The unit suite is the surviving evidence.
 - the other browser was never in the listing, because it never wrote presence:
   realtime off in that browser, or its own Drive traffic refused, or a board whose
   `realtime/` folder it cannot create.

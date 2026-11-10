@@ -255,38 +255,36 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     expect(runtime(b).accountChannel.status().appliedSeq).toBe(appliedBefore);
   });
 
-  it('T9: a browser that never called any enrollment API establishes the account authority by itself', async () => {
-    // The shipped product has no enrollment panel: a normal browser must arrive
-    // at the account room on its own, from nothing but a connected Google
-    // account. This is the whole of gap 1 — the pin used to be reachable only
-    // through a component that is mounted nowhere.
+  it('T9: a browser that never called any enrollment API reaches the account room by itself', async () => {
+    // The shipped product has no enrollment panel. On the Drive-authorized path
+    // there is no `account:<hash>` pin to establish at all: the account room is
+    // admitted by the same `/drive/admit` exchange every board room uses, so a
+    // browser that has never called an enrollment API reaches it from nothing
+    // but a connected Google account.
     const unenrolled = await createBrowser({ label: 'kiosk', email: OWNER, cloud });
     try {
       const pinsOf = async () => ((await unenrolled.storage.get('pboardSecurityPins')).pboardSecurityPins ?? {}) as Record<string, unknown>;
-      expect(Object.keys(await pinsOf()), 'a fresh profile holds no pin').toEqual([]);
+      expect(Object.keys(await pinsOf()).filter(key => key.startsWith('account:')),
+        'a fresh Drive-authorized profile needs no account pin').toEqual([]);
 
       // Opening a board is the only thing a person does, and it must not wait
-      // on this: the bootstrap is started by it, never awaited by it.
-      const board = await unenrolled.rx.createProject('Opened before any pin', 'project');
+      // on the account room: the board log is its own room.
+      const board = await unenrolled.rx.createProject('Opened before any enrollment', 'project');
       await unenrolled.runtime.googleDrive.syncProject(board.id, { force: true });
       await unenrolled.runtime.collaborationManager.start(board.id);
       expect(await until(() => unenrolled.rooms().some(room => room.boardId === board.id && room.log?.phase === 'synced')),
-        'the board log must reach synced while the account authority is still being established').toBe(true);
+        'the board log must reach synced on its own').toBe(true);
 
-      // The authority browser admits this device on its own next pass — its
-      // reconcile round, which is the product's cadence and needs no gesture on
-      // either side. The adopting browser is already `awaiting-admission`.
-      expect(await untilSettled(async () => Boolean((await pinsOf())[`account:${account}`])),
-        `the connected account must adopt the published account authority; the channel says ${channelProblem(unenrolled)}`).toBe(true);
-      await a.runtime.googleDrive.reconcileAll({ force: true });
-
-      // And the authority arrives without a gesture: one pin, one account room.
-      expect(Object.keys(await pinsOf()).filter(key => key.startsWith('account:')), 'exactly one account pin').toEqual([`account:${account}`]);
+      // The account room arrives the same way — no pin, no ceremony, no
+      // authority browser standing by.
       expect(await until(() => runtime(unenrolled).accountChannel.status().state === 'connected'),
-        `the bootstrapped browser must reach the account room: ${channelProblem(unenrolled)}`).toBe(true);
-      expect(accountRoomSockets(unenrolled), 'one account room, not a retry loop').toBeGreaterThan(0);
-      const status = runtime(unenrolled).accountChannel.status();
-      expect(status.authority?.state, `the report names how the authority arrived: ${channelProblem(unenrolled)}`).not.toBe('idle');
+        `the connected account must reach the account room by itself: ${channelProblem(unenrolled)}`).toBe(true);
+      // Read at the relay, not from the client's own bookkeeping: the account
+      // room is the room whose board id is `account:<hash>`.
+      const relayRooms = [...cloud.signaling.rooms.values()].filter(room => room.board === `account:${account}`);
+      expect(relayRooms.length, `one account room at the relay, not a retry loop: ${channelProblem(unenrolled)}`).toBe(1);
+      expect(Object.keys(await pinsOf()).filter(key => key.startsWith('account:')),
+        'and it did so without minting an authority').toEqual([]);
     } finally { await unenrolled.close(); }
   });
 
@@ -325,10 +323,10 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
     } finally { await cold.close(); }
   });
 
-  it('F9: two contexts of one profile bootstrapping at once end with one account pin and one account room', async () => {
+  it('F9: two contexts of one profile bootstrapping at once end with one account room and no pin', async () => {
     // The MV3 worker and the sidebar are separate JS contexts over one storage,
-    // and both bootstrap on their own. The race must end in one authority, not
-    // two manifests, two pins or two rooms.
+    // and both start the account channel on their own. The race must end in one
+    // room, not two sockets or two authorities.
     const profile = createSharedProfile();
     const [worker, sidebar] = await Promise.all([
       createBrowser({ label: 'boot-worker', email: OWNER, cloud, profile }),
@@ -341,8 +339,8 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
         `both contexts must end up in the room: worker ${channelProblem(worker)}; sidebar ${channelProblem(sidebar)}`).toBe(true);
 
       const pins = ((await worker.storage.get('pboardSecurityPins')).pboardSecurityPins ?? {}) as Record<string, unknown>;
-      expect(Object.keys(pins).filter(key => key.startsWith('account:')), 'one account pin, however many contexts raced for it')
-        .toEqual([`account:${account}`]);
+      expect(Object.keys(pins).filter(key => key.startsWith('account:')),
+        'the Drive path establishes no account pin, however many contexts raced for the room').toEqual([]);
       const rooms = [...cloud.signaling.rooms.values()].filter(room => room.board === `account:${account}`);
       expect(rooms.length, 'one account room: both contexts verified the same authority').toBe(1);
     } finally {
@@ -792,52 +790,29 @@ describe('account-level board discovery', { timeout: 180_000 }, () => {
       .toBe(subsBeforeDuplicate + 1); // again exactly A's own publish.
   });
 
-  it('F1: an expired manifest plus a dead transport leaves the channel able to reconnect', async () => {
-    // The routine death of a backgrounded tab: the proxy ages the tunnel out,
-    // and by then the five-minute admission manifest captured at open has
-    // expired — re-presenting it refused every retry, and a settled handle
-    // refused to be opened again. The channel must state the expiry, and once
-    // the account authority renews, come back with nothing but its own retries
-    // and the product's ordinary `start()`.
-    //
-    // The clock is the only thing faked here (`toFake: ['Date']`): every timer,
-    // socket, and fake-service I/O keeps running for real.
-    vi.useFakeTimers({ toFake: ['Date'] });
-    try {
-      const live = accountSockets();
-      expect(live.length, 'scenario order: both browsers hold live account sockets').toBeGreaterThanOrEqual(2);
-      vi.advanceTimersByTime(6 * 60_000);                       // the manifest's five minutes die
-      for (const socket of live) socket.kill();                 // and the proxy ages the tunnels out
+  it('F1: a dead transport leaves the channel able to reconnect on its own', async () => {
+    // The routine death of a backgrounded tab: the proxy ages the tunnel out.
+    // On the Drive-authorized path the admission is a short-lived, socket-bound
+    // ticket minted per dial (`/drive/admit`, `googleDriveAdmission.ts`), so a
+    // reconnect re-admits with a fresh one; there is no five-minute manifest to
+    // expire and no authority gesture to renew it. What must hold is that the
+    // channel comes back by itself and keeps carrying records.
+    const live = accountSockets();
+    expect(live.length, 'scenario order: both browsers hold live account sockets').toBeGreaterThanOrEqual(2);
+    for (const socket of live) socket.kill();                   // the proxy ages the tunnels out
 
-      // The named cause, not a silent hang: every retry says the manifest is
-      // expired, which is also the reviewable fact that the channel is no
-      // longer quietly re-presenting the captured one — it is re-resolving and
-      // reporting what the fresh resolution found.
-      expect(await until(() => runtime(a).accountChannel.status().error?.includes('expired') === true
-        && runtime(b).accountChannel.status().error?.includes('expired') === true),
-        `both channels must state the expiry as their reason: A ${channelProblem(a)}; B ${channelProblem(b)}`).toBe(true);
+    expect(await until(() => runtime(a).accountChannel.status().state === 'connected'
+      && runtime(b).accountChannel.status().state === 'connected'),
+      `both channels must reconnect on their own: A ${channelProblem(a)}; B ${channelProblem(b)}`).toBe(true);
 
-      // The owner browser — which holds the account authority — renews. This is
-      // the product gesture ("Initialize / renew my account"), and nothing else.
-      await runtime(a).experimentalEnrollment.initialize('account');
-
-      // The channels recover themselves: each dial re-resolves its admission,
-      // finds the renewed manifest, and is admitted. No close, no rebuild the
-      // test performs, no reload.
-      expect(await until(() => runtime(a).accountChannel.status().state === 'connected'
-        && runtime(b).accountChannel.status().state === 'connected'),
-        `both channels must reconnect on the renewed manifest: A ${channelProblem(a)}; B ${channelProblem(b)}`).toBe(true);
-
-      // And it is a live channel, not a decorative one: a record published
-      // after the recovery arrives at the other context.
-      const probe = crypto.randomUUID();
-      const appliedBefore = runtime(b).accountChannel.status().appliedSeq;
-      expect(await runtime(a).accountChannel.publish('board.created', probe)).toBe(true);
-      expect(await until(() => runtime(b).accountChannel.status().appliedSeq > appliedBefore),
-        `a record must cross the recovered channel: ${channelProblem(b)}`).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
+    // And it is a live channel, not a decorative one: a record published after
+    // the recovery arrives at the other context.
+    const probe = crypto.randomUUID();
+    const appliedBefore = runtime(b).accountChannel.status().appliedSeq;
+    expect(await runtime(a).accountChannel.publish('board.created', probe)).toBe(true);
+    expect(await until(() => runtime(b).accountChannel.status().appliedSeq > appliedBefore),
+      `a record must cross the recovered channel: ${channelProblem(b)}`).toBe(true);
   });
+
 
 });

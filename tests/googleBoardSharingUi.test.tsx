@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { BoardCollaborationControls } from '../src/sidebar/components/BoardCollaborationControls';
+import { GoogleBoardSharing } from '../src/sidebar/components/GoogleBoardSharing';
 
 const f = vi.hoisted(() => ({ sync: vi.fn(), getProject: vi.fn(), selectProject: vi.fn(), start: vi.fn(), stop: vi.fn(), getCurrentProject: vi.fn() }));
 vi.mock('../src/platform/browser', () => ({ browser: { permissions: { request: vi.fn() } } }));
@@ -33,7 +33,7 @@ afterEach(async () => { await act(async () => root.unmount()); container.remove(
 
 it('shows a newly discovered invitation outside collapsed settings, waits for the signed grant, then opens received content', async () => {
   const changed = vi.fn();
-  await act(async () => root.render(<BoardCollaborationControls projectId={null} onChanged={changed} />));
+  await act(async () => root.render(<GoogleBoardSharing projectId={null} onChanged={changed} />));
   const inbox = container.querySelector('[aria-label="Shared board invitations"]')!;
   expect(inbox).not.toBeNull(); expect(inbox.closest('details')).toBeNull();
   expect(inbox.textContent).toContain('a@example.test'); expect(inbox.textContent).toContain('Waiting for owner');
@@ -51,7 +51,7 @@ it('shows a newly discovered invitation outside collapsed settings, waits for th
 });
 it('refreshes on focus, never offers boards without invitations, and removes stale invitations when validation fails', async () => {
   f.sync.mockResolvedValue({ email: 'b@example.test', boards: [], ready: [] });
-  await act(async () => root.render(<BoardCollaborationControls projectId={null} onChanged={() => {}} />));
+  await act(async () => root.render(<GoogleBoardSharing projectId={null} onChanged={() => {}} />));
   expect(container.querySelector('[aria-label="Shared board invitations"]')).toBeNull();
   f.sync.mockResolvedValue(reply(true));
   await act(async () => window.dispatchEvent(new Event('focus')));
@@ -65,7 +65,7 @@ it('refreshes on focus, never offers boards without invitations, and removes sta
 it('restores the previous live session after a failed open without selecting a missing board', async () => {
   f.sync.mockResolvedValue(reply(true));
   f.start.mockRejectedValueOnce(new Error('Grant expired'));
-  await act(async () => root.render(<BoardCollaborationControls projectId="previous-board" onChanged={() => {}} />));
+  await act(async () => root.render(<GoogleBoardSharing projectId="previous-board" onChanged={() => {}} />));
   await act(async () => buttons()[0].click());
   expect(f.stop).toHaveBeenCalledOnce();
   expect(f.start.mock.calls.map(call => call[0])).toEqual(['invited-board', 'previous-board']);
@@ -74,7 +74,7 @@ it('restores the previous live session after a failed open without selecting a m
 });
 it('keeps permitted invitations actionable when another board hits the directory quota', async () => {
   f.sync.mockResolvedValue({ ...reply(true), issues: [{ boardId: 'other-board', code: 'directory_capacity' }] });
-  await act(async () => root.render(<BoardCollaborationControls projectId={null} onChanged={() => {}} />));
+  await act(async () => root.render(<GoogleBoardSharing projectId={null} onChanged={() => {}} />));
   expect(buttons()).toHaveLength(1);
   expect(container.textContent).toContain('rendezvous board directory is full');
   expect(container.textContent).toContain('private Drive synchronization continue independently');
@@ -85,7 +85,7 @@ it('separates the account’s own boards from invitations and routes them to Dri
     { publication: { policy: { boardId: 'own-board', ownerEmail: 'B@Example.test' } } },
     { publication: { policy: { boardId: 'invited-board', ownerEmail: 'a@example.test' } } }
   ], ready: ['own-board', 'invited-board'] });
-  await act(async () => root.render(<BoardCollaborationControls projectId={null} onChanged={() => {}} />));
+  await act(async () => root.render(<GoogleBoardSharing projectId={null} onChanged={() => {}} />));
   const own = container.querySelector('[aria-label="Your boards to restore"]')!;
   const inbox = container.querySelector('[aria-label="Shared board invitations"]')!;
   expect(own.textContent).toContain('own-board'.slice(0, 8));

@@ -2,6 +2,15 @@
  * Two browser contexts, one Google account, relay (durable operation log)
  * collaboration with the peer pools switched off.
  *
+ * The authority here is **Google Drive**, not a signed device manifest: the
+ * browser composition root supplies `getDriveIdentityCredentials`
+ * (`src/sync/googleAuth.ts`), so the runtime admits every room through
+ * `/drive/admit`, a second browser of the same account joins the *same* relay
+ * room because it proves the same Drive folder, and there is no identity
+ * directory, no `account:<hash>` pin and no device-request ceremony on this
+ * path at all (`tests/multiBrowser/driveAuthorityRuntime.test.ts` pins that the
+ * legacy `/identity/` and `/grants/` endpoints are never contacted).
+ *
  * Scenario order matters: each scenario continues from the board state the
  * previous one left, mirroring the owner's manual five-step test. Assertions
  * are observable outcomes — what browser B's repository contains, the content
@@ -37,55 +46,6 @@ async function reattach(browser: BrowserHandle) {
   await browser.runtime.collaborationManager.setEnabled(true);
 }
 
-/** One admission round of the identity directory: the owner browser approves
- * device requests it finds pending, the requesting browser re-reads its grant. */
-async function grantRound(browsers: BrowserHandle[], boardId: string) {
-  for (const browser of browsers) await browser.runtime.boardCollaboration.identitySharing.sync(boardId, true);
-}
-
-/** Run the grantee's identity-directory round directly. Returns the error text
- * (the product path swallows it inside the authority auto-bootstrap), or null
- * when the round completes. */
-async function identitySyncIssue(browser: BrowserHandle, boardId: string): Promise<string | null> {
-  try {
-    await browser.runtime.boardCollaboration.identitySharing.sync(boardId, true);
-    return null;
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error);
-  }
-}
-
-function gapMessage(browser: BrowserHandle, boardId: string, issue: string | null): string {
-  return `PRODUCT GAP — browser ${browser.label} never filed a device request for board ${boardId}. `
-    + (issue === null
-      ? 'The identity-directory round completed with nothing the flow can use: no device request filed for a same-account device that is absent from the board grant, though syncWork() must file one for every listed account whose device is missing.'
-      : `The identity-directory round itself failed: "${issue}". `)
-    + 'Mechanism: every authority decision runs through the single decision point `adoptAuthority` (src/collab/boardGrants.ts), consulted '
-    + 'by the identity auto-bootstrap, boardSecurityFor() and the panel alike. It must ADOPT the advertised authority for a Drive-exported '
-    + 'board (the project.json export marker records durability, never rival trust) and file the device request through '
-    + 'googleIdentitySharing.syncWork(). If this message appears, either the decision point wrongly refuses adoption (a pin, a live '
-    + 'directory advertisement it should join, or a signed data block it should reason about), or the auto-bootstrap swallowed the round; '
-    + 'the consequence it guards against is a second device-local authority — two relay rooms, two content keys, divergent boards.';
-}
-
-/** Explain *why* the relay never synchronized instead of timing out silently:
- * the room record carries the transport's own last answer. */
-function relayNeverSynced(browser: BrowserHandle, boardId: string, expectation: string): Error {
-  const room = roomFor(browser, boardId);
-  return new Error(`PRODUCT GAP — browser ${browser.label} never synchronized board ${boardId} over the durable operation log (${expectation}). `
-    + `The room record says: ${JSON.stringify({ error: room?.error ?? null, log: room?.log ?? null, starts: room?.starts ?? 0 })}. `
-    + `Suspected mechanism: the realtime factory in src/sync/runtime.ts keeps a per-runtime `
-    + "`signalingSettings` cache that is only ever assigned inside legacyCollaborationManager.myRole, which never runs while the operation protocol owns a board; "
-    + 'the factory and boardSecurityFor() therefore keep selecting the no-relay posture (and authority adoption for this board runs only through the single decision point, adoptAuthority in src/collab/boardGrants.ts).');
-}
-
-async function expectRelaySynced(browser: BrowserHandle, boardId: string, expectation: string) {
-  const synced = await untilQuiet(() => logStatusOf(browser, boardId)?.phase === 'synced');
-  if (!synced) throw relayNeverSynced(browser, boardId, expectation);
-  const log = logStatusOf(browser, boardId)!;
-  if (typeof log.appliedSeq !== 'number') throw relayNeverSynced(browser, boardId, `${expectation} (no applied sequence reported)`);
-}
-
 /** `until` returning false instead of throwing, so callers can attach a
  * product-gap explanation to the condition they actually waited for. */
 async function untilQuiet(predicate: () => boolean): Promise<boolean> {
@@ -118,11 +78,28 @@ async function untilSettled(probe: () => Promise<boolean>): Promise<boolean> {
   return probe();
 }
 
+/** Explain *why* the relay never synchronized instead of timing out silently:
+ * the room record carries the transport's own last answer. */
+function relayNeverSynced(browser: BrowserHandle, boardId: string, expectation: string): Error {
+  const room = roomFor(browser, boardId);
+  return new Error(`PRODUCT GAP — browser ${browser.label} never synchronized board ${boardId} over the durable operation log (${expectation}). `
+    + `The room record says: ${JSON.stringify({ error: room?.error ?? null, log: room?.log ?? null, starts: room?.starts ?? 0 })}. `
+    + 'On the Drive-authorized path every room is admitted through `/drive/admit`: the account proves the board folder with its own '
+    + 'Google identity and the relay derives the room from `(boardId, folderId)`. A second browser of the same account lands in the same '
+    + 'room because it resolves the same folder, not because of a device grant.');
+}
+
+async function expectRelaySynced(browser: BrowserHandle, boardId: string, expectation: string) {
+  const synced = await untilQuiet(() => logStatusOf(browser, boardId)?.phase === 'synced');
+  if (!synced) throw relayNeverSynced(browser, boardId, expectation);
+  const log = logStatusOf(browser, boardId)!;
+  if (typeof log.appliedSeq !== 'number') throw relayNeverSynced(browser, boardId, `${expectation} (no applied sequence reported)`);
+}
+
 describe('two browsers, one Google account', { timeout: 120_000 }, () => {
   let cloud: Cloud;
   let a: BrowserHandle;
   let b: BrowserHandle;
-  let bootBoard = '';
   let sharedBoard = '';
 
   beforeAll(async () => {
@@ -138,7 +115,6 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
 
   it('scenario 1: both browsers load local storage, then Drive, then reach a synced log state without a peer-pool fallback', async () => {
     const board = await a.rx.createProject('Relay boot board', 'project');
-    bootBoard = board.id;
     await a.rx.addItem({ projectId: board.id, content: 'Sealed before either browser opened the relay' });
     await a.runtime.googleDrive.syncProject(board.id, { force: true });
 
@@ -152,22 +128,17 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
     expect(projects.some(project => project.id === board.id), 'Drive reconcile must import the account\'s board').toBe(true);
 
     await openBoard(b, board.id);
-    // A second browser of the SAME account must adopt the board's existing
-    // authority. The relay room identity is derived from the authority key, so
-    // two rooms for one board measure two authorities (and two content keys).
-    await untilQuiet(() => [...cloud.signaling.rooms.values()].some(room => room.board === board.id));
+    // A second browser of the SAME account reaches the same room without any
+    // grant ceremony: the room id is derived from `(boardId, folderId)`, which
+    // both browsers resolve from the one Drive folder they can both read.
+    await expectRelaySynced(b, board.id, 'a same-account second browser must reach the log through Drive admission');
     const authorityRooms = new Set([...cloud.signaling.rooms.values()].filter(room => room.board === board.id).map(room => room.room));
-    expect(authorityRooms.size, 'a second same-account browser must adopt the existing board authority, never mint its own — '
-      + 'the single decision point (adoptAuthority, src/collab/boardGrants.ts) must adopt the advertised authority for a Drive-exported board; '
-      + 'its export marker is a durability record, not rival trust').toBe(1);
-    // B's device joins through admission: it asks, the online owner approves,
-    // the grant re-read lets B's next attach through.
-    const issue = await identitySyncIssue(b, board.id);
-    const requested = await untilQuiet(() => (cloud.signaling.directory.get(board.id)?.pending.length ?? 0) >= 1);
-    if (!requested) throw new Error(gapMessage(b, board.id, issue));
-    await grantRound([a, b], board.id);
-    await reattach(b);
-    await expectRelaySynced(b, board.id, 'a same-account second browser must reach the log through device admission');
+    expect(authorityRooms.size, 'both browsers of one account must hold exactly one relay room').toBe(1);
+    expect(roomFor(b, board.id)!.topic, 'and it is the same room the author is on').toBe(roomFor(a, board.id)!.topic);
+
+    // The Drive-authorized path never consults the identity directory the
+    // retired signed-authority path published into.
+    expect(cloud.signaling.directory.size, 'no identity-directory policy exists on the Drive path').toBe(0);
 
     // Neither browser may have fallen back to the peer pools: the room record
     // is the browser's own last answer about its live channel.
@@ -203,12 +174,6 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
   it('scenario 3: a card typed on browser B appears on browser A with its content intact', async () => {
     await openBoard(a, sharedBoard);
     await openBoard(b, sharedBoard);
-    const issue = await identitySyncIssue(b, sharedBoard);
-    const requested = await untilQuiet(() => (cloud.signaling.directory.get(sharedBoard)?.pending.length ?? 0) >= 1);
-    if (!requested) throw new Error(gapMessage(b, sharedBoard, issue));
-    await grantRound([a, b], sharedBoard);
-    await reattach(a);
-    await reattach(b);
     await expectRelaySynced(a, sharedBoard, 'browser A must be live on the board before B edits it');
     await expectRelaySynced(b, sharedBoard, 'browser B must be live on the board to edit it');
 
@@ -222,9 +187,8 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
         const submissions = [...cloud.signaling.rooms.values()].flatMap(roomEntry => roomEntry.submissions);
         throw new Error(`PRODUCT GAP — the card browser B typed never reached browser A with its content. `
           + `A's room: ${JSON.stringify({ error: room?.error ?? null, log: room?.log ?? null })}; log submissions: ${JSON.stringify(submissions)}. `
-          + 'If two devices sealed with two different content keys, the missing mechanism is in the key courier hand-off: '
-          + 'runKeyCourier (src/sync/operations/keyCourierTransport.ts) lets a writer generate a fresh key when no grant exists yet, '
-          + 'and nothing re-wraps the board key for a wrap key published after the writer last attached.');
+          + 'Both devices read the same plaintext Drive-authorized room (`createPlaintextOperationCodec`, src/sync/operations/plaintextCodec.ts), '
+          + 'so a missing delivery is a transport or projection fault, never a key hand-off.');
       }
     } finally { stop(); }
   });
@@ -284,7 +248,6 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
     // already left the board has no channel to relay it on — that case is the
     // scheduled Drive round, which scenario 8 exercises.
     await openBoard(a, sharedBoard);
-    await grantRound([a, b], sharedBoard);
     await reattach(a); await reattach(b);
     await expectRelaySynced(a, sharedBoard, 'the erasing browser must hold the board log open');
     await expectRelaySynced(b, sharedBoard, 'the watching browser must hold the board log open');
@@ -331,7 +294,6 @@ describe('two browsers, one Google account', { timeout: 120_000 }, () => {
     await backgroundReconcile(b);
     await openBoard(a, board.id);
     await openBoard(b, board.id);
-    await grantRound([a, b], board.id);
     await reattach(a);
     await reattach(b);
     await expectRelaySynced(a, board.id, 'the authoring browser must be live before the erase races the stream');

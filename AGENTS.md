@@ -13,3 +13,12 @@ Project implementation details:
 - Remote actions require explicit applicable authorization under the pinned SECURITY policy. This migration authorizes no commits, tags, pushes, remote workflow runs, publication, deployments or credential changes. Do not silently change the standards pin or activate distribution.
 
 Keep subsystem instructions where present. No project-owned nested AGENTS.md was found at adoption; dependency/worktree copies are outside this checkout's instruction scope.
+
+## Testing and documentation maintenance
+
+When modifying Pboard, inspect the existing testing infrastructure and [testing architecture](docs/testing/architecture.md). Changes affecting authentication, collaboration, synchronization, persistence, external APIs, or browser lifecycle must include appropriate updates to local mocks, regression tests, and technical documentation. Execute the relevant regression suite and report its results; disclose checks that cannot run.
+
+- Review identity mocks and authorization tests for authentication changes; review Drive fixtures and contract tests for Drive API changes.
+- Review relay protocol contracts, server fixtures and synchronization tests for message changes; review convergence and regression tests for synchronization changes, and recovery and durability tests for persistence changes.
+- Cover new user-visible collaborative operations with multi-client tests. For collaboration bugs, reproduce the bug in a regression test before fixing it whenever feasible.
+- Update affected architecture diagrams and mock limitations. Add new scenarios to the testing scenario catalog when one exists, and keep contracts and documentation aligned with actual behavior.

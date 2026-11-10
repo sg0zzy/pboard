@@ -2656,6 +2656,14 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
           getKey: identityUnavailable, getAuthorization: identityUnavailable,
           googleDrive: { folderId, actorId: peerId, getCredentials: () => googleAuth.getDriveIdentityCredentials!(), fetcher: rawFetcher },
           authBudget: budget, reconnects: room.reconnects,
+          // The explicit-Reconnect bypass the signed-authority room gets below.
+          // Without it `healRelay(force)` could never repair a Drive-authorized
+          // room that had met the reconnect ceiling: the heal leg re-attaches
+          // and reads the room record, and the room stayed `reconnect:throttled`
+          // forever with no gesture able to clear it. The key is only present
+          // when a forced heal put it there, so no automatic path can pass the
+          // ceiling.
+          reconnectCeilingBypassOnce: ceilingBypassOnce.delete(boardId),
           seal: codec.seal,
           // An unreadable row is an integrity failure, never a foreign seal to
           // skip while advancing the durable replay cursor.
@@ -2690,8 +2698,9 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
         });
         driveAuthorityLogs.set(boardId, log);
         room.channel = log.metrics; room.session = session.metrics;
+        const record = (outcome: LogCycleOutcome) => { room.consolidation = describeLogCycle(outcome); };
         const consolidate = () => { void runLogConsolidation({ boardId, folderId, log, session, drive, role: () => drive.folderRole(), storage })
-          .then(outcome => { room.consolidation = describeLogCycle(outcome); })
+          .then(record)
           .catch(error => { room.error = error instanceof Error ? error.message : String(error); }); };
         const timer = collaborationCounters.countedInterval('log.consolidate', consolidate, LOG_CONSOLIDATE_MS);
         return {
@@ -2699,6 +2708,16 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
           async close() {
             if (driveAuthorityLogs.get(boardId) === log) driveAuthorityLogs.delete(boardId);
             collaborationCounters.clearCountedTimer(timer);
+            // Publish the board's outstanding log tail before the socket goes
+            // away, exactly as the signed-authority room does. A fire-and-forget
+            // cycle here loses its lease to a disconnected transport, so leaving
+            // a board could strand every unconsolidated operation in the log —
+            // and on this path the interval never had a chance to run yet, so
+            // *every* switch would strand the tail and the durable snapshot
+            // would keep the state from before the session's own edits.
+            await runLogConsolidation({ boardId, folderId, log, session, drive, role: () => drive.folderRole(), storage })
+              .then(record)
+              .catch(error => { room.consolidation = `failed:${error instanceof Error ? error.message : String(error)}`; });
             releaseLogConsolidation(boardId);
             await log.close();
           }

@@ -9,8 +9,8 @@ async function waitFor(check: () => boolean | Promise<boolean>) {
 
 it('uses the Android lifecycle with the shared Drive runtime for bidirectional changes and background replay', { timeout: 120_000 }, async () => {
   const cloud = createCloud();
-  const firefox = await createBrowser({ label: 'firefox', email: 'same@example.com', cloud, driveAuthority: true });
-  const android = await createBrowser({ label: 'android', email: 'same@example.com', cloud, driveAuthority: true });
+  const firefox = await createBrowser({ label: 'firefox', email: 'same@example.com', cloud });
+  const android = await createBrowser({ label: 'android', email: 'same@example.com', cloud });
   const auth = { isConfigured: () => true, getConnectionState: async () => 'connected' as const,
     connect: async () => {}, disconnect: async () => {}, getAccessToken: async () => 'unused' };
   const service = createAndroidSync(async () => android.rx, auth, android.storage,

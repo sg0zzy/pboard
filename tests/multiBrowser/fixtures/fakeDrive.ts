@@ -294,6 +294,10 @@ export class FakeDrive {
     if (isApi && method === 'PATCH') {
       const file = this.byId(idOf(1));
       if (!file || !this.visible(file, email)) return json({ error: { message: 'missing' } }, 404);
+      if (!WRITABLE.has(this.effectiveRole(file, email) ?? '')) {
+        this.refusals.push({ email, url, status: 403 });
+        return json({ error: { status: 'PERMISSION_DENIED' } }, 403);
+      }
       const patch = JSON.parse(String(init.body ?? '{}')) as { trashed?: boolean; name?: string; contentRestrictions?: FakeFile['contentRestrictions'] };
       if (patch.contentRestrictions) file.contentRestrictions = patch.contentRestrictions;
       if (patch.trashed !== undefined) file.trashed = patch.trashed;
