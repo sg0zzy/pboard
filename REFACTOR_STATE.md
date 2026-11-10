@@ -94,7 +94,7 @@ These are gaps, not plans. Nothing in this repository should be read as promisin
 ## Measured at this revision
 
 Client: `tsc` clean; full suite 1 870 tests / 257 files, including the 172 two-browser tests under
-`tests/multiBrowser/` and the 106 Android checks; `npm run build:all` with zero errors. Relay: 169 tests,
+`tests/multiBrowser/` and the 130 Android checks; `npm run build:all` with zero errors. Relay: 169 tests,
 `cargo clippy --all-targets` with zero warnings. These are measurements of this working tree on 10 November 2026
 and are not a release gate.
 

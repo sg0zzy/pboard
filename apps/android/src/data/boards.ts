@@ -4,9 +4,9 @@ export type BoardOverview = {
   name?: unknown;
   updatedAt?: unknown;
   category?: unknown;
-  color?: unknown;
+  /** Derived from the template by `categoryOf`; not a persistence field. */
+  categoryColor?: unknown;
   template?: unknown;
-  firstCardType?: unknown;
   firstCard?: unknown;
 };
 

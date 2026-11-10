@@ -5,7 +5,7 @@ import { focusTargetAfterStatusMove } from '../../../src/sidebar/statusFocus';
 import { CardActions, type CardAction } from './components/CardActions';
 import { cardTextForClipboard } from '../../../src/sidebar/cardText';
 import { serializeBoard, serializeProject } from '../../../src/sidebar/serialize';
-import { buildBoardArchive } from '../../../src/sidebar/download';
+import { buildBoardArchiveAsync } from './platform/boardArchive';
 import { copyText, saveBoardArchive } from './platform/boardExport';
 import type { FingerprintTransition } from '../../../src/sidebar/components/ProjectFingerprint';
 import { updateCardPhoto } from './storage/cardPhotos';
@@ -21,7 +21,7 @@ import { BoardScreen } from './screens/BoardScreen';
 import { BoardFormScreen, type BoardDraft } from './screens/BoardFormScreen';
 import { CardFormScreen, type CardDraft, type CardEditField } from './screens/CardFormScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
-import { openRepository, readSnapshot, watchRepository, overviewBoards, setShowPreviews, setUiScale, EMPTY_SNAPSHOT, type Snapshot, type RxRepository, type BoardItem, type Project } from './storage/repository';
+import { openRepository, readSnapshot, snapshotsEqual, watchRepository, overviewBoards, setShowPreviews, setUiScale, setCollapseCards, EMPTY_SNAPSHOT, type Snapshot, type RxRepository, type BoardItem, type Project } from './storage/repository';
 
 type Screen = { kind: 'home' } | { kind: 'settings' } | { kind: 'board'; id: string } | { kind: 'board-form'; id?: string } | { kind: 'card-form'; projectId: string; id?: string; field?: CardEditField; afterItemId?: string };
 export default function App() {
@@ -42,7 +42,6 @@ export default function App() {
   const celebrationRevision = useRef(0);
   const [busy, setBusy] = useState(false);
   const dirty = useRef(false);
-  const pending = useRef(false);
   const backRef = useRef<() => void>(() => {});
   const mainRef = useRef<HTMLDivElement>(null);
   const { service: cloud, state: cloudState } = useCloudSync(Boolean(repository), screen.kind === 'board' ? screen.id : screen.kind === 'card-form' ? screen.projectId : screen.kind === 'board-form' ? screen.id ?? null : null);
@@ -55,7 +54,9 @@ export default function App() {
       if (!active) return;
       setRepository(repo);
       stop = watchRepository(repo, value => {
-        if (active) { setSnapshot(value); setReady(true); setLoadError(false); }
+        // The watcher can emit the same values several times per write; only a
+        // real change should cost a render.
+        if (active) { setSnapshot(previous => snapshotsEqual(previous, value) ? previous : value); setReady(true); setLoadError(false); }
       }, error => {
         console.error('Could not read local boards', error);
         if (active) setLoadError(true);
@@ -82,7 +83,7 @@ export default function App() {
     else navigate({ kind: 'home' });
   }
   function goBack(exitFromHome = false) {
-    if (pending.current) return;
+    if (queued.current) return;
     if (cardMenu) { setCardMenu(cardMenu.choosingTarget ? { ...cardMenu, choosingTarget: false } : null); return; }
     if (cardPicker) { setCardPicker(null); return; }
     if (confirmation) { setConfirmation(null); return; }
@@ -109,22 +110,38 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  async function mutate<T>(action: (repo: RxRepository) => Promise<T>, after?: (result: T) => void, failureMessage = 'Could not save this change. Please try again.', allowReadOnly = false) {
-    if (!repository || pending.current) return;
+  // Edits run one at a time to keep repository revision writes ordered, but a
+  // second tap is queued rather than dropped: the old guard returned silently,
+  // so a fast second swipe or a Save pressed twice lost the user's action.
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
+  const queued = useRef(0);
+  function mutate<T>(action: (repo: RxRepository) => Promise<T>, after?: (result: T) => void, failureMessage = 'Could not save this change. Please try again.', allowReadOnly = false): Promise<void> {
+    if (!repository) return Promise.resolve();
     // Local-first: edits are never blocked while Drive/WebRTC role resolution is
     // still in flight; writes apply locally and replicate when the live room or
     // the next backup sync comes up. Only a *resolved* viewer role gates writes.
-    if (!allowReadOnly && cloudState?.projectId && (screen.kind === 'board' || screen.kind === 'card-form' || screen.kind === 'board-form') && cloudState.role === 'viewer') { setNotice('This board is currently read-only.'); return; }
-    pending.current = true; setBusy(true); setNotice(null);
-    try {
-      const result = await action(repository);
-      const value = await readSnapshot(repository);
-      setSnapshot(value);
-      after?.(result);
-    } catch (error) {
-      console.error('Could not save local change', error);
-      setNotice(failureMessage);
-    } finally { pending.current = false; setBusy(false); }
+    if (!allowReadOnly && cloudState?.projectId && (screen.kind === 'board' || screen.kind === 'card-form' || screen.kind === 'board-form') && cloudState.role === 'viewer') { setNotice('This board is currently read-only.'); return Promise.resolve(); }
+    const run = async () => {
+      try {
+        const result = await action(repository);
+        // The repository already pushed the new state through the watcher; this
+        // read is only a fallback for the case where it has not arrived yet.
+        const value = await readSnapshot(repository);
+        setSnapshot(previous => snapshotsEqual(previous, value) ? previous : value);
+        after?.(result);
+      } catch (error) {
+        console.error('Could not save local change', error);
+        setNotice(failureMessage);
+      }
+    };
+    queued.current++;
+    if (queued.current === 1) { setBusy(true); setNotice(null); }
+    const next = queue.current.then(run, run).finally(() => {
+      queued.current--;
+      if (queued.current === 0) setBusy(false);
+    });
+    queue.current = next;
+    return next;
   }
   function saveBoard(draft: BoardDraft) {
     if (screen.kind !== 'board-form') return;
@@ -190,7 +207,7 @@ export default function App() {
   }
   function downloadBoard(project: Project) {
     const cards = snapshot.cards.filter(value => value.projectId === project.id);
-    void mutate(async repo => saveBoardArchive(await buildBoardArchive(project, cards, repo.getImage)), saved => { if (saved) setNotice('Board archive saved.'); }, 'Could not download this board. Please try again.', true);
+    void mutate(async repo => saveBoardArchive(await buildBoardArchiveAsync(project, cards, repo.getImage)), saved => { if (saved) setNotice('Board archive saved.'); }, 'Could not download this board. Please try again.', true);
   }
   function deleteBoard(project: Project) {
     setConfirmation({ title: 'Delete board?', message: `Delete “${project.name}”? Private boards are also removed from Google Drive when connected. On a shared board, owners delete live content for collaborators; other users only remove it from their own board list.`, actionLabel: 'Delete', onConfirm: () => {
@@ -228,19 +245,26 @@ export default function App() {
   // to the home page instead of leaving a dead screen behind. Card edits bounce
   // back to their (still existing) board. The interstitial page stays as a
   // defensive fallback for the card case and renders before the effect runs.
+  //
+  // A save in flight deliberately does **not** suppress this. `goBack` still
+  // refuses to navigate while the queue is busy (the user is mid-action), but a
+  // board that no longer exists cannot be left on screen just because a write
+  // has not settled: the earlier guard read `queued.current`, a ref, which is
+  // not an effect dependency, so the effect could bail out once and never run
+  // again — stranding the user on a vanished board.
   useEffect(() => {
-    if (!ready || pending.current) return;
+    if (!ready) return;
     if (missing) { navigate({ kind: 'home' }); return; }
     if (missingCard && screen.kind === 'card-form') navigate({ kind: 'board', id: screen.projectId });
   }, [ready, missing, missingCard, screen, project]);
   return <div className="app-shell" ref={mainRef} tabIndex={-1} aria-busy={busy || !ready} onKeyDown={event => { if (event.key === 'Escape') { event.preventDefault(); goBack(); } }}>
     {loadError && <div className="load-error" role="alert"><p>Could not load your saved boards.</p><button onClick={() => setAttempt(value => value + 1)}>Retry</button></div>}
     {!ready ? (!loadError && <p className="empty-state" role="status">Loading boards…</p>) : missing || missingCard ? <main className="screen-content"><p>{missingCard ? 'This card' : 'This board'} is no longer available.</p><button onClick={() => navigate({ kind: 'home' })}>Back to home</button></main> :
-      screen.kind === 'home' ? <HomeScreen boards={overviewBoards(snapshot)} showPreviews={snapshot.showPreviews} onOpen={board => navigate({ kind: 'board', id: board.id })} onSettings={() => navigate({ kind: 'settings' })} onNotice={setNotice} onCreate={() => navigate({ kind: 'board-form' })} cloud={cloudState ?? null} /> :
+      screen.kind === 'home' ? <HomeScreen boards={overviewBoards(snapshot)} showPreviews={snapshot.showPreviews} onPreviews={show => { void mutate(repo => setShowPreviews(repo, show)); }} onOpen={board => navigate({ kind: 'board', id: board.id })} onSettings={() => navigate({ kind: 'settings' })} onNotice={setNotice} onCreate={() => navigate({ kind: 'board-form' })} cloud={cloudState ?? null} /> :
       screen.kind === 'settings' ? <SettingsScreen cloud={<CloudSettings service={cloud} state={cloudState} />} uiScale={snapshot.uiScale ?? 1} onScale={scale => { void mutate(repo => setUiScale(repo, scale)); }} projects={snapshot.projects} showPreviews={snapshot.showPreviews} busy={busy} onBack={() => goBack()} onPreviews={show => { void mutate(repo => setShowPreviews(repo, show)); }} onMoveBoard={moveBoard} /> :
       screen.kind === 'board-form' ? <BoardFormScreen key={screen.id ?? 'new-board'} project={project} busy={busy} onBack={() => goBack()} onChange={value => { dirty.current = value; }} onSave={saveBoard} /> :
       screen.kind === 'card-form' && project ? <CardFormScreen getImage={repository?.getImage} key={screen.id ?? `new-card-${screen.afterItemId ?? 'end'}`} project={project} card={card} focusField={screen.field} busy={busy} onBack={() => goBack()} onChange={value => { dirty.current = value; }} onSave={saveCard} /> :
-      screen.kind === 'board' && project ? <BoardScreen readOnly={Boolean(cloudState?.projectId === project.id && cloudState?.role === 'viewer')} cloud={<CloudBoard key={project.id} service={cloud} state={cloudState} projectId={project.id} />} focusCardId={focusCardId} onFocusHandled={() => setFocusCardId(null)} uiScale={snapshot.uiScale ?? 1} fingerprintTransition={fingerprintTransition} onCardActions={value => setCardMenu({ id: value.id, choosingTarget: false })} onInsertAfter={value => navigate({ kind: 'card-form', projectId: value.projectId, afterItemId: value.id })} onCopyBoard={() => copyBoard(project)} onCopySection={status => copyBoard(project, status)} onDownloadBoard={() => downloadBoard(project)} getImage={repository?.getImage} project={project} cards={snapshot.cards.filter(value => value.projectId === project.id)} busy={busy} onBack={() => goBack()} onEditBoard={() => navigate({ kind: 'board-form', id: project.id })} onDeleteBoard={() => deleteBoard(project)} onAddCard={() => navigate({ kind: 'card-form', projectId: project.id })} onEditCard={(value, field) => navigate({ kind: 'card-form', projectId: project.id, id: value.id, field })} onDeleteCard={deleteCard} onTrashSection={status => trashSection(project.id, status)} onEmptyTrash={() => emptyTrash(project.id)} onChooseCardField={(value, field) => setCardPicker({ id: value.id, field })} onUpdateCard={updateCard} onReorderCard={(value, ids) => { void mutate(repo => repo.moveItem(value.projectId, value.id, ids), () => setFocusCardId(value.id)); }} /> : null}
+      screen.kind === 'board' && project ? <BoardScreen collapseCards={snapshot.collapseCards} onCollapseCards={collapse => { void mutate(repo => setCollapseCards(repo, collapse)); }} readOnly={Boolean(cloudState?.projectId === project.id && cloudState?.role === 'viewer')} cloud={<CloudBoard key={project.id} service={cloud} state={cloudState} projectId={project.id} />} focusCardId={focusCardId} onFocusHandled={() => setFocusCardId(null)} uiScale={snapshot.uiScale ?? 1} fingerprintTransition={fingerprintTransition} onCardActions={value => setCardMenu({ id: value.id, choosingTarget: false })} onInsertAfter={value => navigate({ kind: 'card-form', projectId: value.projectId, afterItemId: value.id })} onCopyBoard={() => copyBoard(project)} onCopySection={status => copyBoard(project, status)} onDownloadBoard={() => downloadBoard(project)} getImage={repository?.getImage} project={project} cards={snapshot.cards.filter(value => value.projectId === project.id)} busy={busy} onBack={() => goBack()} onEditBoard={() => navigate({ kind: 'board-form', id: project.id })} onDeleteBoard={() => deleteBoard(project)} onAddCard={() => navigate({ kind: 'card-form', projectId: project.id })} onEditCard={(value, field) => navigate({ kind: 'card-form', projectId: project.id, id: value.id, field })} onDeleteCard={deleteCard} onTrashSection={status => trashSection(project.id, status)} onEmptyTrash={() => emptyTrash(project.id)} onChooseCardField={(value, field) => setCardPicker({ id: value.id, field })} onUpdateCard={updateCard} onReorderCard={(value, ids) => { void mutate(repo => repo.moveItem(value.projectId, value.id, ids), () => setFocusCardId(value.id)); }} /> : null}
     {celebration && screen.kind === 'board' && screen.id === celebration.projectId && <BoardConfetti key={celebration.revision} revision={celebration.revision} />}
     <div className="notice" role="status" aria-live="polite" aria-atomic="true">{notice}</div>
     {cardMenu && menuCard && project && <CardActions card={menuCard} cards={snapshot.cards.filter(value => value.projectId === project.id)} choosingTarget={cardMenu.choosingTarget} onCancel={() => goBack()} onAction={action => cardAction(menuCard, action)} onMerge={target => mergeCards(menuCard, target)} onMode={mode => { setCardMenu(null); updateCard(menuCard, { displayMode: mode }); }} />}

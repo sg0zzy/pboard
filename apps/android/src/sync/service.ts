@@ -187,8 +187,15 @@ export function createAndroidSync(getRepository: () => Promise<RxRepository>, au
     pollLive() {
       const live = runtime.collaborationManager.state();
       const error = live.error ?? '';
-      emit({ peers: live.connectedPeers.length,
-        ...(error || (lastLiveError && state.error === lastLiveError) ? { error } : {}) });
+      const peers = live.connectedPeers.length;
+      // This runs every second while the app is foregrounded. Emitting
+      // unconditionally re-rendered the whole tree — every board card — once a
+      // second even with nothing to report. Emit only when something changed.
+      // A live error may only clear itself, never a separate backup failure.
+      const applyError = !!error || (!!lastLiveError && state.error === lastLiveError);
+      const errorChanged = applyError && state.error !== error;
+      if (peers === state.peers && !errorChanged) return;
+      emit({ peers, ...(applyError ? { error } : {}) });
       lastLiveError = error;
     },
     async invite(projectId: string, email: string, role: 'editor' | 'viewer') {
