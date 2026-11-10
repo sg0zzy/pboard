@@ -7,6 +7,24 @@ import { exposeCollaborationDiagnostics, roomSnapshots } from "../sync/realtimeD
 import { collaborationManager } from "../sync/browser";
 import { loadIceServers } from "../collab/security/ice";
 import { browser } from "../platform/browser";
+import { configureDebugForContext, emit as debugEmit, registerDebugStateInspection, roomViewSource } from "../debug";
+import { markBridgeWatching } from "../sync/transportDiagnostics";
+import { repository } from "../storage/browser";
+
+// Debug bridge for this context too (rooms live in the sidebar's runtime, and
+// disabled costs a storage read then nothing). See src/debug/browser.ts.
+void configureDebugForContext("sidebar").then((handle) => {
+  if (!handle) return;
+  // The sidebar's module graph owns its own transport ledger: board rooms
+  // dial from here, so this context must watch dials too.
+  markBridgeWatching();
+  registerDebugStateInspection(handle, "sidebar", {
+    listBoards: async () => (await repository.listProjects()).map((project) => project.id),
+    countCards: async (boardId) => (await repository.listCards(boardId)).length,
+    rooms: roomViewSource(roomSnapshots),
+  });
+  debugEmit({ component: "lifecycle", event: "runtime.initialized", severity: "info", details: { context: "sidebar-document" } });
+});
 
 // The sidebar is a second JS context with its own Drive ledger; read it here as
 // `pboardDriveQuota()` to tell a context that is idle from one that is looping.

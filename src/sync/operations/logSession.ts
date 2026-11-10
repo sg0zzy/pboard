@@ -33,7 +33,8 @@
 import { parseStrictJson } from '../../collab/security/canonical';
 import { collaborationDiagnostic } from '../../collab/diagnostics';
 import { collaborationCounters } from '../../collab/counters';
-import { trackTransportSocket, type TransportDial, type TransportTrigger } from '../transportDiagnostics';
+import { trackTransportSocket, emitBridgeFrame, type TransportDial, type TransportTrigger } from '../transportDiagnostics';
+import { emit } from '../../debug/bus';
 import { automaticAuthBudget, type AuthBudget } from '../../collab/authBudget';
 import {
   LOG_CONNECT_TIMEOUT_MS, LOG_HEARTBEAT_MS, LOG_REQUEST_TIMEOUT_MS, protocolRefusal, reconnectDelay, terminalRefusal, ServiceAdmissionUnavailable
@@ -342,6 +343,8 @@ export class RelaySession {
     this.releaseDial = probe.release;
     this.lastDisconnect = null;
     this.startHeartbeat();
+    if (probe.dial?.debugConnectionId)
+      emit({ component: "lifecycle", event: "socket.ownership.assigned", severity: "info", connectionId: probe.dial.debugConnectionId, details: { owner: 'RelaySession', topic: this.options.topic } });
   }
 
   /**
@@ -858,12 +861,14 @@ export class RelaySession {
     const socket = this.socket;
     if (!socket || socket.readyState !== this.options.Socket.OPEN) throw new Error('Operation log is disconnected');
     socket.send(JSON.stringify(frame));
+    if (this.connectionDial) emitBridgeFrame(this.connectionDial, "sent", frame);
   }
 
   private async receive(raw: string): Promise<void> {
     if (this.mode === 'closed' || !this.connected()) return;
     const message = parseStrictJson(raw, 256 * 1024) as Frame | null;
     if (!message || typeof message.type !== 'string') return;
+    if (this.connectionDial) emitBridgeFrame(this.connectionDial, "received", message);
     switch (message.type) {
       case 'welcome':
         // A second welcome on a live socket is a protocol violation; ignoring it
@@ -904,6 +909,7 @@ export class RelaySession {
         }
         if (room) break; // not an answer this connection has outstanding
         // No room named: the connection itself was declined.
+        this.emitAuthRejected(code);
         const failure = new AttachRefused(code);
         for (const entry of [...this.pending.values()]) { clearTimeout(entry.timer); entry.reject(failure); entry.attachment.failed(code); }
         this.pending.clear();
@@ -1023,6 +1029,7 @@ export class RelaySession {
         // was refused, so no retry can fix it.
         const code = aString(message.code) ?? 'server_error';
         collaborationDiagnostic('logsync.session_refused');
+        this.emitAuthRejected(code);
         this.lastDisconnect = `refused:${code}`;
         // A protocol-family verdict is about *this build's frames*, not about the
         // network: every further dial this context makes will be answered the same
@@ -1053,7 +1060,29 @@ export class RelaySession {
     }
   }
 
+  /** Connection-level refusal (frame `refused` without a room, or `error`
+   * answering `authenticate`): the identity/admission itself was declined.
+   * Room-scoped refusals are authorization, not authentication. */
+  private emitAuthRejected(code: string): void {
+    const connectionId = this.connectionDial?.debugConnectionId;
+    if (!connectionId) return;
+    emit({
+      component: "auth",
+      event: "authentication.failed",
+      severity: "error",
+      connectionId,
+      ...(this.primaryPending ? { boardId: this.primaryPending } : {}),
+      details: { code, pendingRooms: this.pending.size },
+    });
+  }
+
   private settleAttach(pending: PendingAttach, role: string | undefined): void {
+    const debugConnectionId = this.connectionDial?.debugConnectionId;
+    if (debugConnectionId) {
+      if (!this.authenticated)
+        emit({ component: "auth", event: "authentication.completed", severity: "info", connectionId: debugConnectionId, boardId: pending.proof.room, details: { version: 3, role: role ?? 'viewer' } });
+      emit({ component: "websocket", event: "subscription.accepted", severity: "info", connectionId: debugConnectionId, boardId: pending.proof.room, details: { role: role ?? 'viewer' } });
+    }
     this.authenticated = true;
     const resolved = role ?? 'viewer';
     // The room's own admission succeeded, so its private ladder starts over: a
@@ -1095,6 +1124,9 @@ export class RelaySession {
     // Bound both the HTTP request and the server reply by the existing grant.
     const timeout = Math.min(this.options.requestTimeoutMs ?? LOG_REQUEST_TIMEOUT_MS, Math.max(0, state.expiresAt * 1000 - Date.now()));
     state.timer = setTimeout(() => this.failGoogleRenewal(room, 'service_auth_required'), timeout);
+    const connectionId = this.connectionDial?.debugConnectionId;
+    if (connectionId)
+      emit({ component: "auth", event: "token.refresh.started", severity: "info", connectionId, boardId: room, details: { admission: "drive-ticket" } });
     try {
       const next = await state.proof.renew(this.requireWelcome());
       if (this.googleRenewals.get(room) !== state) return;
@@ -1102,8 +1134,12 @@ export class RelaySession {
         throw new Error('Invalid Google renewal');
       }
       state.expiresAt = next.expiresAt;
+      if (connectionId)
+        emit({ component: "auth", event: "token.refresh.completed", severity: "info", connectionId, boardId: room, details: { admission: "drive-ticket", expiresAt: next.expiresAt } });
       this.transmit({ type: 'renewGoogle', room, serviceAdmission: next.ticket });
     } catch {
+      if (connectionId)
+        emit({ component: "auth", event: "token.refresh.failed", severity: "error", connectionId, boardId: room, details: { admission: "drive-ticket" } });
       if (this.googleRenewals.get(room) === state) this.failGoogleRenewal(room, 'service_auth_required');
     }
   }
@@ -1113,6 +1149,18 @@ export class RelaySession {
     // is an `attach` on the same authenticated socket, with its own proof.
     const first = !this.authenticated && !this.primaryPending;
     if (first) this.primaryPending = proof.room;
+    const debugConnectionId = this.connectionDial?.debugConnectionId;
+    if (debugConnectionId)
+      emit({
+        component: "auth",
+        event: "authentication.started",
+        severity: "info",
+        connectionId: debugConnectionId,
+        boardId: proof.room,
+        details: { version: 3, first, ...(proof.google ? { admission: "drive-ticket" } : { admission: "signed-receipt" }) },
+      });
+    if (debugConnectionId && !first)
+      emit({ component: "websocket", event: "subscription.requested", severity: "info", connectionId: debugConnectionId, boardId: proof.room });
     return new Promise<{ room: string; role: string }>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(proof.room);
@@ -1198,6 +1246,8 @@ export class RelaySession {
     this.releaseDial?.(); this.releaseDial = undefined;
     const dial = this.connectionDial;
     this.connectionDial = undefined;
+    if (dial?.debugConnectionId)
+      emit({ component: "lifecycle", event: "socket.ownership.released", severity: "info", connectionId: dial.debugConnectionId, details: { owner: 'RelaySession', reason } });
     // Recorded before the close event can arrive, and only when this call is
     // *why* the socket ends: an explicit author, or a socket still open that we
     // are about to close. A socket the browser has already closed is left to
@@ -1210,6 +1260,8 @@ export class RelaySession {
     }
     if (socket) {
       if (socket.readyState === this.options.Socket.OPEN) {
+        if (dial?.debugConnectionId)
+          emit({ component: "websocket", event: "connection.closing", severity: "info", connectionId: dial.debugConnectionId, details: { reason } });
         try { socket.send(JSON.stringify({ type: 'leave' })); } catch { /* already gone */ }
       }
       try { socket.close(); } catch { /* already gone */ }

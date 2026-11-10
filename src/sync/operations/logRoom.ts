@@ -11,6 +11,7 @@
  * also why one room losing its attachment cannot disturb another's cursor.
  */
 import { parseStrictJson } from '../../collab/security/canonical';
+import { emit } from '../../debug/bus';
 import { importSigningKey, signBytes, type StoredDeviceKey } from '../../collab/security/keys';
 import { prepareRelayAdmission, type RelayAuthorization } from '../../collab/security/relayAdmission';
 import type { ServiceAdmissionRequest } from '../../collab/experimentalWebSocketSignaling';
@@ -139,7 +140,13 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
     let sawForeign = false;
     for (const row of rows) {
       const seq = aNumber(row.seq), opId = aString(row.opId), payload = aString(row.payload);
+      // A row at/below our cursor or already durable: a known duplicate from
+      // replay overlap. Debug severity: during a bootstrap replay this is
+      // routine bookkeeping, and a trace reader can still find it.
+      if (typeof seq === 'number' && typeof opId === 'string' && (seq <= appliedSeq || durable.has(seq)))
+        emit({ component: "sync", event: "operation.duplicate", severity: "debug", boardId: options.boardId, operationId: opId, details: { seq, appliedSeq, reason: seq <= appliedSeq ? "cursor" : "durable" } });
       if (typeof seq !== 'number' || seq <= appliedSeq || durable.has(seq) || typeof opId !== 'string' || typeof payload !== 'string') continue;
+      emit({ component: "sync", event: "operation.received", severity: "info", boardId: options.boardId, operationId: opId, details: { seq } });
       let operation: Operation;
       try {
         operation = await options.open(payload, opId);
@@ -172,19 +179,22 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
       // paths consult — and let the sequence become durable below so the cursor
       // advances past it.
       if (!isKnownVocabulary(operation)) { metrics.skipped++; collaborationDiagnostic('logsync.unsupported_operation', { count: seq }); }
+      emit({ component: "sync", event: "operation.validated", severity: "info", boardId: options.boardId, operationId: opId, details: { seq, clock: operation.clock, kind: operation.kind, ...(isKnownVocabulary(operation) ? {} : { vocabulary: "unsupported" }) } });
       operations.push(operation);
       sequences.push(seq);
     }
     if (!operations.length) { if (sawForeign) await advance(); return; }
     // The cursor advances only after the engine has taken them: an operation it
     // rejected must be seen again on the next reconnect, not skipped.
-    // The local operation store accepts at most 128 operations per durable
+    // The local store accepts at most 128 operations per durable
     // transaction, while a relay replay page may contain up to 512. Commit and
     // advance each chunk independently so a later failure never skips it.
     for (let offset = 0; offset < operations.length; offset += 128) {
       const chunk = operations.slice(offset, offset + 128);
       await options.receive(chunk);
       metrics.received += chunk.length;
+      for (const operation of chunk)
+        emit({ component: "sync", event: "operation.applied", severity: "info", boardId: options.boardId, operationId: operation.opId, details: { kind: operation.kind, seq: operation.seq } });
       for (const seq of sequences.slice(offset, offset + 128)) durable.add(seq);
       await advance();
     }
@@ -238,6 +248,8 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
     // batch so a backlog cannot fill that queue in one synchronous fan-out.
     for (let offset = 0; offset < operations.length; offset += 16) {
       const batch = operations.slice(offset, offset + 16);
+      for (const operation of batch)
+        emit({ component: "sync", event: "operation.transmitted", severity: "info", boardId: options.boardId, operationId: operation.opId, details: { seq: operation.seq } });
       const sealed = await Promise.all(batch.map(async operation => ({
         opId: operation.opId,
         protocolVersion: LOG_PROTOCOL_VERSION,
@@ -255,6 +267,14 @@ export async function createRoomCore(options: RoomCoreOptions): Promise<RoomCore
         acknowledged.add(opId);
         metrics.acked++;
         if (duplicate) metrics.duplicates++;
+        emit({
+          component: "sync",
+          event: duplicate ? "operation.duplicate" : "operation.acknowledged",
+          severity: "info",
+          boardId: options.boardId,
+          operationId: opId,
+          details: { seq, ...(duplicate ? { serverDuplicate: true } : {}) }
+        });
         // An acknowledged sequence is durable whether or not the broadcast for it
         // has arrived; remembering it keeps a reload from waiting on our own edit.
         durable.add(seq);

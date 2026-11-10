@@ -24,6 +24,9 @@
  * through optional chaining.
  */
 
+import { emit } from "../debug/bus";
+import { newDebugId } from "../debug/ids";
+
 /** What asked for the socket. A stable string: the console groups by it.
  *
  *  - `session:attach` — the probe dial that opens the shared (v3) connection
@@ -91,6 +94,11 @@ export type TransportHistoryEntry = {
 export type TransportDial = {
   readonly id: number;
   readonly trigger: TransportTrigger;
+  /** Stable globally-unique id for the Live Debug Bridge, present only when
+   * the bridge channel is watching this context. Frame-level emitters thread
+   * it onto `websocket.*` events so the bridge registry can fold them into
+   * the same connection entry the ledger opened. */
+  readonly debugConnectionId: string | undefined;
   /** Record the socket's close. Idempotent: the first close wins.
    *
    *  `known` names a cause the caller established itself and the browser cannot
@@ -139,6 +147,17 @@ export const MAX_TRANSPORT_HISTORY = 32;
 // module whose entry point returns `undefined` and never allocates.
 declare const __PBOARD_DIAGNOSTICS__: boolean;
 const DIAGNOSTICS: boolean = typeof __PBOARD_DIAGNOSTICS__ === "undefined" ? false : __PBOARD_DIAGNOSTICS__;
+
+// The Live Debug Bridge is a second, independent consumer of this ledger:
+// when a running context has configured the bridge (`markBridgeWatching()`
+// from `src/debug/browser.ts`), every dial also emits structured
+// `websocket.*` events onto the debug bus — the same real events the console
+// ledger sees, no separate instrumentation path. Without either consumer the
+// entry point still returns `undefined` and allocates nothing.
+let bridgeWatching = false;
+export function markBridgeWatching(): void {
+  bridgeWatching = true;
+}
 
 /** The id prefix kept for a device key: enough to tell two devices apart in a
  *  paste, far too short to be any use as a credential. */
@@ -218,6 +237,30 @@ export function trackTransportSocket(
   dialCount++;
   byTrigger.set(entry.trigger, (byTrigger.get(entry.trigger) ?? 0) + 1);
 
+  // A globally unique id per socket: the console ledger's numeric id restarts
+  // with every MV3 context, and the bridge merges *contexts across reloads*
+  // — a per-context `conn-1` would collide in exactly the scenario (repeated
+  // extension reloads) this ledger exists to diagnose.
+  const connectionId = bridgeWatching ? newDebugId("conn") : "";
+  if (bridgeWatching) {
+    // EventTarget listeners only observe; they cannot change behaviour, and
+    // `{ once: true }` means this socket accumulates nothing over its life.
+    // Test doubles without addEventListener simply never fire these.
+    try {
+      socket.addEventListener("open", () => {
+        emit({ component: "websocket", event: "connection.opened", severity: "info", connectionId });
+      }, { once: true });
+    } catch { /* non-DOM socket double */ }
+    emit({
+      component: "websocket",
+      event: "connection.requested",
+      severity: "info",
+      connectionId,
+      ...(room ? { boardId: room } : {}),
+      details: { trigger, ...(room ? { room } : {}), ...(device ? { device: device.slice(0, DEVICE_PREFIX_LENGTH) } : {}) }
+    });
+  }
+
   /** Whether the recorded close carried the browser's own event. Only the first
    *  record may set the author; a late event only refines code and reason. */
   let fromEvent = false;
@@ -231,6 +274,7 @@ export function trackTransportSocket(
   return {
     id: entry.id,
     trigger: entry.trigger,
+    debugConnectionId: bridgeWatching ? connectionId : undefined,
     closed(event, known) {
       // A close whose cause is already known is recorded *before* the browser
       // delivers the event, and must be: our own `close()` would otherwise
@@ -273,9 +317,28 @@ export function trackTransportSocket(
       byClose[by]++;
       countedReasonKey = reason ? `${by}:${code}:${reason}` : `${by}:${code}`;
       byCloseReason.set(countedReasonKey, (byCloseReason.get(countedReasonKey) ?? 0) + 1);
+      if (bridgeWatching) {
+        emit({
+          component: "websocket",
+          event: "connection.closed",
+          severity: by === "network" ? "warn" : "info",
+          connectionId,
+          ...(entry.room ? { boardId: entry.room } : {}),
+          details: { cause: by, code, ...(reason ? { reason } : {}), lifetimeMs: entry.lifetimeMs, trigger: entry.trigger }
+        });
+      }
     },
     reconnected(delayMs) {
       entry.reconnect = { scheduled: true, delayMs: Math.max(0, Math.round(delayMs)) };
+      if (bridgeWatching)
+        emit({
+          component: "websocket",
+          event: "reconnect.scheduled",
+          severity: "info",
+          connectionId,
+          ...(entry.room ? { boardId: entry.room } : {}),
+          details: { delayMs: entry.reconnect.delayMs, trigger: entry.trigger }
+        });
     },
     relabel(next) {
       if (entry.trigger === next) return;
@@ -284,6 +347,38 @@ export function trackTransportSocket(
       byTrigger.set(next, (byTrigger.get(next) ?? 0) + 1);
     }
   };
+}
+
+/** Frame-level bridge emission for socket owners: called with the dial they
+ * hold, so an unwatched context pays one property read and nothing else.
+ * `frame` is projected to its `type` plus an explicit detail list — payload
+ * contents never leave through this path. */
+export function emitBridgeFrame(
+  dial: TransportDial | undefined,
+  direction: "sent" | "received",
+  frame: { type?: unknown; action?: unknown; room?: unknown; board?: unknown },
+  details: { operationId?: string; severity?: "debug" | "info" | "warn" | "error"; code?: string } = {}
+): void {
+  const connectionId = dial?.debugConnectionId;
+  if (!connectionId) return;
+  const kind = typeof frame.type === "string" ? frame.type : "unknown";
+  const action = typeof frame.action === "string" ? `:${frame.action}` : "";
+  const board = typeof frame.board === "string" ? frame.board : undefined;
+  emit({
+    component: "websocket",
+    event: direction === "sent" ? "message.sent" : "message.received",
+    // Per-frame events are debug-level by default: they are high-volume
+    // observability, and callers escalate explicitly (a refusal is a warn).
+    severity: details.severity ?? "debug",
+    connectionId,
+    ...(board ? { boardId: board } : {}),
+    ...(details.operationId ? { operationId: details.operationId } : {}),
+    details: {
+      frame: `${kind}${action}`,
+      ...(dial?.trigger ? { trigger: dial.trigger } : {}),
+      ...(details.code ? { code: details.code } : {})
+    }
+  });
 }
 
 /** The counters and history as one pasteable object. Always readable, even in a

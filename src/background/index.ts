@@ -23,12 +23,48 @@ import { browser } from "../platform/browser";
 import { handleDriveSyncMessage, registerDriveBackgroundSync } from "../sync/background";
 import { registerDriveAccountPolling } from '../sync/drivePolling';
 import { collaborationCounters } from "../collab/counters";
+import { configureDebugForContext, emit as debugEmit, registerDebugStateInspection, roomViewSource } from "../debug";
+import { markBridgeWatching } from "../sync/transportDiagnostics";
 
 const SELECTION_MENU_ID = "pin-selection-to-pboard";
 const LINK_MENU_ID = "pin-link-to-pboard";
 const PAGE_MENU_ID = "pin-page-to-pboard";
 const IMAGE_MENU_ID = "pin-image-to-pboard";
 const WEB_PAGES = ["http://*/*", "https://*/*"];
+
+// The Live Debug Bridge must be configured before anything can dial: the
+// transport ledger consults `markBridgeWatching` at dial time, and the bus
+// needs its identity before the first event. Disabled by default — see
+// src/debug/browser.ts for the policy — so this costs one storage read and
+// then nothing; every `emit` downstream is a boolean test when off.
+// MV3 gives no honest shutdown hook (Firefox terminates this worker without
+// running cleanup), so `background.boot` is emitted per *wake*, and the
+// bridge infers "previous context ended" from a boot without a paired
+// shutdown — the same fact `pboardCollaboration()` reports as repeated
+// worker starts.
+void configureDebugForContext("background").then((handle) => {
+  if (!handle) return;
+  markBridgeWatching();
+  registerDebugStateInspection(handle, "background", {
+    listBoards: async () => (await repository.listProjects()).map((project) => project.id),
+    countCards: async (boardId) => (await repository.listCards(boardId)).length,
+    rooms: roomViewSource(roomSnapshots),
+  });
+  debugEmit({
+    component: "lifecycle",
+    event: "background.boot",
+    severity: "info",
+    details: { version: safeManifestVersion() },
+  });
+  debugEmit({ component: "lifecycle", event: "listeners.registered", severity: "debug", details: { scope: "background-top-level" } });
+});
+function safeManifestVersion(): string {
+  try {
+    return browser.runtime.getManifest().version;
+  } catch {
+    return "unknown";
+  }
+}
 
 browser.runtime.onInstalled.addListener(() => { void registerMenus(); });
 void registerMenus();

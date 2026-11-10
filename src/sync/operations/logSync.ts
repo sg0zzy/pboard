@@ -35,7 +35,8 @@ import { prepareRelayAdmission, type RelayAuthorization } from '../../collab/sec
 import { validateWebSocketEndpoint } from '../../collab/security/endpoint';
 import { collaborationDiagnostic } from '../../collab/diagnostics';
 import { collaborationCounters } from '../../collab/counters';
-import { trackTransportSocket, type TransportDial, type TransportTrigger } from '../transportDiagnostics';
+import { trackTransportSocket, emitBridgeFrame, type TransportDial, type TransportTrigger } from '../transportDiagnostics';
+import { emit } from '../../debug/bus';
 import { automaticAuthBudget, type AuthBudget } from '../../collab/authBudget';
 import type { ServiceAdmissionRequest } from '../../collab/experimentalWebSocketSignaling';
 import type { Operation } from './protocol';
@@ -620,6 +621,9 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
   const send = (message: unknown) => {
     if (!socket || socket.readyState !== Socket.OPEN) throw new Error('Operation log is disconnected');
     socket.send(JSON.stringify(message));
+    // `message` is a Frame at every call site; only its `type` is read here.
+    const frame = message as Frame;
+    if (roomDial) emitBridgeFrame(roomDial, "sent", frame, frame?.type === "authenticate" ? { severity: "info" } : {});
   };
   const abandon = (cause: Error) => {
     for (const entry of waiting.splice(0)) { clearTimeout(entry.timer); entry.reject(cause); }
@@ -806,6 +810,8 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
     const signature = await signBytes(await importSigningKey(key.privateJwk), new TextEncoder().encode(JSON.stringify(
       ['pboard-ws-auth-v2', challenge, session, admission.room, key.keyId, admission.digest])));
     if (stopped || !socket || socket.readyState !== Socket.OPEN) return;
+    if (roomDial?.debugConnectionId)
+      emit({ component: "auth", event: "authentication.started", severity: "info", connectionId: roomDial.debugConnectionId, boardId: admission.room, details: { version: 2, serviceAdmission: serviceAdmission !== undefined } });
     send({ type: 'authenticate', version: 2, room: admission.room, deviceKeyId: key.keyId, signature,
       authorization: admission.authorization, ...(serviceAdmission ? { serviceAdmission } : {}) });
   }
@@ -818,6 +824,7 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
         if (stopped || socket !== ws || ws.readyState !== Socket.OPEN) return;
         const message = parseStrictJson(String(event.data), 256 * 1024) as Frame | null;
         if (!message || typeof message.type !== 'string') return;
+        if (dial) emitBridgeFrame(dial, "received", message);
         // Roster and signaling frames belong to the peer transport; ignoring them
         // keeps this client working against a relay that still sends them.
         if (!['welcome', 'authenticated', 'sync', 'error', 'pong', 'server_shutdown'].includes(message.type)) return;
@@ -830,6 +837,8 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
             if (message.peerId !== key.keyId || message.session !== session) throw new Error('Operation log identity mismatch');
             clearTimeout(deadline);
             authenticated = true;
+            if (dial?.debugConnectionId)
+              emit({ component: "auth", event: "authentication.completed", severity: "info", connectionId: dial.debugConnectionId, boardId: roomId, details: { version: 2 } });
             // `attempts` is deliberately NOT reset here: only a connection that
             // reaches `synced` has earned the reset.
             connecting = false;
@@ -856,6 +865,8 @@ async function openPrivateRoom(options: LogSyncOptions, Socket: typeof WebSocket
             core.metrics.refused++;
             room.reconnectReason = `refused:${code}`;
             debug('logsync.rejected');
+            if (dial?.debugConnectionId)
+              emit({ component: "auth", event: "authentication.failed", severity: "error", connectionId: dial.debugConnectionId, boardId: roomId, details: { code, terminal: terminal(code) } });
             if (terminal(code)) {
               stopped = true;
               room.phase = 'error'; room.error = code; announce();

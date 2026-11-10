@@ -4,6 +4,7 @@ import { defaultDriveQuotaThrottle, driveQuotaError, driveRequestCost, driveRequ
 import { driveBoundedRetryDelayMs } from "./driveRetry";
 import { shareGet } from "./driveSharedRequest";
 import { driveHttpError } from "./driveHttp";
+import { emit } from "../debug/bus";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
@@ -68,6 +69,13 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
     const cost = driveRequestCost(input, init.method ?? "GET");
+    const method = init.method ?? "GET";
+    // Diagnostics cover transfers and failures, not every cheap poll: list
+    // GETs emit nothing, media GETs are `download.*`, writes are `upload.*`.
+    const observable = method !== "GET" || input.includes("alt=media");
+    const what = method === "GET" ? "download" : "upload";
+    if (observable)
+      emit({ component: "drive", event: `${what}.requested`, severity: "debug", details: { method, attempt, cost } });
     // Respect projected budget deferrals and real Google quota cooldowns.
     await quota.acquire(cost, init.signal);
     // Account signaling/preferences and snapshots must observe writes made
@@ -75,18 +83,39 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     const response = await fetcher(input, { ...init, headers,
       ...(!init.method || init.method === "GET" ? { cache: "no-store" as const } : {}) });
     quota.observe(cost, response.headers, driveRequestSignature(input, init.method ?? "GET"));
-    if (response.status === 401 && retry) return authorizedFetch(input, init, false, attempt, spentMs);
-    if (response.status === 429 && isDriveQuotaFailure(await errorDetail(response.clone()))) throw await requestError(response);
+    if (response.status === 401 && retry) {
+      if (observable)
+        emit({ component: "drive", event: "retry.scheduled", severity: "info", details: { reason: "token-expired", method } });
+      return authorizedFetch(input, init, false, attempt, spentMs);
+    }
+    if (response.status === 429 && isDriveQuotaFailure(await errorDetail(response.clone()))) {
+      if (observable)
+        emit({ component: "drive", event: "ratelimit.detected", severity: "warn", details: { method, cost } });
+      throw await requestError(response);
+    }
     // A transient Google-side failure (internalError, rate limit) usually
     // clears on a replay; only one-shot methods are replayed. A quota denial is
     // not replayed blindly.
     if (!response.ok && DRIVE_TRANSIENT_STATUSES[response.status] && attempt + 1 < DRIVE_TRANSIENT_ATTEMPTS &&
         isDriveReplayableMethod(init.method)) {
       const delay = driveBoundedRetryDelayMs(attempt, response.headers.get("Retry-After"), spentMs, await errorDetail(response));
+      if (observable)
+        emit({ component: "drive", event: "retry.scheduled", severity: "info", details: { method, status: response.status, delayMs: delay, attempt: attempt + 1 } });
       await new Promise<void>((resolve) => { setTimeout(resolve, delay); });
       return authorizedFetch(input, init, retry, attempt + 1, spentMs + delay);
     }
-    if (!response.ok) throw await requestError(response);
+    if (!response.ok) {
+      if (observable)
+        emit({
+          component: "drive",
+          event: response.status === 409 ? "revision.conflict" : response.status === 403 ? "authorization.failed" : `${what}.failed`,
+          severity: "error",
+          details: { method, status: response.status, ...(response.status === 429 ? { rateLimited: true } : {}) }
+        });
+      throw await requestError(response);
+    }
+    if (observable)
+      emit({ component: "drive", event: `${what}.completed`, severity: "debug", details: { method, status: response.status } });
     return response;
   }
 

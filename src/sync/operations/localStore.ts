@@ -1,4 +1,5 @@
 import type { ChangeJournal } from '../../storage/changeJournal';
+import { emit } from '../../debug/bus';
 import { canonical, validateCommand, validateOperation, validateSegment, MAX_SEGMENT_BYTES, MAX_SEGMENT_OPERATIONS, PROTOCOL, type Command, type Frontier, type Operation, type Segment } from './protocol';
 import type { LegacyMigrationIntent } from './legacyMigrationPreparation';
 
@@ -21,7 +22,7 @@ export class LocalOperationStore {
     const input = structuredClone(command), seen = structuredClone(observed);
     validateCommand(input);
     const actor = crypto.randomUUID();
-    return this.journal.operationTransaction(boardId, tables, (tx, result) => {
+    const operation = await this.journal.operationTransaction<Operation>(boardId, tables, (tx, result) => {
       const streams = tx.objectStore('operationStreams'), request = streams.get(boardId);
       request.onsuccess = () => {
         const allocate = () => {
@@ -55,6 +56,16 @@ export class LocalOperationStore {
         }
       };
     });
+    // Diagnostics after the transaction: `created` (sequence/opId allocated)
+    // and `queued` (durable outbox row) are both true exactly when the
+    // transaction committed, and a rolled-back append must not emit either.
+    // Snapshot-ingested operations (sourceId) are existing history, not new
+    // local work: they are not reported as created here.
+    if (!sourceId) {
+      emit({ component: "sync", event: "operation.created", severity: "info", boardId, operationId: operation.opId, details: { seq: operation.seq, clock: operation.clock, kind: input.kind, collection: input.collection } });
+      emit({ component: "sync", event: "operation.queued", severity: "info", boardId, operationId: operation.opId, details: { outbox: true } });
+    }
+    return operation;
   }
   async observed(boardId: string): Promise<{ frontier: Frontier; clock: number }> {
     const stream = await this.journal.read<Stream | undefined>('operationStreams', store => store.get(boardId));
