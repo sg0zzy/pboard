@@ -39,6 +39,7 @@
     "rxdb": "^17.5.0"
   },
   "devDependencies": {
+    "@capacitor/core": "8.5.3",
     "@types/firefox-webext-browser": "^143.0.0",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
