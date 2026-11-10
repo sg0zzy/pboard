@@ -22,6 +22,7 @@ import { mkdtemp, writeFile, readFile, rm, mkdir } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
+import { createServer as httpServer } from "node:http";
 import { once } from "node:events";
 import { zipSync } from "fflate";
 import { build } from "vite";
@@ -29,6 +30,57 @@ import { startBridge } from "./server.ts";
 import { observeRelayLogs, toLines } from "./relayObserver.ts";
 import { configureDebugBus } from "../../src/debug/bus.ts";
 import { HttpBridgeTransport } from "../../src/debug/bridgeTransport.ts";
+
+// --- Synthetic Drive (loopback, in-memory): same fixture contract as
+// secure-browser-smoke. The runtime is Drive-connected over this stub; zero
+// real Google contact. No real board data exists in this test. ---
+const driveFiles = new Map();
+let driveSequence = 0;
+const driveStub = httpServer(async (req, res) => {
+  try {
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const email = (req.headers.authorization ?? "").replace("Bearer ", "");
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    res.setHeader("Content-Type", "application/json");
+    if (url.pathname.endsWith("/about")) { res.end(JSON.stringify({ user: { emailAddress: email, displayName: "E2E fixture" } })); return; }
+    if (url.pathname.endsWith("/permissions")) { res.end(JSON.stringify({ permissions: [{ id: "owner", type: "user", role: "owner", emailAddress: email }] })); return; }
+    if (url.pathname.endsWith("/files") && req.method === "GET") {
+      const query = url.searchParams.get("q") ?? "";
+      const name = query.match(/name = '([^']+)'/)?.[1];
+      const parent = query.match(/'([^']+)' in parents/)?.[1];
+      const space = url.searchParams.get("spaces");
+      const files = [...driveFiles.values()].filter((f) => (!name || f.name === name) && (!parent || f.parents.includes(parent)) && (space !== "appDataFolder" || (f.parents.includes("appDataFolder") && f.ownerEmail === email)));
+      res.end(JSON.stringify({ files: files.map(({ contents, ...f }) => f) }));
+      return;
+    }
+    if (url.pathname.endsWith("/files") && req.method === "POST") {
+      let metadata;
+      let contents = "";
+      const boundary = req.headers["content-type"]?.match(/boundary=(.*)/)?.[1];
+      if (boundary) {
+        const parts = text.split(`--${boundary}`).filter((x) => x.includes("Content-Type")).map((x) => x.split("\r\n\r\n")[1].trim());
+        metadata = JSON.parse(parts[0]);
+        contents = parts[1];
+      } else metadata = JSON.parse(text);
+      const file = { ...metadata, id: `file-${++driveSequence}`, parents: metadata.parents ?? ["root"], ownerEmail: email, contents };
+      driveFiles.set(file.id, file);
+      res.end(JSON.stringify(file));
+      return;
+    }
+    const id = url.pathname.split("/").at(-1);
+    const file = driveFiles.get(id);
+    if (!file || (file.parents.includes("appDataFolder") && file.ownerEmail !== email)) { res.statusCode = 404; res.end("{}"); return; }
+    if (req.method === "DELETE") { driveFiles.delete(id); res.end("{}"); return; }
+    if (req.method === "PATCH") file.contents = text;
+    res.end(url.searchParams.get("alt") === "media" ? file.contents : JSON.stringify(file));
+  } catch (error) {
+    res.statusCode = 500;
+    res.end(JSON.stringify({ error: String(error) }));
+  }
+});
+await new Promise((r) => driveStub.listen(0, "127.0.0.1", r));
+const driveUrl = `http://127.0.0.1:${driveStub.address().port}`;
 
 const work = await mkdtemp(join(tmpdir(), "pboard-debug-e2e-"));
 const drivers = [];
@@ -179,6 +231,7 @@ try {
     "manifest.json": Buffer.from(JSON.stringify(manifest)),
     "e2e.html": Buffer.from("<script type=\"module\" src=\"probe.js\"></script>"),
     "probe.js": await readFile(join(work, "extension/probe.js")),
+    "e2e-config.json": Buffer.from(JSON.stringify({ driveUrl })),
   });
 
   // 4. Two profiles, bridge enabled per profile with distinct client ids.
@@ -200,15 +253,15 @@ try {
   await a(`e2e.configure(${JSON.stringify(relayUrl)})`);
   await b(`e2e.configure(${JSON.stringify(relayUrl)})`);
   await a("e2e.create()");
-  // The fixture is "signed in" only while the authority is created, so the
-  // Drive grant mirror is examinable (absent → create) but no Drive folder
-  // provisioning runs at start(); the webrtc fixture runs the same way.
+  // Drive-connected fixture (stubbed, loopback): the operation-log path the
+  // runtime drives opens with this posture (secure-smoke pattern). The
+  // grant-mirror check during initialize is therefore examinable too.
   await a("e2e.signIn()");
+  await b("e2e.signIn()");
   // Promise-returning probe calls must be awaited *page-side* before
   // JSON.stringify (stringify of a pending promise is "{}"), and results
   // re-embedded with one JSON.stringify so the page receives one string.
   const invitation = await a("(async()=>JSON.stringify(await e2e.invite()))()");
-  await a("e2e.signOut()");
   const request = JSON.parse(await b(`(async()=>JSON.stringify(await e2e.request(${JSON.stringify(invitation)})))()`));
   const approved = await a(`(async()=>JSON.stringify(await e2e.approve(${JSON.stringify(JSON.stringify(request))},${JSON.stringify(request.deviceKeyId)},"editor")))()`);
   await b(`e2e.trust(${JSON.stringify(approved)},${JSON.stringify(request.authorityKeyId)})`);
