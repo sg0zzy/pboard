@@ -417,6 +417,40 @@ describe('mobile navigation and editing', () => {
     expect(host.textContent).not.toContain('no longer available');
     expect(host.querySelectorAll('.board-tile')).toHaveLength(0);
   });
+  it('returns home when a board delete fails after the board has already left the list', async () => {
+    // The local marker commits first, so the watcher removes the board from the
+    // list before the remaining deletion work runs. If that remaining work then
+    // fails, mutate's success callback — the usual route home — never runs.
+    // The screen must still return home: the board does not exist any more.
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      storage.deleteBoard.mockImplementation(async () => {
+        storage.snapshot = { ...storage.snapshot, projects: [] };
+        storage.listener!({ ...storage.snapshot });
+        throw new Error('Drive unavailable');
+      });
+      await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+      await act(async () => [...host.querySelectorAll('button')].find(button => button.textContent === 'Delete board')!.click());
+      await act(async () => [...host.querySelectorAll<HTMLButtonElement>('dialog button')].find(button => button.textContent === 'Delete')!.click());
+      expect(host.querySelector('h1')?.textContent).toBe('pboard');
+      expect(host.textContent).not.toContain('no longer available');
+      // The failure is still reported rather than silently swallowed.
+      expect(host.querySelector('[role=status]')?.textContent).toContain('Could not delete this board');
+    } finally { error.mockRestore(); }
+  });
+  it('returns home when the open board disappears while a write is still in flight', async () => {
+    storage.snapshot.cards = [{ id: 'card', projectId: 'phone', content: 'Locked', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
+    // Hold the first write open so the board vanishes mid-save.
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    storage.update.mockImplementationOnce(async () => { await blocked; });
+    await act(async () => root.render(<App />)); await click('Open PhoneHaul');
+    await click('Change status of card 1'); await click('confirmed');
+    // The owner deletes the board elsewhere; the watcher delivers the empty list.
+    await act(async () => storage.listener!({ projects: [], cards: [], showPreviews: true }));
+    expect(host.querySelector('h1')?.textContent).toBe('pboard');
+    await act(async () => { release(); await blocked; });
+  });
   it('returns to the board when an open card editor loses its card', async () => {
     storage.snapshot.cards = [{ id: 'c1', projectId: 'phone', content: 'one', type: 'task', status: 'candidate', order: 0, createdAt: '', updatedAt: '' }];
     await act(async () => root.render(<App />)); await click('Open PhoneHaul');

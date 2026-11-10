@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # Run every test suite in this repository that is safe to run locally.
 #
-#   scripts/test-all.sh                 offline sweep: typecheck, root Vitest,
-#                                       Android typecheck + Vitest, relay cargo
-#                                       tests, buffer probe, recovery inventory
-#   scripts/test-all.sh --full          also run the recovery harness including
-#                                       its local Chromium fixtures. Expect this
-#                                       to fail at the first native fixture: it
-#                                       currently requires a Google credential
-#                                       its fixtures do not supply. Run the same
-#                                       command without --full for a green gate.
-#   scripts/test-all.sh --only <name>   run one suite: root|android|relay|buffer|recovery|types
+#   scripts/test-all.sh                 offline sweep: root + Android typechecks,
+#                                       root Vitest, Android Vitest, relay cargo
+#                                       tests, durable buffer probe
+#   scripts/test-all.sh --only <name>   run one suite: root|android|relay|buffer|types
 #   scripts/test-all.sh --list          show suites and what each one runs
 #   scripts/test-all.sh --keep-going    continue after failures, report all
 #   scripts/test-all.sh --help
+#
+# The recovery material does not appear as a suite because the root Vitest run
+# already executes all of it: `tests/recovery/**` matches the `tests/**/*.test.*`
+# glob, so its 237 tests and its scenario-inventory check run in `root`, and
+# `scripts/recovery/run.mjs`'s default file list is a strict subset of the same
+# glob plus the `cargo test` that the `relay` suite already runs. Adding it here
+# would only repeat work.
+#
+# The recovery harness adds unique value only with `--browser` (native Chromium
+# fixtures). That path currently needs a Google credential its fixtures do not
+# supply, so it is a manual, opt-in command — not a gate:
+#     node scripts/recovery/run.mjs --browser
 #
 # Never run here, by design:
 #   * `npm run test:collaboration` / `automatic-smoke.mjs` — they default to a
@@ -30,7 +36,6 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 ONLY=""
-MODE=default
 KEEP_GOING=0
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pboard-tests.XXXXXX")"
 RESULTS=()
@@ -44,10 +49,10 @@ usage() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
-    --full) MODE=full; shift ;;
+    --full) echo "--full was removed: the recovery harness is manual (see --help)" >&2; exit 2 ;;
     --only) [ $# -ge 2 ] || { echo "--only needs a suite name" >&2; exit 2; }
             case "$2" in
-              types|root|android|relay|buffer|recovery) ONLY="$2" ;;
+              types|root|android|relay|buffer) ONLY="$2" ;;
               *) echo "Unknown suite: $2 (see --list)" >&2; exit 2 ;;
             esac
             shift 2 ;;
@@ -56,11 +61,11 @@ while [ $# -gt 0 ]; do
       cat <<'LIST'
 suites:
   types     root `tsc --noEmit`, Android `tsc --noEmit`
-  root      root Vitest (tests/**/*.test.{ts,tsx,mjs}, includes multiBrowser)
+  root      root Vitest (tests/**/*.test.{ts,tsx,mjs}: unit, multiBrowser, recovery,
+            and the recovery scenario-inventory check)
   android   Android Vitest (apps/android/tests/**/*.check.{ts,tsx})
   relay     cargo test --locked for services/pboard-signaling
   buffer    cargo build of the relay binary + services/pboard-signaling/buffer-probe.mjs
-  recovery  scripts/recovery/run.mjs (inventory by default; full harness with --full)
 LIST
       exit 0 ;;
     *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
@@ -150,16 +155,6 @@ if want buffer; then
   else
     echo "!! skipping buffer: cargo not found on PATH"
     RESULTS+=("SKIP  buffer (cargo missing)")
-  fi
-fi
-
-if want recovery; then
-  # The harness is offline either way; --full adds local Chromium fixtures and
-  # therefore needs a browser plus a fixture relay build.
-  if [ "$MODE" = full ]; then
-    run recovery "recovery harness with local browser fixtures" node scripts/recovery/run.mjs --browser
-  else
-    run recovery "recovery scenario inventory" node scripts/recovery/run.mjs --inventory
   fi
 fi
 

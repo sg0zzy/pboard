@@ -245,8 +245,15 @@ export default function App() {
   // to the home page instead of leaving a dead screen behind. Card edits bounce
   // back to their (still existing) board. The interstitial page stays as a
   // defensive fallback for the card case and renders before the effect runs.
+  //
+  // A save in flight deliberately does **not** suppress this. `goBack` still
+  // refuses to navigate while the queue is busy (the user is mid-action), but a
+  // board that no longer exists cannot be left on screen just because a write
+  // has not settled: the earlier guard read `queued.current`, a ref, which is
+  // not an effect dependency, so the effect could bail out once and never run
+  // again — stranding the user on a vanished board.
   useEffect(() => {
-    if (!ready || queued.current) return;
+    if (!ready) return;
     if (missing) { navigate({ kind: 'home' }); return; }
     if (missingCard && screen.kind === 'card-form') navigate({ kind: 'board', id: screen.projectId });
   }, [ready, missing, missingCard, screen, project]);
