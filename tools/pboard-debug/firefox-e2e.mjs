@@ -12,8 +12,10 @@
  *   C  after a stop/start cycle, connections are closed and ownership
  *      released — reload-leak report from the registry findings
  *   D  pull-model state inspection returns a real board snapshot
+ *   E  the relay process is killed and restarted: the crash and the recovery
+ *      are observed at the bridge (closes, reconnect schedules, re-accepts)
  *
- * Usage: node tools/pboard-debug/firefox-e2e.mjs [--scenario A|B|C|D|all]
+ * Usage: node tools/pboard-debug/firefox-e2e.mjs [--scenario A|B|C|D|E|all]
  * Requires: /usr/bin/firefox, geckodriver (PBOARD_GECKODRIVER or npx),
  * services/pboard-signaling/target/debug/pboard-signaling, vite.
  */
@@ -185,22 +187,13 @@ try {
   });
 
   // 2. Local Rust relay with automatic board grants (no accounts, no prod).
+  // Started through a helper so scenario E can crash and restart the real
+  // process on the SAME port while the bridge keeps observing: the browsers'
+  // persisted relay URL must stay valid, which is exactly the path a real
+  // operator's restart takes.
+  const relayGrants = join(work, "grants.json");
+  await writeFile(relayGrants, '{"rooms":{}}');
   const relayPort = await port();
-  const grants = join(work, "grants.json");
-  await writeFile(grants, '{"rooms":{}}');
-  rust = spawn(resolve("services/pboard-signaling/target/debug/pboard-signaling"), {
-    env: { ...process.env, PBOARD_SIGNALING_GRANTS: grants, PBOARD_SIGNALING_BIND: `127.0.0.1:${relayPort}`, PBOARD_SIGNALING_BOARD_GRANTS: "1", RUST_LOG: "pboard_signaling=info" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  // Feed the relay's own tracing output into the bridge as `relay.*` events
-  // (the same observer a journald tail would use in production). Tracing
-  // writes to stdout; both streams are observed so a future switch to stderr
-  // keeps observation intact. One 'data' consumer per stream, manually teed:
-  // mixing async-iteration and 'data' listeners on one stream loses chunks.
-  const stderr = teeLines(rust.stderr);
-  const stdout = teeLines(rust.stdout);
-  observeRelayLogs(toLines(stdout.iterable));
-  observeRelayLogs(toLines(stderr.iterable));
   function teeLines(stream) {
     const chunks = [];
     const waiters = [];
@@ -221,8 +214,22 @@ try {
       })(),
     };
   }
-  await until(async () => { try { return (await fetch(`http://127.0.0.1:${relayPort}/healthz`)).ok; } catch { return false; } }, "Rust relay did not start");
-  console.log(`relay on ws://127.0.0.1:${relayPort}/ws`);
+  async function startRelay() {
+    rust = spawn(resolve("services/pboard-signaling/target/debug/pboard-signaling"), {
+      env: { ...process.env, PBOARD_SIGNALING_GRANTS: relayGrants, PBOARD_SIGNALING_BIND: `127.0.0.1:${relayPort}`, PBOARD_SIGNALING_BOARD_GRANTS: "1", RUST_LOG: "pboard_signaling=info" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    // Feed the relay's own tracing output into the bridge as `relay.*` events
+    // (the same observer a journald tail would use in production). Tracing
+    // writes to stdout; both streams are observed so a future switch to stderr
+    // keeps observation intact. One 'data' consumer per stream, manually teed:
+    // mixing async-iteration and 'data' listeners on one stream loses chunks.
+    observeRelayLogs(toLines(teeLines(rust.stdout).iterable));
+    observeRelayLogs(toLines(teeLines(rust.stderr).iterable));
+    await until(async () => { try { return (await fetch(`http://127.0.0.1:${relayPort}/healthz`)).ok; } catch { return false; } }, "Rust relay did not start");
+    console.log(`relay on ws://127.0.0.1:${relayPort}/ws`);
+  }
+  await startRelay();
 
   // 3. Probe extension: real runtime + real debug SDK via vite build.
   await build({
@@ -382,6 +389,38 @@ try {
     const afterReconnect = await bridgeApi("/connections/checks");
     const dupAfter = afterReconnect.findings.filter((finding) => finding.kind === "duplicate-connections" && ["firefox-a", "firefox-b"].includes(finding.key?.split("|")[0]));
     check("C3 reconnect registers exactly one live socket per client", dupAfter.length === 0, JSON.stringify(dupAfter.map((f) => f.summary)));
+
+    // --- Scenario E: the relay process is killed, then restarted ---
+    // Real fault observation on the real stack: the crash must arrive at the
+    // bridge as a non-clean close plus scheduled reconnect for every browser,
+    // the restart as fresh accepted sessions, and collaboration must recover.
+    // Counts are baseline-subtracted: the ring still holds the whole session.
+    const wsQuery = `/events?${new URLSearchParams({ filter: JSON.stringify({ component: "websocket" }), limit: "5000" })}`;
+    const countWs = (events, event, match = () => true) => events.filter((e) => e.event === event && ["firefox-a", "firefox-b"].includes(e.clientId) && match(e)).length;
+    const before = await bridgeApi(wsQuery);
+    const baseClosed = countWs(before.events, "connection.closed", (e) => e.details?.cause === "network");
+    const baseSched = countWs(before.events, "reconnect.scheduled");
+    const beforeRelay = await bridgeApi(`/events?${new URLSearchParams({ filter: JSON.stringify({ component: "relay", event: "connection.accepted" }), limit: "5000" })}`);
+    const relayExited = new Promise((done) => rust.once("exit", done));
+    rust.kill("SIGKILL");
+    await relayExited;
+    const crashSeen = await until(async () => {
+      const r = await bridgeApi(wsQuery);
+      const closes = countWs(r.events, "connection.closed", (e) => e.details?.cause === "network") - baseClosed;
+      const sched = countWs(r.events, "reconnect.scheduled") - baseSched;
+      return closes >= 2 && sched >= 1 ? { closes, sched } : false;
+    }, "relay kill not observed as non-clean closes + scheduled reconnect at the bridge", 200);
+    check("E1 relay crash observed as non-clean closes + scheduled reconnect", crashSeen.closes >= 2 && crashSeen.sched >= 1, `closes=${crashSeen.closes} reconnect.scheduled=${crashSeen.sched}`);
+    await startRelay();
+    // A restarted relay has lost its grant cache: every reconnecting device
+    // would answer `authorization_unavailable` until the authority device
+    // republishes its board grant. This is the same advertised-repair step
+    // `healRelay` performs on the operation path; here the operator gesture
+    // is explicit.
+    await a("(async()=>JSON.stringify(await e2e.runtime.boardCollaboration.security('e2e-board',true)).slice(0,120))()");
+    await until(() => Promise.all([a("e2e.peers()"), b("e2e.peers()")]).then((counts) => counts.every((n) => n === 1)), "collaboration did not recover after relay restart", 500);
+    const reopened = await bridgeApi(`/events?${new URLSearchParams({ filter: JSON.stringify({ component: "relay", event: "connection.accepted" }), limit: "5000" })}`);
+    check("E2 relay restart observed (accepted sessions) and collaboration recovered", reopened.events.length - beforeRelay.events.length >= 2, `accepted +${reopened.events.length - beforeRelay.events.length}`);
   }
 
   const failed = results.filter((entry) => !entry.ok);
