@@ -40,17 +40,33 @@ flowchart LR
 
 ## Gaps and implementation direction
 
-1. Establish a real Firefox automation feasibility test with two disposable profiles and the actual extension, with explicit process cleanup and no production-network access. Existing `services/pboard-signaling/firefox-ui-smoke.mjs` and related Firefox scripts provide a starting point. Firefox is installed on the development host; a WebDriver executable was not found on PATH during this audit. Two-browser automation and CI availability remain unverified.
+1. ~~Establish a real Firefox automation feasibility test with two disposable
+   profiles and the actual extension, with explicit process cleanup and no
+   production-network access.~~ **Closed for the debug bridge:**
+   `npm run debug:test:e2e` runs two disposable headless profiles with the
+   real extension and the real Rust relay against a loopback Drive stub, with
+   explicit process cleanup (`tools/pboard-debug/firefox-e2e.mjs`,
+   [debugging/firefox-debugging.md](../debugging/firefox-debugging.md)). It
+   proves local feasibility, not CI availability (no CI browser execution has
+   been demonstrated), and its collaboration fixture is the legacy board-grant
+   posture.
 2. Provide explicit test-only service endpoints and authentication seams, compiled out of production, without bypassing authorization. Reuse the Rust relay and its test-only verifier where possible; prove ID-token, access-token and Drive identity matching. The in-process synthetic token convention is not a substitute for that validation.
 3. Consolidate and contract-test the Drive and relay doubles against the production requests and server semantics. Enforce inherited ACLs on every mutation, including revocation and conditional writes. The fake does not claim Google Drive compatibility; revisions, failure injection, clock behavior and HTTP fidelity need systematic assessment.
-4. Add deterministic fault scenarios, event correlation with redaction, independent persisted-state and server assertions, reproducible seeded model tests and machine-readable failure reports. Existing restart/replay faults and counters are partial coverage only.
+4. ~~Add deterministic fault scenarios, event correlation with redaction,
+   independent persisted-state and server assertions, reproducible seeded
+   model tests and machine-readable failure reports.~~ **Partly provided by
+   the debug bridge:** seeded mock-mode scenarios with bridge-gated fault
+   injection, schema-enforced redaction, cross-client trace correlation and
+   exported machine-readable captures
+   ([debugging/test-harness-integration.md](../debugging/test-harness-integration.md)).
+   Independent persisted-state assertions and a full offline run remain open.
 5. Add a scenario catalog, consistency checks, documented local commands, CI browser installation/execution and release verification gates only after the corresponding tests work. Do not silently exclude failures or use production credentials or endpoints.
 
 ## Current verification and limitations
 
-The most recent complete local Vitest run reports **1,870 passed, 0 failed** across 257 files. Reaching that required two kinds of work, both worth knowing before the next investigation:
+The most recent complete local Vitest run reports **1,904 passed, 0 failed** across 260 files (includes the Live Debug Bridge suites — `npm run debug:test`). Reaching that required two kinds of work, both worth knowing before the next investigation:
 
 - **Real defects on the Drive-authorized path**, each now fixed and covered: the reconnect-ceiling bypass was wired only into the signed-authority room, so `healRelay(force)` could never repair a Drive-authorized room; a Drive-authorized board's room never flushed its log tail on close, so switching boards stranded the tail and the durable snapshot kept the state from before the session's edits; a record enqueued while the account channel's flush was running was stranded until the next `synced` edge, which a healthy connection never reaches; and `assertCanMutate` consulted only the project row, so a tombstoned board whose row survives let a live device author into it after the owner's erase.
-- **Suites written for the retired signed-authority path**, retargeted to Drive-ACL authority (same-account join, editor/viewer roles, one room per Drive folder, no courier dials) or removed where the code they exercised is unreachable in every shipping composition root (the account re-pin panel, the `account:<hash>` pin ceremony, and the Drive-presence ghost room). The local Drive fake's viewer metadata-write authorization was independently reproduced and corrected with a regression test during this audit. No two-Firefox acceptance test, randomized replay, full offline run, or remote CI execution has been demonstrated. The count above is local evidence; it is not proof of deployment behaviour.
+- **Suites written for the retired signed-authority path**, retargeted to Drive-ACL authority (same-account join, editor/viewer roles, one room per Drive folder, no courier dials) or removed where the code they exercised is unreachable in every shipping composition root (the account re-pin panel, the `account:<hash>` pin ceremony, and the Drive-presence ghost room). The local Drive fake's viewer metadata-write authorization was independently reproduced and corrected with a regression test during this audit. No randomized replay, full offline run, or remote CI execution has been demonstrated. Two-Firefox acceptance now exists for the debug bridge (`npm run debug:test:e2e`, local only) and demonstrates local feasibility, not CI. The count above is local evidence; it is not proof of deployment behaviour.
 
 For the implemented metadata-write boundary, Google's [role reference](https://developers.google.com/workspace/drive/api/guides/ref-roles) distinguishes reader and writer access. Actual Drive uses finer-grained [file capabilities](https://developers.google.com/workspace/drive/api/reference/rest/v3/files); the fixture's role check is an approximation and does not yet model every restriction or shared-drive rule.

@@ -22,3 +22,15 @@ When modifying Pboard, inspect the existing testing infrastructure and [testing 
 - Review relay protocol contracts, server fixtures and synchronization tests for message changes; review convergence and regression tests for synchronization changes, and recovery and durability tests for persistence changes.
 - Cover new user-visible collaborative operations with multi-client tests. For collaboration bugs, reproduce the bug in a regression test before fixing it whenever feasible.
 - Update affected architecture diagrams and mock limitations. Add new scenarios to the testing scenario catalog when one exists, and keep contracts and documentation aligned with actual behavior.
+
+## Live Debug Bridge
+
+When changing authentication, synchronization, transport, Drive, or persistence code, keep the Live Debug Bridge instrumentation truthful (see [docs/debugging/](docs/debugging/README.md)):
+
+- Emit only through `src/debug` helpers, and register every event name in `DEBUG_EVENTS` (`src/debug/schema.ts`) before emitting it; unregistered names are rejected at both producer and bridge.
+- Diagnostics must never change application behaviour and must be content-free: ids, counts, states and codes only — never tokens, credentials, SDP, key material or board contents. The bus redacts by key name as a backstop, not as permission.
+- `src/debug` and `tools/pboard-debug` run under Node's type stripping: keep those modules free of runtime imports in `schema.ts` and of non-erasable TypeScript syntax.
+- Changes to `src/debug`, `tools/pboard-debug`, or any emit site require `npm run debug:test`; changes to collaboration transports additionally require the real-browser acceptance run `npm run debug:test:e2e` (Firefox + geckodriver via `PBOARD_GECKODRIVER`, see [firefox-debugging.md](docs/debugging/firefox-debugging.md)).
+- Update `docs/debugging/event-schema.md` when the registry changes, `docs/debugging/instrumentation.md` when emit sites change, and `CARD_OPERATION_TRACE_STAGES` when a user-visible pipeline gains or loses a stage.
+- The bridge binds loopback only, authenticates with `PBOARD_DEBUG_TOKEN` when set, and refuses cross-origin callers; fault injection exists only in bridge mode `mock`. Production observation is read-only (relay log observer); accessing production at all requires explicit applicable authorization under the pinned SECURITY policy.
+- Exported captures and E2E artefacts live under gitignored `test-results/`; they contain ids and timings. Never commit them; when quoting one (a report demonstration), include only the minimal excerpt and never expand redacted or content-bearing fields.
