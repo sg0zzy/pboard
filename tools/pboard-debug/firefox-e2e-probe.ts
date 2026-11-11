@@ -17,23 +17,19 @@ import { roomSnapshots } from "../../src/sync/realtimeDiagnostics";
 const api = (globalThis as unknown as { chrome: typeof extensionBrowser }).chrome;
 const config: { driveUrl: string } = await (await fetch(api.runtime.getURL("e2e-config.json"))).json();
 
-let connected = false;
+let connected = true;
 let identity = "owner@example.test";
 const rx = await createRxRepository({ name: "pboarde2edebag", blobs: createIndexedDbBlobStore() });
 
 const runtime = createDriveRuntime({
+  // Fixture posture: always-connected account whose Drive HTTP answers from
+  // the loopback stub, and NO Drive identity credentials — the collaboration
+  // room is then the signed board-grant (legacy authority) room, the same
+  // fixture collaboration the grant smokes drive. The Drive-authority room
+  // (getDriveIdentityCredentials present) verifies real Google JWTs and is
+  // not fixture-testable; the bridge instruments both paths identically.
   auth: {
-    getAccessToken: async () => {
-      if (!connected) throw Error("No Google credential is available");
-      return identity;
-    },
-    // The operation-sync build opens its relay room only with Drive identity
-    // credentials; the fixture returns the same stub token (the loopback
-    // relay admits by board grant, and no real Google is contacted).
-    getDriveIdentityCredentials: async () => {
-      if (!connected) throw Error("No Google credential is available");
-      return { accessToken: identity, idToken: `fixture-id-token-for-${identity}` };
-    },
+    getAccessToken: async () => identity,
     getConnectionState: async () => (connected ? "connected" : "disconnected"),
     isConfigured: () => true,
     connect: async () => {
@@ -43,6 +39,7 @@ const runtime = createDriveRuntime({
       connected = false;
     },
   },
+  operationSync: false,
   storage: api.storage.local,
   getRepository: async () => rx,
   // Same fixture posture as the proven smokes: googleapis requests answer

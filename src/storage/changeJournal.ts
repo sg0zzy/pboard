@@ -1,6 +1,7 @@
 import { portableJournalChanges, type JournalProof, type HistoryAdmission } from "../collab/security/journalProof";
 import { canonicalize, type Json } from "../collab/security/canonical";
 import { collaborationCounters } from "../collab/counters";
+import { emit } from "../debug/bus";
 import { dominates, latestFact, mergeFacts,
   type BoardDeletionState, type BoardTombstoneFact, type BoardTombstoneKind, type CausalContext, type DeletionRole } from "./boardTombstone";
 import { confirmedBoardCleanup, failedBoardCleanup, pendingBoardCleanup, type BoardCleanupState } from "./boardCleanup";
@@ -493,6 +494,14 @@ export class ChangeJournal {
         }
         for (const entry of entries) {
           const previous = existing.find(c => c.id === entry.id && c.state === "committed");
+          // `observed` entries reaching durable commit here are the posture's
+          // applied-change signal: peer replication, reconciliation receive and
+          // Drive history archive all land through this method (local origins
+          // are authored writes, already signalled at the storage hook).
+          // Content-free — identity and provenance only.
+          if (!previous && entry.origin === "observed")
+            emit({ component: "sync", event: "operation.applied", severity: "info", boardId: entry.boardId, operationId: entry.id,
+              details: { journal: entry.collection, documentId: entry.documentId, parents: entry.parents.length } });
           if (!previous) store.put(entry);
           else if ((!previous.proof && entry.proof) || (!previous.admission && entry.admission)) store.put({ ...previous,
             ...(entry.proof ? { proof: entry.proof } : {}), ...(entry.admission ? { admission: entry.admission } : {}) });

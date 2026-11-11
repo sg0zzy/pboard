@@ -192,11 +192,14 @@ try {
     env: { ...process.env, PBOARD_SIGNALING_GRANTS: grants, PBOARD_SIGNALING_BIND: `127.0.0.1:${relayPort}`, PBOARD_SIGNALING_BOARD_GRANTS: "1", RUST_LOG: "pboard_signaling=info" },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  // Feed the relay's own tracing lines into the bridge as `relay.*` events
-  // (the same observer a journald tail would use in production). One 'data'
-  // consumer, manually teed: mixing async-iteration and 'data' listeners on
-  // one stream loses chunks.
+  // Feed the relay's own tracing output into the bridge as `relay.*` events
+  // (the same observer a journald tail would use in production). Tracing
+  // writes to stdout; both streams are observed so a future switch to stderr
+  // keeps observation intact. One 'data' consumer per stream, manually teed:
+  // mixing async-iteration and 'data' listeners on one stream loses chunks.
   const stderr = teeLines(rust.stderr);
+  const stdout = teeLines(rust.stdout);
+  observeRelayLogs(toLines(stdout.iterable));
   observeRelayLogs(toLines(stderr.iterable));
   function teeLines(stream) {
     const chunks = [];
@@ -218,7 +221,6 @@ try {
       })(),
     };
   }
-  rust.stdout.on("data", (v) => { relayLogTail = (relayLogTail + v.toString()).slice(-20000); });
   await until(async () => { try { return (await fetch(`http://127.0.0.1:${relayPort}/healthz`)).ok; } catch { return false; } }, "Rust relay did not start");
   console.log(`relay on ws://127.0.0.1:${relayPort}/ws`);
 
@@ -320,6 +322,12 @@ try {
   const opened = connectionEvents.events.filter((e) => e.event === "connection.opened");
   const requested = connectionEvents.events.filter((e) => e.event === "connection.requested");
   const authenticated = authEvents.events.filter((e) => e.event === "authentication.completed");
+  if (process.env.PBOARD_E2E_DUMP) {
+    const all = await bridgeApi(`/events?${new URLSearchParams({ limit: "5000" })}`);
+    const counts = new Map();
+    for (const e of all.events) counts.set(`${e.clientId} ${e.component}/${e.event}`, (counts.get(`${e.clientId} ${e.component}/${e.event}`) ?? 0) + 1);
+    for (const [key, count] of [...counts].sort()) console.error(`dump ${count}× ${key}`);
+  }
   check("A2 connection lifecycle events (requested+opened)", requested.length >= 1 && opened.length >= 1, `requested=${requested.length} opened=${opened.length}`);
   check("A3 auth completed for both clients", authenticated.length >= 1, `auth events=${authEvents.events.length}`);
   const relaySeen = await until(async () => { const r = await bridgeApi(`/events?${new URLSearchParams({ filter: JSON.stringify({ component: "relay" }) })}`); return r.events.length >= 2 ? r : false; }, "no relay.* events from the real Rust relay", 50);

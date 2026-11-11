@@ -5,6 +5,7 @@ import { ChangeJournal, documentValue, type Change, type JournalEntry } from "./
 import { canonicalize } from "../collab/security/canonical";
 import { resolutionParents } from "./resolutionOrigin";
 import { isJournalMaterialization } from "./journalMaterialization";
+import { emit } from "../debug/bus";
 
 // Explicit allowlist: replication/storage maintenance must never invent ancestry.
 const localContexts = new Set(["rx-collection-bulk-insert", "rx-collection-bulk-remove", "rx-document-save-data", "incremental-write"]);
@@ -56,7 +57,24 @@ export function installJournalStorage<T>(collection: RxCollection<T>, name: Chan
     // A thrown/ambiguous storage error leaves prepared rows for startup recovery.
     const result = await original.call(storage, rows, context);
     if (entries.length) {
-      await journal.finish(entries, new Set(result.error.map(error => error.documentId)));
+      const failedIds = new Set(result.error.map((error) => error.documentId));
+      await journal.finish(entries, failedIds);
+      // The causal journal is this posture's authored-change choke point:
+      // a locally committed entry is an operation this device created, an
+      // observed one is an operation it applied from a peer. `journal.prepare`
+      // is the only producer here, so origins are exactly local/observed.
+      // Content-free — identity, ordering and origin only.
+      for (const entry of entries) {
+        if (failedIds.has(entry.documentId)) continue;
+        emit({
+          component: "sync",
+          event: entry.origin === "local" ? "operation.created" : "operation.applied",
+          severity: "info",
+          boardId: entry.boardId,
+          operationId: entry.id,
+          details: { journal: name, collection: entry.collection, documentId: entry.documentId, parents: entry.parents.length },
+        });
+      }
       const conversion = committed?.(entries);
       if (conversion) await conversion;
     }

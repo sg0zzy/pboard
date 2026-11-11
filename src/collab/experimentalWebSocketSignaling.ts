@@ -7,7 +7,8 @@ import { validateWebSocketEndpoint } from "./security/endpoint";
 import { prepareRelayAdmission, type RelayAuthorization } from "./security/relayAdmission";
 import { collaborationDiagnostic } from "./diagnostics";
 import { collaborationCounters } from "./counters";
-import { trackTransportSocket, type TransportDial } from "../sync/transportDiagnostics";
+import { trackTransportSocket, emitBridgeFrame, type TransportDial } from "../sync/transportDiagnostics";
+import { emit } from "../debug/bus";
 import { automaticAuthBudget, type AuthBudget } from "./authBudget";
 
 export type ServiceAdmissionRequest = { challenge: string; session: string; room: string; key: StoredDeviceKey };
@@ -63,6 +64,7 @@ export function createExperimentalWebSocketSignaling(options: {
   function roster() { rosterHandler([...peers.keys()].sort()); }
   function send(message: unknown) {
     if (!socket || socket.readyState !== Socket.OPEN) throw new Error("Experimental signaling is disconnected");
+    emitBridgeFrame(currentDial, "sent", message as { type?: unknown }, { severity: "debug" });
     socket.send(JSON.stringify(message));
   }
   async function connect() {
@@ -107,6 +109,7 @@ export function createExperimentalWebSocketSignaling(options: {
       inbound = inbound.then(async () => {
         if (stopped || socket !== ws || ws.readyState !== Socket.OPEN) return;
         const message = parseStrictJson(String(event.data), 128 * 1024) as Record<string, unknown>;
+        emitBridgeFrame(currentDial, "received", message as { type?: unknown }, { severity: "debug" });
         switch (message.type) {
           case "welcome": {
             if (message.version !== 1 || typeof message.challenge !== "string" || typeof message.session !== "string" || ownSession) throw new Error("Invalid signaling welcome");
@@ -134,6 +137,9 @@ export function createExperimentalWebSocketSignaling(options: {
             }
             const signature = await signBytes(await importSigningKey(key.privateJwk), bytes);
             if (stopped || socket !== ws || ws.readyState !== Socket.OPEN) return;
+            // Same schema-v1 auth pair the log transports emit, so a relay
+            // room looks alike from the bridge whichever transport dials it.
+            dial?.debugConnectionId !== undefined && emit({ component: "auth", event: "authentication.started", severity: "info", connectionId: dial.debugConnectionId, details: { version: admission ? 2 : 1, room: options.topic.slice(0, 96), ...(admission ? { authorization: true } : {}) } });
             send({ type: "authenticate", version: admission ? 2 : 1, room, deviceKeyId: ownId, signature,
               ...(admission ? { authorization: admission.authorization } : {}), ...(serviceAdmission ? { serviceAdmission } : {}) });
             break;
@@ -141,6 +147,7 @@ export function createExperimentalWebSocketSignaling(options: {
           case "authenticated":
             if (message.peerId !== ownId || message.session !== ownSession) throw new Error("Signaling identity mismatch");
             authenticated = true;
+            currentDial?.debugConnectionId !== undefined && emit({ component: "auth", event: "authentication.completed", severity: "info", connectionId: currentDial.debugConnectionId, details: { version: message.version === 2 ? 2 : 1, room: options.topic.slice(0, 96) } });
             debug("relay.authenticated");
             send({ type: "join" }); break;
           case "joined":
@@ -208,7 +215,7 @@ export function createExperimentalWebSocketSignaling(options: {
       }
     };
   }
-  function fail(error: unknown) { debug("relay.start_failed"); stopped = true; rejectJoin?.(error instanceof Error ? error : new Error(String(error))); errorHandler(error); }
+  function fail(error: unknown) { debug("relay.start_failed"); currentDial?.debugConnectionId !== undefined && emit({ component: "auth", event: "authentication.failed", severity: "error", connectionId: currentDial.debugConnectionId, details: { reason: (error instanceof Error ? error.message : String(error)).slice(0, 160), room: options.topic.slice(0, 96) } }); stopped = true; rejectJoin?.(error instanceof Error ? error : new Error(String(error))); errorHandler(error); }
   return {
     join(handler) {
       rosterHandler = handler;
