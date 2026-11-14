@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, Fragment, type DragEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { processImageFile } from "../images/processing";
 import type { CaptureRegionResponse, ToolbarPinContext, ToolbarPinKind, ToolbarPinResponse } from "../messaging/messages";
 import { repository, RXDB_MIGRATION_ERROR_KEY } from "../storage/browser";
@@ -11,7 +11,7 @@ import {
   type BoardItemStatus,
   type BoardTemplate
 } from "../types";
-import { Card } from "./components/Card";
+import { MemoizedCard as Card } from "./components/Card";
 import { PendingWorkControls } from "./components/PendingWorkControls";
 import { ConflictResolutionControls } from "./components/ConflictResolutionControls";
 import { dedupe } from "./minWidth";
@@ -115,6 +115,8 @@ export function App() {
   const pendingStatusesRef = useRef<Record<string, BoardItemStatus>>({});
   const statusCommitScheduler = useRef(new StatusCommitScheduler(STATUS_MOVE_DELAY_MS));
   const itemsRef = useRef<BoardItem[]>([]);
+  /** The board a stable handler must act on *now*, not the one its closure saw. */
+  const currentProjectRef = useRef<import("../types").Project | null>(null);
   const fingerprintTimer = useRef<number | null>(null);
   const fingerprintRevision = useRef(0);
   const projectNameInputRef = useRef<HTMLInputElement>(null);
@@ -360,6 +362,7 @@ export function App() {
   }
 
   itemsRef.current = items;
+  currentProjectRef.current = currentProject;
   const fingerprintItems = items;
   const visibleItems = items.filter((item) =>
     item.status !== "rejected" &&
@@ -499,13 +502,13 @@ export function App() {
   async function removeCardPermanently(itemId: string) {
     clearPendingStatus(itemId);
     setPendingDelete(null);
-    if (selectedCardId === itemId) setSelectedCardId(null);
+    if (selectedCardIdRef.current === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
   }
 
   async function discardEmptyCard(itemId: string) {
     clearPendingStatus(itemId);
-    if (selectedCardId === itemId) setSelectedCardId(null);
+    if (selectedCardIdRef.current === itemId) setSelectedCardId(null);
     await repository.deleteItem(itemId);
   }
 
@@ -514,7 +517,10 @@ export function App() {
   }
 
   async function requestItemDeletion(itemId: string) {
-    const item = items.find((candidate) => candidate.id === itemId);
+    // Live list, not the render's snapshot: a memoized card can hold this
+    // handler from an older render, and the trash decision depends on the
+    // card's *current* status.
+    const item = itemsRef.current.find((candidate) => candidate.id === itemId);
     if (item?.status === "trash") {
       void removeCardPermanently(itemId);
     } else {
@@ -698,6 +704,18 @@ export function App() {
     setFocusRequest({ id: targetId, startEditing: false });
   }
 
+  /**
+   * The status section a card navigates within, computed from a *live* list.
+   * `cardSection` reads the render's `items`; a memoized card must not depend on
+   * the render it last painted in, so both keyboard handlers use this instead.
+   */
+  function sectionForLive(current: BoardItem, live: BoardItem[]): BoardItem[] {
+    if (current.status === "rejected") return live.filter((item) => item.status === "rejected");
+    if (current.status === "done") return live.filter((item) => item.status === "done");
+    if (current.status === "trash") return live.filter((item) => item.status === "trash");
+    return live.filter((item) => item.status !== "rejected" && item.status !== "done" && item.status !== "trash");
+  }
+
   function statusSection(status: BoardItemStatus) {
     if (status === "rejected") return rejectedItems;
     if (status === "done") return doneItems;
@@ -712,19 +730,31 @@ export function App() {
   }
 
   function navigateCard(itemId: string, direction: -1 | 1) {
-    const targetId = adjacentItemId(cardSection(itemId).map((item) => item.id), itemId, direction);
+    const current = itemsRef.current.find((item) => item.id === itemId);
+    if (!current) return;
+    const targetId = adjacentItemId(sectionForLive(current, itemsRef.current).map((item) => item.id), itemId, direction);
     if (!targetId) return;
     setSelectedCardId(targetId);
     setFocusRequest({ id: targetId, startEditing: false });
   }
 
   async function moveCardWithKeyboard(itemId: string, direction: -1 | 1) {
-    if (!currentProject) return;
-    const targetId = adjacentItemId(cardSection(itemId).map((item) => item.id), itemId, direction);
+    // Reads the live board, not the render's snapshot: this runs from a stable
+    // handler that a card holds across renders (`keyboardMoveCard`), so a
+    // captured `items`/`currentProject` would reorder the board as it was when
+    // the card last painted.
+    const board = currentProjectRef.current;
+    const live = itemsRef.current;
+    if (!board) return;
+    // Same sectioning as `cardSection`, against the live list: the four groups
+    // are not one filter each (trash/rejected/done are their own arrays).
+    const current = live.find((item) => item.id === itemId);
+    if (!current) return;
+    const targetId = adjacentItemId(sectionForLive(current, live).map((item) => item.id), itemId, direction);
     if (!targetId) return;
     const position: DropPosition = direction === -1 ? "before" : "after";
-    const ordered = reorderAtTarget(items.map((item) => item.id), itemId, targetId, position);
-    await repository.moveItem(currentProject.id, itemId, ordered);
+    const ordered = reorderAtTarget(live.map((item) => item.id), itemId, targetId, position);
+    await repository.moveItem(board.id, itemId, ordered);
     setSelectedCardId(itemId);
     setFocusRequest({ id: itemId, startEditing: false });
   }
@@ -838,6 +868,40 @@ export function App() {
     }
   }
 
+  /**
+   * The three handlers that used to be inline lambdas per card.
+   *
+   * `Card` is memoized by painted value, so a lambda created during a render is
+   * either a no-op for every card (they all repaint) or — if the comparator
+   * ignored it — a closure a later event would call with stale `items`/
+   * `currentProject`. These keep one identity each and read the live values at
+   * call time instead.
+   */
+  const insertAfterCard = useCallback((itemId: string) => {
+    const board = currentProjectRef.current;
+    if (board) void createCard(board.id, itemId);
+  }, []);
+  const keyboardMoveCard = useCallback((itemId: string, direction: -1 | 1) => {
+    void moveCardWithKeyboard(itemId, direction);
+  }, []);
+  const duplicateCard = useCallback((itemId: string) => { void duplicateItem(itemId); }, []);
+  // Zero-argument per card, so the identity has to be per card id; without the
+  // cache it would be a new lambda on every render and every card would repaint.
+  const focusHandlers = useRef(new Map<string, () => void>());
+  const cardFocusHandled = (itemId: string): (() => void) => {
+    const existing = focusHandlers.current.get(itemId);
+    if (existing) return existing;
+    const handler = () => setFocusRequest((current) => current?.id === itemId ? null : current);
+    focusHandlers.current.set(itemId, handler);
+    // A board accumulates cards over a session, so ids are dropped when they
+    // leave it rather than kept for the life of the page.
+    if (focusHandlers.current.size > 2000) {
+      const live = new Set(itemsRef.current.map((item) => item.id));
+      for (const id of focusHandlers.current.keys()) if (!live.has(id)) focusHandlers.current.delete(id);
+    }
+    return handler;
+  };
+
   function renderSortableCard(item: BoardItem) {
     if (!currentProject) return null;
     const showBefore = dropTarget?.id === item.id && dropTarget.position === "before";
@@ -862,15 +926,15 @@ export function App() {
           isDragging={draggedId === item.id}
           isMergeTarget={mergeTargetId === item.id}
           isMergeSource={draggedId === item.id && (dragMergeMode || mergeTargetId !== null)}
-          onInsertAfter={(itemId) => void createCard(currentProject.id, itemId)}
-          onDuplicate={(itemId) => void duplicateItem(itemId)}
+          onInsertAfter={insertAfterCard}
+          onDuplicate={duplicateCard}
           selected={selectedCardId === item.id}
           onSelect={setSelectedCardId}
           onNavigate={navigateCard}
-          onKeyboardMove={(itemId, direction) => void moveCardWithKeyboard(itemId, direction)}
+          onKeyboardMove={keyboardMoveCard}
           focusRequested={focusRequest?.id === item.id}
           startEditingOnFocus={focusRequest?.id === item.id && focusRequest.startEditing}
-          onFocusHandled={() => setFocusRequest((current) => current?.id === item.id ? null : current)}
+          onFocusHandled={cardFocusHandled(item.id)}
         />
         {pendingMerge?.sourceId === item.id && (
           <DeleteConfirmation

@@ -22,6 +22,13 @@ npm run debug:status
 open http://127.0.0.1:8790/ui   # dashboard
 ```
 
+`scripts/build_all.sh` also stages a diagnostics build at `dist-debug/` (manifest name
+`Pboard (debug channel)`) that has the channel compiled in and enabled by default
+against the same loopback URL, so no storage switch is needed; load it with
+`about:debugging` → Load Temporary Add-on → `dist-debug/manifest.json` in its own
+profile (one temporary add-on per extension ID per profile). `npm run build:firefox-debug`
+builds only that tree. It is developer-only; CI does not build it.
+
 A `DEV` build (or a `VITE_PBOARD_DIAGNOSTICS=1` / `__PBOARD_DIAGNOSTICS__=true`
 build) enables the channel automatically, pointing at the loopback default;
 `{ enabled: false }` silences it. Production builds without the storage

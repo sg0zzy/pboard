@@ -23,6 +23,12 @@ The channel is enabled by exactly one of two policies
    without the storage setting create no transport at all; `emit` stays a
    boolean test and dials carry no debug ids.
 
+   `scripts/build_all.sh` produces such a build as the second Firefox bundle
+   (`dist-debug/`, `npm run build:firefox-debug` for it alone); it points at the
+   default loopback URL and grants `http://127.0.0.1/*` in its generated
+   manifest. Load it in a separate profile from the ordinary `dist/` bundle —
+   Firefox keeps one temporary add-on per extension ID.
+
 Both contexts (background and sidebar) configure independently and get
 distinct `context` fields; ids come from `src/debug/ids.ts` (`clientId` stable
 per profile via storage, `sessionId` per boot). With `VITE` builds there is

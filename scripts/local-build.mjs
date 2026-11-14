@@ -18,7 +18,7 @@ const json = path => JSON.parse(readFileSync(path, 'utf8'));
 
 function sourceSnapshot(destination, buildOptions) {
   const files = [...new Set(git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean))].sort();
-  const excluded = /(^|\/)(node_modules|local_artifacts|dist|web-ext-artifacts|\.git|\.delta|\.build-state|\.gradle|build)(\/|$)|(^|\/)(\.env(?:\..*)?|local\.properties|google-services\.json)$|\.(?:keystore|jks|p12|pem|key)$/i;
+  const excluded = /(^|\/)(node_modules|local_artifacts|dist(?:-debug)?|web-ext-artifacts|\.git|\.delta|\.build-state|\.gradle|build)(\/|$)|(^|\/)(\.env(?:\..*)?|local\.properties|google-services\.json)$|\.(?:keystore|jks|p12|pem|key)$/i;
   const inventory = [];
   for (const name of files) {
     if (excluded.test(name) && name !== '.env.example') continue;
@@ -56,6 +56,9 @@ export function buildLocal(targets, options = {}) {
   if (!targets.length) targets = config.matrix.local.required;
   targets = [...new Set(targets)];
   if (targets.some(t => !config.matrix.local.required.includes(t))) throw Error('Local targets: firefox, chromium, android');
+  // The debug-channel variant is a Firefox developer bundle only; it must never be
+  // produced for a distributable target (see BUILD.md).
+  if (options.diagnostics && targets.some(t => t !== 'firefox')) throw Error('The debug-channel bundle is Firefox-only; build it with build-firefox-debug.mjs');
   if (options.skipFrontend) throw Error('Reusing an old frontend cannot prove source identity; build without --skip-frontend');
   if (!existsSync(join(root, 'node_modules'))) throw Error('Run npm ci at the repository root');
   const core = readFileSync(join(root, 'VERSION'), 'utf8').trim().replace(/-dev$/, '');
@@ -67,7 +70,7 @@ export function buildLocal(targets, options = {}) {
   mkdirSync(snapshot, { mode: 0o700 });
   const outputs = [], outcomes = targets.map(id => ({ id, required: true, outcome: 'pending' }));
   try {
-    const buildOptions = { signalingExperiment: !!options.signalingExperiment, signalingUrl: options.signalingExperiment ? (process.env.VITE_PBOARD_SIGNALING_WS_URL || 'ws://127.0.0.1:8787/ws') : undefined };
+    const buildOptions = { signalingExperiment: !!options.signalingExperiment, signalingUrl: options.signalingExperiment ? (process.env.VITE_PBOARD_SIGNALING_WS_URL || 'ws://127.0.0.1:8787/ws') : undefined, diagnostics: !!options.diagnostics };
     if (options.signalingExperiment && process.env.VITE_PBOARD_SIGNALING_GOOGLE_ENROLLMENT === '1') {
       const key = JSON.parse(process.env.VITE_PBOARD_SIGNALING_AUTHORITY || 'null');
       if (!key || Object.keys(key).sort().join(',') !== 'crv,kty,x,y' || key.kty !== 'EC' || key.crv !== 'P-256' || !/^[A-Za-z0-9_-]{43}$/.test(key.x) || !/^[A-Za-z0-9_-]{43}$/.test(key.y)) throw Error('Google enrollment requires only a public P-256 authority pin');
@@ -78,7 +81,7 @@ export function buildLocal(targets, options = {}) {
       if (url.username || url.password || url.search || url.hash || !(url.protocol === 'wss:' || (url.protocol === 'ws:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)))) throw Error('Invalid experimental signaling URL');
     }
     const { digest, buildEnv } = sourceSnapshot(snapshot, buildOptions);
-    const env = { ...buildEnv, PBOARD_STAGE: '1', PBOARD_SIGNALING_DEV_BUILD: options.signalingExperiment ? '1' : '' };
+    const env = { ...buildEnv, PBOARD_STAGE: '1', PBOARD_SIGNALING_DEV_BUILD: options.signalingExperiment ? '1' : '', PBOARD_DEBUG_BUNDLE: options.diagnostics ? '1' : '', VITE_PBOARD_DIAGNOSTICS: options.diagnostics ? '1' : '' };
     if (options.signalingExperiment) {
       if (targets.includes('android')) throw Error('Experimental extension build supports firefox/chromium only');
       env.VITE_PBOARD_SIGNALING_WS_URL = process.env.VITE_PBOARD_SIGNALING_WS_URL || 'ws://127.0.0.1:8787/ws';
@@ -96,16 +99,17 @@ export function buildLocal(targets, options = {}) {
       standardsCommit: json(join(root, 'dev-standards.lock.json')).commit,
       configurationSha256: hash(readFileSync(join(root, 'project-standards.json'))),
       environment: { os: platform(), architecture: arch(), kernel: release(), node: process.version, npm: execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(), dependencyLocks: Object.fromEntries(['package-lock.json', 'apps/android/package-lock.json'].map(p => [p, hash(readFileSync(join(snapshot, p)))])) },
-      options: { targets, testOnly: true, signalingExperiment: !!options.signalingExperiment, signalingUrl: options.signalingExperiment ? env.VITE_PBOARD_SIGNALING_WS_URL : undefined, googleEnrollment: !!buildOptions.googleEnrollment, enrollmentAuthority: buildOptions.enrollmentAuthority },
+      options: { targets, testOnly: true, signalingExperiment: !!options.signalingExperiment, signalingUrl: options.signalingExperiment ? env.VITE_PBOARD_SIGNALING_WS_URL : undefined, googleEnrollment: !!buildOptions.googleEnrollment, enrollmentAuthority: buildOptions.enrollmentAuthority, diagnostics: !!options.diagnostics },
       ci: process.env.CI ? { run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, event: process.env.GITHUB_EVENT_NAME, eventSha: process.env.GITHUB_SHA, head: process.env.PR_HEAD_SHA, base: process.env.PR_BASE_SHA, revisionPolicy: 'proposed-merge for PR; event SHA for push' } : undefined
     };
     updateBuild(dir, info);
     const archive = (path, target, extension, packageVersion, extra = {}) => {
-      const filename = `Pboard-${id}-${target}-universal.${extension}`;
+      const suffix = options.diagnostics ? '-debug' : '';
+      const filename = `Pboard-${id}-${target}${suffix}-universal.${extension}`;
       copyFileSync(path, join(dir, filename), 1);
       const bytes = readFileSync(join(dir, filename));
       outputs.push({ filename, target, bytes: bytes.length, sha256: hash(bytes), packageVersion, ...extra });
-      console.log(`ARTIFACT ${target}: local_artifacts/${id}/${filename}`);
+      console.log(`ARTIFACT ${target}${suffix}: local_artifacts/${id}/${filename}`);
     };
     for (const target of targets) {
       try {
@@ -141,18 +145,31 @@ export function buildLocal(targets, options = {}) {
           archive(apk, target, 'apk', id, { versionCode: code, signing: 'debug-test-only', certificateSha256: signer });
         } else {
           run('npm', ['run', target === 'firefox' ? 'build' : 'build:chromium'], snapshot, env);
-          if (target === 'firefox') run('npm', ['run', 'lint:firefox'], snapshot, env);
-          if (options.signalingExperiment && target === 'firefox') {
-            const version = json(join(snapshot, 'package.json')).version;
-            run('npm', ['exec', '--', 'web-ext', 'build', '--config', 'web-ext-config.cjs', '--overwrite-dest', '--filename', `pboard-${version}.zip`], snapshot, env);
-            run(process.execPath, ['scripts/verify-package.mjs'], snapshot, env);
+          const stagedDist = target === 'firefox' && options.diagnostics ? 'dist-debug' : target === 'firefox' ? 'dist' : 'dist/chromium';
+          if (target === 'firefox') {
+            if (options.diagnostics) {
+              // The debug-channel tree is linted, verified and packaged from its own
+              // directory; dist/ stays the ordinary developer install.
+              run('npm', ['exec', '--', 'web-ext', 'lint', '--config', 'web-ext-lint-config.cjs', '--warnings-as-errors', '--source-dir', stagedDist], snapshot, env);
+              run(process.execPath, ['scripts/verify-build.mjs', 'firefox', stagedDist], snapshot, env);
+              const version = json(join(snapshot, 'package.json')).version;
+              run('npm', ['exec', '--', 'web-ext', 'build', '--config', 'web-ext-config.cjs', '--source-dir', stagedDist, '--overwrite-dest', '--filename', `pboard-${version}.zip`], snapshot, env);
+              run(process.execPath, ['scripts/verify-package.mjs', `web-ext-artifacts/pboard-${version}.zip`, stagedDist], snapshot, env);
+            } else {
+              run('npm', ['run', 'lint:firefox'], snapshot, env);
+              if (options.signalingExperiment) {
+                const version = json(join(snapshot, 'package.json')).version;
+                run('npm', ['exec', '--', 'web-ext', 'build', '--config', 'web-ext-config.cjs', '--overwrite-dest', '--filename', `pboard-${version}.zip`], snapshot, env);
+                run(process.execPath, ['scripts/verify-package.mjs'], snapshot, env);
+              } else run('npm', ['run', 'package:firefox'], snapshot, env);
+            }
           } else run('npm', ['run', `package:${target}`], snapshot, env);
           const packageVersion = json(join(snapshot, 'package.json')).version;
-          archive(join(snapshot, `web-ext-artifacts/pboard-${target === 'chromium' ? 'chromium-' : ''}${packageVersion}.zip`), target, 'zip', packageVersion, { signing: 'unsigned-upload-archive', productVersion: id });
+          archive(join(snapshot, `web-ext-artifacts/pboard-${target === 'chromium' ? 'chromium-' : ''}${packageVersion}.zip`), target, 'zip', packageVersion, { signing: 'unsigned-upload-archive', productVersion: id, ...(options.diagnostics ? { debugChannel: true } : {}) });
           // Preserve existing unpacked-extension developer installation paths as intermediates.
-          const dist = target === 'firefox' ? 'dist' : 'dist/chromium';
+          const dist = target === 'firefox' ? (options.diagnostics ? 'dist-debug' : 'dist') : 'dist/chromium';
           withArtifactLock(ARTIFACTS_DIR, () => {
-          if (target === 'firefox') {
+          if (target === 'firefox' && !options.diagnostics) {
             // Preserve Chromium's separate staging tree while replacing Firefox intermediates.
             const chromium = join(root, 'dist/chromium');
             if (existsSync(chromium)) cpSync(chromium, join(scratch, 'chromium-staging'), { recursive: true });

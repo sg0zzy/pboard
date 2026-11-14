@@ -4,6 +4,8 @@ import { runInNewContext } from "node:vm";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const requestedVariant = process.argv[2] ?? "all";
+// Optional alternate output directory (e.g. the `dist-debug` developer bundle).
+const requestedDirectory = process.argv[3];
 const packageMetadata = await readJson("package.json");
 
 // The startup sandbox deliberately has no IndexedDB, so the legacy Dexie storage
@@ -25,8 +27,18 @@ async function assertFile(path) {
   await access(resolve(root, path));
 }
 
-function verifyBackgroundStartup(source, kind) {
+async function verifyBackgroundStartup(source, kind, debugChannel = false) {
   const listeners = new Map();
+  // Timers are tracked so the debug channel's inspection poll (a self-rescheduling
+  // timer) can be stopped when verification ends; an ordinary bundle leaves none.
+  const timers = new Set();
+  const sandboxSetTimeout = (fn, ms, ...args) => {
+    const id = setTimeout(() => { timers.delete(id); fn(...args); }, ms);
+    timers.add(id);
+    return id;
+  };
+  const sandboxClearTimeout = (id) => { timers.delete(id); clearTimeout(id); };
+  const stopTimers = () => { for (const id of timers) clearTimeout(id); timers.clear(); };
   const event = (name) => ({
     addListener(listener) { listeners.set(name, listener); },
     removeListener() {}
@@ -75,21 +87,32 @@ function verifyBackgroundStartup(source, kind) {
   ]));
   runInNewContext(source, {
     [kind === "firefox" ? "browser" : "chrome"]: api,
-    console: sandboxConsole, crypto: globalThis.crypto, setTimeout, clearTimeout,
+    console: sandboxConsole, crypto: globalThis.crypto, setTimeout: sandboxSetTimeout, clearTimeout: sandboxClearTimeout,
     setInterval, clearInterval, queueMicrotask, TextEncoder, TextDecoder,
     URL, URLSearchParams, AbortController, performance, structuredClone,
     Headers, Request, Response, Blob, atob, btoa,
     // Present in both real background contexts (Firefox page, Chromium service worker);
     // Dexie dispatches CustomEvent when closing the storage that failed without IndexedDB.
     Event, CustomEvent, EventTarget, DOMException,
-    fetch: async () => { throw new Error("Unexpected network request during startup verification"); }
+    // A debug-channel bundle dials the loopback bridge by design; every other
+    // request during startup is still a failure. The bridge itself is absent here,
+    // so its endpoints answer "unavailable" instead of rejecting.
+    fetch: async (input) => {
+      if (debugChannel && /^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d+\//.test(String(input))) {
+        // The bridge accepts and answers; nothing is listening in this sandbox.
+        return { ok: true, status: 200, text: async () => "" };
+      }
+      throw new Error("Unexpected network request during startup verification");
+    }
   }, { filename: `${kind}/background.js`, timeout: 5000 });
+  await new Promise((done) => setTimeout(done, 250));
+  stopTimers();
   for (const name of ["installed", "message", "menu", "command", "alarm"]) {
     if (!listeners.has(name)) throw new Error(`${kind} background did not register ${name}`);
   }
 }
 
-async function verifyVariant(directory, manifest, kind) {
+async function verifyVariant(directory, manifest, kind, debugChannel = false) {
   await assertFile(`${directory}/manifest.json`);
   await assertFile(`${directory}/sidebar.html`);
   await assertFile(`${directory}/background.js`);
@@ -128,14 +151,24 @@ async function verifyVariant(directory, manifest, kind) {
   if (!background.includes("OffscreenCanvas")) {
     throw new Error(`${kind} background bundle is missing the service-worker image path`);
   }
-  verifyBackgroundStartup(background, kind);
+  await verifyBackgroundStartup(background, kind, debugChannel);
 }
 
-if (requestedVariant === "firefox" || requestedVariant === "all") {
-  await verifyVariant("dist", await readJson("dist/manifest.json"), "firefox");
-}
-if (requestedVariant === "chromium" || requestedVariant === "all") {
-  await verifyVariant("dist/chromium", await readJson("dist/chromium/manifest.json"), "chromium");
+if (requestedDirectory) {
+  if (requestedVariant !== "firefox") throw new Error("An alternate directory is only supported for the firefox variant");
+  const manifest = await readJson(`${requestedDirectory}/manifest.json`);
+  const debugChannel = manifest.name === "Pboard (debug channel)";
+  if (debugChannel && !manifest.host_permissions.includes("http://127.0.0.1/*")) {
+    throw new Error("Debug-channel bundle does not grant the loopback bridge origin");
+  }
+  await verifyVariant(requestedDirectory, manifest, "firefox", debugChannel);
+} else {
+  if (requestedVariant === "firefox" || requestedVariant === "all") {
+    await verifyVariant("dist", await readJson("dist/manifest.json"), "firefox");
+  }
+  if (requestedVariant === "chromium" || requestedVariant === "all") {
+    await verifyVariant("dist/chromium", await readJson("dist/chromium/manifest.json"), "chromium");
+  }
 }
 if (!["firefox", "chromium", "all"].includes(requestedVariant)) {
   throw new Error(`Unknown build variant: ${requestedVariant}`);

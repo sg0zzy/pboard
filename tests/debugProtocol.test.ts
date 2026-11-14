@@ -16,6 +16,7 @@ import { ConnectionRegistry, registryFromEvents } from "../src/debug/connectionR
 import { buildTraceView, cardOperationComplete, correlateTraces, TraceIndex } from "../src/debug/trace";
 import { resolveClientId, resolveSessionId, newDebugId } from "../src/debug/ids";
 import type { DebugTransport } from "../src/debug/bus";
+import { HttpBridgeTransport } from "../src/debug/bridgeTransport";
 
 let clock = 1_000;
 function makeEvent(overrides: Partial<DebugEvent> = {}): DebugEvent {
@@ -316,5 +317,60 @@ describe("ids", () => {
     expect(await resolveClientId("not safe!", undefined)).toMatch(/^client-[0-9a-f]{20}$/);
     expect(resolveSessionId("x".repeat(500))).toMatch(/^session-[0-9a-f]{20}$/);
     expect(newDebugId("conn")).toMatch(/^conn-[0-9a-f]{20}$/);
+  });
+});
+
+describe("bridge transport CORS posture", () => {
+  // A browser extension page is a cross-origin caller of the loopback bridge
+  // (`moz-extension://…` → `http://127.0.0.1:8790`). The bridge refuses every
+  // OPTIONS preflight with 405 and no CORS grant, so a fetch that asks for one
+  // never reaches `/ingest`: the client silently delivered nothing and the bus
+  // counted the loss as a transport drop. The transport must therefore issue
+  // CORS-simple requests only — the property that keeps it working is the
+  // *absence* of any header that triggers a preflight.
+  const SAFELISTED_TYPES = ["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"];
+
+  function isPreflightTriggering(headers: Record<string, string> | undefined): boolean {
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      if (name.toLowerCase() !== "content-type") return true; // any other header preflights
+      const type = value.split(";")[0].trim().toLowerCase();
+      if (!SAFELISTED_TYPES.includes(type)) return true;
+    }
+    return false;
+  }
+
+  async function captureCalls(): Promise<{ url: string; init?: { method?: string; body?: string; headers?: Record<string, string>; keepalive?: boolean } }[]> {
+    const calls: { url: string; init?: { method?: string; body?: string; headers?: Record<string, string>; keepalive?: boolean } }[] = [];
+    const transport = new HttpBridgeTransport({
+      url: "http://127.0.0.1:8790",
+      clientId: "cors-client",
+      sessionId: "cors-session",
+      context: "node-test",
+      fetchImpl: async (input, init) => { calls.push({ url: input, init }); return { ok: true, status: 200, text: async () => "{}" }; },
+    });
+    transport.send([makeEvent()]);
+    transport.attachInspector(async () => ({ kind: "board-state", capturedAt: "x", boards: [], connections: [] }));
+    transport.startInspectionPolling(10);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    transport.close();
+    return calls;
+  }
+
+  it("sends no request the browser would preflight", async () => {
+    const calls = await captureCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const posting = calls.filter((call) => call.init?.method === "POST");
+    expect(posting.length).toBeGreaterThan(0);
+    for (const call of calls) expect(isPreflightTriggering(call.init?.headers)).toBe(false);
+  });
+
+  it("still posts the JSON envelope the bridge parses", async () => {
+    const calls = await captureCalls();
+    const ingest = calls.find((call) => call.url.includes("/ingest"));
+    expect(ingest?.init?.method).toBe("POST");
+    const envelope = JSON.parse(ingest!.init!.body!) as { protocol: number; clientId: string; events: unknown[] };
+    expect(envelope.protocol).toBe(1);
+    expect(envelope.clientId).toBe("cors-client");
+    expect(envelope.events).toHaveLength(1);
   });
 });

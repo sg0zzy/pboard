@@ -144,9 +144,13 @@ export function BoardConfetti({ revision }: { revision: number }) {
             width: `${particle.width}px`,
             height: `${particle.height}px`,
             "--confetti-color": particle.color,
-            "--confetti-start-y": `${particle.startY}%`,
-            "--confetti-middle-y": `${particle.middleY}%`,
-            "--confetti-end-y": `${particle.endY}%`,
+            // `cqh` is the overlay's height (the board), the same measure the
+            // original `top: …%` resolved against. `translateY(%)` would instead
+            // resolve against the piece's own few-pixel height, so the unit is
+            // part of the geometry, not a cosmetic choice.
+            "--confetti-start-y": `${particle.startY}cqh`,
+            "--confetti-middle-y": `${particle.middleY}cqh`,
+            "--confetti-end-y": `${particle.endY}cqh`,
             "--confetti-delay": `${particle.delay}ms`,
             "--confetti-duration": `${particle.duration}ms`,
             "--confetti-kick": `${particle.kick}px`,

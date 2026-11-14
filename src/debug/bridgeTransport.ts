@@ -103,7 +103,16 @@ export class HttpBridgeTransport implements DebugTransport {
       // keepalive lets a batch finish during teardown; browsers cap it at ~64 KiB,
       // and oversized bodies are simply dropped by the bridge.
       keepalive: true,
-      headers: { "content-type": "application/json" },
+      // CORS-simple on purpose: `text/plain` is a safelisted content type, so
+      // the browser sends the POST directly. Setting `application/json` here
+      // made every ingest a preflighted cross-origin request (extension origin →
+      // http://127.0.0.1), and the bridge answers OPTIONS with 405 and no CORS
+      // grant — so the fetch rejected before any byte reached /ingest, the bus
+      // counted a transport drop, and after five consecutive failures the
+      // 30 s cooldown stopped delivery. That is why a running debug build
+      // showed zero clients on the bridge. The bridge parses the body as JSON
+      // without looking at the header, so the type is only advisory.
+      headers: { "content-type": "text/plain;charset=UTF-8" },
     }).then((response) => {
       if (!response.ok) this.options.onError?.(`bridge ingest failed: HTTP ${response.status}`);
     }, (error: unknown) => {
@@ -138,7 +147,9 @@ export class HttpBridgeTransport implements DebugTransport {
           return fetchImpl(this.endpoint("/inspect/respond"), {
             method: "POST",
             body: JSON.stringify({ requestId: request.requestId, snapshot }),
-            headers: { "content-type": "application/json" },
+            // Same rule as ingest: a safelisted type keeps the answer a simple
+            // request, so no preflight is needed for the inspection reply.
+            headers: { "content-type": "text/plain;charset=UTF-8" },
           });
         })
         .catch((error: unknown) => this.options.onError?.(error instanceof Error ? String(error) : String(error)))

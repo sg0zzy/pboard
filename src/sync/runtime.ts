@@ -2173,8 +2173,15 @@ export function createDriveRuntime({ auth: googleAuth, storage, getRepository, f
     const existing = accountManifestKeepAlives.get(account);
     if (!connected) { if (existing) { clearInterval(existing.timer); accountManifestKeepAlives.delete(account); } return; }
     if (existing) return;
-    const entry = { publishedAt: 0, timer: setInterval(() => undefined, 0) };
-    entry.timer = setInterval(() => { void keepAccountManifestFresh(account, entry).catch(() => undefined); }, 60_000);
+    // The entry is registered only once its real 60 s timer exists: a
+    // placeholder handle would have to be replaced immediately, and the
+    // discarded interval kept firing for the lifetime of the context. One
+    // zero-delay interval is a permanent wakeup that no later `clearInterval`
+    // can reach — it was the sidebar's own share of a spinning event loop.
+    const entry: { timer: ReturnType<typeof setInterval>; running?: Promise<void>; publishedAt: number } = {
+      publishedAt: 0,
+      timer: setInterval(() => { void keepAccountManifestFresh(account, entry).catch(() => undefined); }, 60_000),
+    };
     accountManifestKeepAlives.set(account, entry);
     void keepAccountManifestFresh(account, entry).catch(() => undefined);
   }

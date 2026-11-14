@@ -7,11 +7,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Server } from "node:http";
 import { startBridge } from "../tools/pboard-debug/server";
 import { DebugBridgeCore } from "../tools/pboard-debug/core";
 import type { IngestEnvelope } from "../src/debug/protocol";
 
-let bridge: { core: DebugBridgeCore; close: () => Promise<void>; url: string };
+let bridge: { core: DebugBridgeCore; close: () => Promise<void>; url: string; server: Server };
 const TOKEN = "test-token-123";
 
 function envelope(clientId: string, events: unknown[]): IngestEnvelope {
@@ -53,7 +54,7 @@ beforeAll(async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "pboard-debug-test-"));
   const handle = startBridge({ host: "127.0.0.1", port: 0, token: TOKEN, mode: "mock", quiet: true, captureDir });
   const bound = await handle.listening;
-  bridge = { core: handle.core, close: handle.close, url: `http://127.0.0.1:${bound.port}` };
+  bridge = { core: handle.core, close: handle.close, url: `http://127.0.0.1:${bound.port}`, server: handle.server };
 });
 
 afterAll(async () => {
@@ -216,4 +217,60 @@ describe("bridge HTTP surface", () => {
     // keeps the requester's client id in its own bookkeeping, not the body.
     expect(answered.body).toMatchObject({ kind: "sync-state" });
   });
+});
+
+describe("keep-alive posture for browser clients", () => {
+  // The browser pools a keep-alive socket and reuses it for the 3 s inspector
+  // poll and the ingest flush. Whoever closes an idle socket first decides
+  // whether a pooled entry can be stale: if the bridge closes it (Node's 5 s
+  // default), Firefox reuses the dead entry once, the request dies at the
+  // transport with no status and no headers, and the console reports it as
+  // "Cross-Origin Request Blocked … CORS request did not succeed" — a
+  // CORS-shaped message for a keep-alive race that the bridge never sees,
+  // because the request never arrives. The bridge must therefore outlast any
+  // browser's own idle timeout so the *client* is always the closer.
+  const BROWSER_IDLE_MS = { firefox: 115_000, chromium: 300_000 };
+
+  it("keeps idle connections open longer than any browser does", () => {
+    expect(bridge.server.keepAliveTimeout).toBeGreaterThan(BROWSER_IDLE_MS.firefox);
+    // Node cuts a request whose headers stall before this; it must not undercut
+    // the socket lifetime, or a slow loopback request is truncated instead.
+    expect(bridge.server.headersTimeout).toBeGreaterThan(bridge.server.keepAliveTimeout);
+    expect(bridge.server.requestTimeout).toBeGreaterThanOrEqual(bridge.server.keepAliveTimeout);
+  });
+
+  it("survives a pooled socket idling past Node's default keep-alive window", async () => {
+    // A raw socket, because this is about the connection, not the request: an
+    // HTTP client library would silently reconnect and hide the regression.
+    const net = await import("node:net");
+    const port = Number(new URL(bridge.url).port);
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    await new Promise<void>((resolve, reject) => { socket.once("connect", () => resolve()); socket.once("error", reject); });
+    const readOne = () => new Promise<string>((resolve, reject) => {
+      let buffer = "";
+      const onData = (chunk: Buffer) => {
+        buffer += chunk.toString("latin1");
+        if (!buffer.includes("\r\n\r\n")) return;
+        socket.off("data", onData);
+        resolve(buffer);
+      };
+      socket.on("data", onData);
+      socket.once("error", reject);
+      socket.once("close", () => reject(new Error("bridge closed the idle socket")));
+    });
+    try {
+      socket.write(`GET /status?token=${TOKEN} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nOrigin: moz-extension://keepalive-test\r\nConnection: keep-alive\r\n\r\n`);
+      expect((await readOne()).split("\r\n")[0]).toContain("200");
+      // The window that used to break it: Node's 5 s default has long expired,
+      // while a browser would still consider this socket reusable.
+      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      expect(socket.destroyed).toBe(false);
+      socket.write(`GET /status?token=${TOKEN} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nOrigin: moz-extension://keepalive-test\r\nConnection: keep-alive\r\n\r\n`);
+      const second = await readOne();
+      expect(second.split("\r\n")[0]).toContain("200");
+      expect(second.toLowerCase()).toContain("access-control-allow-origin: moz-extension://keepalive-test");
+    } finally {
+      socket.destroy();
+    }
+  }, 20_000);
 });

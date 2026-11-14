@@ -71,6 +71,28 @@ export function startBridge(options: StartOptions = {}) {
   const server = createServer((request, response) => {
     void handle(core, request, response);
   });
+  /**
+   * The browser pools this connection and reuses it for `/inspect/request`,
+   * `/ingest` and the REST reads. Node's default `keepAliveTimeout` is 5 s, so
+   * an idle socket is closed by *us* — and the pooled entry Firefox still holds
+   * is reused once more before it learns the socket is gone. A request written
+   * into that dying socket fails at the transport with no status and no
+   * headers, which the console reports as
+   *
+   *   Cross-Origin Request Blocked: … (Reason: CORS request did not succeed)
+   *
+   * — a CORS-shaped message for a keep-alive race, seen as a burst of errors
+   * whenever the inspector poll (3 s) or the ingest flush idles past the
+   * window, and invisible to the bridge itself because the request never
+   * arrives. Whose close wins is the whole fix: waiting far longer than any
+   * browser keeps an idle socket (Firefox ~115 s, Chromium ~300 s) means the
+   * client is always the one that closes first, so a pooled entry is never
+   * stale, and `headersTimeout`/`requestTimeout` stay above it so Node does not
+   * cut a slow request instead.
+   */
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
+  server.requestTimeout = 300_000;
   const wss = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (request, socket, head) => {

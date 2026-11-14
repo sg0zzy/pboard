@@ -3,7 +3,7 @@
 import { act, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Card } from "../src/sidebar/components/Card";
+import { Card, cardPropsEqual, type CardProps } from "../src/sidebar/components/Card";
 import type { BoardItem } from "../src/types";
 
 const item: BoardItem = {
@@ -185,5 +185,54 @@ describe("card display controls", () => {
     const event = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
     act(() => card.dispatchEvent(event));
     expect(event.defaultPrevented).toBe(false);
+  });
+});
+
+describe("card repaint predicate", () => {
+  // Adding one card used to repaint the whole board: the sidebar hands every
+  // card a fresh `item` object (a read returns new objects for unchanged rows)
+  // and fresh handler closures on each App render. Measured at 400 cards, one
+  // insert cost 12.5 ms of render with every card repainting and 0.5 ms when
+  // only the inserted one does — the difference is this predicate.
+  const base = {
+    item: {
+      id: "card-1", projectId: "p", type: "note", status: "candidate", content: "hello",
+      order: 0, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+      displayMode: "standard",
+    },
+    pendingStatus: "candidate",
+    template: "project",
+    isDragging: false, isMergeTarget: false, isMergeSource: false, selected: false,
+    focusRequested: false, startEditingOnFocus: false,
+  } satisfies Partial<CardProps>;
+  // Handlers are deliberately recreated for every comparison below.
+  const handlers = () => ({
+    onUpdate: async () => {}, onStatusChange: () => {}, onDelete: async () => {},
+    onDiscardEmpty: async () => {}, onDragStart: () => {}, onDragOver: () => {},
+    onDrop: () => {}, onDragEnd: () => {}, onInsertAfter: () => {}, onDuplicate: () => {},
+    onSelect: () => {}, onNavigate: () => {}, onKeyboardMove: () => {}, onFocusHandled: () => {},
+  });
+  const props = (overrides: Record<string, unknown> = {}): CardProps => ({ ...base, ...handlers(), ...overrides }) as unknown as CardProps;
+
+  it("skips a repaint when only object identity and handler identity changed", () => {
+    expect(cardPropsEqual(props(), props())).toBe(true);
+  });
+
+  it("repaints for every value the card paints from", () => {
+    const changed: Array<Record<string, unknown>> = [
+      { item: { ...base.item, content: "edited" } },
+      { item: { ...base.item, title: "a title" } },
+      { item: { ...base.item, type: "bug" } },
+      { item: { ...base.item, status: "done" } },
+      { item: { ...base.item, displayMode: "compact" } },
+      { item: { ...base.item, imageId: "abc" } },
+      { pendingStatus: "done" }, { isDragging: true }, { isMergeTarget: true },
+      { isMergeSource: true }, { selected: true }, { focusRequested: true },
+    ];
+    for (const override of changed) expect(cardPropsEqual(props(), props(override))).toBe(false);
+  });
+
+  it("treats a different card as a different element", () => {
+    expect(cardPropsEqual(props(), props({ item: { ...base.item, id: "card-2" } }))).toBe(false);
   });
 });

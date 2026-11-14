@@ -34,7 +34,8 @@
     "apk:debug:install": "node scripts/build-apk.mjs --install",
     "apk:debug:run": "node scripts/build-apk.mjs --run",
     "lint:firefox": "web-ext lint --config web-ext-lint-config.cjs --warnings-as-errors",
-    "build:diagnostics": "VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs firefox && VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs chromium"
+    "build:diagnostics": "VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs firefox && VITE_PBOARD_DIAGNOSTICS=1 node scripts/build.mjs chromium",
+    "build:firefox-debug": "node scripts/build-firefox-debug.mjs"
   },
   "dependencies": {
     "dexie": "^4.4.6",

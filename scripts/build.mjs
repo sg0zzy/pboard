@@ -11,7 +11,9 @@ if (!process.env.PBOARD_STAGE) {
   process.exit(0);
 }
 const variant = process.argv[2] === "chromium" ? "chromium" : "firefox";
-const outputDir = variant === "chromium" ? "dist/chromium" : "dist";
+// The debug-channel Firefox bundle is staged beside the ordinary tree so both can
+// be loaded as temporary add-ons at once; see scripts/build-firefox-debug.mjs.
+const outputDir = variant === "chromium" ? "dist/chromium" : (process.env.PBOARD_DEBUG_BUNDLE === "1" ? "dist-debug" : "dist");
 const env = { ...process.env, PBOARD_OUT_DIR: outputDir };
 if (variant === "chromium") env.VITE_GOOGLE_DRIVE_FIREFOX_CLIENT_SECRET = "";
 

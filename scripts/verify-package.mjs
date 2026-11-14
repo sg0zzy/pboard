@@ -37,6 +37,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const root = resolve(new URL("..", import.meta.url).pathname);
   const { version } = JSON.parse(await readFile(resolve(root, "package.json"), "utf8"));
   const archive = resolve(root, process.argv[2] ?? `web-ext-artifacts/pboard-${version}.zip`);
-  const count = await verifyPackage(archive, resolve(root, "dist"));
+  const count = await verifyPackage(archive, resolve(root, process.argv[3] ?? "dist"));
   console.log(`Firefox package verification passed (${count} files): ${archive}`);
 }

@@ -74,8 +74,14 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
     // GETs emit nothing, media GETs are `download.*`, writes are `upload.*`.
     const observable = method !== "GET" || input.includes("alt=media");
     const what = method === "GET" ? "download" : "upload";
+    // The signature names the endpoint with resource ids folded away (the same
+    // one the quota ledger groups by). Without it a transfer event says only
+    // "a GET happened", so a repeating download is indistinguishable from
+    // ordinary traffic and the one fact that identifies a loop — *which*
+    // endpoint keeps being asked for — never reaches the bridge.
+    const signature = observable ? driveRequestSignature(input, method) : undefined;
     if (observable)
-      emit({ component: "drive", event: `${what}.requested`, severity: "debug", details: { method, attempt, cost } });
+      emit({ component: "drive", event: `${what}.requested`, severity: "debug", details: { method, attempt, cost, ...(signature ? { signature } : {}) } });
     // Respect projected budget deferrals and real Google quota cooldowns.
     await quota.acquire(cost, init.signal);
     // Account signaling/preferences and snapshots must observe writes made
@@ -115,7 +121,7 @@ export function createDriveTransport(auth: GoogleAuthProvider, fetcher: typeof f
       throw await requestError(response);
     }
     if (observable)
-      emit({ component: "drive", event: `${what}.completed`, severity: "debug", details: { method, status: response.status } });
+      emit({ component: "drive", event: `${what}.completed`, severity: "debug", details: { method, status: response.status, ...(signature ? { signature } : {}) } });
     return response;
   }
 

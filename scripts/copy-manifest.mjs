@@ -41,3 +41,14 @@ if (process.env.PBOARD_SIGNALING_DEV_BUILD === '1') {
   manifest.host_permissions.push(`${scheme}//${endpoint.hostname}/*`);
   await writeFile(path, JSON.stringify(manifest, null, 2) + '\n');
 }
+
+// Debug-channel developer bundle: label it and grant only the loopback bridge, so
+// the background context may POST diagnostics to 127.0.0.1:8790. Tracked manifests
+// and OAuth declarations stay untouched; this never reaches a distributable build.
+if (process.env.PBOARD_DEBUG_BUNDLE === '1') {
+  const path = join(root, outputDir, 'manifest.json');
+  const manifest = JSON.parse(await readFile(path, 'utf8'));
+  manifest.name = 'Pboard (debug channel)';
+  if (!manifest.host_permissions.includes('http://127.0.0.1/*')) manifest.host_permissions.push('http://127.0.0.1/*');
+  await writeFile(path, JSON.stringify(manifest, null, 2) + '\n');
+}

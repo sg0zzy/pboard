@@ -36,22 +36,35 @@ When no SDK is found the build fails with the variables to set and every path it
 npm ci
 npm run typecheck
 npm test
-scripts/build_all.sh                         # Firefox + Chromium + Android debug
-scripts/build_all.sh firefox chromium        # explicit subset
+scripts/build_all.sh                         # Firefox + Chromium + Android debug, plus the Firefox debug-channel bundle
+scripts/build_all.sh firefox chromium        # explicit subset; the Firefox debug-channel bundle is added too
+scripts/build_all.sh chromium                # no Firefox: no debug-channel bundle
 npm run build                               # managed Firefox build + package
-npm run build:chromium                       # managed Chromium build + package
-npm run build:all                            # managed builds of both browsers
-npm run build:diagnostics                   # both browsers with transport/view diagnostics compiled in
+npm run build:chromium                      # managed Chromium build + package
+npm run build:all                          # managed builds of both browsers
+npm run build:diagnostics                 # both browsers with transport/view diagnostics compiled in
+npm run build:firefox-debug              # managed Firefox debug-channel bundle only
+```
 
-`build:diagnostics` sets `VITE_PBOARD_DIAGNOSTICS=1` for both browser builds, which compiles in the
-per-connection ledger behind `(await pboardCollaboration()).transport` — connection ids, dial
-triggers, close codes and reasons, reconnect delays, and the view read/emission counters. Without
-the flag the ledger is compiled out entirely (no allocation, no behaviour change) and the console
-says so, so an empty `transport` object is never mistaken for "no connections".
+`build:diagnostics` and `build:firefox-debug` set `VITE_PBOARD_DIAGNOSTICS=1`, which compiles in
+the Live Debug Bridge channel and the per-connection ledger behind
+`(await pboardCollaboration()).transport` — connection ids, dial triggers, close codes and
+reasons, reconnect delays, and the view read/emission counters. Without the flag the ledger is
+compiled out entirely (no allocation, no behaviour change) and the console says so, so an empty
+`transport` object is never mistaken for "no connections".
+
+`scripts/build_all.sh` builds the ordinary Firefox bundle (staged at `dist/`) **and** a second
+Firefox bundle with the debug channel compiled in and enabled by default (staged at
+`dist-debug/`, manifest name `Pboard (debug channel)`, managed artifact
+`Pboard-<identity>-firefox-debug-universal.zip`). Both can be loaded as temporary add-ons in
+separate Firefox profiles at the same time; the debug tree grants only
+`http://127.0.0.1/*` for the loopback bridge. It is skipped in GitHub Actions, and
+`PBOARD_BUILD_DEBUG=0 scripts/build_all.sh …` opts out locally;
+`npm run build:firefox-debug` produces it alone.
 
 **Never ship a diagnostics build to users.** It retains up to 32 connection records and the view
-counters in memory, and the normal `npm run build`, `build:chromium`, `build:all`, `package:*`,
-`release:*` and `scripts/build_all.sh` paths do not set the flag.
+counters in memory, and the normal `npm run build`, `build:chromium`, `build:all`, `package:*`
+and `release:*` paths do not set the flag. CI also never builds the debug-channel bundle.
 npm run check                               # root typecheck/tests + both browser builds/verification
 npm --prefix apps/android run typecheck
 npm --prefix apps/android test
@@ -89,7 +102,7 @@ The recovery material is deliberately not a separate suite. `tests/recovery/**` 
 
 The script never runs `npm run test:collaboration`, `automatic-smoke.mjs`, `secure-browser-smoke.mjs` or the geckodriver/hosted smokes, because those need a public endpoint, live Google credentials or a browser driver; that exclusion is deliberate rather than an oversight. Browser builds and `verify-build.mjs` are also out of scope: they produce artifacts, so `npm run check` remains the gate for those.
 
-The vitest configuration includes `tests/**/*.test.{ts,tsx,mjs}`, so the isolated two-browser suite under `tests/multiBrowser/` runs as part of `npm test` rather than as a separate harness. `verify-build.mjs` takes `firefox`, `chromium` or `all`; with no argument it verifies `all`, and it is the gate that fails a build whose bundled background script cannot start. `cargo clippy --all-targets` is the lint gate for the relay and must report zero warnings.
+The vitest configuration includes `tests/**/*.test.{ts,tsx,mjs}`, so the isolated two-browser suite under `tests/multiBrowser/` runs as part of `npm test` rather than as a separate harness. `verify-build.mjs` takes `firefox`, `chromium` or `all`; with no argument it verifies `all`, and an optional second argument selects an alternate Firefox directory (`node scripts/verify-build.mjs firefox dist-debug`). It is the gate that fails a build whose bundled background script cannot start. `cargo clippy --all-targets` is the lint gate for the relay and must report zero warnings.
 
 ## Relay service (`services/pboard-signaling`)
 
@@ -113,7 +126,7 @@ None of this is deployed by a repository build: the crate is implemented and tes
 
 ## Managed artifacts
 
-Output: `local_artifacts/<core>-local.<unique-integer>/Pboard-<identity>-<target>-universal.{zip,apk}`, with `build-info.json`. Each directory is an exclusive direct-child reservation. Manifest schema 1 / manager `pboard-local-builds` records state, source SHA/dirty/snapshot digest, effective configuration digest, standards pin, locks, host/toolchain, package versions, checksums/sizes and target outcomes. Local Android certificates are recorded as debug-only.
+Output: `local_artifacts/<core>-local.<unique-integer>/Pboard-<identity>-<target>-universal.{zip,apk}`, with `build-info.json`; the optional Firefox debug-channel bundle adds a `-debug` target suffix (`Pboard-<identity>-firefox-debug-universal.zip`) and records `options.diagnostics: true`. Each directory is an exclusive direct-child reservation. Manifest schema 1 / manager `pboard-local-builds` records state, source SHA/dirty/snapshot digest, effective configuration digest, standards pin, locks, host/toolchain, package versions, checksums/sizes and target outcomes. Local Android certificates are recorded as debug-only.
 
 Source identity covers path/content/mode of tracked and relevant untracked inputs, deletions, and the effective public Firefox OAuth parameter. Compilation reads a private snapshot, not the changing working tree. Secret/env files, raw Git patches, caches, dependencies, Git internals, artifacts and private native config are excluded. Env files are not copied; only the documented public OAuth parameter is supplied privately. Dependency bytes come from installed `node_modules` identified by lockfiles; run `npm ci` after changing a lock and do not mutate dependencies during a build. Native private `google-services.json` integrations are not configured by the managed profile; official releases never consume ignored private source inputs.
 
@@ -136,7 +149,12 @@ For manual recovery, stop/inspect the selected failed/interrupted build's proces
 
 ## Loading the extension
 
-Firefox: `about:debugging` → This Firefox → Load Temporary Add-on → `dist/manifest.json`. Chromium: `chrome://extensions` → Developer mode → Load unpacked → `dist/chromium/`. These are development installations, not evidence of store signing or acceptance.
+Firefox: `about:debugging` → This Firefox → Load Temporary Add-on → `dist/manifest.json`.
+The debug-channel bundle from `scripts/build_all.sh` loads the same way from
+`dist-debug/manifest.json` in its own profile (start `npm run debug:bridge` first); a profile can
+only hold one temporary add-on per extension ID, so use separate profiles for the two trees.
+Chromium: `chrome://extensions` → Developer mode → Load unpacked → `dist/chromium/`. These are
+development installations, not evidence of store signing or acceptance.
 
 ## Chrome Web Store submission
 

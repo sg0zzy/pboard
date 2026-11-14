@@ -35,8 +35,14 @@ content-free events, and mode-gated control.
 - **No wildcard is ever emitted.** A foreign `Origin` gets 403
   `cross-origin requests are not allowed`.
 - `OPTIONS` is answered 405 with no CORS grant: preflighted requests are not
-  our client; the SDK deliberately stays CORS-simple (text body, `token` in
-  the query).
+  our client; the SDK stays CORS-simple (`token` in the query, and a
+  **safelisted** `content-type` — `text/plain` — never `application/json`,
+  which would trigger a preflight that the bridge refuses). Because a refused
+  preflight rejects the fetch before any byte reaches `/ingest`, this rule is
+  load-bearing: a POST that preflights delivers nothing and only shows up as
+  `droppedByOverflow`-adjacent transport drops, never as a bridge error.
+  `tests/debugProtocol.test.ts` pins it; the bridge parses the body as JSON
+  without consulting the header.
 
 ## Modes: observation vs control
 

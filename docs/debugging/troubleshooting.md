@@ -16,6 +16,36 @@ Symptom → most likely cause → the one check that settles it.
    `drops`/`transport` counts via the `pboardDebug()` handle.
 4. **Token mismatch** — bridge logs `401 missing or invalid debug token`; the
    client needs the same `token` setting (sent as `?token=`).
+5. **The POST preflighted and the bridge refused it** — the bridge answers
+   `OPTIONS` 405 with no CORS grant, so an ingest sent with a non-safelisted
+   `content-type` (e.g. `application/json`) never reaches `/ingest`: the
+   bridge stays at `clients: []` with no error of its own, while the client
+   counts transport drops and after five failures pauses for 30 s
+   ([security.md](security.md)). Settle it by watching the loopback socket:
+   `strace -f -p $(pgrep -f pboard-debug/server.ts) -e trace=read | grep -o
+   'OPTIONS /ingest'`. A request here is the bug, not the symptom — the
+   transport must use a safelisted `text/plain` body.
+
+## "CORS request did not succeed" in the browser console
+
+Firefox reports a request that died **before any response** as
+`Cross-Origin Request Blocked … (Reason: CORS request did not succeed)`, with
+`Status code: (null)`. That message is not always about CORS. The common
+non-CORS cause is a **keep-alive race**: the browser pools a loopback socket
+and reuses it after idling, and if the bridge closed that socket first, the
+reused entry is written into a dead connection — no status, no headers, and
+nothing in the bridge's own logs, because the request never arrives. The
+inspector poll (3 s) and the ingest flush idle past Node's 5 s default
+`keepAliveTimeout` constantly, so this shows up as periodic bursts.
+
+The bridge therefore sets `keepAliveTimeout` (120 s) above every browser's own
+idle timeout (Firefox ~115 s, Chromium ~300 s) so the *client* is always the
+one that closes; `headersTimeout`/`requestTimeout` stay above it.
+`tests/debugBridge.test.ts` pins both the values and a real pooled-socket
+reuse across the old window. If you still see the message, check the request
+actually reached the bridge (`strace -p $(pgrep -f pboard-debug/server.ts) -e
+trace=read | grep -c 'GET /inspect/request'`): zero hits means connection-level,
+not CORS. The other cause is the preflight rule above.
 
 ## Events arrive but stop after a while
 
