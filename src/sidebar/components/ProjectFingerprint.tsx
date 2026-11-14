@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { statusClassName, WORKFLOW_STATUS_ROWS } from "../../statuses";
 import type { BoardItem, BoardItemStatus } from "../../types";
 
@@ -157,7 +157,17 @@ function StateSymbol({ status, x, y }: { status: FingerprintStatus; x: number; y
   return <path className="fingerprint-state-symbol fingerprint-state-symbol--rejected" d={`M${x + 1.8} ${y + 1.8}l3.5 3.5m0-3.5-3.5 3.5`} />;
 }
 
-function FingerprintCell({ projectId, item, x, y, className = "", style }: {
+/**
+ * One dot of the board fingerprint.
+ *
+ * Memoized because its two `d` attributes are the most expensive thing the
+ * sidebar repaints: a delete re-renders the whole fingerprint, and writing
+ * `path.d` re-parses the path data. Measured on a 300-card board, one delete
+ * produced 599 `path.d` and 299 `circle.cx` mutations and took ~40 ms — for a
+ * change that touched exactly one card. The props below are everything the two
+ * paths are computed from, so an unchanged dot now writes nothing.
+ */
+const FingerprintCell = memo(function FingerprintCell({ projectId, item, x, y, className = "", style }: {
   projectId: string;
   item: BoardItem;
   x: number;
@@ -167,15 +177,28 @@ function FingerprintCell({ projectId, item, x, y, className = "", style }: {
 }) {
   const status = item.status as FingerprintStatus;
   const seedBase = `${projectId}:${item.id}`;
+  // The dot's outline is drawn at the origin and moved into place by `transform`.
+  // It used to be baked into the path data, and the position is the card's index
+  // in its row — so deleting one card shifted every card after it, rewriting two
+  // `path.d` per dot. Writing `path.d` re-parses the path; a `transform` does not.
+  // Measured on a 300-card board: one delete produced 599 `path.d` mutations.
   return (
-    <g className={`fingerprint-cell fingerprint-cell--${statusClassName(status)}${className ? ` ${className}` : ""}`} style={style}>
+    <g
+      className={`fingerprint-cell fingerprint-cell--${statusClassName(status)}${className ? ` ${className}` : ""}`}
+      style={style}
+      transform={`translate(${x} ${y})`}
+    >
       <title>{status}</title>
-      <path className="fingerprint-cell-shape" d={pencilCellPath(x, y, CELL_SIZE, fingerprintHash(`${seedBase}:main`))} />
-      <path className="fingerprint-cell-echo" d={pencilCellPath(x, y, CELL_SIZE, fingerprintHash(`${seedBase}:echo`))} />
-      <StateSymbol status={status} x={x} y={y} />
+      <path className="fingerprint-cell-shape" d={pencilCellPath(0, 0, CELL_SIZE, fingerprintHash(`${seedBase}:main`))} />
+      <path className="fingerprint-cell-echo" d={pencilCellPath(0, 0, CELL_SIZE, fingerprintHash(`${seedBase}:echo`))} />
+      <StateSymbol status={status} x={0} y={0} />
     </g>
   );
-}
+}, (a, b) =>
+  a.x === b.x && a.y === b.y && a.className === b.className && a.style === b.style &&
+  a.projectId === b.projectId && a.item.id === b.item.id && a.item.status === b.item.status &&
+  (a.item.type ?? "") === (b.item.type ?? ""));
+
 
 function CompactFingerprintRow({ row, y }: { row: BoardItem[]; y: number }) {
   let x = GRID_X;

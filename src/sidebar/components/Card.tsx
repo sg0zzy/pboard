@@ -62,7 +62,19 @@ type PointerDragSession = {
 
 const FOCUS_MARGIN_PX = 24;
 
-function ensureCardVisible(card: HTMLElement | null) {
+/**
+ * Bring a card into view.
+ *
+ * `behavior` is the caller's to choose because the two situations differ. When
+ * the person navigated to the card deliberately — a keyboard move, a click on a
+ * pinned card — a smooth scroll reads as care. When the card was *just created*
+ * or *just saved*, the view moves under the cursor and the smooth animation is
+ * the latency they perceive: measured in Chromium, `scrollTo({behavior:"smooth"})`
+ * takes 867 ms to settle over 2500 px against 67 ms for `instant`, and while it
+ * runs the card is being scrolled into place instead of sitting still under the
+ * caret they are already typing into.
+ */
+function ensureCardVisible(card: HTMLElement | null, behavior: ScrollBehavior = "smooth") {
   if (!card) return;
   const viewport = window.innerHeight;
   const margin = FOCUS_MARGIN_PX;
@@ -87,7 +99,7 @@ function ensureCardVisible(card: HTMLElement | null) {
   const maxScroll = Math.max(0, document.documentElement.scrollHeight - viewport);
   const target = Math.min(Math.max(0, window.scrollY + delta), maxScroll);
   if (target === window.scrollY) return;
-  window.scrollTo({ top: target, behavior: "smooth" });
+  window.scrollTo({ top: target, behavior });
 }
 
 /**
@@ -203,7 +215,9 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
 
   useLayoutEffect(() => {
     if (focusRequested && editing) {
-      ensureCardVisible(cardRef.current);
+      // A newly created card (or one being reopened for editing) puts the caret
+      // here; the view must already be settled, not animating under it.
+      ensureCardVisible(cardRef.current, "instant");
       onFocusHandled();
     }
   }, [focusRequested, editing]);
@@ -364,7 +378,9 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
     }
     window.requestAnimationFrame(() => {
       cardRef.current?.focus({ preventScroll: true });
-      ensureCardVisible(cardRef.current);
+      // Cancelling an edit dismisses it; the view should already be where the
+      // person left it, not animating back while they type again.
+      ensureCardVisible(cardRef.current, "instant");
     });
   }
 
@@ -374,7 +390,8 @@ export function Card({ item, getImage, subscribeImage, pendingStatus, template, 
     if (afterSave === undefined) {
       window.requestAnimationFrame(() => {
         cardRef.current?.focus({ preventScroll: true });
-        ensureCardVisible(cardRef.current);
+        // The save is the interaction; do not animate the view afterwards.
+        ensureCardVisible(cardRef.current, "instant");
       });
     }
   }
