@@ -171,6 +171,18 @@ export interface PboardDriveSignalStore {
    * Optional: a store without a cheap answer omits it and the poll reads Drive.
    */
   ownRecord?(): PboardDriveSignalRecord | null;
+  /**
+   * This session's own record, read from Drive when no local copy exists.
+   *
+   * The poll loop asks for its own presence on every tick. `ownRecord()` answers
+   * when this context wrote the file; a second context of the same browser — a
+   * sidebar beside the worker — did not, and falling back to `readPeer(me)` there
+   * cost a media download per tick for a record whose `modifiedTime` had not
+   * moved (~1.7 per second, 200 units each, measured on a live profile). A store
+   * that can answer this more cheaply than a download does; `readPeer` keeps its
+   * faithful-read contract for callers that ask what Drive holds now.
+   */
+  readOwnCached?(): Promise<PboardDriveSignalRecord | null>;
   /** All peer records in the room (any age); the caller applies the TTL. */
   listPeers(): Promise<Record<string, PboardDriveSignalRecord>>;
   /** Remove this peer's own record (idempotent). */
@@ -301,7 +313,8 @@ export function createDriveSignaling(options: PboardDriveSignalingOptions): Pboa
   async function readOwn(): Promise<PboardDriveSignalRecord> {
     // A store that wrote the record knows it already; asking Drive for our own
     // presence on every poll cost a name lookup and a download per tick.
-    const record = store.ownRecord?.() ?? await store.readPeer(me);
+    const record = store.ownRecord?.()
+      ?? (store.readOwnCached ? await store.readOwnCached() : await store.readPeer(me));
     return record ?? { updatedAt: store.now(), peers: [], outbox: [] };
   }
 

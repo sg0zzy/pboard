@@ -64,7 +64,14 @@ it('does not rescan the change history when a board has many journal rows', asyn
   const card = await repo.addItem({ projectId: board.id, content: 'After history' });
   await repo.updateItem(card.id, { content: 'After history edited' });
   // The committed log is read once and shared, not once per board.
-  expect(counts.get('entries') ?? 0).toBeLessThanOrEqual(6);
+  //
+  // `prepare` additionally resolves a write's parent with two *keyed* reads on the
+  // `version` index (the exact version, then the versions sharing its timestamp)
+  // instead of reading this document's whole history. The budget counts calls, not
+  // rows, so it allows those two while still failing any change that scans the
+  // history again — that scan grows one entry per card operation, and was 2,421
+  // rows / 1.4 MB per insert on a board with 2,420 of them.
+  expect(counts.get('entries') ?? 0).toBeLessThanOrEqual(8);
 });
 
 it('keeps the total journal reads of one edit independent of the board history', async () => {
@@ -98,4 +105,36 @@ it('keeps the erasure markers and the committed log consistent with the journal'
   // A marker updated in place is visible too: the shared copy is dropped when
   // the receipts table changes.
   expect((await repo.journal.boardErasure(board.id))?.cloudPending).toBe(false);
+});
+
+it('resolves an edit against a board with history without reading that history', async () => {
+  // The parent lookup used to read the document's whole version history, and for a
+  // project row that history grows one entry per card operation: measured at 2,421
+  // rows and 1.4 MB for a single insert on a board with 2,420 of them, 46.7 ms
+  // against 7.4 ms on a fresh board — insert, edit and delete all paid it.
+  //
+  // An edit always has a previous value, so its parent is resolvable by the keyed
+  // `version` index. A first insert still reads the history by design (there is no
+  // previous value to key on), which is why this exercises an edit.
+  const { repo, board } = await setup();
+  for (let index = 0; index < 40; index++) {
+    const card = await repo.addItem({ projectId: board.id, content: `Card ${index}` });
+    await repo.updateItem(card.id, { content: `Card ${index} edited` });
+  }
+  const target = await repo.addItem({ projectId: board.id, content: 'Before' });
+  const journal = repo.journal as unknown as { read: <T>(name: string, op: (s: IDBObjectStore) => IDBRequest<T>) => Promise<T> };
+  const keys: string[] = [];
+  const original = journal.read.bind(journal);
+  journal.read = async (name, op) => {
+    // Name the index the read uses, without running it twice.
+    const described = String((op as unknown as { toString(): string }).toString());
+    keys.push(`${name}:${/version/.test(described) ? "version" : "other"}`);
+    return original(name, op);
+  };
+  await repo.updateItem(target.id, { content: 'After' });
+  const entryReads = keys.filter(key => key.startsWith("entries:"));
+  // Every entry read for the edit is keyed on `version`; a wholesale scan of the
+  // store would show up as `entries:other`.
+  expect(entryReads.length).toBeGreaterThan(0);
+  expect(entryReads.every(key => key === "entries:version")).toBe(true);
 });

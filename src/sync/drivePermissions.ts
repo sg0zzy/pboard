@@ -981,10 +981,48 @@ export function createDriveSignalStore(options: {
      * method promises.
      */
     ownRecord: () => (ownRecord ? structuredClone(ownRecord) : null),
+    /**
+     * Our own presence record, served from the last listing when it is still
+     * fresh, else read from Drive.
+     *
+     * This is where the recurring cost was: a sidebar and a background worker
+     * open the same room, and the one that did not *write* the file fell back to
+     * `readOwn()`'s `readPeer(me)` on every tick — one 200-unit media download per
+     * tick, ~1.7 per second, for a record whose `modifiedTime` had not moved. The
+     * listing that `listPeers` already performs carries that stamp, so an
+     * unchanged record costs nothing extra here while a changed one is read
+     * immediately. `readPeer` itself stays a faithful read of Drive.
+     */
+    async readOwnCached(): Promise<PboardDriveSignalRecord | null> {
+      if (ownRecord) return structuredClone(ownRecord);
+      const folderId = await realtimeFolderId();
+      const file = await transport.findFile(fileName(peerId), folderId);
+      if (!file) return null;
+      const stamp = stampOf(file);
+      const cached = seen.get(file.id);
+      const at = now();
+      if (cached && stamp && cached.modifiedTime === stamp && at - cached.at < rereadMs) {
+        return structuredClone(cached.record);
+      }
+      try {
+        const record = JSON.parse(await transport.downloadFile(file.id)) as PboardDriveSignalRecord;
+        seen.set(file.id, { modifiedTime: stamp, at, record });
+        return record;
+      } catch {
+        return null;
+      }
+    },
     async readPeer(peer) {
       const folderId = await realtimeFolderId();
       const file = await transport.findFile(fileName(peer), folderId);
       if (!file) return null;
+      // `readPeer` is the *faithful* read: it must not answer from a cache, because
+      // a caller asking it is asking what Drive holds now (a file edited or
+      // deleted behind our back has to read as it actually is, including as
+      // unreadable). The poll loop does not need that fidelity for its own record —
+      // it asks `ownRecord()` first, and only falls back here in a context that
+      // never wrote the file — so the saving lives at the call site, below, not by
+      // making this method lie.
       try {
         return JSON.parse(await transport.downloadFile(file.id)) as PboardDriveSignalRecord;
       } catch {

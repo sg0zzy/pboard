@@ -181,7 +181,7 @@ export class ChangeJournal {
   constructor(name: string) { this.name = `${name}-change-journal-v1`; }
   async open(): Promise<void> {
     this.database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(this.name, 11);
+      const request = indexedDB.open(this.name, 12);
       request.onupgradeneeded = () => {
         // Transport-independent operation WAL shares the existing journal DB.
         for (const name of ["operations", "operationStreams", "operationOutbox", "operationSegments", "operationCheckpoints"]) {
@@ -197,6 +197,11 @@ export class ChangeJournal {
         const operationMetadata = request.transaction!.objectStore('operationCheckpoints');
         if (!operationMetadata.indexNames.contains('kind')) operationMetadata.createIndex('kind', 'kind');
         if (!operationMetadata.indexNames.contains('kindBoard')) operationMetadata.createIndex('kindBoard', ['kind', 'boardId']);
+        // v12: exact parent lookup for the entries store (see the creation below).
+        if (request.result.objectStoreNames.contains("entries")) {
+          const entriesStore = request.transaction!.objectStore("entries");
+          if (!entriesStore.indexNames.contains("version")) entriesStore.createIndex("version", ["collection", "documentId", "value.updatedAt"]);
+        }
         const operationRows = request.transaction!.objectStore('operations');
         if (!operationRows.indexNames.contains('sourceId')) operationRows.createIndex('sourceId', 'sourceId', { unique: true });
         if (!operationRows.indexNames.contains('stream')) operationRows.createIndex('stream', ['boardId', 'operation.actorId', 'operation.seq']);
@@ -204,6 +209,13 @@ export class ChangeJournal {
         const entries = request.result.createObjectStore("entries", { keyPath: "id" });
         entries.createIndex("boardId", "boardId"); entries.createIndex("state", "state");
         entries.createIndex("[collection+documentId]", ["collection", "documentId"]);
+        // Exact parent lookup: a journal value always carries `updatedAt`, and a
+        // write's parent is the entry holding the previous document's bytes. The
+        // candidate query above returns a document's whole history, and for a
+        // project row that is one entry per card operation — 2,421 rows and
+        // 1.4 MB per insert on a board with 2,420 operations. This index makes the
+        // common case a keyed read, so history size stops mattering.
+        entries.createIndex("version", ["collection", "documentId", "value.updatedAt"]);
         const receipts = request.result.createObjectStore("receipts", { keyPath: "id" });
         receipts.createIndex("destination", "destination");
         }
@@ -372,7 +384,23 @@ export class ChangeJournal {
   async prepare(collection: Change["collection"], document: Record<string, unknown>, previous: Record<string, unknown> | undefined, local: boolean, resolution?: string[], authenticated = false): Promise<JournalEntry> {
     const boardId = String(collection === "projects" ? document.id : document.projectId);
     const common = { boardId, collection, documentId: String(document.id) };
-    const candidates = await this.entries.where("[collection+documentId]").equals([collection, common.documentId]).toArray();
+    // The parent is the entry whose bytes equal the *previous* document, so the
+    // keyed read yields that entry or proves it absent; the candidate set is then
+    // every version sharing its timestamp, which is where the ambiguity rules
+    // below look for a second indistinguishable head. Both are keyed reads on the
+    // `version` index instead of a scan of the document's whole history — and for
+    // a project row that history is one entry per card operation (2,421 rows and
+    // 1.4 MB per insert on a board with 2,420 of them).
+    //
+    // A first insert (no previous value) or an explicit resolution still reads the
+    // history, because their rules genuinely need it: a removal re-signs in place
+    // and is matched by content rather than bytes, and a resolution names entries
+    // directly.
+    const previousAt = previous && typeof previous.updatedAt === "string" ? String(previous.updatedAt) : undefined;
+    const exact = previousAt && !resolution ? await this.exactVersion(collection, common.documentId, previousAt) : undefined;
+    const candidates = exact && !resolution
+      ? await this.candidatesAt(collection, common.documentId, String(exact.value.updatedAt))
+      : await this.entries.where("[collection+documentId]").equals([collection, common.documentId]).toArray();
     if (!local) {
       const exact = candidates.find(c => c.boardId === boardId && c.state === "committed" && canonicalize(c.value) === canonicalize(documentValue(document)) && !!c.proof);
       if (exact) return exact;
@@ -642,6 +670,30 @@ export class ChangeJournal {
       return value;
     });
     return this.committedLoad;
+  }
+  /**
+   * The entry holding exactly the document a write is replacing.
+   *
+   * The stored value is not always byte-identical to the previous document the
+   * writer was handed (RxDB's own row carries fields `documentValue` strips), so
+   * this can legitimately miss; the caller then falls back to reading the
+   * document's history, exactly as before this index existed.
+   */
+  private async exactVersion(collection: Change["collection"], documentId: string, updatedAt: string): Promise<JournalEntry | undefined> {
+    return this.read<JournalEntry | undefined>("entries",
+      store => store.index("version").get([collection, documentId, updatedAt]) as IDBRequest<JournalEntry | undefined>);
+  }
+  /**
+   * Every version recorded with this exact timestamp.
+   *
+   * One keyed read replaces the scan of the document's whole history, and it is
+   * the complete candidate set the rules below need: they ask whether a *second*
+   * entry carries the same bytes, and a second entry with the same bytes for the
+   * same document shares this timestamp.
+   */
+  private async candidatesAt(collection: Change["collection"], documentId: string, updatedAt: string): Promise<JournalEntry[]> {
+    return this.read<JournalEntry[]>("entries",
+      store => store.index("version").getAll([collection, documentId, updatedAt]) as IDBRequest<JournalEntry[]>);
   }
   async localSourceIds(boardId: string): Promise<string[]> {
     return (await this.read<IDBValidKey[]>('entries', store => store.index('localBoard').getAllKeys([boardId, 'committed', 'local']))).map(String);
